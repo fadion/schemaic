@@ -304,13 +304,16 @@ that arm is a separate decision from the one the absent arm is about, and tests 
 **`queue_notice` is the shared startup-notice channel**, over the `RECOVERIES` list the
 config-recovery modal drains with `take_recoveries`. Everything loaded before the window is
 drawn has the same problem — there is no surface yet to say anything on — so one channel beats
-each loader inventing its own, and `conn/secrets.rs` is the second caller (a locked keyring is
-*the* reason connections stop authenticating and used to reach neither a banner nor a log line).
+each loader inventing its own, and `conn/secrets.rs` is the second caller — for what its
+legacy-plaintext migration's save reports, now that its load reads no secret (a locked keyring,
+*the* reason connections stop authenticating, used to be queued here too, and before that reached
+neither a banner nor a log line; it is said per connection when one is read).
 **What it queues is a `Notice`, not a sentence**, because the queue is filled in core before the
 window exists and drained by an interface that says it in its own language.
 `Unreadable { name, error, swept }` and `Missing { name, from }` are what `recovery_notice` and
 `missing_notice` build (`notice_name` is the file name both say), `KeyringUnreadable` and
-`KeyringSave` are `Hydration::notice`'s and `Sanitized::notice`'s (under `core/secrets.rs`), and
+`KeyringSave` are `Hydration::notice`'s — `conn::secrets::unreadable_notice`'s in the app — and
+`Sanitized::notice`'s (under `core/secrets.rs`), and
 `Said` carries text its caller has already worded in the interface's language — the app's
 `conn-delete-keyring-*` notice after a failed `forget_connection`. `Notice::message` is the
 English, the sentences this queue used to hold, and the interface's `i18n::notice_text` is held

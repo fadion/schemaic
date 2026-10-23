@@ -1556,6 +1556,9 @@ pub enum DbRefusal {
     SqliteGenerated(String),
     /// SQLite's table sizes are read only for files up to `cap` bytes.
     SqliteSizesTooLarge { cap: u64, file: u64 },
+    /// The OS keyring would not give a saved connection's secret at connect
+    /// time; the backend's own message. Nothing was deleted.
+    KeyringUnreadable(String),
 }
 
 impl DbRefusal {
@@ -1591,7 +1594,8 @@ impl DbRefusal {
             | DbRefusal::SqliteUri(_)
             | DbRefusal::SqliteNoColumn { .. }
             | DbRefusal::SqliteGenerated(_)
-            | DbRefusal::SqliteSizesTooLarge { .. } => true,
+            | DbRefusal::SqliteSizesTooLarge { .. }
+            | DbRefusal::KeyringUnreadable(_) => true,
         }
     }
 
@@ -1733,6 +1737,10 @@ impl DbRefusal {
                  reading every page of the file, and this one is {}.",
                 crate::stats::format_bytes(*cap),
                 crate::stats::format_bytes(*file)
+            ),
+            DbRefusal::KeyringUnreadable(error) => format!(
+                "Schemaic could not read this connection's saved credentials from the OS \
+                 keyring ({error}). Nothing was deleted: unlock the keyring and try again."
             ),
         }
     }

@@ -167,7 +167,10 @@ fn azure_unavailable(server: &str) -> ConnectFailure {
 async fn auth_method(db: &Db) -> Result<tiberius::AuthMethod, DbError> {
     use schemaic_core::connection::AuthMode;
     match db.auth {
-        AuthMode::Password => Ok(tiberius::AuthMethod::sql_server(&db.user, &db.pass)),
+        AuthMode::Password => Ok(tiberius::AuthMethod::sql_server(
+            &db.user,
+            db.password().await?,
+        )),
         #[cfg(windows)]
         AuthMode::Windows => Ok(tiberius::AuthMethod::Integrated),
         #[cfg(not(windows))]

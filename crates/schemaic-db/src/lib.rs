@@ -633,6 +633,27 @@ pub struct Db {
     /// token is signed for the instance that checks it
     /// ([`Self::signing_target`]). `None` where the two are the same.
     pub(crate) signing: Option<(String, u16)>,
+    /// Where the password comes from when `pass` is empty — the app's lazy
+    /// keyring read ([`Self::with_password_source`]). `None` means `pass` is
+    /// the whole answer.
+    pub(crate) pass_source: Option<PasswordSource>,
+}
+
+/// A password read **when a connect needs it**, rather than when the handle is
+/// made: the app reads saved secrets from the OS keyring lazily, and a keychain
+/// read can wait on a prompt, so it belongs on the worker that connects and not
+/// on the UI thread that mints the handle.
+///
+/// Called at most once per sign-in, on Tokio's blocking pool. What it reads is
+/// the caller's to cache; an `Err` is the connect's error.
+#[derive(Clone)]
+pub struct PasswordSource(std::sync::Arc<dyn Fn() -> Result<String, DbError> + Send + Sync>);
+
+impl PasswordSource {
+    /// Wrap the read.
+    pub fn new(read: impl Fn() -> Result<String, DbError> + Send + Sync + 'static) -> Self {
+        PasswordSource(std::sync::Arc::new(read))
+    }
 }
 
 /// **Hand-written, because the derived one printed the password.**
@@ -667,6 +688,7 @@ impl std::fmt::Debug for Db {
             .field("auth", &self.auth)
             .field("init_sql", &self.init_sql)
             .field("signing", &self.signing)
+            .field("pass_source", &self.pass_source.is_some())
             .finish()
     }
 }
@@ -739,6 +761,7 @@ impl Db {
                     let (host, port) = conn.tcp_target();
                     (host.to_string(), port)
                 }),
+                pass_source: None,
             },
             None => Db {
                 engine,
@@ -752,6 +775,7 @@ impl Db {
                 auth,
                 init_sql,
                 signing: None,
+                pass_source: None,
             },
         }
     }
@@ -783,7 +807,31 @@ impl Db {
             auth: schemaic_core::connection::AuthMode::Password,
             init_sql: String::new(),
             signing: None,
+            pass_source: None,
         }
+    }
+
+    /// Read the password from `source` at connect time when this handle was
+    /// made without one — the app's saved connections, whose secrets are read
+    /// from the keyring on first use. A handle that has a password keeps it,
+    /// and `source` is never called.
+    pub fn with_password_source(mut self, source: PasswordSource) -> Db {
+        if self.pass.is_empty() {
+            self.pass_source = Some(source);
+        }
+        self
+    }
+
+    /// The password this handle signs in with: its own, or what its
+    /// [`PasswordSource`] reads, on the blocking pool since that read can wait
+    /// on a keychain prompt.
+    pub(crate) async fn password(&self) -> Result<String, DbError> {
+        let Some(source) = self.pass_source.clone() else {
+            return Ok(self.pass.clone());
+        };
+        tokio::task::spawn_blocking(move || (source.0)())
+            .await
+            .map_err(|e| DbError::Connect(e.to_string()))?
     }
 
     /// Attach the server's own `host:port` to a handle built by
@@ -879,7 +927,7 @@ impl Db {
     /// be fetched for a plan that would send it in the clear.
     pub(crate) async fn sign_in_secret(&self) -> Result<String, DbError> {
         let Some(cloud) = self.auth.cloud() else {
-            return Ok(self.pass.clone());
+            return self.password().await;
         };
         if self.auth.transport_refusal(self.tls.as_ref()).is_some() {
             return Err(DbError::Refused(DbRefusal::Transport(self.auth)));
@@ -4061,6 +4109,77 @@ mod tests {
                 "{mode:?}"
             );
         }
+    }
+
+    /// **The keyring is read at sign-in, not when the handle is made** — the
+    /// app mints handles on its UI thread, and a keychain read can wait on a
+    /// prompt. A handle that already has a password never asks.
+    #[tokio::test]
+    async fn a_password_source_is_read_at_sign_in_and_only_when_needed() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source = {
+            let calls = calls.clone();
+            PasswordSource::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok("from-keyring".to_string())
+            })
+        };
+        let lazy = Db::from_parts(
+            Engine::MySql,
+            "h".into(),
+            3306,
+            "u".into(),
+            String::new(),
+            String::new(),
+        )
+        .with_password_source(source.clone());
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "not read when minted");
+        assert_eq!(lazy.sign_in_secret().await.unwrap(), "from-keyring");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !format!("{lazy:?}").contains("from-keyring"),
+            "and a debug print reads nothing"
+        );
+
+        let given = Db::from_parts(
+            Engine::MySql,
+            "h".into(),
+            3306,
+            "u".into(),
+            "typed".into(),
+            String::new(),
+        )
+        .with_password_source(source);
+        assert_eq!(given.sign_in_secret().await.unwrap(), "typed");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a given password is not re-read"
+        );
+    }
+
+    /// A keyring that will not answer fails the connect with its own refusal,
+    /// rather than signing in with an empty password and reporting the
+    /// server's *Access denied*.
+    #[tokio::test]
+    async fn an_unreadable_password_source_fails_the_sign_in() {
+        let db = Db::from_parts(
+            Engine::Postgres,
+            "h".into(),
+            5432,
+            "u".into(),
+            String::new(),
+            String::new(),
+        )
+        .with_password_source(PasswordSource::new(|| {
+            Err(DbError::Refused(
+                schemaic_core::model::DbRefusal::KeyringUnreadable("locked".into()),
+            ))
+        }));
+        let err = db.sign_in_secret().await.unwrap_err();
+        assert!(err.to_string().contains("locked"), "{err}");
     }
 
     #[test]

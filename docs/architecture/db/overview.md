@@ -405,6 +405,17 @@ Populates each result column's
 `origin` (real table/column + key flags) from the wire protocol. Connection **identity** is the
 `Db` handle (`Db::connect(&Connection, tunnel_port)`), not a `mysql://…` URL — credentials go
 through `OptsBuilder` (passwords with `@ / # ? %` need no escaping; no plaintext URL anywhere).
+**A handle's password can be read at sign-in rather than when it is minted.** `PasswordSource`
+(an `Arc<dyn Fn() -> Result<String, DbError>>`) rides on `Db.pass_source`, attached by
+`Db::with_password_source` **only when `pass` is empty**, so a password the caller already had is
+never re-read. `Db::password()` is the one reader — its own `pass`, or the source run on Tokio's
+`spawn_blocking`, since the app's source is a keyring read that can wait on a keychain prompt and
+the handle is minted on the UI thread — and `sign_in_secret` (MySQL and PostgreSQL) and
+`mssql::auth_method`'s `Password` arm both go through it. A source's `Err` is the connect's error
+(`a_password_source_is_read_at_sign_in_and_only_when_needed`,
+`an_unreadable_password_source_fails_the_sign_in`). `Debug` prints only whether a source is set.
+`parts()` still hands out `pass`, which is empty for such a handle — the MCP endpoint handoff,
+its one production reader, ignores it, the subprocess reading the password itself.
 Schema introspection fills the **full** column model (see `core::schema`): MySQL from
 `information_schema.COLUMNS` (`COLUMN_DEFAULT`/`EXTRA`/`COLLATION_NAME`/`COLUMN_COMMENT`/
 `GENERATION_EXPRESSION`) + `STATISTICS` (`SUB_PART`/`COLLATION` for prefix + `DESC`, and
@@ -674,7 +685,9 @@ under `mssql.rs`),
 `mysql::enforce_session`'s refusal of a client character set that can hide a quote and
 `unpinnable_mode` — its refusal when the server puts a quote-moving `sql_mode` back — and
 `read_only_plan_refusal`, `pg::set_up_read_only`'s refusal of a path that shadows a builtin
-(`ShadowedBuiltin`, under `Enforce::ReadOnly` below), SQL Server's Windows and cloud IAM sign-in arms, `explain_setup`'s
+(`ShadowedBuiltin`, under `Enforce::ReadOnly` below), SQL Server's Windows and cloud IAM sign-in arms,
+a `PasswordSource` the keyring would not answer (`KeyringUnreadable`, minted by the app's closure
+and passed through `Db::password` as it came), `explain_setup`'s
 read-only gate (`read_only_refusal(..).reason`), `kill_session`'s cancel, the blank-string and
 code-page checks, `sqlite::open_target`'s three refusals, SQLite's "the SQLite worker failed: …"
 (a `Query` once) at each of its six sites, its default-reset refusals and `table_stats`' size

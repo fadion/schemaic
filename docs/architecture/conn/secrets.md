@@ -4,8 +4,33 @@
 `load_connections`/`save_connections`/`forget_connection` wrappers every connection save routes
 through and the process-level `last_hydration` they share. It arrived here from `schemaic-app`
 unchanged; what it decides — `classify_get`/`classify_delete` as free functions, why a refused
-delete is reported only for a secret this load actually read a value out of — is written up
+delete is reported only for a secret this process actually read a value out of — is written up
 under `core/secrets.rs`, beside the pure half it serves.
+**`load_connections` no longer reads the keyring**; a connection's secrets are read the first
+time something needs them (why, and what it did to the save path, is under `core/secrets.rs`).
+The load only migrates legacy plaintext — `plaintext_on_disk`, then `sanitize_file`, the save,
+clearing the `.bak` that still holds the plaintext, and `absorb_stored` — since that is a
+question about the file and can stay eager, and it queues no startup `KeyringUnreadable` notice
+any more. **`secret(id, kind)` is the read, and it is blocking — for as long as a keychain prompt
+stands open — so it never runs on the UI thread.** It answers from `last_hydration`'s cache
+first; otherwise it takes a separate `read_lock`, asks the cache again under it, reads the
+keyring and `record`s the answer. **The two locks are deliberate.** `last_hydration` is never
+held across a keyring read, because the app's saves take it on the UI thread and a read can sit
+behind a prompt for as long as the user leaves it; `read_lock` is what serialises the reads, so
+two workers asking for the same secret raise one prompt, the second finding the first's answer.
+An `Err` is not cached, so the next use asks again — the keyring may have been unlocked
+meanwhile. `secret_unprompted` is its sibling for a read nobody asked for, the health ping's on
+its timer: a secret already marked unreadable this session returns the cached error rather
+than reading again, or a locked keyring or a declined macOS prompt would be raised anew on every
+tick; the next read the user makes happen asks again. The rest is for the app's two kinds of
+caller: `known(id, kind)` is the cache alone, for the UI thread, which hands a miss to a worker;
+`fill(conn, kinds)` fills a worker's **copy** about to connect, stopping at the first secret the
+keyring would not give; `deliver(conn, kinds)` hands what was read to the connection **in the
+saved list**, on the UI thread, marking it read (`Hydration::deliver`); and
+`unreadable_notice(id)` is the `KeyringUnreadable` notice for one connection's unread secrets.
+`save_connections` holds the hydration lock for the whole save, because a read recorded between
+its `sanitize_file` and its `absorb_stored` would be overwritten by this save's copy — and
+taking it never waits on a prompt, since no keyring read holds it.
 **`load_connections_readonly` is that wrapper's headless twin, and the difference is that it
 reports instead of repairing.** The app's load self-heals — a `connections.json` still carrying
 legacy plaintext is migrated into the keyring and the on-disk copy rewritten blanked — which a
@@ -21,7 +46,7 @@ a keyring round trip per secret the command would never use — and a locked key
 reported all of them in the app's Markdown `notice`, which tells the user to leave form fields
 blank. `supplied` is what the caller got another way, `DbPassword` under `--password-stdin`,
 and the keyring is not asked for it at all. It never touches
-`last_hydration`, which exists to stop a later *save* deleting a secret it could not read, and
+`last_hydration`, which exists to stop a later *save* deleting a secret it never read, and
 there is no later save here. An unmigrated file still works — the plaintext it carries hydrates
 a connection exactly as a keyring entry would — it simply stays plaintext.
 The target-gated `keyring` backends
@@ -39,7 +64,7 @@ entry and the manifest both used to say the opposite ("blocks on its own executo
 nesting a tokio runtime"), and `schemaic query -c <conn>` exited 101 on Linux with zbus's
 "Cannot start a runtime from within a runtime" (issue #1): `cli::run::main` does everything
 inside `rt.block_on(dispatch(..))`, and `hydrate_for_cli` → `KeyringStore::get` ran there.
-`schemaic list` reads no secret and never tripped it; the GUI reaches the keyring from its UI
+`schemaic list` reads no secret and never tripped it; the GUI then read the keyring from its UI
 thread, which drives no runtime; Windows' Credential Manager is synchronous. **So
 `KeyringStore::{get,set,delete}` each run their whole body, `Entry::new` included, through
 `off_runtime`**, a `std::thread::scope` thread with no runtime context whatever the caller's,

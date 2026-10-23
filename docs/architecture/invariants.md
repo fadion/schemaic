@@ -1030,7 +1030,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   *of the placeholder* and the copy has nothing left to replace (`ddl.rs` has the whole of it).
 - **Connection secrets persist to the OS keyring, not `connections.json`.** DB/SSH passwords and the
   SSH key passphrase go through `schemaic_core::secrets` (`SecretStore` seam) + `schemaic-conn`'s
-  keyring-backed store; the JSON on disk is blanked and hydrated on load. All connection saves route
+  keyring-backed store; the JSON on disk is blanked, and a connection's secrets are read from the
+  keyring the first time something needs them, never at startup — so a save must leave alone every
+  secret it never read (`Hydration::read`, under `core/secrets.rs`), and every saved connection
+  becomes a `Db` through `main.rs`'s `saved_db`, which attaches the read, or it signs in with an
+  empty password the server reports as *Access denied*
+  (`every_saved_connection_connects_through_connect_saved`). All connection saves route
   through `conn::secrets::{load,save}_connections`/`forget_connection` (which wrap
   `persist::{load,save}_connections`) — never call `persist::save_connections` directly from a front
   end, or you reintroduce plaintext. **Nor does the AI panel's MCP endpoint carry one** — it
@@ -1038,11 +1043,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   agent's own file readers can open. Plaintext in the JSON is a *fallback only* for a machine with no
   working keyring — **and the app now says so when it happens**, rather than letting a stated
   invariant be quietly false on someone's machine: `Sanitized::notice` names the file the passwords
-  landed in and the button that opens its folder, `Hydration::notice` names a keyring that would not
-  answer and says the stored secrets were *not* deleted, and both reach the user (the startup ones
-  through `persist::queue_notice`, a mid-session save's through `save_connections`' return value and
-  `main.rs`'s `persist_conns`). A refused *delete* is the third case and is reported only for a
-  secret this session actually read a value out of. See `core/secrets.rs` and `conn/secrets.rs`.
+  landed in and the button that opens its folder, `conn::secrets::unreadable_notice` names a keyring
+  that would not answer and says the stored secrets were *not* deleted, and both reach the user (the
+  load's migration through `persist::queue_notice`, a mid-session save's through `save_connections`'
+  return value and `main.rs`'s `persist_conns`, a read the form or *Duplicate* asked for through
+  `with_secrets`, once per connection per session, and a connect's as its own error,
+  `DbRefusal::KeyringUnreadable`). A refused *delete* is the third case and is reported only for a
+  secret this session actually read a value out of or wrote. See `core/secrets.rs` and `conn/secrets.rs`.
 - **Own per-entity signals in a child `Scope`; dispose it *deferred*.** A `Tab`/`ConnNode` creates
   its signals in `parent.create_child()`; removal disposes that scope via
   `exec_after(Duration::ZERO, …)` — one tick later, after the keyed `dyn_container` has unmounted

@@ -220,6 +220,9 @@ type GuardCloseFn = GuardTxFn;
 /// initial load, the connection-wide Refresh and the per-database Refresh all
 /// take, so what the tree shows while a fetch is out is decided once.
 type FetchSchemaFn = Rc<dyn Fn(&ConnNode, Db)>;
+/// Read a saved connection's secrets off the UI thread, hand them to the saved
+/// list, then run the callback there — `with_secrets`.
+type WithSecretsFn = Rc<dyn Fn(u64, Box<dyn FnOnce()>)>;
 use schemaic_ai::harness::{Agent, Harness};
 use schemaic_core::filter::{BrowseKey, Order, table_query};
 use schemaic_core::intel::SqlDialect;
@@ -634,6 +637,84 @@ fn psql_shell(
     let launcher =
         resolve_cli(&["psql"]).map_err(|e| e.said(|| tr!("cli-no-client", client = "psql")))?;
     psql_shell_config(launcher, conn, db).map_err(refusal_text)
+}
+
+/// **The one place the app turns a saved connection into a `Db`.** The saved
+/// list holds no secret it has not been handed (`secrets::deliver`), so the
+/// password is read from the keyring at sign-in, on the worker that connects —
+/// never here, on the UI thread, where a keychain prompt would freeze the
+/// window. A password the list does hold (typed into the form, or plaintext
+/// the keyring would not take) is used as it is.
+///
+/// Every connect goes through here or fails as an empty password, which the
+/// server reports as *Access denied* rather than as the missing secret it is —
+/// so `every_saved_connection_connects_through_connect_saved` holds the count
+/// of `Db::connect` calls in this file.
+fn connect_saved(conn: &schemaic_core::connection::Connection, tunnel: Option<u16>) -> Db {
+    saved_db(conn, tunnel, secrets::secret)
+}
+
+/// [`connect_saved`] for the health ping, which runs on a timer: a password
+/// the keyring has refused this session is not asked for again
+/// (`secrets::secret_unprompted`), or every tick would raise the prompt the
+/// user just declined.
+fn connect_saved_unprompted(
+    conn: &schemaic_core::connection::Connection,
+    tunnel: Option<u16>,
+) -> Db {
+    saved_db(conn, tunnel, secrets::secret_unprompted)
+}
+
+/// [`connect_saved`] and its sibling, with the read they attach.
+fn saved_db(
+    conn: &schemaic_core::connection::Connection,
+    tunnel: Option<u16>,
+    read: fn(
+        u64,
+        schemaic_core::secrets::SecretKind,
+    ) -> Result<Option<String>, schemaic_core::secrets::StoreError>,
+) -> Db {
+    let id = conn.id;
+    Db::connect(conn, tunnel).with_password_source(schemaic_db::PasswordSource::new(move || {
+        read(id, schemaic_core::secrets::SecretKind::DbPassword)
+            .map(Option::unwrap_or_default)
+            .map_err(|e| DbError::Refused(schemaic_core::model::DbRefusal::KeyringUnreadable(e.0)))
+    }))
+}
+
+/// `conn`'s SSH block with the secrets its auth method takes read in
+/// (`secrets::tunnel_kinds`), for opening its tunnel — on Tokio's blocking
+/// pool, since the read can wait on a keychain prompt.
+async fn tunnel_secrets(
+    conn: &schemaic_core::connection::Connection,
+) -> Result<schemaic_core::connection::SshTunnel, DbError> {
+    let kinds = schemaic_core::secrets::tunnel_kinds(conn);
+    let mut copy = conn.clone();
+    tokio::task::spawn_blocking(move || secrets::fill(&mut copy, &kinds).map(|()| copy.ssh))
+        .await
+        .map_err(|e| DbError::Connect(e.to_string()))?
+        .map_err(|e| DbError::Refused(schemaic_core::model::DbRefusal::KeyringUnreadable(e.0)))
+}
+
+/// `conn` with its database password filled in, for a client launched in the
+/// terminal, which takes it in its environment.
+///
+/// **Read on the UI thread when nothing has read it yet** — the one keyring read
+/// that is, since a launch builds its command synchronously. In practice it is
+/// answered from the cache: the client opens on the active connection, whose
+/// tree connected (and read the password) when it was opened. Only a password
+/// sign-in reads it.
+fn with_saved_password(
+    mut conn: schemaic_core::connection::Connection,
+) -> schemaic_core::connection::Connection {
+    if conn.password.is_empty()
+        && conn.effective_auth() == schemaic_core::connection::AuthMode::Password
+        && let Ok(Some(p)) =
+            secrets::secret(conn.id, schemaic_core::secrets::SecretKind::DbPassword)
+    {
+        conn.password = p;
+    }
+    conn
 }
 
 /// The SQL Server fourth: `sqlcmd`, the ODBC one or the Go rewrite — they
@@ -2587,7 +2668,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             } else {
                 None
             };
-            Ok(Db::connect(&conn, tunnel))
+            Ok(connect_saved(&conn, tunnel))
         })
     };
 
@@ -9354,7 +9435,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             } else {
                 None
             };
-            let db = Db::connect(&conn, tunnel);
+            let db = connect_saved_unprompted(&conn, tunnel);
             // Stamped before the ping, checked when it lands: up to five seconds
             // pass in between, and the connection the user is on can change
             // inside them.
@@ -9962,7 +10043,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             });
                         }
                         // One `Db` for this connection, cloned per-database fetch.
-                        let db = Db::connect(&conn_send, tunnel_port);
+                        let db = connect_saved(&conn_send, tunnel_port);
                         // **Most-wanted first.** `start_fetch` bounds how many
                         // of these run at once (`INTROSPECT_PERMITS`), so the
                         // order the queue is filled in decides which
@@ -10040,27 +10121,37 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 let (tunnel_port, new_handle) = if conn_task.uses_tunnel() {
                     match cached_port {
                         Some(p) => (Some(p), None),
-                        None => match schemaic_db::ssh::open_tunnel(
-                            &conn_task.ssh,
-                            conn_task.tcp_target().0,
-                            conn_task.tcp_target().1,
-                        )
-                        .await
-                        {
-                            Ok(h) => (Some(h.port()), Some(h)),
-                            Err(e) => {
-                                send(Err(LoadFailure::Tunnel {
-                                    text: e.to_string(),
-                                    shown: db_error_shown(&e),
-                                }));
-                                return;
+                        None => {
+                            // The tunnel's own secrets first, read here on the
+                            // worker: the saved list carries none until the
+                            // form has been opened on it.
+                            let opened = match tunnel_secrets(&conn_task).await {
+                                Ok(ssh) => {
+                                    schemaic_db::ssh::open_tunnel(
+                                        &ssh,
+                                        conn_task.tcp_target().0,
+                                        conn_task.tcp_target().1,
+                                    )
+                                    .await
+                                }
+                                Err(e) => Err(e),
+                            };
+                            match opened {
+                                Ok(h) => (Some(h.port()), Some(h)),
+                                Err(e) => {
+                                    send(Err(LoadFailure::Tunnel {
+                                        text: e.to_string(),
+                                        shown: db_error_shown(&e),
+                                    }));
+                                    return;
+                                }
                             }
-                        },
+                        }
                     }
                 } else {
                     (None, None)
                 };
-                let db = Db::connect(&conn_task, tunnel_port);
+                let db = connect_saved(&conn_task, tunnel_port);
                 match db.list_databases().await {
                     Ok(listed) => send(Ok((tunnel_port, new_handle, listed))),
                     // The tunnel this load opened, if any, closes here with it.
@@ -11756,13 +11847,99 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // reach a file already open under another connection.
     *switch_conn_late.borrow_mut() = Some(switch_conn.clone());
 
-    // Load an existing connection into the edit form.
-    let select_conn: Rc<dyn Fn(u64)> = Rc::new(move |id: u64| {
-        if let Some(conn) = connections.with_untracked(|cs| cs.iter().find(|c| c.id == id).cloned())
-        {
+    // Read saved connection `id`'s secrets, hand them to the saved list, then
+    // run `then` — all three kinds, since what follows shows or copies them.
+    //
+    // **The read is on a worker and the handover on this thread**, in one step
+    // with nothing between: the list never holds a secret marked read that its
+    // field does not carry, which is what a save trusts (`secrets::deliver`).
+    // Secrets already read are handed over at once, without a round trip.
+    // A keyring that would not answer is said once per connection per session;
+    // the secrets it held stay where they are.
+    let with_secrets: WithSecretsFn = {
+        let handle = handle.clone();
+        let told: Rc<RefCell<HashSet<u64>>> = Rc::default();
+        Rc::new(move |id: u64, then: Box<dyn FnOnce()>| {
+            let told = told.clone();
+            let hand_over = move || {
+                let delivered = connections.with_untracked(|cs| {
+                    cs.iter().find(|c| c.id == id).map(|c| {
+                        let mut copy = c.clone();
+                        secrets::deliver(&mut copy, &schemaic_core::secrets::SecretKind::ALL);
+                        (copy != *c).then_some(copy)
+                    })
+                });
+                if let Some(Some(copy)) = delivered {
+                    connections.update(|cs| {
+                        if let Some(c) = cs.iter_mut().find(|c| c.id == id) {
+                            *c = copy;
+                        }
+                    });
+                }
+                if let Some(notice) = secrets::unreadable_notice(id)
+                    && told.borrow_mut().insert(id)
+                {
+                    error_modal_text.set(Some(ModalError::app(schemaic_ui::i18n::notice_text(
+                        &notice,
+                    ))));
+                    error_modal_open.set(true);
+                }
+                then();
+            };
+            if schemaic_core::secrets::SecretKind::ALL
+                .iter()
+                .all(|&k| secrets::known(id, k).is_some())
+            {
+                hand_over();
+                return;
+            }
+            let send = create_ext_action(cx, move |()| hand_over());
+            handle.spawn_blocking(move || {
+                for kind in schemaic_core::secrets::SecretKind::ALL {
+                    // An unreadable one is recorded as such, and said above.
+                    let _ = secrets::secret(id, kind);
+                }
+                send(());
+            });
+        })
+    };
+
+    // Load an existing connection into the edit form — at once, then its
+    // secrets once they are read, into the fields still showing that
+    // connection and still empty (anything typed meanwhile is the user's).
+    let select_conn: Rc<dyn Fn(u64)> = {
+        let with_secrets = with_secrets.clone();
+        Rc::new(move |id: u64| {
+            let Some(conn) =
+                connections.with_untracked(|cs| cs.iter().find(|c| c.id == id).cloned())
+            else {
+                return;
+            };
             draft.load(&conn);
-        }
-    });
+            (with_secrets)(
+                id,
+                Box::new(move || {
+                    if draft.id.get_untracked() != Some(id) {
+                        return;
+                    }
+                    let Some(c) =
+                        connections.with_untracked(|cs| cs.iter().find(|c| c.id == id).cloned())
+                    else {
+                        return;
+                    };
+                    for (field, value) in [
+                        (draft.password, c.password),
+                        (draft.ssh_password, c.ssh.password),
+                        (draft.ssh_key_passphrase, c.ssh.key_passphrase),
+                    ] {
+                        if field.with_untracked(String::is_empty) && !value.is_empty() {
+                            field.set(value);
+                        }
+                    }
+                }),
+            );
+        })
+    };
 
     // Create a brand-new connection from the blank form — a unique default name
     // and a distinct colour — persist it, and select it, so it is in the list
@@ -11818,38 +11995,49 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // it carries, and those only reach the keyring through a save; a duplicate
     // that evaporates when the user clicks another row would have saved them
     // nothing.
+    //
+    // The source's secrets are read first (`with_secrets`): the saved list
+    // carries none until something has used the connection, and a copy made
+    // before the read would carry nothing.
     let duplicate_conn: Rc<dyn Fn(u64)> = {
         let select_conn = select_conn.clone();
+        let with_secrets = with_secrets.clone();
         Rc::new(move |id: u64| {
-            let Some(src) =
-                connections.with_untracked(|cs| cs.iter().find(|c| c.id == id).cloned())
-            else {
-                return;
-            };
-            let (names, used_colors, next_id) = connections.with_untracked(|cs| {
-                (
-                    cs.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
-                    cs.iter()
-                        .filter_map(|c| c.color.clone())
-                        .collect::<Vec<_>>(),
-                    Connection::next_id_after(cs, highest_conn_id.get_untracked()),
-                )
-            });
-            // A fresh colour, not the original's: the dot is what tells two
-            // connections apart in the switcher and on their tabs, and a copy
-            // of a connection is precisely the case where the *names* are
-            // nearly identical too.
-            let copy = src.duplicate(
-                next_id,
-                unique_name(&format!("{} (copy)", src.name), &names),
-                Some(pick_connection_color(&used_colors)),
+            let select_conn = select_conn.clone();
+            (with_secrets)(
+                id,
+                Box::new(move || {
+                    let Some(src) =
+                        connections.with_untracked(|cs| cs.iter().find(|c| c.id == id).cloned())
+                    else {
+                        return;
+                    };
+                    let (names, used_colors, next_id) = connections.with_untracked(|cs| {
+                        (
+                            cs.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                            cs.iter()
+                                .filter_map(|c| c.color.clone())
+                                .collect::<Vec<_>>(),
+                            Connection::next_id_after(cs, highest_conn_id.get_untracked()),
+                        )
+                    });
+                    // A fresh colour, not the original's: the dot is what tells two
+                    // connections apart in the switcher and on their tabs, and a copy
+                    // of a connection is precisely the case where the *names* are
+                    // nearly identical too.
+                    let copy = src.duplicate(
+                        next_id,
+                        unique_name(&format!("{} (copy)", src.name), &names),
+                        Some(pick_connection_color(&used_colors)),
+                    );
+                    connections.update(|cs| cs.push(copy));
+                    persist_conns(
+                        Some(active_conn.get_untracked()),
+                        persist::Saving::Replacing,
+                    );
+                    (select_conn)(next_id);
+                }),
             );
-            connections.update(|cs| cs.push(copy));
-            persist_conns(
-                Some(active_conn.get_untracked()),
-                persist::Saving::Replacing,
-            );
-            (select_conn)(next_id);
         })
     };
 
@@ -12774,6 +12962,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let history_clear_conn = history.clear_conn.clone();
         let snippet_clear_conn = snippet_store.clear_conn.clone();
         let log_write = log_write.clone();
+        let select_conn = select_conn.clone();
         Rc::new(move |id: u64| {
             let was_active = active_conn.get_untracked() == id;
             // Release any pinned transaction connection on the connection being
@@ -12893,7 +13082,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // nothing removes it.
             persist_conns(new_active, persist::Saving::Erasing);
             match &top {
-                Some(c) => draft.load(c),
+                // Through `select_conn`, so the form gets its secrets too.
+                Some(c) => (select_conn)(c.id),
                 None => {
                     draft.blank();
                     // A fresh blank form still gets an identity colour so a
@@ -14575,6 +14765,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 (install_terminal)(&cfg, None, "read-only refusal message shell");
                 return;
             }
+            // Read only now, past the refusal: a launch that is refused asks
+            // the keyring for nothing.
+            let conn = with_saved_password(conn);
             // For an SSH connection, point the client at the local tunnel
             // (127.0.0.1:<port>), not the firewalled remote host (review H11). If
             // the tunnel isn't up yet, say so rather than silently failing.
@@ -14664,6 +14857,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let tunnels = tunnels.clone();
         let tunnel_failures = tunnel_failures.clone();
         Rc::new(move |conn: Connection| {
+            let conn = with_saved_password(conn);
             if !conn.uses_tunnel() {
                 return Ok(conn);
             }
@@ -17013,6 +17207,40 @@ mod app_tests {
                  itself, so the refusal is once again a caller's `if`"
             );
         }
+    }
+
+    /// **Every saved connection connects through `connect_saved`** (or the
+    /// health ping's sibling, through the same `saved_db`), which attaches the
+    /// keyring read. The saved list holds no password until the
+    /// form has been opened on a connection, so a `Db::connect` of a saved
+    /// connection signs in with an empty one — reported by the server as
+    /// *Access denied*, not as the missing secret it is.
+    ///
+    /// Two calls are allowed: `saved_db`'s own, and the form's *Test*,
+    /// which connects the draft as typed rather than a saved connection.
+    #[test]
+    fn every_saved_connection_connects_through_connect_saved() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        let calls: Vec<&str> = body
+            .lines()
+            .filter(|l| l.contains("Db::connect("))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                "Db::connect(conn, tunnel).with_password_source(schemaic_db::PasswordSource::new(move || {",
+                "let db = Db::connect(&conn, tunnel.as_ref().map(|h| h.port()));",
+            ],
+            "a new `Db::connect` here: a saved connection connects through \
+             `connect_saved`, or it signs in without its password"
+        );
     }
 
     /// **A double spawn failure leaves nothing, not the previous session.**

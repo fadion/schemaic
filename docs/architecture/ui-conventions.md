@@ -715,13 +715,14 @@
     (`app_tests`) holds `refusal_text` equal to `message` for every variant of `Refusal::ALL`.
     The startup notices are the case where the words are queued before there is anyone to say
     them. `persist::RECOVERIES` holds `persist::Notice` values — a file unreadable or missing, a
-    keyring that would not answer, a save it did not fully take — and, like `Refusal`, `Notice`
+    save the keyring did not fully take — and, like `Refusal`, `Notice`
     has `message` and no `Display` (under `core/persist.rs`). `i18n::notice_text` words each from
     `notice-unreadable`/`-kept`/`-swept`, `notice-missing`/`-restored`,
     `notice-keyring-unread`/`-why`/`-kept`, `notice-in-the-clear`/`-where` and
     `notice-undeleted`/`-after`, one message per line joined with `"\n"` and the save's two
     paragraphs with `"\n\n"`, as core's English breaks them; a parser's or keyring's own text
-    inside goes in as written. `report_recoveries` and the app's mid-session save both show it,
+    inside goes in as written. `report_recoveries`, the app's mid-session save and its read of a
+    connection's secrets (`with_secrets`, a keyring that would not answer) all show it,
     and `Notice::Said` is the one variant it passes through, its text already worded by the
     caller. `english_says_every_startup_notice_as_core_does` holds it equal to `message` for both
     `swept` states, both siblings, the keyring read with and without its reason and the save's

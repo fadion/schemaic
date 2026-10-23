@@ -1260,6 +1260,9 @@ pub fn db_refusal_text(r: &schemaic_core::model::DbRefusal) -> String {
             cap = bytes(*cap),
             file = bytes(*file)
         ),
+        DbRefusal::KeyringUnreadable(error) => {
+            tr!("db-refused-keyring-unreadable", error = error.as_str())
+        }
     }
 }
 
@@ -1868,6 +1871,7 @@ mod tests {
                 cap: 4096,
                 file: 3 * 1024 * 1024 * 1024,
             },
+            DbRefusal::KeyringUnreadable(s("keyring locked")),
         ];
         for auth in [
             AuthMode::Password,

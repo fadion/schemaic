@@ -8,6 +8,34 @@ CLI (`schemaic-cli`, below). `main` returns a `std::process::ExitCode` so the on
 answer with one. A query tab's identity is `(conn_id, database)`;
 the app resolves `conn_id` → `Db` at run time (`db_for`), so a tab keeps its connection after a
 switch.
+**A saved connection's secrets are read when it is used, so a saved connection becomes a `Db` in
+one place.** The saved list holds no secret it has not been handed (`conn/secrets.rs`, and why
+under `core/secrets.rs`), so `Db::connect` on it signs in with an empty password — reported by
+the server as *Access denied*, not as the missing secret it is. `saved_db(conn, tunnel, read)`
+holds the one `Db::connect` of a saved connection and attaches the keyring read as a
+`PasswordSource`, which `schemaic-db` runs on the blocking pool at sign-in, never on the UI thread
+that mints the handle; a keyring that will not answer fails the connect as
+`DbRefusal::KeyringUnreadable`. `connect_saved` passes `secrets::secret` and is what `db_for` and
+`load_schema`'s two connects use; `connect_saved_unprompted`, the health ping's in `check_conn`,
+passes `secret_unprompted`, so a declined prompt is not raised again on every tick. Not to be
+confused with `ai.rs`'s `saved_db`, the MCP subprocess's.
+`every_saved_connection_connects_through_connect_saved` pins the `Db::connect` calls left in
+`main.rs` to two — `saved_db`'s and the form's *Test*, which connects the draft as typed. The tunnel's secrets come first: `tunnel_secrets` reads what
+`secrets::tunnel_kinds` names on `spawn_blocking` before `load_schema` opens a tunnel.
+`with_saved_password`, behind `reach_for_cli` and `open_db_cli`, reads the database password for
+a terminal client or a backup or restore tool, and only under a password sign-in — **the one
+keyring read that can happen on the UI thread**, because a launch builds its command
+synchronously, and in practice a cache hit, the active connection's tree connect having read it
+already. **`with_secrets(id, then)` is the one path by which a read reaches the saved list.** It
+reads all three kinds on `handle.spawn_blocking` — or skips the round trip when all are known —
+then on the UI thread, through `create_ext_action`, delivers them into the `connections` signal's
+entry in one step, so no save can fall between a field being filled and its secret being marked
+read, and shows `unreadable_notice` once per connection per session. `select_conn` uses it — the
+form loads at once, and the three secret fields are filled only if the form still shows that id
+and the field is still empty, since anything typed meanwhile is the user's; the post-delete form
+reload goes through `select_conn` for the same reason — and so does `duplicate_conn`, because a
+copy made before the read would carry no credentials. The AI panel's `--mcp-serve` child was lazy
+and per-connection already (`keyring_connection`, below) and is unchanged.
 **The app draws its words from `schemaic-ui`'s catalogue, not a second one.** `main.rs` defines
 its own `tr!` — `fl!(schemaic_ui::i18n::LOADER, …)` — above the `mod` lines, so every module of
 the crate sees it, and `crates/schemaic-app/i18n.toml` points `assets_dir` at
@@ -1088,8 +1116,9 @@ plan, sign-in mode, init SQL, signing target — so whatever could rewrite the e
 `$SCHEMAIC_MCP_ENDPOINT`, could have the subprocess fetch the saved password from the keyring and
 send it to a host of its own with TLS off, attach init SQL of its own to the session, or (with the
 data levels above) widen what it reads. `saved_db(v, lookup) -> Result<Option<Db>, String>` now
-answers a blob that carries a `conn_id` with `Db::connect(&saved, tunnel)` — exactly how `main.rs`
-builds the app's own `Db` — so all of those are the saved connection's. The blob supplies only what
+answers a blob that carries a `conn_id` with `Db::connect(&saved, tunnel)` — how `main.rs`
+builds the app's own `Db`, less the lazy password source, `keyring_connection` having read the
+password into `saved` already — so all of those are the saved connection's. The blob supplies only what
 the saved connection cannot know, the local port of the app's SSH tunnel, and only when
 `saved.uses_tunnel()`; a tunnelled connection whose blob has no port is refused, and the blob's
 `host` is never read, because `Db::connect` writes `127.0.0.1` for a tunnel itself. What stays the

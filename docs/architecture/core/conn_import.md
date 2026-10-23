@@ -507,7 +507,7 @@ is 0 as every parser's is, and the two per-machine grants are back at their defa
 `cli_access` off and `ai_data` unset, because letting a tool or an assistant read a database on
 one machine is no grant on another. Everything else stays, the key, certificate and SQLite
 paths included — a path is not a secret, and a team may well share it. **It is built from the
-hydrated in-memory list, never from the on-disk `connections.json`**, and that is load-bearing:
+in-memory list, never from the on-disk `connections.json`**, and that is load-bearing:
 the disk copy is the one that holds every secret in the clear wherever the keyring is
 unavailable (`core/secrets.rs`), so serialising it would export exactly what this function
 exists to leave out — the blanking is this function's own job, not the save path's

@@ -66,6 +66,9 @@ fn classify_delete(answer: Result<(), keyring::Error>) -> bool {
 /// query` exited 101 on every Linux desktop (issue #1). zbus is on `async-io`
 /// now (`zbus_is_not_on_its_tokio_backend`), and this stays anyway: a backend
 /// is a feature any dependency can flip, and the rule does not depend on it.
+/// The GUI's reads now come from Tokio's blocking pool too ([`secret`] is
+/// called at connect time), whose threads carry the runtime's context — so the
+/// GUI is no longer the caller this was never needed for.
 ///
 /// A plain scoped thread has no runtime context, whatever the caller's, so the
 /// answer here does not depend on who is asking — which is the point of doing it
@@ -105,52 +108,157 @@ impl SecretStore for KeyringStore {
     }
 }
 
-/// What the last [`load_connections`] learned about the keyring.
+/// What this process has learned about the keyring: which secrets were read,
+/// which could not be, and what the keyring holds.
 ///
-/// Process-level because the save path can't reach the load's return value:
-/// [`save_connections`] is called from the read-only toggle, the active-connection
-/// switch, `save_conn` and the delete path, none of which carry connection state.
-/// Without it a save cannot tell "the user cleared this password" from "we
-/// couldn't read it at startup", and the first reading deletes it.
+/// Process-level because the save path can't reach the reads: [`save_connections`]
+/// is called from the read-only toggle, the active-connection switch, `save_conn`
+/// and the delete path, and the reads happen on whichever worker connects. Without
+/// it a save cannot tell "the user cleared this password" from "nobody read it",
+/// and the first reading deletes it.
+///
+/// **Never held across a keyring call**: a read can sit behind a macOS prompt for
+/// as long as the user leaves it, and the app's saves take this lock on the UI
+/// thread. [`read_lock`] is what serialises the reads themselves.
 fn last_hydration() -> &'static Mutex<Hydration> {
     static H: OnceLock<Mutex<Hydration>> = OnceLock::new();
     H.get_or_init(|| Mutex::new(Hydration::default()))
 }
 
-/// Load saved connections, hydrating each one's secrets from the keyring. If the
-/// file still carries legacy plaintext (first launch after upgrading, or after a
-/// spell without a keyring), migrate it into the keyring and rewrite the on-disk
-/// copy blanked — a one-time self-heal.
+/// Held across a keyring read, so two workers asking for the same secret at once
+/// raise one prompt rather than two — the second finds the first's answer.
+fn read_lock() -> &'static Mutex<()> {
+    static R: OnceLock<Mutex<()>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(()))
+}
+
+/// [`last_hydration`], poison-safe. **`into_inner`, not a default**: a poisoned
+/// mutex used to hand the save a *default* `Hydration` — nothing marked
+/// unreadable — and the save then read every empty field as a password the user
+/// had cleared and deleted it from the keyring. The failure direction of a lock
+/// has to be "keep what we knew", not "know nothing".
+fn hydration() -> std::sync::MutexGuard<'static, Hydration> {
+    last_hydration().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Load saved connections **without reading the keyring** — each connection's
+/// secrets are read the first time it is used ([`secret`], [`deliver`]), so a
+/// keychain that asks per item after an update asks only for what is used.
+///
+/// If the file still carries legacy plaintext (first launch after upgrading, or
+/// after a spell without a keyring), migrate it into the keyring and rewrite the
+/// on-disk copy blanked — a one-time self-heal, and a question about the file
+/// rather than the keyring, so it stays here. The returned list keeps those
+/// values, which are now the keyring's too.
 pub fn load_connections() -> ConnectionsFile {
-    let store = KeyringStore;
-    let mut file = persist::load_connections();
-    let hydration = secrets::hydrate_file(&mut file, &store);
-    if hydration.needs_resave {
-        let sanitized = secrets::sanitize_file(&file, &store, &hydration);
+    let file = persist::load_connections();
+    if secrets::plaintext_on_disk(&file) {
+        let mut slot = hydration();
+        let sanitized = secrets::sanitize_file(&file, &KeyringStore, &slot);
         persist::save_connections(&sanitized.file, Saving::Replacing);
         // The pre-migration file (with plaintext secrets) was snapshotted to
         // `.bak` by that save — scrub it, and the `.corrupt` sibling with it, so
         // no plaintext credential lingers.
         persist::clear_connections_backup();
+        slot.absorb_stored(&sanitized, &file);
         // The migration is the one save that can leave plaintext behind without
-        // the user having done anything, so it reports on the same channel.
+        // the user having done anything, so it reports on the startup channel.
         if let Some(notice) = sanitized.notice() {
             persist::queue_notice(notice);
         }
     }
-    // **Said, not only recorded.** `any_unreadable` had a doc claiming the app
-    // surfaces this and no caller anywhere; the failure reached neither a banner
-    // nor a log line, so the app came up with every password field blank, every
-    // connection failing with the server's own *Access denied*, and nothing
-    // saying the keyring was the reason. This is the startup notice channel the
-    // config-recovery modal already drains.
-    if let Some(notice) = hydration.notice() {
-        persist::queue_notice(notice);
-    }
-    if let Ok(mut slot) = last_hydration().lock() {
-        *slot = hydration;
-    }
     file
+}
+
+/// One saved connection's secret of `kind`, from what this process already
+/// knows or else from the keyring — **blocking, and possibly for as long as a
+/// keychain prompt stands open**, so never call it on the UI thread.
+///
+/// `Ok(None)` is no entry. An `Err` is a keyring that would not answer; it is
+/// not cached, so the next use asks again (the keyring may have been unlocked
+/// meanwhile).
+///
+/// What it reads is cached, and reaches the saved list only through [`deliver`]:
+/// a value read here and never delivered is invisible to a save, which is what
+/// keeps a save between the two from reading the empty field as a clear.
+pub fn secret(id: u64, kind: SecretKind) -> Result<Option<String>, StoreError> {
+    if let Some(known) = hydration().known(id, kind) {
+        return Ok(known.map(str::to_string));
+    }
+    let _reading = read_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // Asked again under the read lock: another worker may have just read it.
+    if let Some(known) = hydration().known(id, kind) {
+        return Ok(known.map(str::to_string));
+    }
+    let answer = KeyringStore.get(&secrets::account(id, kind));
+    hydration().record(id, kind, &answer);
+    answer
+}
+
+/// [`secret`] for a read **nobody asked for** — the health ping's, on a timer:
+/// a secret the keyring has already refused this session is not asked for
+/// again, or a locked keyring or a declined keychain prompt would be raised
+/// anew on every tick. The next read the user makes happen asks again.
+pub fn secret_unprompted(id: u64, kind: SecretKind) -> Result<Option<String>, StoreError> {
+    {
+        let h = hydration();
+        if h.is_unreadable(id, kind) {
+            return Err(StoreError(h.error.clone().unwrap_or_default()));
+        }
+    }
+    secret(id, kind)
+}
+
+/// What this process already knows of a secret, without asking the keyring:
+/// `Some(answer)` when it has been read, `None` when it has not.
+///
+/// For the UI thread, which must not wait on a keychain prompt: it uses this,
+/// and hands a miss to a worker that calls [`secret`].
+pub fn known(id: u64, kind: SecretKind) -> Option<Option<String>> {
+    hydration().known(id, kind).map(|v| v.map(str::to_string))
+}
+
+/// Fill `conn`'s empty secrets of `kinds` from [`secret`] — for a **copy** a
+/// worker is about to connect with, never the saved list (that is
+/// [`deliver`]'s). Stops at the first secret the keyring would not give, and
+/// returns its error.
+pub fn fill(conn: &mut Connection, kinds: &[SecretKind]) -> Result<(), StoreError> {
+    for &kind in kinds {
+        let slot = match kind {
+            SecretKind::DbPassword => &mut conn.password,
+            SecretKind::SshPassword => &mut conn.ssh.password,
+            SecretKind::SshPassphrase => &mut conn.ssh.key_passphrase,
+        };
+        if slot.is_empty() {
+            *slot = secret(conn.id, kind)?.unwrap_or_default();
+        }
+    }
+    Ok(())
+}
+
+/// Hand what has been read of `conn`'s secrets of `kinds` to `conn` — **the one
+/// in the app's saved list** — marking them read for the saves that follow
+/// ([`Hydration::deliver`]).
+///
+/// On the thread that owns the list, in the same step as the write to it, so no
+/// save can fall between the field being filled and the secret being marked.
+/// A secret not read yet, or unreadable, is left empty and protected.
+pub fn deliver(conn: &mut Connection, kinds: &[SecretKind]) {
+    hydration().deliver(conn, kinds);
+}
+
+/// What to tell the user about secrets of `id` the keyring would not give —
+/// `None` when every one it was asked for was read.
+pub fn unreadable_notice(id: u64) -> Option<persist::Notice> {
+    let h = hydration();
+    let secrets = SecretKind::ALL
+        .iter()
+        .filter(|&&k| h.is_unreadable(id, k))
+        .count();
+    (secrets > 0).then(|| persist::Notice::KeyringUnreadable {
+        secrets,
+        error: h.error.clone(),
+    })
 }
 
 /// [`load_connections`] for a front end that **must not write the file**.
@@ -220,29 +328,22 @@ pub fn hydrate_for_cli(conn: &mut Connection, supplied: &[SecretKind]) -> Vec<St
 /// for why a save that *drops* a connection must not leave a `.bak`.
 #[must_use = "a `Some` is what the user is told; dropping it is how this went unsurfaced before"]
 pub fn save_connections(file: &ConnectionsFile, saving: Saving) -> Option<persist::Notice> {
-    // **`into_inner`, not `unwrap_or_default`.** A poisoned mutex used to hand
-    // the save a *default* `Hydration` — nothing marked unreadable — and the
-    // save then read every empty field as a password the user had cleared and
-    // deleted it from the keyring. The failure direction of a lock has to be
-    // "keep what we knew", not "know nothing".
-    let mut hydration = last_hydration()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    // Held for the whole save: a read landing in between would be recorded and
+    // then overwritten by this save's copy. Taking it never waits on a prompt,
+    // since no keyring read holds it (`last_hydration`).
+    let mut hydration = hydration();
     let sanitized = secrets::sanitize_file(file, &KeyringStore, &hydration);
     persist::save_connections(&sanitized.file, saving);
     // A secret the user has since typed in is no longer unread; leaving it
     // marked would suppress the delete when they later clear it on purpose.
     hydration.resolve_against(file);
     // And a secret this save just *wrote* is one the store is now known to
-    // hold, exactly as if a load had read it. `Hydration::stored` used to be
+    // hold, exactly as if it had been read. `Hydration::stored` used to be
     // pushed to by a load and by nothing else, so a password typed into a
     // connection that had none and cleared again in the same session had its
     // refused delete go unreported — and came back on the next launch.
-    hydration.absorb_stored(&sanitized);
-    if let Ok(mut slot) = last_hydration().lock() {
-        *slot = hydration;
-    }
+    hydration.absorb_stored(&sanitized, file);
+    drop(hydration);
     let notice = sanitized.notice()?;
     told_once(&notice).then_some(notice)
 }
@@ -272,9 +373,7 @@ pub fn forget_connection(id: u64) -> bool {
             "the OS keyring would not delete a removed connection's secrets"
         );
     }
-    if let Ok(mut slot) = last_hydration().lock() {
-        slot.forget(id);
-    }
+    hydration().forget(id);
     gone
 }
 

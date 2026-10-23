@@ -181,8 +181,11 @@ character and its code page where it is known), SQLite's `open_target` refusals 
 failure, MySQL's quote-safety and read-only plan refusals, a read-only PostgreSQL session's
 `ShadowedBuiltin { schema, name, operator }` — a schema on its path holding what PostgreSQL could
 pick in a builtin's place, its two wordings `db-refused-shadowed-function` and
-`db-refused-shadowed-operator` in `i18n::db_refusal_text` — and the rest under `schemaic-db`'s
-`DbError` entry. Both carried a finished English `String` until now, so every one of them reached
+`db-refused-shadowed-operator` in `i18n::db_refusal_text` — `KeyringUnreadable(String)`, the one
+variant made outside that crate, by the app's `PasswordSource` when the OS keyring will not give a
+saved connection's password at connect (the backend's message inside, worded as
+`db-refused-keyring-unreadable`), so the connect fails as the missing secret it is rather than as
+the server's *Access denied* — and the rest under `schemaic-db`'s `DbError` entry. Both carried a finished English `String` until now, so every one of them reached
 the window in English whatever the interface's language — the app's `db_error_shown` passed
 `Refused(m)` through as written. `message()` is each producer's old English **byte for byte**,
 and `Display` is it, so the CLI, the MCP server and the logs, which keep `to_string()`, read

@@ -29,7 +29,7 @@ use crate::persist::ConnectionsFile;
 /// Which secret of a connection an entry holds. The keyring account name is
 /// `conn.{id}.{suffix}`, so one connection's secrets never collide and
 /// entries for different connections stay independent.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum SecretKind {
     /// The database password ([`Connection::password`]).
     DbPassword,
@@ -165,12 +165,21 @@ pub trait SecretStore {
     fn delete(&self, account: &str) -> bool;
 }
 
-/// What a load learned about the store, which the matching save needs to know.
+/// What this process has learned about the store, which every save needs to
+/// know.
 ///
-/// The two fields answer different questions and both are consumed at save time:
-/// `needs_resave` asks *should we rewrite the file now*, `unreadable` asks *which
-/// entries must this save leave alone*.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// The fields answer different questions and all are consumed at save time:
+/// `needs_resave` asks *should we rewrite the file now*, `read` asks *which empty
+/// fields mean what they say*, `unreadable` *which of the rest to report*, and
+/// the store's known contents *which values a save need not write again*.
+///
+/// **Reading is lazy in the app**: a connection's secrets are read the first
+/// time something needs them ([`Hydration::record`]) and reach the saved list
+/// only when the app hands them over ([`Hydration::deliver`]). Everything not
+/// read is left exactly as it is in the store, which is what makes the lazy
+/// read safe — before it, an empty field could only mean *read and absent* or
+/// *cleared by the user*, and the save deleted on both.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Hydration {
     /// Some connection carried legacy plaintext on disk, so the file should be
     /// re-saved to migrate it into the store and blank the disk copy.
@@ -200,9 +209,129 @@ pub struct Hydration {
     /// retype them, and a misremembered one is then written over the still-intact
     /// stored secret.
     pub error: Option<String>,
+    /// Secrets whose field in the list being saved **carries the store's
+    /// answer**: read into it, written from it by a save, or cleared in it after
+    /// one of those.
+    ///
+    /// The only empty fields a save deletes for. An empty field outside this
+    /// set was never read, so it says nothing about the store, and treating it
+    /// as a clear is how a lazily loaded list would delete every credential on
+    /// its first save.
+    pub read: Vec<(u64, SecretKind)>,
+    /// What the store is known to hold, per secret — `Some` a value, `None` no
+    /// entry — from a read or from a save that wrote or deleted it.
+    ///
+    /// Two uses: a second read of the same secret is answered from here
+    /// ([`Hydration::known`]), so one *Always allow* lasts the process; and a
+    /// save does not rewrite a value the store already holds, since on macOS a
+    /// write to an item another code signature created prompts as a read does.
+    /// Private, so the values cannot reach a `Debug` print.
+    held: std::collections::HashMap<(u64, SecretKind), Option<String>>,
+}
+
+/// Hand-written so the held secrets stay out of a log: the derive would print
+/// them.
+impl std::fmt::Debug for Hydration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let held: Vec<&(u64, SecretKind)> = self.held.keys().collect();
+        f.debug_struct("Hydration")
+            .field("needs_resave", &self.needs_resave)
+            .field("unreadable", &self.unreadable)
+            .field("stored", &self.stored)
+            .field("error", &self.error)
+            .field("read", &self.read)
+            .field("held", &held)
+            .finish()
+    }
+}
+
+/// Push `pair` unless it is already there.
+fn note(list: &mut Vec<(u64, SecretKind)>, pair: (u64, SecretKind)) {
+    if !list.contains(&pair) {
+        list.push(pair);
+    }
 }
 
 impl Hydration {
+    /// What the store is known to hold for this secret: `Some(Some(v))` a value,
+    /// `Some(None)` no entry, `None` not known — never read, or the read failed.
+    pub fn known(&self, id: u64, kind: SecretKind) -> Option<Option<&str>> {
+        self.held.get(&(id, kind)).map(|v| v.as_deref())
+    }
+
+    /// Record the store's answer to a read of one secret.
+    ///
+    /// Does **not** mark the secret read: the answer is in this cache, not yet
+    /// in the list a save writes, and a save between the two must still leave
+    /// it alone. [`Hydration::deliver`] is the other half.
+    pub fn record(
+        &mut self,
+        id: u64,
+        kind: SecretKind,
+        answer: &Result<Option<String>, StoreError>,
+    ) {
+        match answer {
+            Ok(value) => {
+                if value.is_some() {
+                    note(&mut self.stored, (id, kind));
+                }
+                self.unreadable.retain(|&p| p != (id, kind));
+                self.held.insert((id, kind), value.clone());
+            }
+            // Don't guess. The save path needs to know this field is empty
+            // because we couldn't read it, not because there's nothing there —
+            // and the *reason* is what the user has to be told, so it is kept
+            // rather than dropped on a wildcard.
+            Err(e) => {
+                tracing::warn!(
+                    conn = id,
+                    kind = ?kind,
+                    error = %e,
+                    "could not read a secret from the OS keyring"
+                );
+                self.error.get_or_insert_with(|| e.0.clone());
+                note(&mut self.unreadable, (id, kind));
+            }
+        }
+    }
+
+    /// Hand what is known of `conn`'s secrets of `kinds` to `conn` — the one in
+    /// the list a save writes — and mark each one handed over as read.
+    ///
+    /// An empty field takes the known value; a non-empty one is kept, since it
+    /// is what the user typed or the plaintext the file still carries. A secret
+    /// not known — never read, or unreadable — is left empty and unmarked, so a
+    /// save still leaves its stored entry alone.
+    ///
+    /// Must run in the same step as the save it protects can see: on the thread
+    /// that owns the list, with no save able to fall between the field being
+    /// filled and the secret being marked.
+    pub fn deliver(&mut self, conn: &mut Connection, kinds: &[SecretKind]) {
+        for &kind in kinds {
+            if !field(conn, kind).is_empty() {
+                continue;
+            }
+            let Some(known) = self.held.get(&(conn.id, kind)) else {
+                continue;
+            };
+            if let Some(v) = known {
+                set_field(conn, kind, v.clone());
+            }
+            note(&mut self.read, (conn.id, kind));
+        }
+    }
+
+    /// Has this secret's field in the saved list been given the store's answer?
+    /// See [`Hydration::read`].
+    pub fn was_read(&self, id: u64, kind: SecretKind) -> bool {
+        self.read.contains(&(id, kind))
+    }
+
+    /// Does the store already hold exactly `value` for this secret?
+    fn holds(&self, id: u64, kind: SecretKind, value: &str) -> bool {
+        matches!(self.known(id, kind), Some(Some(v)) if v == value)
+    }
+
     /// Did this connection's secret of `kind` fail to read?
     pub fn is_unreadable(&self, id: u64, kind: SecretKind) -> bool {
         self.unreadable.iter().any(|&(i, k)| i == id && k == kind)
@@ -301,11 +430,23 @@ impl Hydration {
     /// one the store is known to hold, which is the question `was_stored` is
     /// asked — and without this half a secret typed and cleared inside one
     /// session had its refused delete pass in silence.
-    pub fn absorb_stored(&mut self, saved: &Sanitized) {
-        for &pair in &saved.stored {
-            if !self.stored.contains(&pair) {
-                self.stored.push(pair);
+    ///
+    /// `file` is the list that was saved — `saved.file` is its blanked disk
+    /// copy — and supplies the values now known to be held. A secret written or
+    /// deleted is one whose field carries the store's answer, so it is read
+    /// from here on; and a deleted one is held no more, or typing the same
+    /// value back in would be skipped as unchanged.
+    pub fn absorb_stored(&mut self, saved: &Sanitized, file: &ConnectionsFile) {
+        for &(id, kind) in &saved.stored {
+            note(&mut self.stored, (id, kind));
+            note(&mut self.read, (id, kind));
+            if let Some(c) = file.connections.iter().find(|c| c.id == id) {
+                self.held
+                    .insert((id, kind), Some(field(c, kind).to_string()));
             }
+        }
+        for &pair in &saved.cleared {
+            self.held.insert(pair, None);
         }
     }
 
@@ -315,7 +456,20 @@ impl Hydration {
     pub fn forget(&mut self, id: u64) {
         self.unreadable.retain(|&(i, _)| i != id);
         self.stored.retain(|&(i, _)| i != id);
+        self.read.retain(|&(i, _)| i != id);
+        self.held.retain(|&(i, _), _| i != id);
     }
+}
+
+/// Does any connection in `file` carry a secret in its fields — legacy
+/// plaintext on disk, to be moved into the store by a save?
+///
+/// The app's load asks only this, of the file and not the store: reading the
+/// store waits until a connection is used.
+pub fn plaintext_on_disk(file: &ConnectionsFile) -> bool {
+    file.connections
+        .iter()
+        .any(|c| SecretKind::ALL.iter().any(|&k| !field(c, k).is_empty()))
 }
 
 /// Fill a connection's empty secret fields from the store, and report whether any
@@ -327,11 +481,14 @@ impl Hydration {
 /// value is never lost even if the keyring is down); an empty field is hydrated
 /// from the keyring when an entry exists, and recorded in `out.unreadable` when
 /// the read fails.
+#[cfg(test)]
 fn hydrate(conn: &mut Connection, store: &dyn SecretStore, out: &mut Hydration) {
     hydrate_kinds(conn, store, out, &[]);
 }
 
-/// [`hydrate`], leaving out the kinds in `skip`.
+/// Fill `conn`'s empty secrets from the store, leaving out the kinds in
+/// `skip`, and flag legacy plaintext for a resave — a read and its delivery in
+/// one step, for a caller that owns `conn` outright.
 fn hydrate_kinds(
     conn: &mut Connection,
     store: &dyn SecretStore,
@@ -340,27 +497,9 @@ fn hydrate_kinds(
 ) {
     for kind in SecretKind::ALL.into_iter().filter(|k| !skip.contains(k)) {
         if field(conn, kind).is_empty() {
-            match store.get(&account(conn.id, kind)) {
-                Ok(Some(v)) => {
-                    out.stored.push((conn.id, kind));
-                    set_field(conn, kind, v);
-                }
-                Ok(None) => {}
-                // Don't guess. The save path needs to know this field is empty
-                // because we couldn't read it, not because there's nothing there
-                // — and the *reason* is what the user has to be told, so it is
-                // kept rather than dropped on a wildcard.
-                Err(e) => {
-                    tracing::warn!(
-                        conn = conn.id,
-                        kind = ?kind,
-                        error = %e,
-                        "could not read a secret from the OS keyring"
-                    );
-                    out.error.get_or_insert_with(|| e.0.clone());
-                    out.unreadable.push((conn.id, kind));
-                }
-            }
+            let answer = store.get(&account(conn.id, kind));
+            out.record(conn.id, kind, &answer);
+            out.deliver(conn, &[kind]);
         } else {
             // Plaintext already on disk → needs migration on the next save.
             out.needs_resave = true;
@@ -371,8 +510,7 @@ fn hydrate_kinds(
 /// Hydrate **one** connection, leaving out the kinds in `supplied` — the
 /// headless CLI's load.
 ///
-/// The app hydrates the whole file because it may show any connection; a
-/// command runs against one, and reading every other connection's secrets was
+/// A command runs against one connection, and reading every other one's secrets was
 /// a keyring round trip (and on macOS, potentially a keychain prompt) per
 /// secret it would never use. `supplied` is what the caller got another way —
 /// `--password-stdin` — which is not read at all, so a locked keyring cannot
@@ -400,8 +538,9 @@ pub fn hydrate_connection(
 /// the passphrase for a password login, the password for a key, both for the
 /// agent.
 ///
-/// The app still hydrates every kind (a form can switch the auth method and
-/// should find the secret there); this is for a caller that only connects.
+/// The app's connection form still reads every kind (it can switch the auth
+/// method and should find the secret there); this is for a caller that only
+/// connects.
 pub fn unused_kinds(conn: &Connection) -> Vec<SecretKind> {
     use crate::connection::SshAuth;
     if !conn.uses_tunnel() {
@@ -414,12 +553,22 @@ pub fn unused_kinds(conn: &Connection) -> Vec<SecretKind> {
     }
 }
 
-/// Hydrate every connection in the file (see [`hydrate`]).
-///
-/// The returned [`Hydration`] must be handed to the [`sanitize_file`] of any
-/// later save of this same file, or a transient store failure at load turns the
-/// next ordinary save into a deletion of every credential it couldn't read.
-pub fn hydrate_file(file: &mut ConnectionsFile, store: &dyn SecretStore) -> Hydration {
+/// The secrets opening `conn`'s SSH tunnel takes — none without a tunnel, and
+/// only the one its SSH auth method uses ([`unused_kinds`]'s complement among
+/// the SSH kinds). What the app reads before it dials the bastion.
+pub fn tunnel_kinds(conn: &Connection) -> Vec<SecretKind> {
+    let unused = unused_kinds(conn);
+    [SecretKind::SshPassword, SecretKind::SshPassphrase]
+        .into_iter()
+        .filter(|k| !unused.contains(k))
+        .collect()
+}
+
+/// Hydrate every connection in the file (see `hydrate`) — the eager load the
+/// app made before it read secrets lazily, kept as the tests' model of a load
+/// that read everything.
+#[cfg(test)]
+fn hydrate_file(file: &mut ConnectionsFile, store: &dyn SecretStore) -> Hydration {
     let mut out = Hydration::default();
     for conn in &mut file.connections {
         hydrate(conn, store, &mut out);
@@ -433,16 +582,19 @@ pub fn hydrate_file(file: &mut ConnectionsFile, store: &dyn SecretStore) -> Hydr
 ///
 /// Per secret: a non-empty value is written to the store and, **only if that
 /// write succeeds**, blanked in the disk copy; if the store is unavailable the
-/// plaintext is left in the disk copy as a fallback. An empty value deletes any
-/// stale store entry, so clearing a password can't be undone by a later hydrate.
+/// plaintext is left in the disk copy as a fallback. A value the store already
+/// holds is not written again, only blanked. An empty value deletes any stale
+/// store entry, so clearing a password can't be undone by a later hydrate —
+/// but only where the field was **read**.
 ///
-/// `hydration` is what the load of this file learned, and it exists for one
-/// branch: **a secret whose read failed is not a cleared secret.** Without it the
-/// empty field is overloaded — a locked keyring at startup looks exactly like a
-/// user who cleared every password, and the next unrelated save (a read-only
-/// toggle is enough, since the whole file is rewritten) deletes credentials that
-/// cannot be recovered. Uncertainty resolves to *don't destroy*. Pass
-/// `&Hydration::default()` only when the file was not hydrated from this store.
+/// `hydration` is what this process learned of the store, and it exists for
+/// that branch: **a secret nobody read, or whose read failed, is not a cleared
+/// secret.** Without it the empty field is overloaded — a connection not used
+/// yet this session, or a locked keyring, looks exactly like a user who cleared
+/// every password, and the next unrelated save (a read-only toggle is enough,
+/// since the whole file is rewritten) deletes credentials that cannot be
+/// recovered. Uncertainty resolves to *don't destroy*. With
+/// `&Hydration::default()` nothing was read, so no empty field deletes.
 pub fn sanitize_file(
     file: &ConnectionsFile,
     store: &dyn SecretStore,
@@ -468,12 +620,14 @@ pub fn sanitize_file(
             let acct = account(conn.id, kind);
             let value = field(conn, kind).to_string();
             if value.is_empty() {
-                if hydration.is_unreadable(conn.id, kind) {
-                    // Empty only because we couldn't read it. Leave the stored
-                    // entry exactly as it was.
+                if !hydration.was_read(conn.id, kind) {
+                    // Empty because nobody read it, or because we couldn't.
+                    // Leave the stored entry exactly as it was.
                     continue;
                 }
-                if !store.delete(&acct) && hydration.was_stored(conn.id, kind) {
+                if store.delete(&acct) {
+                    out.cleared.push((conn.id, kind));
+                } else if hydration.was_stored(conn.id, kind) {
                     // The disk copy says empty and the keyring still holds the
                     // old value, so the next hydrate would restore a password
                     // the user deliberately cleared. The next save retries the
@@ -487,6 +641,10 @@ pub fn sanitize_file(
                     // one.
                     out.undeleted.push((conn.id, kind));
                 }
+            } else if hydration.holds(conn.id, kind, &value) {
+                // Already there, so not written again: on macOS a write to an
+                // item another code signature created prompts as a read does.
+                set_field(conn, kind, String::new());
             } else if store.set(&acct, &value) {
                 // The store now holds it, whoever read it first — see
                 // `Sanitized::stored`.
@@ -529,6 +687,9 @@ pub struct Sanitized {
     /// one session and cleared in the same one had its refused delete go
     /// unreported — and came back on the next launch.
     pub stored: Vec<(u64, SecretKind)>,
+    /// Secrets this save **deleted** from the store, which it therefore no
+    /// longer holds — folded into [`Hydration`] by the same call.
+    pub cleared: Vec<(u64, SecretKind)>,
 }
 
 impl Sanitized {
@@ -833,6 +994,20 @@ mod tests {
         assert_eq!(unused_kinds(&c).len(), 2);
     }
 
+    #[test]
+    fn a_tunnel_takes_only_the_secret_its_auth_method_uses() {
+        use crate::connection::SshAuth;
+        let mut c = conn(1);
+        assert!(tunnel_kinds(&c).is_empty(), "no tunnel, no SSH secret");
+        c.ssh.enabled = true;
+        c.ssh.auth = SshAuth::Password;
+        assert_eq!(tunnel_kinds(&c), vec![SecretKind::SshPassword]);
+        c.ssh.auth = SshAuth::KeyPair;
+        assert_eq!(tunnel_kinds(&c), vec![SecretKind::SshPassphrase]);
+        c.ssh.auth = SshAuth::Agent;
+        assert!(tunnel_kinds(&c).is_empty());
+    }
+
     /// **A file has no tunnel, whatever its SSH block says.** A SQLite
     /// connection switched over from a tunnelled server one keeps
     /// `ssh.enabled` until its form is next saved; the CLI read the SSH
@@ -1076,7 +1251,7 @@ mod tests {
         assert_eq!(out.stored, vec![(7, SecretKind::DbPassword)]);
         assert_eq!(store.stored("conn.7.password").as_deref(), Some("s3cret"));
         // What the app does with it at the save site.
-        hydration.absorb_stored(&out);
+        hydration.absorb_stored(&out, &file);
         hydration.resolve_against(&file);
         assert!(hydration.was_stored(7, SecretKind::DbPassword));
 
@@ -1138,6 +1313,85 @@ mod tests {
             disk.connections[0].password, "",
             "and no plaintext appears on disk either"
         );
+    }
+
+    /// **A secret nobody read is not a secret anybody cleared.** The app reads a
+    /// connection's secrets the first time it is used, so every connection not
+    /// used yet this session has empty fields — and the first ordinary save, a
+    /// read-only toggle, used to read each of them as a password the user had
+    /// removed and delete it from the keyring.
+    #[test]
+    fn a_save_leaves_alone_every_secret_it_never_read() {
+        let store = MemStore::seeded(&[
+            ("conn.7.password", "s3cret"),
+            ("conn.7.ssh_password", "tunnel"),
+        ]);
+        let mut c = conn(7);
+        c.ssh.enabled = true;
+        // Loaded without reading the keyring, then the read-only flag flipped.
+        c.read_only = true;
+        let file = ConnectionsFile {
+            connections: vec![c],
+            active: Some(7),
+            highest_id: 0,
+        };
+        let out = sanitize_file(&file, &store, &Hydration::default());
+        assert_eq!(store.stored("conn.7.password").as_deref(), Some("s3cret"));
+        assert_eq!(
+            store.stored("conn.7.ssh_password").as_deref(),
+            Some("tunnel")
+        );
+        assert!(out.undeleted.is_empty() && out.in_the_clear.is_empty());
+        assert_eq!(out.notice(), None);
+    }
+
+    /// A [`MemStore`] that counts its writes.
+    struct CountingStore {
+        inner: MemStore,
+        sets: std::cell::Cell<usize>,
+    }
+
+    impl SecretStore for CountingStore {
+        fn get(&self, account: &str) -> Result<Option<String>, StoreError> {
+            self.inner.get(account)
+        }
+        fn set(&self, account: &str, secret: &str) -> bool {
+            self.sets.set(self.sets.get() + 1);
+            self.inner.set(account, secret)
+        }
+        fn delete(&self, account: &str) -> bool {
+            self.inner.delete(account)
+        }
+    }
+
+    /// **A save writes only the secrets that changed.** On macOS a write to a
+    /// keychain item another code signature created asks for the login
+    /// password, so rewriting every secret on every save turned one prompt per
+    /// item after an update into one per item per save.
+    #[test]
+    fn a_save_does_not_rewrite_a_secret_the_store_already_holds() {
+        let store = CountingStore {
+            inner: MemStore::seeded(&[("conn.7.password", "s3cret")]),
+            sets: std::cell::Cell::new(0),
+        };
+        let mut file = ConnectionsFile {
+            connections: vec![conn(7)],
+            active: Some(7),
+            highest_id: 0,
+        };
+        let hydration = hydrate_file(&mut file, &store);
+        assert_eq!(file.connections[0].password, "s3cret");
+        let out = sanitize_file(&file, &store, &hydration);
+        assert_eq!(
+            store.sets.get(),
+            0,
+            "nothing changed, so nothing is written"
+        );
+        assert_eq!(
+            out.file.connections[0].password, "",
+            "and the disk copy is still blank"
+        );
+        assert!(out.in_the_clear.is_empty());
     }
 
     /// Once the user supplies a value, the protection must lift — otherwise a
@@ -1249,16 +1503,149 @@ mod tests {
 
     #[test]
     fn sanitize_deletes_stale_entry_for_cleared_field() {
-        // Keyring had an old password; the user cleared the field. Sanitize must
-        // delete the stale entry so a later hydrate can't resurrect it.
+        // Keyring had an old password, read into the field; the user cleared
+        // it. Sanitize must delete the stale entry so a later hydrate can't
+        // resurrect it.
         let store = MemStore::seeded(&[("conn.7.password", "old")]);
-        let file = ConnectionsFile {
-            connections: vec![conn(7)], // password empty
+        let mut file = ConnectionsFile {
+            connections: vec![conn(7)],
             active: Some(7),
             highest_id: 0,
         };
-        let _ = sanitize(&file, &store);
+        let hydration = hydrate_file(&mut file, &store);
+        file.connections[0].password.clear();
+        let out = sanitize_file(&file, &store, &hydration);
         assert_eq!(store.stored("conn.7.password"), None);
+        assert!(out.cleared.contains(&(7, SecretKind::DbPassword)));
+    }
+
+    /// **The lazy read, in its two halves.** A read lands in the cache and
+    /// nowhere else, so a save that falls between it and the delivery still
+    /// sees a never-read field and leaves the entry alone; once delivered, the
+    /// field carries the value and a clear means what it says.
+    #[test]
+    fn a_read_counts_for_the_save_only_once_it_is_delivered() {
+        let store = MemStore::seeded(&[("conn.7.password", "s3cret")]);
+        let mut h = Hydration::default();
+        h.record(7, SecretKind::DbPassword, &store.get("conn.7.password"));
+        assert_eq!(h.known(7, SecretKind::DbPassword), Some(Some("s3cret")));
+        assert!(!h.was_read(7, SecretKind::DbPassword));
+
+        // A save before delivery: the list's field is still empty.
+        let mut file = ConnectionsFile {
+            connections: vec![conn(7)],
+            active: Some(7),
+            highest_id: 0,
+        };
+        let _ = sanitize_file(&file, &store, &h);
+        assert_eq!(store.stored("conn.7.password").as_deref(), Some("s3cret"));
+
+        h.deliver(&mut file.connections[0], &SecretKind::ALL);
+        assert_eq!(file.connections[0].password, "s3cret");
+        assert!(h.was_read(7, SecretKind::DbPassword));
+        // The SSH secrets were never read, so delivery leaves them unmarked.
+        assert!(!h.was_read(7, SecretKind::SshPassword));
+
+        file.connections[0].password.clear();
+        let _ = sanitize_file(&file, &store, &h);
+        assert_eq!(
+            store.stored("conn.7.password"),
+            None,
+            "a delivered clear deletes"
+        );
+    }
+
+    /// A read that failed hands nothing over, so the field stays protected.
+    #[test]
+    fn an_unreadable_secret_is_not_delivered() {
+        let store = MemStore::seeded(&[("conn.7.password", "s3cret")]);
+        store.set_available(false);
+        let mut h = Hydration::default();
+        h.record(7, SecretKind::DbPassword, &store.get("conn.7.password"));
+        assert!(h.is_unreadable(7, SecretKind::DbPassword));
+        assert_eq!(h.known(7, SecretKind::DbPassword), None);
+        let mut c = conn(7);
+        h.deliver(&mut c, &[SecretKind::DbPassword]);
+        assert!(!h.was_read(7, SecretKind::DbPassword));
+
+        // A later read that works lifts the mark.
+        store.set_available(true);
+        h.record(7, SecretKind::DbPassword, &store.get("conn.7.password"));
+        assert!(!h.is_unreadable(7, SecretKind::DbPassword));
+    }
+
+    /// A changed value is written, and a value cleared and then typed back in
+    /// is written again — the delete means the store no longer holds it, so
+    /// "unchanged" must not skip it.
+    #[test]
+    fn a_changed_or_retyped_secret_is_written() {
+        let store = CountingStore {
+            inner: MemStore::seeded(&[("conn.7.password", "old")]),
+            sets: std::cell::Cell::new(0),
+        };
+        let mut file = ConnectionsFile {
+            connections: vec![conn(7)],
+            active: Some(7),
+            highest_id: 0,
+        };
+        let mut h = hydrate_file(&mut file, &store);
+
+        file.connections[0].password = "new".to_string();
+        let out = sanitize_file(&file, &store, &h);
+        h.absorb_stored(&out, &file);
+        assert_eq!(store.sets.get(), 1);
+        assert_eq!(
+            store.inner.stored("conn.7.password").as_deref(),
+            Some("new")
+        );
+
+        file.connections[0].password.clear();
+        let out = sanitize_file(&file, &store, &h);
+        h.absorb_stored(&out, &file);
+        assert_eq!(store.inner.stored("conn.7.password"), None);
+
+        file.connections[0].password = "new".to_string();
+        let out = sanitize_file(&file, &store, &h);
+        h.absorb_stored(&out, &file);
+        assert_eq!(store.sets.get(), 2, "the retyped value is written again");
+        assert_eq!(
+            store.inner.stored("conn.7.password").as_deref(),
+            Some("new")
+        );
+    }
+
+    /// The cache holds secrets, so its `Debug` must not print them.
+    #[test]
+    fn a_hydration_debug_print_names_no_secret() {
+        let mut h = Hydration::default();
+        h.record(7, SecretKind::DbPassword, &Ok(Some("s3cret".to_string())));
+        let shown = format!("{h:?}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(shown.contains("DbPassword"), "{shown}");
+    }
+
+    #[test]
+    fn plaintext_on_disk_looks_at_every_kind() {
+        let mut file = ConnectionsFile {
+            connections: vec![conn(1), conn(2)],
+            active: Some(1),
+            highest_id: 0,
+        };
+        assert!(!plaintext_on_disk(&file));
+        file.connections[1].ssh.key_passphrase = "kp".to_string();
+        assert!(plaintext_on_disk(&file));
+    }
+
+    /// `forget` drops what was known too, so a reused id reads afresh.
+    #[test]
+    fn forget_drops_the_known_values_and_the_read_marks() {
+        let mut h = Hydration::default();
+        h.record(7, SecretKind::DbPassword, &Ok(Some("s3cret".to_string())));
+        let mut c = conn(7);
+        h.deliver(&mut c, &[SecretKind::DbPassword]);
+        h.forget(7);
+        assert_eq!(h.known(7, SecretKind::DbPassword), None);
+        assert!(!h.was_read(7, SecretKind::DbPassword));
     }
 
     #[test]
