@@ -859,6 +859,16 @@ pub fn tools_list(
             McpTool::from_name(t["name"].as_str().unwrap_or(""))
                 .is_some_and(|tool| tool.offered(reads_data, schema, host))
         });
+        // **Every tool reads rows or the catalogue**, so each says what its
+        // results are (security review S3): a row value or a comment phrased
+        // as an instruction is data, and the model is told so where it learns
+        // the tool, once, rather than around every result the panel shows.
+        for t in list.iter_mut() {
+            if let Some(d) = t["description"].as_str() {
+                t["description"] =
+                    Value::String(format!("{d} {}", schemaic_core::prompt::TOOL_RESULT_NOTE));
+            }
+        }
     }
     tools
 }
@@ -2731,6 +2741,28 @@ mod tests {
     /// with `"database": "chinook"` ran in `world` and answered `relation
     /// "track" does not exist`. On PostgreSQL nothing else reaches another
     /// database at all.
+    /// **Every tool tells the model its results are data** (security review
+    /// S3). The panel's own prompts fence what they read from the database
+    /// (`core::prompt`), but a tool result reached the model with nothing
+    /// saying so, and a row value or a column comment phrased as an
+    /// instruction — to call `propose_table_change`, say — had only the
+    /// model's judgement against it. Every tool reads rows or the catalogue,
+    /// so every description carries the note.
+    #[test]
+    fn every_tool_says_its_results_are_data_not_instructions() {
+        let tools = super::tools_list(schemaic_db::Engine::Postgres, true, true, Host::Panel);
+        let tools = tools.as_array().expect("a list");
+        assert!(!tools.is_empty());
+        for t in tools {
+            let description = t["description"].as_str().expect("a description");
+            assert!(
+                description.ends_with(schemaic_core::prompt::TOOL_RESULT_NOTE),
+                "{}: {description}",
+                t["name"]
+            );
+        }
+    }
+
     #[test]
     fn run_query_takes_a_database_and_uses_it() {
         let tools = super::tools_list(schemaic_db::Engine::Postgres, true, true, Host::Standalone);

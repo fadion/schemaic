@@ -121,6 +121,9 @@
   `the_gate_agrees_with_the_one_result_shape_applies_to_the_same_string` pins that on what they
   *keep* as well as on what they drop, so one of them cannot drift back to withholding the whole
   message while the others redact.
+  `TOOL_RESULT_NOTE` is the same provenance for the MCP server's tool results, said **once per
+  tool description** rather than around every result — `cli/mcp.rs`'s `tools_list` appends it to
+  each tool, and that entry has the reason it is not a fence.
 - `summary.rs` — the grid's "AI Summary" cell/column prompts. `sample_column` spreads its
   sample *evenly* across loaded rows rather than taking the first N, because a sorted result's
   head often shares a date/status/prefix that reads as a pattern that isn't real; `sample_row`
