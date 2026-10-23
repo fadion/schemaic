@@ -575,12 +575,13 @@ pub async fn open_tunnel(
     // being reused against a dead tunnel forever (review H9). Per hop, because
     // the host-key types asked for are that hop's (`host_key_order`).
     let config_for = |listed: &[(usize, ssh_key::PublicKey)]| {
-        let mut preferred = russh::Preferred::default();
-        preferred.key = host_key_order(listed).into();
         Arc::new(client::Config {
             keepalive_interval: Some(Duration::from_secs(30)),
             keepalive_max: 3,
-            preferred,
+            preferred: russh::Preferred {
+                key: host_key_order(listed).into(),
+                ..Default::default()
+            },
             ..Default::default()
         })
     };
