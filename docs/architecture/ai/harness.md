@@ -218,15 +218,25 @@ the two grades that mean something.
 under its read-only sandbox, Antigravity's as `run_command`. `schemaic exec` is a write the
 panel's read-only MCP tools never offer, and `query`, `export`, `dump` and `mcp` read past the
 panel's AI data level, on any connection the user has granted CLI access — provided the vendor's
-sandbox lets the child reach the database's socket and the OS keyring, which has not been checked
-live, no such harness being to hand. So all three agent spawns in `app/ai.rs` — `run_inline`, the
+sandbox lets the child run it and reach the database's socket and the OS keyring. Measured on
+Windows 11 (2026-10-23), each harness spawned with the panel's own argv and environment: Codex CLI
+0.153.4 rejected **every** shell call as *"blocked by policy"* before a process started — not only
+`schemaic list`, a TCP connect and a keyring read but `whoami` and a `Get-Content` in its own cwd —
+and Antigravity 1.4.6's headless mode auto-denied `run_command` for every command, ending the turn, its
+`schedule` tool's work included when that re-entered `run_command`. The same probe outside a
+harness reached all three database ports and the keyring. So on Windows neither shell reaches
+`schemaic` at all. Antigravity's notebook and browser tools were *reported* unavailable in this
+mode by the model, which made no call, so that is not proven; and Linux and macOS are unmeasured
+— there Codex's Landlock and Seatbelt sandboxes let a command run and restrict its network and
+writes instead, so the answer may differ. All three agent spawns in `app/ai.rs` — `run_inline`, the
 session spawn and Antigravity's `spawn_child` — set `schemaic_core::AGENT_CHILD_ENV`
 (`SCHEMAIC_AGENT_CHILD`) to `1`, which anything the agent's shell runs inherits, and the command
 line's `dispatch` refuses every command but `version` under it with `Exit::Refused` (under
 `cli/run.rs`). **It is a speed bump, not a boundary.** A shell that knows the name can unset it,
 so what stands between the agent and the keyring is still the vendor's sandbox, and the
 plaintext `connections.json` of the keyring-unavailable fallback stays readable by the built-in
-file readers above, which no environment variable reaches. The panel's own MCP subprocess is
+file readers above, which no environment variable reaches — the same run's `view_file` read a file
+outside its cwd without a prompt. The panel's own MCP subprocess is
 unaffected: `--mcp-serve` is answered in `app/main.rs` before the command line's dispatch, so it
 never asks.
 **Cursor is the third `Restricted`, and it is reached by neither a sandbox nor a flag but by rules
