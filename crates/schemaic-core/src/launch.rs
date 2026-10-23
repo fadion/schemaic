@@ -244,7 +244,8 @@ pub fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
 /// launchers ship. So this refuses rather than pretending, the way
 /// [`psql_target`] does for a conninfo-shaped name.
 ///
-/// Only the DB-CLI launchers ask. The user's own terminal shell is a shell by
+/// The DB-CLI launchers ask, and so does the Docker import's `docker_launcher`
+/// (`app::conn_sources`). The user's own terminal shell is a shell by
 /// definition and is not this question.
 pub fn direct_spawn_verdict(resolved: &std::path::Path) -> Result<(), Refusal> {
     let is_shim = resolved

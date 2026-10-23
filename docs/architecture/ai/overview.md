@@ -151,7 +151,11 @@ passed via `--mcp-config`, so the user's own global servers do not join Schemaic
 `--setting-sources user` keeps the user's own `~/.claude/settings.json` — their own choice — and
 drops the two directory-relative sources, because the CLI resolves them against the child's
 working directory; the one-shot paths below inherit the app's own working directory instead, and
-the flag covers them for the same reason.
+the flag covers them for the same reason. What it keeps is not inert: that file's `hooks` and
+`apiKeyHelper` are commands, run with the child's environment, beside its `env` and its plugins —
+whose skills may bring back what `--tools ""` removed, a plugin's MCP servers being
+`--strict-mcp-config`'s to keep out — so the residual is a tampered *user* config rather than a
+planted one, and it includes running commands.
 **And the session child runs in a directory made for it, never in the temp dir itself.**
 `ai::session_cwd` creates `<temp>/schemaic-run-<pid>-<started>-<tag>`, fresh per session, through
 `create_exclusive_dir` — `DirBuilder::mode(0o700).create` on Unix, `fs::create_dir` elsewhere, and

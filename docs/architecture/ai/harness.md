@@ -384,6 +384,11 @@ Claude's it leaves the grade to `--sandbox`/`--tools` alone
 (`isolation_does_not_decide_the_grade`). Note the two probes answer an absent flag in opposite
 directions on purpose: a missing isolation flag is a known, lesser, still-runnable state, while
 a missing *grade* means nobody knows whether side effects are blocked at all.
+**Claude's pair is not total either, and what `--setting-sources user` keeps includes commands**:
+the user's own `~/.claude/settings.json` still loads — its `hooks` and `apiKeyHelper`, run with
+the child's environment, its `env`, and its plugins, whose skills may bring back what `--tools ""`
+removed (a plugin's MCP servers stay out, `--strict-mcp-config` covering them) — so the residual
+is a tampered user config, the very hooks Codex's `--ignore-user-config` drops.
 **And "the probe saw it" was false on every real machine, because Codex keeps that flag off its
 top-level help page.** Measured against the installed binary: `codex --help` lists `--model`,
 `--sandbox`, `--help` and `--version` and *not* `--ignore-user-config`, while `codex exec --help`
@@ -587,7 +592,12 @@ Antigravity's legs stay unverified *here*, neither binary being on the machine t
 others, and that is said rather than assumed. **What the three still on argv cost is stated at
 the capability too**, since that is why it keeps being raised: `/proc/<pid>/cmdline` is
 world-readable on Linux, so a one-shot turn's whole prompt — attached grid rows and Fill/Seed's
-sample included — is visible to every local account for the life of the process. Everything is
+sample included — is visible to every local account for the life of the process. **Claude's
+persistent session is on argv too, for its system context rather than its turns**:
+`build_session_args` passes the system context, schema outline included, as the value of
+`--append-system-prompt`, so the outline is readable the same way for the whole life of the
+session process — the "no prompt in argv" said of the persistent harnesses above is about the
+turns alone. Everything is
 ready for a flip: `stdin_prompt` is threaded through `InlinePlan`, `run_inline` pipes it whenever
 the capability is true, and `turn_stdin_prompt` covers the persistent shape, so moving one leg is
 this `match` arm and a measurement against the installed binary. `turn_stdin_prompt` and `inline_stdin_prompt` build what

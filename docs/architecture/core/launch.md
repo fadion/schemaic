@@ -84,6 +84,13 @@ connection's client. `mysql` staying Oracle's is a known residual — on a moder
 `mysql` is a symlink to the MariaDB client and no inspection of the *name* tells them apart — so
 this closes the case that was measured, a box whose only client is `mariadb`, and leaves the
 symlink case as it was rather than trading it for a new one.
+**`VerifyCa` is `--ssl` plus `--ssl-ca` and no `--ssl-verify-server-cert`, and that is the rung,
+not a dropped check** — also measured, 2026-10-23, with the MariaDB 10.11.14 client against a
+TLS-enabled 10.11 server: `--ssl --ssl-ca=<an unrelated self-made CA>` is refused (*TLS/SSL error:
+self-signed certificate in certificate chain*), and the server's own CA connects. So the client
+verifies the chain on `--ssl-ca` alone, and `--ssl-verify-server-cert` adds only the host-name
+check, which is precisely what Verify CA leaves out and `VerifyFull` adds. Read as "Verify CA
+sends nothing that verifies", the arm invites a fix that turns it into Verify full.
 **That contract spent a while attached to the wrong item.** `44ccfa4` inserted `MysqlClient`'s
 doc *between* `mysql_cli_tls_args`' doc block and its signature, so the "non-empty, saying
 nothing is not neutral" paragraph became the opening of the published rustdoc for that *enum*
