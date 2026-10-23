@@ -1894,7 +1894,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   program that is not one of them, which is exactly how this passed for as long as it did, so the
   gate now also asserts the launcher is in a `LAUNCHERS` allowlist declaring `(program,
   is_an_interpreter)` for each of the three, and `a_launcher_that_is_an_interpreter_is_declared`
-  fails if a second interpreter is added without amending that paragraph. **A refusal is a `Result`, not a caller's
+  fails if a second interpreter is added without amending that paragraph. **The one shell this
+  app does start is the message terminal, and rule 1 names it too**: `launch::message_shell_command`
+  is `cmd /v:on` or `/bin/sh` by design, so it keeps the rule by making its command line a constant
+  and passing the message only in the environment (`SCHEMAIC_MESSAGE`), expanded where neither shell
+  parses it again. It was shell source made safe by a character allowlist — the metacharacter
+  filter this rule exists to avoid — and that allowlist printed every apostrophe, em dash and `&`
+  in the 38 messages that reach the terminal as a space, in all nine languages; the detail and the
+  tests are under `core::launch`. **A refusal is a `Result`, not a caller's
   `if`** — `mysql_shell`/`psql_shell` and their `_config` halves return a `Result` where they
   returned an `Option` or a bare config (a `launch::Refusal` from a `_config` half, which the
   `*_shell` calling it words through `refusal_text`; `String` from the `*_shell`s and

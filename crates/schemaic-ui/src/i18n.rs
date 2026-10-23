@@ -2518,26 +2518,79 @@ mod tests {
         }
     }
 
-    /// **The keyring refusal reaches the terminal panel whole in every
-    /// language.** *Open in CLI* prints it through a message shell, whose
-    /// `launch::shell_message_text` turns an apostrophe into a space, and
-    /// English's "this connection's saved credentials" read *connection s
-    /// saved* there — French's *n'a pas pu* the same. Worded without one, so
-    /// the sanitiser has nothing to take.
+    /// **Every message the terminal panel prints arrives whole, in every
+    /// language.** The message shell used to strip each character outside a
+    /// shell-safe allowlist: English's "this connection's saved credentials"
+    /// read *connection s saved*, French lost every elision, and the refusal
+    /// explaining `'&'` and `'|'` lost both. These are the ids that reach
+    /// `message_shell` (Open in CLI, backup and restore, the tunnel, a shell
+    /// that would not start), each rendered with every argument any of them
+    /// takes, and through `launch::message_shell_command` each one must come
+    /// out as it went in.
     #[test]
-    fn the_keyring_refusal_survives_the_message_shell_in_every_language() {
+    fn every_terminal_message_survives_the_message_shell_in_every_language() {
+        const IDS: &[&str] = &[
+            "term-shell-failed",
+            "term-cli-read-only",
+            "db-refused-keyring-unreadable",
+            "cli-no-client",
+            "cli-no-client-on-path",
+            "cli-no-tool",
+            "cli-no-either-tool",
+            "cli-no-either-client",
+            "cli-sqlcmd-windows-in-wsl",
+            "cli-refused-shim",
+            "cli-refused-name-equals",
+            "cli-refused-name-uri",
+            "cli-refused-file-dash",
+            "cli-refused-sqlcmd-entra",
+            "cli-refused-sqlcmd-host",
+            "cli-refused-sqlcmd-ca",
+            "cli-refused-sqlcmd-client-cert",
+            "cli-refused-wsl-paths",
+            "cli-refused-tunnelled-verify",
+            "cli-refused-not-container-id",
+            "cli-refused-file-line-break",
+            "cli-refused-role",
+            "cli-refused-mysql-source-path",
+            "cli-refused-cloud-token",
+            "tunnel-still-opening",
+            "tunnel-could-not-open",
+            "tunnel-server-failed",
+            "backup-read-only-server",
+            "backup-not-started",
+            "backup-done",
+            "backup-failed",
+            "restore-read-only",
+            "restore-engine-not-here",
+            "restore-unreadable",
+            "restore-refused",
+            "restore-refused-more",
+            "restore-switch",
+            "restore-switch-unnamed",
+        ];
+        let args = HashMap::from(
+            [
+                "client", "database", "error", "first", "how", "line", "more", "name", "path",
+                "program", "second", "switches", "tool",
+            ]
+            .map(|k| (k, "x")),
+        );
         for &lang in UiLanguage::ALL {
-            let text = loader(lang)
-                .get_args(
-                    "db-refused-keyring-unreadable",
-                    HashMap::from([("error", "locked")]),
-                )
-                .replace(['\u{2068}', '\u{2069}'], "");
-            assert_eq!(
-                schemaic_core::launch::shell_message_text(&text),
-                text,
-                "{lang:?}"
-            );
+            let l = loader(lang);
+            for id in IDS {
+                assert!(l.has(id), "{lang:?}: no {id}");
+                let text = l
+                    .get_args(id, args.clone())
+                    .replace(['\u{2068}', '\u{2069}'], "");
+                assert_eq!(
+                    schemaic_core::launch::message_shell_command(&text, cfg!(windows))
+                        .message
+                        .1,
+                    text.trim(),
+                    "{lang:?} {id}"
+                );
+            }
         }
     }
 

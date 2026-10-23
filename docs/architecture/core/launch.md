@@ -12,7 +12,10 @@ there, and the argument that they are inert in it is an argument about third-par
 nothing here re-checks. It was not verified against a real `xdg-open` (none on the machine), which
 is recorded rather than glossed; the guarantee that remains is one argv element carrying only RFC
 3986's allowlist. `explorer` and `open` are genuine executables and the rule holds on those two
-exactly as stated, which is what the `LAUNCHERS` table's second column records. And **the
+exactly as stated, which is what the `LAUNCHERS` table's second column records. The rule also
+names the one shell this app starts itself, the **message terminal** (`message_shell_command`,
+below), which is kept to it by a different means: its command line is a constant and the message
+reaches `cmd` or `sh` only through the environment. And **the
 string is validated where it stops being data**, not at the site that produced it: a producer may
 have its own good reasons to be permissive — the terminal's link tagger admits `&` because a query
 string needs one — and the launcher does not inherit them.
@@ -181,6 +184,34 @@ CLIs read any word beginning with `-` as an option, so a user named `--profile=p
 in under somebody else's profile rather than fail; an empty value is refused because a flag
 with none takes the next flag as one, and a control character because none belongs in a host or
 a user (`a_value_shaped_like_an_option_is_refused`, under `cloud_iam.rs`, is what exercises it).
+`message_shell_command(msg, windows)` is **the one place a shell runs on this app's say-so** —
+the terminal panel's throwaway session that prints a refusal, a missing client or an OS error and
+stays open; `app/main.rs`'s `message_shell` maps the `MessageShell` it returns into a
+`ShellConfig` and decides nothing. **The message never reaches the command line.** The command is
+a constant — `cmd.exe /v:on /k echo(!SCHEMAIC_MESSAGE!` on Windows, `/bin/sh -c "printf '%s\n'
+\"$SCHEMAIC_MESSAGE\"; unset SCHEMAIC_MESSAGE; exec /bin/sh"` elsewhere — and the message travels
+in `MESSAGE_VAR`, the struct's one environment pair. Each shell expands it where the value is not
+parsed again: `cmd`'s delayed `!…!` is substituted after the line has been read for `&`, `|`, `^`
+and `%`, and `sh`'s is a double-quoted parameter expansion handed to `printf '%s\n'`, which reads
+no `\` in it. `echo(` rather than `echo ` is load-bearing too: a message of `/?`, `on` or `off` is
+printed instead of obeyed. Don't move the message back into the argv to tidy it. It used to be
+shell source — `cmd /k echo <msg>` and `printf … '<msg>'` — held safe by an allowlist,
+`shell_message_text`, that turned every character outside letters, digits, space and
+`.,:;!?-_/()[]+=@#\` into a space. That held the line and mangled what it carried: the 38
+catalogue messages that can reach this terminal lost, in all nine languages, every apostrophe,
+French elision and em dash (*This database s name*), and a refusal explaining `'&'` and `'|'` lost
+those very characters (*a database name carrying or would be a second command*). A hostile
+message was printed verbatim through a real `cmd.exe` in the app and through `dash` in WSL when
+this landed, nothing injected. What the value still loses is only what would break the line: a run
+of control characters (an OS error's CRLF, a tab, a bell) becomes one space, a bidirectional
+override or isolate (U+202A–202E, U+2066–2069) is dropped so it cannot reorder the sentence on
+screen, and the ends are trimmed. `a_message_shell_reads_its_message_from_the_environment_only`
+holds the composition — no byte of a hostile message on either platform's command line —
+`a_message_shell_is_cmd_with_delayed_expansion_or_sh_with_printf` pins the two commands,
+`a_message_keeps_every_printable_character` and
+`a_message_is_one_line_with_no_control_or_direction_characters` the value, and `ui::i18n`'s
+`every_terminal_message_survives_the_message_shell_in_every_language` renders each of the 38 ids
+in every language, with every argument any of them takes, and requires it to come out unchanged.
 **The backup-and-restore half** is the argv for the engines' own tools, which the database
 menu's *Back up* and *Restore from file* run in the terminal panel as *Open in CLI* runs a client
 — argv only, the password in the tool's environment variable. `backup_file_target` is the check

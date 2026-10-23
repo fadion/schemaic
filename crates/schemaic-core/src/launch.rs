@@ -35,6 +35,11 @@
 //!    can guarantee on its own. Removing the dependence means preferring a
 //!    resolvable `$BROWSER`/`gio open` on the Linux arm; until then this
 //!    paragraph is the guarantee.
+//!
+//!    The other shell is the **message terminal** ([`message_shell_command`]),
+//!    which *is* `cmd` or `sh` by design. Its command line is a constant; the
+//!    message reaches it only through the environment, expanded where neither
+//!    shell parses it again.
 //! 2. **The string is validated where it stops being data**, not at the site
 //!    that produced it. A caller upstream may have its own reasons to be
 //!    permissive (the terminal's link tagger admits `&` because a query string
@@ -742,59 +747,78 @@ fn is_windows_path(p: &str) -> bool {
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
 }
 
-/// `msg` reduced to bytes that are inert inside **both** shells' `echo`.
+/// The environment variable a message terminal reads its message from.
+pub const MESSAGE_VAR: &str = "SCHEMAIC_MESSAGE";
+
+/// A message terminal's command: the program, its arguments, and the one
+/// environment variable (`MESSAGE_VAR`, the message) it is spawned with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageShell {
+    pub program: &'static str,
+    pub args: Vec<String>,
+    pub message: (String, String),
+}
+
+/// The shell that prints `msg` in the terminal panel and stays open —
+/// `windows` picks `cmd.exe` over `/bin/sh`.
 ///
-/// **The one place in the app where a string really is handed to a shell.** The
-/// two rules at the top of this module say the argv here is executed directly
-/// and nothing parses it — true of every other function, and not of the
-/// message terminal: it spawns `/bin/sh -c "printf '%s\n' '<msg>'; exec /bin/sh"` on Unix
-/// and `cmd.exe /k echo <msg>` on Windows, so the message is **shell source**.
-/// A `'` in it closes the quote on Unix; `&`, `|`, `^`, `>` and `%` are syntax
-/// to `cmd`. That was harmless while every caller passed a fixed sentence, and
-/// stops being harmless the moment one reports a program name out of
-/// `terminal.json` or an OS error string back to the user.
+/// **The one place in the app where a shell runs on the app's say-so**, so the
+/// rule at the top of this module is kept here by a different means: **the
+/// message never reaches the command line.** It travels in [`MESSAGE_VAR`],
+/// and each shell expands it at a point where the value is not parsed again —
+/// `cmd /v:on`'s delayed `!SCHEMAIC_MESSAGE!` is substituted after the line has
+/// been read for `&`, `|`, `^` and `%`, and `sh`'s `"$SCHEMAIC_MESSAGE"` is a
+/// quoted parameter expansion handed to `printf '%s\n'`, which reads no `\` in
+/// it. `echo(` rather than `echo ` so a message of `/?`, `on` or `off` is
+/// printed instead of obeyed. The command line is a constant.
 ///
-/// An **allowlist**, for the reason [`is_url_byte`]'s doc gives: filtering every
-/// metacharacter of every shell is how one of them comes to be missed. Letters
-/// and digits in any script, space and a short punctuation set that neither
-/// shell treats as syntax; everything else — every other non-ASCII character
-/// (typographic quotes and dashes, fullwidth symbols, direction marks) and every
-/// control character, newline among them — becomes a space, and runs of spaces collapse
-/// so a stripped run does not leave a gap. The result can be pasted into either
-/// command with no quoting beyond what is already there.
+/// It used to be shell source — `cmd /k echo <msg>` and `printf … '<msg>'` —
+/// made safe by an allowlist that turned every other character into a space.
+/// That held the line, and it printed *This database s name contains or
+/// would be a second command* for a refusal explaining `'&'` and `'|'`, lost
+/// every French elision and every dash, in all nine languages, across the 38
+/// messages that reach this terminal.
 ///
-/// **A letter in any script is kept** because a translated message is made of
-/// them — German's `für` printed `f r` — and no shell gives one a meaning. It
-/// was once dropped for the console's codepage, but the panel's console is a
-/// pseudo-console, which takes `cmd`'s UTF-16 and hands back UTF-8. **So is a
-/// combining mark on a kept letter** — an NFD `für`, a Devanagari virama —
-/// which is part of the letter it sits on; one with no letter before it goes.
-///
-/// **The backslash is on the list**, so a Windows path in a message stays a
-/// path: `cmd` gives it no meaning, `sh` none inside single quotes, and the
-/// Unix shell prints the message with `printf '%s\n'` rather than an `echo`
-/// that would read `\n` or `\c` in it. Stripped, a restore refusal named
-/// `C: Users jonid backup.sql`.
-pub fn shell_message_text(msg: &str) -> String {
-    let mut out = String::with_capacity(msg.len());
+/// The value is still made **one line**: a control character (an OS error's
+/// CRLF) becomes a space, and a bidirectional override or isolate goes, so it
+/// cannot reorder the sentence on screen.
+pub fn message_shell_command(msg: &str, windows: bool) -> MessageShell {
+    let mut value = String::with_capacity(msg.len());
     for ch in msg.chars() {
-        // A combining mark only on a kept letter (or on a mark already kept on
-        // one): it is part of that letter, and neither shell reads one as
-        // syntax. With nothing to attach to — after a stripped character, or
-        // first — it goes like any other non-ASCII symbol.
-        let on_letter = out.chars().last().is_some_and(|p| {
-            p.is_alphanumeric() || unicode_normalization::char::is_combining_mark(p)
-        });
-        let keep = ch.is_alphanumeric()
-            || (on_letter && unicode_normalization::char::is_combining_mark(ch))
-            || " .,:;!?-_/()[]+=@#\\".contains(ch);
-        let ch = if keep { ch } else { ' ' };
-        if ch == ' ' && out.ends_with(' ') {
+        if matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}') {
             continue;
         }
-        out.push(ch);
+        if ch.is_control() {
+            if !value.ends_with(' ') {
+                value.push(' ');
+            }
+            continue;
+        }
+        value.push(ch);
     }
-    out.trim().to_string()
+    let (program, args) = if windows {
+        (
+            "cmd.exe",
+            vec![
+                "/v:on".to_string(),
+                "/k".to_string(),
+                format!("echo(!{MESSAGE_VAR}!"),
+            ],
+        )
+    } else {
+        (
+            "/bin/sh",
+            vec![
+                "-c".to_string(),
+                format!("printf '%s\\n' \"${MESSAGE_VAR}\"; unset {MESSAGE_VAR}; exec /bin/sh"),
+            ],
+        )
+    };
+    MessageShell {
+        program,
+        args,
+        message: (MESSAGE_VAR.to_string(), value.trim().to_string()),
+    }
 }
 
 /// The arguments for `docker` that list the running containers' full ids, one
@@ -1455,69 +1479,81 @@ mod tests {
         }
     }
 
-    /// **The message terminal is the one place a string reaches a shell**, and
-    /// its callers stopped being fixed sentences the moment one reported a
-    /// program name out of `terminal.json`.
+    /// Text that is syntax to one shell or the other, in one message.
+    const HOSTILE: &str =
+        "Couldn't start '; rm -rf ~; echo ' & del | x ^ %PATH% $HOME `id` \"q\" !v! <a> /?";
+
+    /// **The message is never shell source** (it was, until the terminal lost
+    /// every `'` and `&` it was meant to print): neither shell's command line
+    /// carries a byte of it, on either platform, however hostile it is.
     #[test]
-    fn a_shell_message_carries_no_syntax_of_either_shell() {
-        // Unix: the message sits inside single quotes in `sh -c`, so the one
-        // byte that matters is `'`. With it gone the `;` cannot start a
-        // command — it is inside the app's quotes, and nothing in the message
-        // can close them.
-        assert_eq!(
-            shell_message_text("Couldn't start '; rm -rf ~; echo '"),
-            "Couldn t start ; rm -rf ; echo"
-        );
-        assert!(!shell_message_text("a'b").contains('\''));
-        // Windows: `cmd /k echo` reads these.
-        for m in ["a & b", "a | b", "a ^ b", "a > b", "a %PATH% b", "a < b"] {
-            let out = shell_message_text(m);
-            assert!(
-                !out.contains(['&', '|', '^', '>', '<', '%', '\'', '"', '`', '$']),
-                "{m} -> {out}"
-            );
+    fn a_message_shell_reads_its_message_from_the_environment_only() {
+        for windows in [true, false] {
+            let shell = message_shell_command(HOSTILE, windows);
+            assert_eq!(shell.message.0, MESSAGE_VAR);
+            assert_eq!(shell.message.1, HOSTILE);
+            let line = std::iter::once(shell.program.to_string())
+                .chain(shell.args.iter().cloned())
+                .collect::<Vec<_>>();
+            for piece in ["rm -rf", "del", "%PATH%", "$HOME", "`id`", "Couldn"] {
+                assert!(
+                    line.iter().all(|part| !part.contains(piece)),
+                    "{windows}: {line:?} carries {piece:?}"
+                );
+            }
         }
-        // A newline would end the command and start another — a bare LF and a
-        // Windows CRLF alike. (These were two copies of the LF case, written as
-        // raw line breaks in the source, so the CRLF one was never tested.)
-        assert_eq!(shell_message_text("one\ntwo"), "one two");
-        assert_eq!(shell_message_text("one\r\ntwo"), "one two");
-        // Ordinary text survives, including the punctuation a real sentence
-        // needs, and a stripped run leaves one space rather than a gap.
+    }
+
+    /// The two commands, spelled out: `cmd`'s delayed expansion inserts the
+    /// value after the line is parsed, so nothing in it is read as syntax, and
+    /// `echo(` prints a message of `/?` or `off` rather than obeying it; `sh`
+    /// prints a double-quoted parameter expansion, which is never re-parsed.
+    #[test]
+    fn a_message_shell_is_cmd_with_delayed_expansion_or_sh_with_printf() {
+        let win = message_shell_command("hello", true);
+        assert_eq!(win.program, "cmd.exe");
+        assert_eq!(win.args, ["/v:on", "/k", "echo(!SCHEMAIC_MESSAGE!"]);
+        let unix = message_shell_command("hello", false);
+        assert_eq!(unix.program, "/bin/sh");
         assert_eq!(
-            shell_message_text(
-                "Couldn't start /usr/bin/zsh (No such file or directory). Pick another shell in terminal settings."
-            ),
-            "Couldn t start /usr/bin/zsh (No such file or directory). Pick another shell in terminal settings."
+            unix.args,
+            [
+                "-c",
+                "printf '%s\\n' \"$SCHEMAIC_MESSAGE\"; unset SCHEMAIC_MESSAGE; exec /bin/sh"
+            ]
         );
-        // **A letter in any script stays** — no shell reads one as syntax, and a
-        // translated message is made of them: German's `für` printed `f r`.
-        // Every other non-ASCII character still goes, the typographic quotes
-        // and dashes among them, along with the marks no allowlist vouches for.
-        assert_eq!(shell_message_text("naïve 東京"), "naïve 東京");
-        assert_eq!(
-            shell_message_text("Kein Client für „mysql“ — öffne"),
-            "Kein Client für mysql öffne"
-        );
-        assert_eq!(shell_message_text("a\u{202E}b \u{FF06} c"), "a b c");
-        // **A combining mark on a kept letter is part of it**: an NFD `für`
-        // (`u` + U+0308) printed `fu r`, and a Hindi OS error was cut apart at
-        // every virama. A mark with no letter before it still goes, so one
-        // cannot ride in on its own after a stripped character.
-        assert_eq!(shell_message_text("fu\u{0308}r"), "fu\u{0308}r");
-        assert_eq!(shell_message_text("स्ट"), "स्ट");
-        assert_eq!(shell_message_text("\u{0308}a & \u{0308}b"), "a b");
-        assert_eq!(shell_message_text("   "), "");
-        assert_eq!(shell_message_text(""), "");
-        // **A Windows path stays legible**: a backslash is no syntax to `cmd`,
-        // and inside `sh`'s single quotes nothing escapes — the Unix branch
-        // prints with `printf '%s\n'`, so no `echo` reads `\n` in it either. A
-        // restore refusal once named `C: Users jonid backup.sql`.
-        assert_eq!(
-            shell_message_text(r"C:\Users\me\new.sql moves to another database"),
-            r"C:\Users\me\new.sql moves to another database"
-        );
-        assert!(!shell_message_text(r"a\'b").contains('\''));
+    }
+
+    /// **The message prints as written** — the apostrophes, dashes, quotes and
+    /// the very `&` and `|` a refusal is explaining, which the old allowlist
+    /// turned into spaces ("a database name carrying or would be…").
+    #[test]
+    fn a_message_keeps_every_printable_character() {
+        for m in [
+            "This database's name contains '&' or '|' — use a query tab.",
+            "Kein Client für „mysql“ — öffne",
+            "Le tunnel SSH n'a pas pu être ouvert\u{a0}: refusé",
+            r"C:\Users\me\new.sql moves to another database",
+            "naïve 東京 fu\u{0308}r स्ट",
+            "{ $how } `name` on line 3",
+        ] {
+            assert_eq!(message_shell_command(m, true).message.1, m);
+            assert_eq!(message_shell_command(m, false).message.1, m);
+        }
+    }
+
+    /// One line, though: a line break or other control character becomes a
+    /// space (an OS error can carry a CRLF), a direction override cannot
+    /// reorder the sentence on screen, and the ends are trimmed.
+    #[test]
+    fn a_message_is_one_line_with_no_control_or_direction_characters() {
+        let value = |m: &str| message_shell_command(m, false).message.1;
+        assert_eq!(value("one\ntwo"), "one two");
+        assert_eq!(value("one\r\ntwo"), "one two");
+        assert_eq!(value("tab\there\u{7}"), "tab here");
+        assert_eq!(value("a\u{202E}b\u{2066}c\u{2069}"), "abc");
+        assert_eq!(value("  padded \n"), "padded");
+        assert_eq!(value(""), "");
     }
 
     /// The programs that would make any amount of filtering above pointless.

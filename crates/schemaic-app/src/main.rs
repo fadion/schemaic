@@ -1709,35 +1709,19 @@ fn dialect_for(engine: schemaic_db::Engine) -> SqlDialect {
 /// A throwaway shell that just prints `msg` and stays open — used to surface "no
 /// client found" in the terminal rather than spawning a broken session.
 ///
-/// **The message is shell source, so it goes through `launch::shell_message_text`
-/// first.** This is the one place in the app that hands a string to a shell:
-/// `sh -c "printf '%s\n' '<msg>'; exec /bin/sh"` and `cmd /k echo <msg>` are both parsed
-/// before they are run. That was harmless while every caller passed a fixed
-/// sentence and stopped being harmless when one began reporting a program name
-/// out of `terminal.json` and an OS error. Validated at the boundary rather than
-/// at each caller, which is `core::launch`'s own rule.
+/// **A shell, so its command comes from `launch::message_shell_command`**: a
+/// constant command line, with the message in the environment where neither
+/// `cmd` nor `sh` parses it — the one place in the app that starts a shell on
+/// its own say-so, and its callers report program names out of
+/// `terminal.json` and OS errors. Built at the boundary rather than at each
+/// caller, which is `core::launch`'s own rule.
 fn message_shell(msg: &str) -> schemaic_term::ShellConfig {
-    let msg = schemaic_core::launch::shell_message_text(msg);
-    #[cfg(windows)]
-    {
-        schemaic_term::ShellConfig {
-            program: "cmd.exe".into(),
-            args: vec!["/k".into(), format!("echo {msg}")],
-            cwd: None,
-            env: Vec::new(),
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        schemaic_term::ShellConfig {
-            program: "/bin/sh".into(),
-            // `printf`, not `echo`: dash's `echo` reads `\n` and `\c` in its
-            // argument, and a message may carry a Windows path's backslashes
-            // (`launch::shell_message_text`).
-            args: vec!["-c".into(), format!("printf '%s\\n' '{msg}'; exec /bin/sh")],
-            cwd: None,
-            env: Vec::new(),
-        }
+    let shell = schemaic_core::launch::message_shell_command(msg, cfg!(windows));
+    schemaic_term::ShellConfig {
+        program: shell.program.into(),
+        args: shell.args,
+        cwd: None,
+        env: vec![shell.message],
     }
 }
 
