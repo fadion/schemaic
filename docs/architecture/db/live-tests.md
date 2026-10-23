@@ -709,7 +709,7 @@ return the builtin's `PostgreSQL …`. It was red on PostgreSQL 16 before the re
 `pg_catalog` first, by its author's report. **It expects a refusal now**, not the builtin's
 answer: `version` is a name the read-only gate allows, so the setup's shadow check refuses the
 session with `DbRefusal::ShadowedBuiltin` naming `public`/`version` before the statement is sent.
-That check has three cases of its own, registered beside it, each over the private
+That check has four cases of its own, registered beside it, each over the private
 `read_only_entries` — a read, a batch, a plan and a pinned session, every one opened enforced, so
 the four paths that run `pg::set_up_read_only` are asked together where this case asks only the
 first. `a_read_only_session_refuses_a_path_that_shadows_a_builtin` plants `public.lower(varchar)`
@@ -720,7 +720,16 @@ refuse with the variant naming `public`, `lower`, not an operator.
 requires the same refusal, `operator` true. `a_read_only_session_runs_beside_an_extensions_functions`
 is the control: `CREATE EXTENSION citext SCHEMA public` puts an allowlisted `lower(citext)` and
 operators there, and every entry must still run; it is skipped, saying so on stderr, on a server
-without `citext`. The three have no unenforced control beyond the first's premise; the refusal's
+without `citext`. `a_read_only_session_refuses_what_an_owner_added_to_an_extension` is the
+control's counterpart: membership alone is not the extension's word, since a database's
+non-superuser owner can install a trusted `citext` and `ALTER EXTENSION citext ADD FUNCTION` one of
+their own — measured on PostgreSQL 16. The fixture builds that end state as the suite's superuser:
+it creates the role `schemaic_it_extension_owner` `NOLOGIN`, installs `citext`, plants
+`public.lower(varchar)`, hands it to that role and adds it to the extension; every entry must then
+refuse naming `public`, `lower`, not an operator, and the role is dropped after the scratch
+database. It is skipped, saying so, without `citext` or without the right to create a role, and it
+was red before the check asked who owns a member ("read: a read-only session trusted the owner's
+addition"), by its author's report. The four have no unenforced control beyond the first's premise; the refusal's
 variant and its fields are what tell it from a session that refuses everything.
 `introspection_calls_no_function_the_database_planted`, in `namespaces.rs`, is the catalogue
 reads' case (`pg::connect_catalogue`, under `schemaic-db`): it plants `public.obj_description(oid,

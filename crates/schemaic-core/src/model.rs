@@ -1662,8 +1662,8 @@ impl DbRefusal {
                 name,
                 operator: true,
             } => format!(
-                "Refused before your statement ran: {schema} holds the operator {name}, which \
-                 belongs to no extension, and PostgreSQL can use it in place of a builtin one, \
+                "Refused before your statement ran: {schema} holds the operator {name}, and \
+                 PostgreSQL can use it in place of a builtin one, \
                  so the read-only check cannot vouch for what a query here would run. Take \
                  {schema} off the connection's search path, or ask the database's owner to drop \
                  it."

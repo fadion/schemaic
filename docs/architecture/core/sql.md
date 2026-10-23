@@ -368,13 +368,15 @@ lower(1)` returned the owner function's value though `lower` is listed. **That g
 session's to close now, by refusing to open** (pentest round 3, V3-1): `pg::set_up_read_only`
 asks whether a schema on the session's resolved path other than `pg_catalog` holds a function
 named like an entry here — the list reaches it through `pg_read_functions()`, public for that
-alone — or any operator at all, that no extension owns, and a read-only session on such a path is
+alone — or any operator at all, that is not an extension member a superuser owns, and a read-only session on such a path is
 refused before the statement is sent (`DbRefusal::ShadowedBuiltin`; the query and its trade are
 under `schemaic-db`'s `Enforce::ReadOnly`). Putting `pg_catalog` first had not been enough: a
 `public.lower(varchar)` answers `lower(a_varchar)` wherever the catalogue sits. It judges the path
 and not the statement, so it over-blocks in the safe direction — an owner's `lower` of any
 signature refuses every read-only read on that path — and it spares an extension's members because
-`citext` puts `lower(citext)` and its operators in `public`. **What it still cannot see**: an
+`citext` puts `lower(citext)` and its operators in `public`, but only those a superuser owns, since
+a database's owner can add a function of their own to a trusted extension they installed. **What
+it still cannot see**: a member a superuser planted; an
 owner's implicit cast, which calls its function with no name in the text at all and is neither a
 listed name nor an operator; a view's body, which the text never shows; and anything on
 MySQL/MariaDB, whose calls meet a deny list rather than this allowlist, so a stored function there

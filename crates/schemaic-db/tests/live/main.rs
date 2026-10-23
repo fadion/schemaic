@@ -143,6 +143,7 @@ live_suite!(
         a_read_only_session_refuses_a_path_that_shadows_a_builtin,
         a_read_only_session_refuses_a_path_with_a_users_operator,
         a_read_only_session_runs_beside_an_extensions_functions,
+        a_read_only_session_refuses_what_an_owner_added_to_an_extension,
     ],
     init_sql: [
         the_init_sql_is_in_force_on_the_operations_connection,

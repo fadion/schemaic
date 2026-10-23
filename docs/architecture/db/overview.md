@@ -1070,9 +1070,19 @@ with the catalogue first, and the text gate's yes to `lower` was about a functio
 owner wrote. `shadowed_builtin_sql(sql::pg_read_functions())` asks for the first object, in a
 schema of `pg_catalog.current_schemas(true)` other than `pg_catalog`, that is a function named
 like an allowlist entry or **any** operator — the text gate reads no operators, so there is no
-list to compare one with, and every operator spelling is some builtin's — and that no extension
-owns (no `pg_depend` row with `deptype = 'e'`): `citext` puts `lower(citext)` and its operators in
-`public`, and refusing those would refuse read-only work on most databases that have it. Like the
+list to compare one with, and every operator spelling is some builtin's — and that is not an
+extension's own: a member (a `pg_depend` row with `deptype = 'e'`) **that a superuser owns**.
+`citext` puts `lower(citext)` and its operators in `public`, and PostGIS, `pg_trgm` and `hstore`
+their operators, and refusing those would refuse read-only work on most databases that have them.
+**Membership alone was the exemption until it was shown not to be the extension's word**: on
+PostgreSQL 16 a non-superuser who owns a database can `CREATE EXTENSION citext` (a trusted one)
+and then `ALTER EXTENSION citext ADD FUNCTION public.lower(varchar)` of their own, which gives
+the plant exactly the row the check trusted. What the extension's script installs is owned by the
+bootstrap superuser whoever ran `CREATE EXTENSION` — measured, all 47 of `citext`'s functions and
+31 of `pg_trgm`'s, installed by a non-superuser — and only the owner's addition is theirs, so the
+query carries each object's owner (`p.proowner`, `o.oprowner`) and spares a member only where
+`pg_catalog.pg_roles` says that owner is `rolsuper`. A superuser who plants one is out of reach of
+this or any check. Refusing every member instead was declined, for the PostGIS reason above. Like the
 path call, the query resolves nothing through the path it is checking — every function, operator,
 relation and type `pg_catalog`-qualified, an operator as `OPERATOR(pg_catalog.=)`, the names
 arriving as `export::sql_literal` strings (`the_shadow_check_names_nothing_bare`,
@@ -1089,8 +1099,10 @@ gate in front of it. **The trade is that it judges the path, not the statement**
 path all the same — the safe direction, and the refusal names the schema and the object so the
 user can take the schema off the path. What it still cannot see is under `core::sql`'s entry.
 The live `a_read_only_session_refuses_a_path_that_shadows_a_builtin`,
-`a_read_only_session_refuses_a_path_with_a_users_operator` and
-`a_read_only_session_runs_beside_an_extensions_functions` hold its three sides.
+`a_read_only_session_refuses_a_path_with_a_users_operator`,
+`a_read_only_session_runs_beside_an_extensions_functions` and
+`a_read_only_session_refuses_what_an_owner_added_to_an_extension` hold its four sides
+(`the_shadow_check_spares_the_catalogue_and_extensions_only` pins the query's text).
 **The app's own catalogue reads put `pg_catalog` first too, on a connection of their own**
 (pentest round 3, V3-3). They run as the connecting user and called the catalogue's functions by
 bare name, so the database's path chose which function ran: an overload matching more exactly than

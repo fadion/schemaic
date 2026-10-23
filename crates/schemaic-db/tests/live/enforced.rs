@@ -737,3 +737,83 @@ pub async fn a_read_only_session_runs_beside_an_extensions_functions(target: &'s
     }
     scratch.teardown().await;
 }
+
+/// **What a database's owner added to an extension is no extension's.** A
+/// non-superuser who owns a database can install a trusted extension such as
+/// `citext` and then `ALTER EXTENSION citext ADD FUNCTION` a function of their
+/// own — measured on PostgreSQL 16 — which gives it the `pg_depend` row that
+/// marks a member. The members the extension's script installs are owned by a
+/// superuser whoever installed it, and only those are spared. The fixture
+/// builds that end state as this suite's superuser: the plant is handed to a
+/// role that is not one, then added. Skipped, saying so, where the server has
+/// no `citext` or the suite's role cannot create a role. PostgreSQL only.
+pub async fn a_read_only_session_refuses_what_an_owner_added_to_an_extension(
+    target: &'static Target,
+) {
+    if target.engine != schemaic_db::Engine::Postgres {
+        return;
+    }
+    const OWNER: &str = "schemaic_it_extension_owner";
+    let scratch = Scratch::create(target, "enforce_extension_addition").await;
+    let able = scratch
+        .exec(
+            "SELECT (SELECT count(*) FROM pg_available_extensions WHERE name = 'citext')::text \
+             || (SELECT (rolsuper OR rolcreaterole)::text FROM pg_roles \
+                 WHERE rolname = current_user)",
+        )
+        .await;
+    if able.cell(0, 0).expect("a value").display() != "1true" {
+        eprintln!(
+            "{}: no citext, or no right to create a role; the case is skipped",
+            target.name
+        );
+        scratch.teardown().await;
+        return;
+    }
+    scratch
+        .exec(&format!(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{OWNER}') \
+             THEN CREATE ROLE {OWNER} NOLOGIN; END IF; END $$"
+        ))
+        .await;
+    scratch.exec("CREATE EXTENSION citext SCHEMA public").await;
+    scratch
+        .exec(
+            "CREATE FUNCTION public.lower(varchar) RETURNS text LANGUAGE sql \
+             AS $$ SELECT 'planted'::text $$",
+        )
+        .await;
+    scratch
+        .exec(&format!(
+            "ALTER FUNCTION public.lower(varchar) OWNER TO {OWNER}"
+        ))
+        .await;
+    scratch
+        .exec("ALTER EXTENSION citext ADD FUNCTION public.lower(varchar)")
+        .await;
+    for (entry, got) in read_only_entries(&scratch).await {
+        match got {
+            Err(DbError::Refused(DbRefusal::ShadowedBuiltin {
+                schema,
+                name,
+                operator,
+            })) => assert_eq!(
+                (schema.as_str(), name.as_str(), operator),
+                ("public", "lower", false),
+                "{entry}"
+            ),
+            Ok(()) => panic!("{entry}: a read-only session trusted the owner's addition"),
+            Err(e) => panic!("{entry}: refused, but not for the addition: {e}"),
+        }
+    }
+    let base = scratch.db.clone();
+    scratch.teardown().await;
+    base.fetch_query(
+        None,
+        &format!("DROP ROLE IF EXISTS {OWNER}"),
+        1,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("dropping {OWNER}: {e}"));
+}

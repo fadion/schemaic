@@ -514,16 +514,26 @@ pub(crate) async fn set_up_read_only(client: &Client) -> Result<(), DbError> {
 /// The query behind [`set_up_read_only`]'s refusal: the first object in a
 /// schema on the session's path, other than `pg_catalog`, that PostgreSQL
 /// could pick in a builtin's place — a function named like one of
-/// `functions` (the read-only gate's allowlist), or **any** operator — and
-/// that no extension owns (a `pg_depend` row with `deptype = 'e'`). Columns:
-/// schema, name, and whether it is an operator.
+/// `functions` (the read-only gate's allowlist), or **any** operator — unless
+/// it is an extension's member (a `pg_depend` row with `deptype = 'e'`) that
+/// a superuser owns. Columns: schema, name, and whether it is an operator.
 ///
 /// **Any operator, not only one named like a builtin**: the text gate never
 /// reads operators, so it has no list to compare them with, and every
 /// operator spelling is some builtin's. **An extension's are not refused**:
-/// `citext` puts `lower(citext)` and its operators in `public`, and refusing
-/// those would refuse read-only work on most databases that have it for
-/// something their owner did not write.
+/// `citext` puts `lower(citext)` and its operators in `public`, PostGIS,
+/// `pg_trgm` and `hstore` their operators, and refusing those would refuse
+/// read-only work on most databases that have them for something their owner
+/// did not write.
+///
+/// **But membership alone is not the extension's word.** A non-superuser who
+/// owns a database can install a trusted extension and then `ALTER EXTENSION
+/// … ADD FUNCTION` one of their own, which gives it the same `pg_depend` row —
+/// measured on PostgreSQL 16 with `citext`. What the extension's script
+/// installs is owned by a superuser whoever ran `CREATE EXTENSION` (the
+/// bootstrap superuser, for a trusted one), and what the owner added is
+/// theirs, so ownership is the test. A superuser who plants one is out of
+/// reach of any check here.
 ///
 /// **It resolves nothing through the path it is checking.** Every function,
 /// operator, relation and type in it is `pg_catalog`-qualified (an operator as
@@ -546,21 +556,25 @@ fn shadowed_builtin_sql(functions: &[&str]) -> String {
         "SELECT n.nspname::pg_catalog.text, x.name::pg_catalog.text, x.operator \
          FROM ( \
            SELECT p.pronamespace AS ns, p.proname AS name, false AS operator, \
-                  p.oid AS oid, 'pg_catalog.pg_proc'::pg_catalog.regclass AS cls \
+                  p.oid AS oid, 'pg_catalog.pg_proc'::pg_catalog.regclass AS cls, \
+                  p.proowner AS owner \
              FROM pg_catalog.pg_proc p \
             WHERE p.proname OPERATOR(pg_catalog.=) ANY (ARRAY[{names}]::pg_catalog.name[]) \
            UNION ALL \
            SELECT o.oprnamespace, o.oprname, true, \
-                  o.oid, 'pg_catalog.pg_operator'::pg_catalog.regclass \
+                  o.oid, 'pg_catalog.pg_operator'::pg_catalog.regclass, o.oprowner \
              FROM pg_catalog.pg_operator o \
          ) x \
          JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) x.ns \
          WHERE n.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' \
            AND n.nspname OPERATOR(pg_catalog.=) ANY (pg_catalog.current_schemas(true)) \
-           AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
-                            WHERE d.classid OPERATOR(pg_catalog.=) x.cls \
-                              AND d.objid OPERATOR(pg_catalog.=) x.oid \
-                              AND d.deptype OPERATOR(pg_catalog.=) 'e') \
+           AND NOT (EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                             WHERE d.classid OPERATOR(pg_catalog.=) x.cls \
+                               AND d.objid OPERATOR(pg_catalog.=) x.oid \
+                               AND d.deptype OPERATOR(pg_catalog.=) 'e') \
+                    AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles r \
+                                 WHERE r.oid OPERATOR(pg_catalog.=) x.owner \
+                                   AND r.rolsuper)) \
          ORDER BY x.operator, 1, 2 LIMIT 1"
     )
 }
@@ -5087,6 +5101,7 @@ mod tests {
             " pg_operator ",
             " pg_namespace ",
             " pg_depend ",
+            " pg_roles ",
             "::text",
             "::name",
             "::regclass",
@@ -5099,6 +5114,7 @@ mod tests {
             "FROM pg_catalog.pg_operator o",
             "JOIN pg_catalog.pg_namespace n",
             "FROM pg_catalog.pg_depend d",
+            "FROM pg_catalog.pg_roles r",
             "OPERATOR(pg_catalog.=)",
             "OPERATOR(pg_catalog.<>) 'pg_catalog'",
         ] {
@@ -5107,8 +5123,10 @@ mod tests {
     }
 
     /// What it refuses: a function of an allowlisted name or any operator, in
-    /// a schema on the resolved path other than the catalogue, that no
-    /// extension owns.
+    /// a schema on the resolved path other than the catalogue, unless it is an
+    /// extension's member **and** a superuser owns it — an owner can add their
+    /// own object to an extension they installed, and only ownership tells it
+    /// from what the extension's script put there.
     #[test]
     fn the_shadow_check_spares_the_catalogue_and_extensions_only() {
         let q = shadowed_builtin_sql(&["lower"]);
@@ -5121,8 +5139,20 @@ mod tests {
             "the path as resolved: {q}"
         );
         assert!(
-            q.contains("d.deptype OPERATOR(pg_catalog.=) 'e'") && q.contains("NOT EXISTS"),
+            q.contains("AND NOT (EXISTS (SELECT 1 FROM pg_catalog.pg_depend d")
+                && q.contains("d.deptype OPERATOR(pg_catalog.=) 'e')"),
             "an extension's member is spared: {q}"
+        );
+        assert!(
+            q.contains(
+                "AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles r \
+                 WHERE r.oid OPERATOR(pg_catalog.=) x.owner AND r.rolsuper))"
+            ),
+            "only when a superuser owns it: {q}"
+        );
+        assert!(
+            q.contains("p.proowner AS owner") && q.contains("o.oprowner"),
+            "{q}"
         );
         assert!(q.ends_with("LIMIT 1"), "one is enough to refuse: {q}");
     }
