@@ -110,8 +110,12 @@ included, and on a read-only
 PostgreSQL session `pg::set_up_read_only` puts `pg_catalog` back in front of it, since the
 gates' builtin allowlist means the builtin only while `pg_catalog` is searched first (security
 review S24, under `schemaic-db`'s `Enforce::ReadOnly`) — and does it naming nothing bare, since
-the path it corrects is the one its own call would resolve through. A writable connection keeps the path as
-written. SQL Server's connect turns `IMPLICIT_TRANSACTIONS` off after
+the path it corrects is the one its own call would resolve through — then refuses the session if a
+schema left on that path still holds a function named like a listed builtin, or an operator, that
+no extension owns (`DbRefusal::ShadowedBuiltin`, pentest round 3), since the best-matching
+overload wins wherever `pg_catalog` sits. A writable connection keeps the path as
+written for the user's statements; the app's own catalogue reads put `pg_catalog` in front of it on
+a connection of their own (`pg::connect_catalogue`, same entry). SQL Server's connect turns `IMPLICIT_TRANSACTIONS` off after
 any init. But the lexing the text gate rests on is in place *before* enforcement runs, and no
 enforcement statement re-sets the client character set — which is what `SET NAMES gbk`
 showed. MySQL's `enforce_session` now reads `character_set_client` back; on PostgreSQL, where

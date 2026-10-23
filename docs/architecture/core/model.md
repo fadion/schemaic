@@ -178,7 +178,10 @@ held to it by `english_says_every_write_failure_as_core_does` (*The string catal
 SQL's `InitSql(InitRefusal)`, a sign-in's `Transport(AuthMode)`, SQL Server's `BlankValue` and
 `CodePage` (each with the file's `row` where an import names one, and `CodePage` the `lost`
 character and its code page where it is known), SQLite's `open_target` refusals and worker
-failure, MySQL's quote-safety and read-only plan refusals, and the rest under `schemaic-db`'s
+failure, MySQL's quote-safety and read-only plan refusals, a read-only PostgreSQL session's
+`ShadowedBuiltin { schema, name, operator }` — a schema on its path holding what PostgreSQL could
+pick in a builtin's place, its two wordings `db-refused-shadowed-function` and
+`db-refused-shadowed-operator` in `i18n::db_refusal_text` — and the rest under `schemaic-db`'s
 `DbError` entry. Both carried a finished English `String` until now, so every one of them reached
 the window in English whatever the interface's language — the app's `db_error_shown` passed
 `Refused(m)` through as written. `message()` is each producer's old English **byte for byte**,

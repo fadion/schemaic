@@ -164,6 +164,14 @@ that got the next fix would have kept it. So this calls
 matched arm by arm into this server's own sentences, because `NoRows::message` points a refused
 write at `schemaic exec` and the assistant's route to a write is `propose_table_change` — in the
 panel; standalone it has none. Same refusal, right advice for whoever is reading it.
+`NoRows::SessionRefused` — a read-only PostgreSQL session that would not open on a path shadowing
+a builtin (`query.rs`'s entry) — answers "Rejected — not a problem with your query, so do not
+retry it: …" with the refusal's sentence, since rewriting the statement cannot get past a check
+of the path, and that sentence already says what the user can do about it.
+**`run_query`'s description ends by saying what read-only is for**: it guards against mistakes
+and keeps the model from writing, and is not a security boundary against a database whose owner
+is hostile. The README says the same of `schemaic query` and the server, and names the
+shadowing-path refusal for PostgreSQL. Neither is pinned by a test.
 **`explain` is `run_query`'s twin for a plan, and it stands exactly where `run_query` does.**
 Same inputs — `sql`, required, and the optional `database` through `tool_database` — and the
 same gate, through `query::read_only_explain`; the reply is `format_plan`, the server's own

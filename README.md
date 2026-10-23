@@ -130,6 +130,12 @@ The agent gets `list_databases`, `list_schema`, `describe_table` and
 `sample_rows` when the connection's **AI data access** is *Let it read data*. Like
 the command line, it needs **CLI access** turned on for the connection.
 
+Read-only, here and in `schemaic query`, guards against mistakes and keeps an
+AI agent from writing. It is not a security boundary against a database whose
+owner is hostile: such an owner can still make a read misbehave. On PostgreSQL,
+a read-only session refuses to start where a schema on the search path holds
+something that can stand in for a built-in function or operator.
+
 ## Install
 
 Binaries for every release are on the

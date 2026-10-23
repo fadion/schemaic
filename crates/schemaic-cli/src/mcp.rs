@@ -647,7 +647,8 @@ pub fn tools_list(
             "description": format!(
                 "Execute ONE read-only SQL statement ({heads} only) against the user's \
                  database connection and return the rows. The connection is {}, so write it in \
-                 that dialect.",
+                 that dialect. Read-only guards against mistakes and keeps you from writing; it \
+                 is not a security boundary against a database whose owner is hostile.",
                 dialect.engine_label(),
             ),
             "inputSchema": {

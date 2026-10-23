@@ -364,8 +364,21 @@ the whole-row `alias.f` form, which reaches only a function taking a row or `any
 — and **the gap between a name and a function**. The list holds names, and PostgreSQL picks the
 overload whose argument types match best across the whole search path: on PG 16.15, with an
 owner-defined `public.lower(integer)` in place inside a rolled-back transaction, `SELECT
-lower(1)` returned the owner function's value though `lower` is listed. An owner's implicit cast
-likewise calls its function with no name in the text at all. That session does not refuse the
+lower(1)` returned the owner function's value though `lower` is listed. **That gap is the
+session's to close now, by refusing to open** (pentest round 3, V3-1): `pg::set_up_read_only`
+asks whether a schema on the session's resolved path other than `pg_catalog` holds a function
+named like an entry here — the list reaches it through `pg_read_functions()`, public for that
+alone — or any operator at all, that no extension owns, and a read-only session on such a path is
+refused before the statement is sent (`DbRefusal::ShadowedBuiltin`; the query and its trade are
+under `schemaic-db`'s `Enforce::ReadOnly`). Putting `pg_catalog` first had not been enough: a
+`public.lower(varchar)` answers `lower(a_varchar)` wherever the catalogue sits. It judges the path
+and not the statement, so it over-blocks in the safe direction — an owner's `lower` of any
+signature refuses every read-only read on that path — and it spares an extension's members because
+`citext` puts `lower(citext)` and its operators in `public`. **What it still cannot see**: an
+owner's implicit cast, which calls its function with no name in the text at all and is neither a
+listed name nor an operator; a view's body, which the text never shows; and anything on
+MySQL/MariaDB, whose calls meet a deny list rather than this allowlist, so a stored function there
+is out of the text's sight by design and rests on the session alone. That session does not refuse the
 non-transactional writers above, so one of them reached any of these ways — behind a view, say —
 is out of both halves' sight; that follows from the two measured facts rather than being
 measured itself. Of the writes this entry lists as passing the gate, the three that are calls —

@@ -32,7 +32,10 @@ alternative the issue also offered is declined under `format.rs`.
 Verified against PostgreSQL 16: `--limit 2 --format jsonl` on a 4078-row table exited 0
 without the flag and 6 with it, rows and stderr warning printed both times; `table` with the
 flag exited 6 under its capped footer; a complete result with the flag exited 0.
-**3 promises that nothing was sent, and the order of the steps is what keeps that true**:
+**3 promises that nothing was sent, and the order of the steps is what keeps that true** — with
+one stated exception, a read-only PostgreSQL session refused after connecting and before the
+statement went (`NoRows::SessionRefused`, `query.rs`'s entry), which `Exit::Refused`'s doc and the
+`--help` line both name:
 select the connection, take the statement, gate it (`query::gate`) or approve it
 (`ExecRequest::approved`), and only then connect. It used to connect first, so a refusal had
 already read the keyring and logged in over SSH, and a loop on a refusal made a real SSH login

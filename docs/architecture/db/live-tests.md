@@ -704,10 +704,30 @@ is refused to the server; each asserts the three rows are still there.
 which function a bare name reaches rather than whether a write lands: it creates a
 `public.version()` answering `'shadowed'`, gives the connection the init SQL `SET search_path TO
 public, pg_catalog`, and has plain `fetch_query` return `'shadowed'` — the premise, so a fixture
-that fails to shadow fails here — before `fetch_query_enforced` with `Enforce::ReadOnly` must
+that fails to shadow fails here — before `fetch_query_enforced` with `Enforce::ReadOnly` had to
 return the builtin's `PostgreSQL …`. It was red on PostgreSQL 16 before the read-only setup put
-`pg_catalog` first, by its author's report; the other three paths that run that setup
-(`pg::set_up_read_only`) have no case of their own.
+`pg_catalog` first, by its author's report. **It expects a refusal now**, not the builtin's
+answer: `version` is a name the read-only gate allows, so the setup's shadow check refuses the
+session with `DbRefusal::ShadowedBuiltin` naming `public`/`version` before the statement is sent.
+That check has three cases of its own, registered beside it, each over the private
+`read_only_entries` — a read, a batch, a plan and a pinned session, every one opened enforced, so
+the four paths that run `pg::set_up_read_only` are asked together where this case asks only the
+first. `a_read_only_session_refuses_a_path_that_shadows_a_builtin` plants `public.lower(varchar)`
+and first has an unenforced `SELECT lower('A'::varchar)` answer `'shadowed'` on a `pg_catalog,
+public` path — the premise, that the catalogue first is not enough — then requires each entry to
+refuse with the variant naming `public`, `lower`, not an operator.
+`a_read_only_session_refuses_a_path_with_a_users_operator` plants `public.===` over integers and
+requires the same refusal, `operator` true. `a_read_only_session_runs_beside_an_extensions_functions`
+is the control: `CREATE EXTENSION citext SCHEMA public` puts an allowlisted `lower(citext)` and
+operators there, and every entry must still run; it is skipped, saying so on stderr, on a server
+without `citext`. The three have no unenforced control beyond the first's premise; the refusal's
+variant and its fields are what tell it from a session that refuses everything.
+`introspection_calls_no_function_the_database_planted`, in `namespaces.rs`, is the catalogue
+reads' case (`pg::connect_catalogue`, under `schemaic-db`): it plants `public.obj_description(oid,
+text)`, `public.format_type(oid, integer)` and a `public.=` on `oid`, each recording in a table
+that it ran, has an unenforced read on a `public, pg_catalog` init-SQL path reach all three — the
+premise — then runs `fetch_schema` and `fetch_table_list` with and without that path and requires
+the record to be empty.
 `a_read_only_session_calls_no_users_function_while_setting_itself_up`, PostgreSQL's alone too and
 registered beside it, asks the same of the setup itself, which runs while the hostile path is still
 in force: it plants a `public.set_config(text, text, boolean)` that turns

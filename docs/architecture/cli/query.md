@@ -37,7 +37,21 @@ the refusal is about a write** (`ReadRefusal::writes`), and `gate` sorts it into
 `NoRows::NotARead`, whose message points at `exec`, or `NoRows::NotPermitted` — a lock, a
 sleep, a second statement — whose message does not: the CLI answered a `FOR UPDATE` with "use
 `exec` to write" after core's own words said it was no write
-(`refusing_what_is_no_write_does_not_name_exec`). Both exit 3. **`NotARead`'s message names no
+(`refusing_what_is_no_write_does_not_name_exec`). Both exit 3. **A third refusal is the
+session's, not the text's**: a read-only PostgreSQL session refuses to open on a path where a
+schema holds what PostgreSQL could pick in a builtin's place (`DbRefusal::ShadowedBuiltin`, under
+`schemaic-db`'s `Enforce::ReadOnly`), and `NoRows::from_db` sorts that one `DbError` into
+`NoRows::SessionRefused`, carrying the refusal's own sentence, and every other into `Failed` —
+other `DbRefusal`s included (`a_shadowed_builtin_is_a_refusal_and_everything_else_a_failure`).
+`read_only_query`, `read_only_explain` and `read_only_export` all go through it — the export asks
+for the refusal *before* it stringifies the read's error for `export_verdict`, and removes the
+`.part`, which is empty since nothing was read. `is_refusal` answers `true` for it and `run.rs`
+gives it exit 3, not 4, though it has logged in to learn it: the statement never ran, and a retry
+unchanged refuses again, which is the thing a caller branches on 3 to know
+(`a_guard_refusal_a_server_failure_and_an_unknown_write_exit_differently`). So `Exit::Refused`'s
+doc and the `--help` exit line now say that one refusal comes after connecting, before the
+statement is sent — 3's "nothing was sent" promise (`run.rs`'s entry) holds for every other
+refusal. **`NotARead`'s message names no
 subcommand but `exec`** — "Only reads are taken here" — because `query`, `explain` and `export`
 all refuse through it, and a message that said `query` told the other two's callers they had
 typed it. It is asked in the **connection's own**

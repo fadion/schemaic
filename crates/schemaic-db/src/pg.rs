@@ -616,9 +616,12 @@ async fn put_catalog_first(client: &Client) -> Result<(), tokio_postgres::Error>
 /// gates all compare. With `pg_catalog` merely moved to the front, what is
 /// visible is what was visible before, and the text is unchanged.
 ///
-/// Not for a pinned `Session` (its path is the user's own, and the reads made
-/// on it — [`routines_on`], [`fetch_col_meta`], [`refetch_on`], [`blob_on`] —
-/// rely on the qualification alone), and not for user SQL or the write paths.
+/// Not for a connection that runs the user's SQL — `fetch_query`'s,
+/// `run_batch`'s, a pinned `Session`'s — whose path is the user's own, nor
+/// for the grid's re-reads of its rows (`fetch_blob`, `refetch_rows`): the
+/// catalogue reads made on those ([`fetch_col_meta`] after a statement,
+/// [`refetch_on`], [`blob_on`]) rely on the qualification alone. Nor for the
+/// write paths.
 pub(crate) async fn connect_catalogue(db: &Db, database: Option<&str>) -> Result<Client, DbError> {
     let client = match database {
         Some(d) => connect_to(db, d).await?,

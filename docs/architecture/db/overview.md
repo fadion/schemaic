@@ -673,7 +673,8 @@ aborted, `Session::open`'s SQLite manual-mode backstop (a `Connect` once) and
 under `mssql.rs`),
 `mysql::enforce_session`'s refusal of a client character set that can hide a quote and
 `unpinnable_mode` — its refusal when the server puts a quote-moving `sql_mode` back — and
-`read_only_plan_refusal`, SQL Server's Windows and cloud IAM sign-in arms, `explain_setup`'s
+`read_only_plan_refusal`, `pg::set_up_read_only`'s refusal of a path that shadows a builtin
+(`ShadowedBuiltin`, under `Enforce::ReadOnly` below), SQL Server's Windows and cloud IAM sign-in arms, `explain_setup`'s
 read-only gate (`read_only_refusal(..).reason`), `kill_session`'s cancel, the blank-string and
 code-page checks, `sqlite::open_target`'s three refusals, SQLite's "the SQLite worker failed: …"
 (a `Query` once) at each of its six sites, its default-reset refusals and `table_stats`' size
@@ -1052,8 +1053,8 @@ boolean)` ran in place of the builtin, kept `public` first, and turned
 `default_transaction_read_only` off, so the user's next statement on the "read-only" session wrote
 (found by an external pentest; the earlier shadowing probes had shadowed `lower` and `abs`, never
 the setup's own functions). Now the path is read with `SHOW search_path` — a command, not a
-function — over the simple protocol in the same round trip as the `SET SESSION CHARACTERISTICS`,
-the new path is built in Rust (`catalog_first_sql`, pure, with three unit tests in `pg.rs`), and
+function — over the simple protocol, after the `SET SESSION CHARACTERISTICS` (that half is
+`put_catalog_first`, which the catalogue connections below share), the new path is built in Rust (`catalog_first_sql`, pure, with three unit tests in `pg.rs`), and
 the one call sent is `pg_catalog.set_config('search_path', <literal>, false)`, schema-qualified,
 the path an `export::sql_literal` string rather than list syntax spliced in, since it is whatever
 text a role default or init SQL set. Don't tidy that call back to a bare `set_config`, nor move
@@ -1062,6 +1063,64 @@ the path-building back into SQL: either reopens it. The live
 `a_read_only_session_calls_no_users_function_while_setting_itself_up` the setup, both on
 `fetch_query_enforced` alone — the first red on PostgreSQL 16 before S24's change, by its author's
 report, the second red against the bare-name setup, by the fix author's report.
+**Then the setup refuses a path on which a builtin's name is shadowed** (pentest round 3, V3-1),
+because `pg_catalog` first is not the whole answer: PostgreSQL picks the overload whose argument
+types match best across the *whole* path, so a `public.lower(varchar)` answers `lower(a_varchar)`
+with the catalogue first, and the text gate's yes to `lower` was about a function the database's
+owner wrote. `shadowed_builtin_sql(sql::pg_read_functions())` asks for the first object, in a
+schema of `pg_catalog.current_schemas(true)` other than `pg_catalog`, that is a function named
+like an allowlist entry or **any** operator — the text gate reads no operators, so there is no
+list to compare one with, and every operator spelling is some builtin's — and that no extension
+owns (no `pg_depend` row with `deptype = 'e'`): `citext` puts `lower(citext)` and its operators in
+`public`, and refusing those would refuse read-only work on most databases that have it. Like the
+path call, the query resolves nothing through the path it is checking — every function, operator,
+relation and type `pg_catalog`-qualified, an operator as `OPERATOR(pg_catalog.=)`, the names
+arriving as `export::sql_literal` strings (`the_shadow_check_names_nothing_bare`,
+`the_shadow_check_takes_its_names_as_literals`). `shadow_of` makes the row a
+`DbRefusal::ShadowedBuiltin { schema, name, operator }`, so `set_up_read_only` returns
+`Result<(), DbError>` now and the answer is a `DbError::Refused` — Schemaic's own sentence, not a
+connect failure — while a `SET` or `SHOW` that fails is still `ConnectFailure::ReadOnlySetup`;
+`run_batch` passes the setup's error on as typed, as the other callers already did, where it used
+to re-wrap it through `db_err`. Asked in the one function every `Enforce::ReadOnly` PostgreSQL
+connection is made with, it covers the enforced read and stream, the batch, the read-only plan, a
+pinned read-only session and the MCP server's `sample_rows`, whose generated `SELECT` has no text
+gate in front of it. **The trade is that it judges the path, not the statement**: an owner's
+`lower(integer)`, which no call on a `varchar` would pick, refuses every read-only read on that
+path all the same — the safe direction, and the refusal names the schema and the object so the
+user can take the schema off the path. What it still cannot see is under `core::sql`'s entry.
+The live `a_read_only_session_refuses_a_path_that_shadows_a_builtin`,
+`a_read_only_session_refuses_a_path_with_a_users_operator` and
+`a_read_only_session_runs_beside_an_extensions_functions` hold its three sides.
+**The app's own catalogue reads put `pg_catalog` first too, on a connection of their own**
+(pentest round 3, V3-3). They run as the connecting user and called the catalogue's functions by
+bare name, so the database's path chose which function ran: an overload matching more exactly than
+the builtin wins wherever `pg_catalog` sits — `obj_description(oid, text)` beats `(oid, name)` for
+an untyped literal — and an identical signature wins on a path that puts `public` first, which
+init SQL, a role default or a database default can each do. Two halves close it. Every catalogue
+function `pg.rs`'s SQL calls is written `pg_catalog.<name>(…)` — `format_type`, the descriptions,
+`pg_get_expr` and the `pg_get_*def`/`pg_get_function_*` family, `aclexplode`, `unnest`, the size
+functions, the aggregates, `now`, `left`, `string_to_array`, `pg_cancel_backend` and the rest —
+which closes the better-matching overload wherever the catalogue sits; and the reads that open
+their own client do it through `pg::connect_catalogue(db, database)` (to the database, or the
+maintenance database for `None`), which runs `put_catalog_first`, so the bare operators (`=` on
+`oid`, `LIKE`) and the catalogue relations, which no call site can qualify in passing, resolve to
+the builtins as well. Those are `fetch_databases`, `fetch_table_list`, `fetch_table_stats`,
+`fetch_sessions`, `fetch_locks`, `fetch_server_vars`, `kill_session`, `fetch_schema`,
+`fetch_replay_access`, `available_extensions`, `trigger_functions`, `roles`, `fetch_principals`
+and `fetch_grants`. **The path is not set to `''`**, which looks like the tighter fix: PostgreSQL
+schema-qualifies in its output every name the path does not reach, so
+`nextval('t_id_seq'::regclass)` would come back as `nextval('public.t_id_seq'::regclass)` and
+`public.` would land on every user type, view body and `regproc` text — which the serial
+detection, the type mapping and the diff and compare round-trips all compare. With the user's path
+kept behind `pg_catalog`, what was visible stays visible and the text is unchanged; don't
+"tighten" it. **What it does not reach is a known residual**: the catalogue reads made on a
+connection the user's own work holds — `fetch_col_meta`, the provenance read `run_statement`
+makes on the statement's connection, and `blob_on`/`refetch_on` on a pinned `Session` — and
+`fetch_blob` and `refetch_rows`, which connect with plain `connect_to`, rest on the qualification
+alone, so on them a bare operator or relation name still resolves through the user's path. User
+SQL and the write paths (`fetch_query`, `run_batch`, `run_script`, `run_ddl`, the write-back,
+`count_rows`) keep the path as written. The live `introspection_calls_no_function_the_database_planted`
+pins both halves on `fetch_schema` and `fetch_table_list`.
 `run_batch`'s re-assertion before each statement (below) is the transaction characteristics only;
 the path is set once. None of the three can be lifted by the statement it guards: PostgreSQL refuses
 `transaction_read_only` once a transaction has taken its snapshot, which a `SELECT` has; a MySQL
