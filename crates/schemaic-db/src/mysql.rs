@@ -1491,7 +1491,7 @@ pub(crate) async fn fetch_schema(
 ) -> Result<DbSchema, DbError> {
     let mut conn = db.open(None, false).await?;
     // The connection id, so a second connection can KILL the read that is
-    // already running on the server — the same shape `count_rows` uses, and
+    // already running on the server — the same shape `fetch_query` uses, and
     // the only thing that actually stops work in flight.
     let conn_id = conn.id();
     let out = tokio::select! {

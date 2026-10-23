@@ -478,7 +478,8 @@ pub(crate) const ENGINE_ENTRY_POINTS: &[&str] = &[
     "fetch_databases",
     "fetch_table_list",
     "fetch_blob",
-    "count_rows",
+    // `count_rows` left the list with release review S1-L5-04: it is
+    // `fetch_query` on a read-only session now, and no engine has one of its own.
     "refetch_rows",
     "commit_writes",
     "import_rows",

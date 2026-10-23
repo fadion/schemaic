@@ -2343,7 +2343,7 @@ pub(crate) async fn fetch_schema(
     let client = connect_catalogue(db, Some(database)).await?;
     // A dozen catalogue queries over every table of the database, so the token
     // is what stops it *on the server* rather than only abandoning the answer —
-    // the same shape `count_rows` uses, and for the same reason.
+    // the same shape `run_statement` uses, and for the same reason.
     let token = client.cancel_token();
     tokio::select! {
         r = collect_schema(&client) => r,
