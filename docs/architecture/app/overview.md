@@ -343,14 +343,30 @@ writing, until its transaction ended, on a connection the whole UI called read-o
 review S20). So when an edit `Connection::ticks_read_only`, both routes ask first, through
 `settle_before_read_only(id, proceed, cancelled)`, which chains `guard_tx` over every Manual tab
 on the connection with an open transaction *before* anything applies, and runs `cancelled` —
-asking nothing further — on the first Cancel. `toggle_read_only`'s Cancel leaves the connection
-writable and unchanged; once all are settled the flip applies and `resettle_sessions` re-pins the
-now idle sessions read-only at once. The form's `save_conn` is thin for this: it reads `id`,
-`previous` and the drafted `conn`, and either calls `save_conn_now` — the save as it was — or
-settles first, its Cancel saving the rest of the edit with `read_only = false` and setting the
-draft's `read_only` back, so the read-only change alone is not saved. Unticking goes straight
-through, as before. `the_read_only_toggle_resettles_pinned_sessions` pins both routes' asking
-`ticks_read_only` and going through the settle, and the form's `writable.read_only = false`.
+asking nothing further — on the first Cancel. **It looks again after each round** and proceeds
+only on one that finds nothing open (release review S3-L2-05): each answer waits on its COMMIT or
+ROLLBACK, the connection stays writable meanwhile, and a transaction another tab opened then used
+to meet the flip after the fact, where its Cancel kept a writable session on a read-only
+connection. `toggle_read_only`'s Cancel leaves the connection writable and unchanged; once all are
+settled the flip applies — **setting the state the click asked for**, decided at the click, since
+two clicks inside one COMMIT each toggled at apply time and left the connection writable — and
+`resettle_sessions` re-pins the now idle sessions read-only at once. The form's `save_conn` is
+thin for this: it reads `id`, `previous` and the drafted `conn`, and either points the draft at
+`id` and calls `save_conn_now` — the save as it was — or settles first, its Cancel saving the rest
+of the edit with `read_only = false` and setting the draft's `read_only` back, so the read-only
+change alone is not saved. **Those arms run when the settle lands, and the form may show another
+connection by then** (release review S3-L1-01): `save_conn_now` writes the list and never the
+draft — it used to set `draft.id` back to the saved id under the other connection's fields, and
+the next Save overwrote this connection with them — and the Cancel arm un-ticks the form only
+while `draft.id` is still this one. Unticking goes straight through, as before.
+`the_read_only_toggle_resettles_pinned_sessions` pins both routes' asking `ticks_read_only` and
+going through the settle, the form's `writable.read_only = false`, `save_conn_now` touching no
+`draft.`, the Cancel arm's guard, the flip's `c.read_only = target`, and the settle's re-scan
+before `proceed`. **A session open landing after a later one is closed, not filed**: `open_session`
+keeps each tab's newest open generation, and `tx::session_still_wanted(mode, launched, newest)`
+keeps only the newest — a writable open still connecting when the read-only tick re-pinned the
+tab landed second and replaced the read-only session (release review S3-L2-04,
+`an_open_a_later_one_superseded_is_not_wanted`); a superseded open's failure is not reported.
 **A re-pin can land under a statement still in flight, so a run's fold asks whether the tab still
 holds the session it ran on.** `TxState` is folded only when an operation finishes, so a tab whose
 *first* statement is still running reads as having nothing open, and the settle re-pins it at

@@ -6806,9 +6806,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let db_for = db_for.clone();
         let drop_session = drop_session.clone();
         let repin_owed = repin_owed.clone();
+        // Each tab's newest open, so one that lands after a later one started
+        // closes instead of replacing it (`session_still_wanted`, release
+        // review S3-L2-04).
+        let open_gen: Rc<RefCell<HashMap<usize, u64>>> = Rc::new(RefCell::new(HashMap::new()));
         Rc::new(move |tab_id: usize| {
             // A re-pin by any route settles one that was owed.
             repin_owed.borrow_mut().remove(&tab_id);
+            let launched = {
+                let mut g = open_gen.borrow_mut();
+                let n = g.entry(tab_id).or_insert(0);
+                *n += 1;
+                *n
+            };
             let Some(tab) = tabs.with_untracked(|v| v.iter().find(|t| t.id == tab_id).copied())
             else {
                 return;
@@ -6838,7 +6848,9 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 connections.with_untracked(|cs| session_enforce(cs, tab.conn_id.get_untracked()));
             let sessions = sessions.clone();
             let closer = handle.clone();
+            let open_gen = open_gen.clone();
             let opened = create_ext_action(cx, move |res: Result<Arc<Session>, ModalError>| {
+                let newest = open_gen.borrow().get(&tab_id).copied();
                 // Re-resolve the tab instead of reading the captured copy. An
                 // open is a full connect — seconds through a tunnel — and a tab
                 // closed meanwhile has had its scope disposed one tick later, so
@@ -6857,15 +6869,17 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         // it under a dead tab id either, where nothing would ever
                         // remove it and the connection would be held for the life
                         // of the process.
-                        if session_still_wanted(mode) {
+                        // Nor file one a later open has superseded.
+                        if session_still_wanted(mode, launched, newest) {
                             sessions.borrow_mut().insert(tab_id, s);
                         } else {
                             closer.spawn(async move { s.close().await });
                         }
                     }
                     // Nothing to flip back, and a modal about a tab the user has
-                    // already closed is noise.
-                    Err(_) if mode.is_none() => {}
+                    // already closed is noise — as is one about an open a later
+                    // one superseded, which answers for the tab now.
+                    Err(_) if mode.is_none() || newest != Some(launched) => {}
                     Err(e) => {
                         tab.tx_mode.set(TxMode::Auto);
                         // The sentence around the error is for the eye; what
@@ -11681,28 +11695,74 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // (`Connection::ticks_read_only`). Asked after, as other stale-session
     // edits are, a Cancel kept the writable session for the rest of its
     // transaction on a connection the whole UI called read-only.
+    //
+    // **Looked at again after every round, and `proceed` only on a round that
+    // finds nothing open** (release review S3-L2-05). The settle is async — each
+    // answer waits on its COMMIT or ROLLBACK — and the connection is writable
+    // until it ends, so another tab may open a transaction meanwhile; scanned
+    // once up front, that one met the flip after the fact, and its Cancel kept a
+    // writable session on a read-only connection (`RepinWhenTxEnds`).
     let settle_before_read_only: SettleBeforeFn = {
         let guard_tx = guard_tx.clone();
         Rc::new(
             move |id: u64, proceed: Rc<dyn Fn()>, cancelled: Rc<dyn Fn()>| {
-                let open: Vec<usize> = tabs.with_untracked(|v| {
-                    v.iter()
-                        .filter(|t| {
-                            t.conn_id.get_untracked() == id
-                                && t.tx_mode.get_untracked() == TxMode::Manual
-                                && t.tx.get_untracked().is_open()
-                        })
-                        .map(|t| t.id)
-                        .collect()
-                });
-                // One prompt at a time, chained as `resettle_sessions` chains its.
-                let mut next: Rc<dyn Fn()> = proceed;
-                for tab_id in open.into_iter().rev() {
-                    let (guard_tx, then, cancelled) = (guard_tx.clone(), next, cancelled.clone());
-                    next =
-                        Rc::new(move || (guard_tx)(tab_id, then.clone(), Some(cancelled.clone())));
-                }
-                next();
+                let open_now = move || -> Vec<usize> {
+                    tabs.with_untracked(|v| {
+                        v.iter()
+                            .filter(|t| {
+                                t.conn_id.get_untracked() == id
+                                    && t.tx_mode.get_untracked() == TxMode::Manual
+                                    && t.tx.get_untracked().is_open()
+                            })
+                            .map(|t| t.id)
+                            .collect()
+                    })
+                };
+                // The round refers to itself (the next round is this one again),
+                // so it lives in a cell that each way out empties, ending the cycle.
+                type Round = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+                let round: Round = Rc::new(RefCell::new(None));
+                let run_round = |r: &Round| {
+                    let f = r.borrow().clone();
+                    if let Some(f) = f {
+                        f();
+                    }
+                };
+                let cancelled: Rc<dyn Fn()> = {
+                    let r = round.clone();
+                    Rc::new(move || {
+                        r.borrow_mut().take();
+                        cancelled();
+                    })
+                };
+                let this_round: Rc<dyn Fn()> = {
+                    let r = round.clone();
+                    let guard_tx = guard_tx.clone();
+                    Rc::new(move || {
+                        let open = open_now();
+                        if open.is_empty() {
+                            r.borrow_mut().take();
+                            proceed();
+                            return;
+                        }
+                        // One prompt at a time, chained as `resettle_sessions`
+                        // chains its, and the next round after the last.
+                        let mut next: Rc<dyn Fn()> = {
+                            let r = r.clone();
+                            Rc::new(move || run_round(&r))
+                        };
+                        for tab_id in open.into_iter().rev() {
+                            let (guard_tx, then, cancelled) =
+                                (guard_tx.clone(), next, cancelled.clone());
+                            next = Rc::new(move || {
+                                (guard_tx)(tab_id, then.clone(), Some(cancelled.clone()))
+                            });
+                        }
+                        next();
+                    })
+                };
+                *round.borrow_mut() = Some(this_round);
+                run_round(&round);
             },
         )
     };
@@ -11719,12 +11779,21 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let settle_before_read_only = settle_before_read_only.clone();
         Rc::new(move |id: u64| {
             let resettle_sessions = resettle_sessions.clone();
+            // **The state the click asked for, set — not a toggle at apply
+            // time** (release review S3-L2-05): `apply` can run after a
+            // settle's COMMIT lands, and two clicks inside it each toggled, so
+            // a user who clicked "read-only" twice ended writable.
+            let Some(target) = connections
+                .with_untracked(|cs| cs.iter().find(|c| c.id == id).map(|c| !c.read_only))
+            else {
+                return;
+            };
             let apply: Rc<dyn Fn()> = Rc::new(move || {
                 let mut fate = OpenSession::Kept;
                 connections.update(|cs| {
                     if let Some(c) = cs.iter_mut().find(|c| c.id == id) {
                         let before = c.clone();
-                        c.read_only = !c.read_only;
+                        c.read_only = target;
                         fate = before.open_session_after(c);
                     }
                 });
@@ -11737,7 +11806,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let ticks = connections.with_untracked(|cs| {
                 cs.iter().find(|c| c.id == id).is_some_and(|c| {
                     let mut after = c.clone();
-                    after.read_only = !c.read_only;
+                    after.read_only = target;
                     c.ticks_read_only(&after)
                 })
             });
@@ -12801,7 +12870,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         cs.push(conn.clone());
                     }
                 });
-                draft.id.set(Some(id));
+                // **Not the form's**: this can run after a read-only tick's
+                // settle, by which time the form may show another connection
+                // (release review S3-L1-01). `save_conn` points the draft at a
+                // created connection itself, synchronously.
                 persist_conns(
                     Some(active_conn.get_untracked()),
                     persist::Saving::Replacing,
@@ -12937,6 +13009,8 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let previous = connections.with_untracked(|cs| cs.iter().find(|c| c.id == id).cloned());
             let conn = draft.to_connection(id);
             if !previous.as_ref().is_some_and(|p| p.ticks_read_only(&conn)) {
+                // A created connection: the form now edits it.
+                draft.id.set(Some(id));
                 save_conn_now(id, previous, conn);
                 return;
             }
@@ -12944,11 +13018,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             writable.read_only = false;
             let (as_edited, kept) = (save_conn_now.clone(), save_conn_now.clone());
             let previous_too = previous.clone();
+            // **The arms below run when the settle's COMMIT or ROLLBACK lands**,
+            // and the user may have selected another connection meanwhile
+            // (release review S3-L1-01): `save_conn_now` writes the list alone,
+            // and the Cancel arm un-ticks the form only while it still shows
+            // this connection — un-ticking another's form made its next Save
+            // writable.
             settle_before_read_only(
                 id,
                 Rc::new(move || as_edited(id, previous.clone(), conn.clone())),
                 Rc::new(move || {
-                    draft.read_only.set(false);
+                    if draft.id.get_untracked() == Some(id) {
+                        draft.read_only.set(false);
+                    }
                     kept(id, previous_too.clone(), writable.clone())
                 }),
             );
@@ -17032,6 +17114,10 @@ mod app_tests {
         assert!(toggle.contains("resettle_sessions(id, fate)"), "{toggle}");
         let save = region("let save_conn_now: Rc<dyn Fn(u64, Option<Connection>, Connection)> = {");
         assert!(save.contains("(resettle_sessions)(id, fate)"));
+        // **A late save touches no form** (release review S3-L1-01): it can run
+        // after the settle, with the form on another connection, whose next
+        // Save then overwrote this one with its fields.
+        assert!(!save.contains("draft."), "{save}");
         // **Ticking read-only is asked before it applies** (security review
         // S20): both routes check `ticks_read_only` and go through the settle,
         // so a Cancel leaves the connection writable instead of keeping a
@@ -17041,10 +17127,26 @@ mod app_tests {
             toggle.contains("settle_before_read_only(id, apply"),
             "{toggle}"
         );
+        // Set, never toggled at apply time, which can run a COMMIT later
+        // (release review S3-L2-05).
+        assert!(toggle.contains("c.read_only = target;"), "{toggle}");
+        assert!(!toggle.contains("c.read_only = !c.read_only"), "{toggle}");
+        // And the settle looks again after each round, proceeding only on one
+        // that finds nothing open.
+        let settle = region("let settle_before_read_only: SettleBeforeFn = {");
+        let rescan = settle
+            .find("let open = open_now();")
+            .expect("the settle no longer re-scans each round");
+        let proceeds = settle.find("proceed();").expect("the settle's proceed");
+        assert!(rescan < proceeds, "{settle}");
         let form = region("let save_conn: Rc<dyn Fn()> = {");
         assert!(form.contains("ticks_read_only("), "{form}");
         assert!(form.contains("settle_before_read_only("), "{form}");
         assert!(form.contains("writable.read_only = false"), "{form}");
+        assert!(
+            form.contains("if draft.id.get_untracked() == Some(id) {\n                        draft.read_only.set(false);"),
+            "the Cancel arm un-ticks a form that may show another connection:\n{form}"
+        );
         let resettle = region("let resettle_sessions: Rc<dyn Fn(u64, OpenSession)> = {");
         assert!(resettle.contains("pinned_fate(TxAsked::Cancelled)"));
         assert!(resettle.contains("pinned_fate(TxAsked::Settled)"));

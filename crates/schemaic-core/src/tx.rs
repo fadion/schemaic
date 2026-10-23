@@ -1292,8 +1292,15 @@ fn set_touches_autocommit(sql: &str, dialect: crate::intel::SqlDialect) -> bool 
 /// filed under a closed tab's id is a connection — and any transaction on it —
 /// held until the process exits, because the `drop_session` that would have
 /// removed it already ran, before the entry existed.
-pub fn session_still_wanted(mode: Option<TxMode>) -> bool {
-    matches!(mode, Some(TxMode::Manual))
+///
+/// **And only by the newest open the tab asked for** (release review
+/// S3-L2-04): `launched` is the generation this open was started under and
+/// `newest` the tab's current one. Two opens can be in flight — a writable one
+/// still connecting when the read-only tick re-pins the tab — and the one that
+/// lands last was filed, so a slower writable connect replaced the read-only
+/// session on a connection marked read-only.
+pub fn session_still_wanted(mode: Option<TxMode>, launched: u64, newest: Option<u64>) -> bool {
+    matches!(mode, Some(TxMode::Manual)) && newest == Some(launched)
 }
 
 /// One tab's transaction, as much of it as [`ddl_blocking_tabs`] needs.
@@ -3241,12 +3248,12 @@ mod tests {
 
     #[test]
     fn a_session_is_kept_only_by_a_tab_that_is_still_manual() {
-        assert!(session_still_wanted(Some(TxMode::Manual)));
+        assert!(session_still_wanted(Some(TxMode::Manual), 1, Some(1)));
     }
 
     #[test]
     fn a_tab_that_flipped_back_to_auto_does_not_want_it() {
-        assert!(!session_still_wanted(Some(TxMode::Auto)));
+        assert!(!session_still_wanted(Some(TxMode::Auto), 1, Some(1)));
     }
 
     #[test]
@@ -3254,7 +3261,23 @@ mod tests {
         // The case that leaks: `None` is "the tab isn't in the list any more",
         // and keying the map by its id would pin a connection nothing can ever
         // remove — `drop_session` already ran, before the entry existed.
-        assert!(!session_still_wanted(None));
+        assert!(!session_still_wanted(None, 1, Some(1)));
+    }
+
+    /// **An open a later one superseded is not wanted, whichever lands last**
+    /// (release review S3-L2-04). A writable open still connecting when the
+    /// read-only tick re-pinned the tab landed second and was filed over the
+    /// read-only one, so the tab wrote on a connection marked read-only. Only
+    /// the newest open the tab asked for is kept.
+    #[test]
+    fn an_open_a_later_one_superseded_is_not_wanted() {
+        let manual = Some(TxMode::Manual);
+        assert!(
+            !session_still_wanted(manual, 1, Some(2)),
+            "the older lands last"
+        );
+        assert!(session_still_wanted(manual, 2, Some(2)), "the newer lands");
+        assert!(!session_still_wanted(manual, 1, None), "no open is current");
     }
 
     // ── Which transactions a schema change has to wait behind ─────────────
