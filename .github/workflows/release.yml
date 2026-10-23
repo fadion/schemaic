@@ -65,7 +65,7 @@ jobs:
             target: macos-arm64
             channel: osx-arm64
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # A channel name is app identity, like `--packId`: an installed app polls
       # the manifest of the channel it was packed from, so renaming one orphans
