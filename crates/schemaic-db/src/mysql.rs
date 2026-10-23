@@ -5747,6 +5747,22 @@ pub(crate) async fn fetch_query(
         let _ = conn.disconnect().await;
         return Err(e);
     }
+    // **And inside a read-only transaction of its own**, because the text may
+    // be several statements — the editor sends a selection as one, and the
+    // driver runs it as a multi-statement query — and the session default is
+    // not what holds the second of them: a stored function the first calls can
+    // run `SET SESSION TRANSACTION READ WRITE`, which MariaDB honours for the
+    // statement after it (measured, `tests/live/enforced.rs`). A running
+    // transaction's access mode cannot change. Never committed: the connection
+    // is closed below, which rolls it back.
+    if enforce == Some(crate::Enforce::ReadOnly)
+        && let Err(e) = conn.query_drop("START TRANSACTION READ ONLY").await
+    {
+        let _ = conn.disconnect().await;
+        return Err(DbError::ConnectFailed(
+            crate::ConnectFailure::PrepareSession(e.to_string()),
+        ));
+    }
     // The connection id, so a second connection can KILL its in-flight query.
     let conn_id = conn.id();
 
@@ -5883,6 +5899,23 @@ pub(crate) async fn run_batch(
     for (i, sql) in stmts.iter().enumerate() {
         if stopped || cancel.is_cancelled() {
             on_result(i, Err(DbError::Cancelled));
+            continue;
+        }
+        // **Again before every statement**: a stored function a `SELECT`
+        // calls can run `SET SESSION TRANSACTION READ WRITE`, which MariaDB
+        // honours for every statement after it on this connection (measured,
+        // `tests/live/enforced.rs`). A statement cannot change the access mode
+        // of its own transaction, so re-asserting it here holds the next one.
+        if enforce == Some(crate::Enforce::ReadOnly)
+            && let Err(e) = conn.query_drop("SET SESSION TRANSACTION READ ONLY").await
+        {
+            stopped = true;
+            on_result(
+                i,
+                Err(DbError::ConnectFailed(
+                    crate::ConnectFailure::PrepareSession(e.to_string()),
+                )),
+            );
             continue;
         }
         let mut dest = RowDest::Capped(row_cap);

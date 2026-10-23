@@ -350,3 +350,97 @@ pub async fn a_read_only_batch_refuses_a_write_a_select_hides(target: &'static T
     );
     scratch.teardown().await;
 }
+
+/// [`seeded`], with the server's [`Target::lifting_function`] created too.
+async fn seeded_with_a_lift(target: &'static Target, test: &str) -> (Scratch, String) {
+    let (scratch, t) = seeded(target, test).await;
+    if let Some(ddl) = target.lifting_function {
+        scratch.exec(ddl).await;
+    }
+    (scratch, t)
+}
+
+/// **A read-only batch stays read-only after a statement that lifts it.** Run
+/// All shares one connection, and on PostgreSQL the session's read-only state
+/// is a setting — `default_transaction_read_only` — which a `SELECT` reaching
+/// `set_config` turns off for every transaction after its own. The write that
+/// follows is a plain `DELETE`, refused by its head anywhere a text gate is
+/// asked; this is the session's half, which has to hold without one.
+pub async fn a_read_only_batch_cannot_be_lifted_for_a_later_statement(target: &'static Target) {
+    let (scratch, t) = seeded_with_a_lift(target, "enforce_lift_batch").await;
+    let stmts = vec![target.lifting_call.to_string(), format!("DELETE FROM {t}")];
+    let mut out = Vec::new();
+    scratch
+        .db
+        .run_batch_enforced(
+            Some(&scratch.database),
+            &stmts,
+            100,
+            CancellationToken::new(),
+            |_, r| out.push(r.map(|_| ()).map_err(|e| e.to_string())),
+            Some(Enforce::ReadOnly),
+        )
+        .await;
+    assert!(
+        out.get(1).is_some_and(Result::is_err),
+        "{}: the write after the lift ran: {out:?}",
+        target.name
+    );
+    assert_eq!(rows_left(&scratch, &t).await, "3", "{}", target.name);
+    scratch.teardown().await;
+}
+
+/// **One text holding the lift and a hidden write is refused too.** The
+/// editor sends a selection of several statements as one text, which MySQL's
+/// driver runs as a multi-statement query, and the text gate passes both when
+/// neither names a write.
+pub async fn a_read_only_text_cannot_lift_itself_for_its_next_statement(target: &'static Target) {
+    let (scratch, t) = seeded_with_a_lift(target, "enforce_lift_text").await;
+    let sql = format!("{}; SELECT purge_all()", target.lifting_call);
+    let got = enforced(&scratch, &sql, Enforce::ReadOnly).await;
+    assert_eq!(
+        rows_left(&scratch, &t).await,
+        "3",
+        "{}: the hidden write after the lift ran ({got:?})",
+        target.name
+    );
+    scratch.teardown().await;
+}
+
+/// **A read-only Manual tab stays read-only across a commit.** Every
+/// transaction the pinned session opens is read-only in its own right, so a
+/// lift inside one cannot reach the next one the tab begins.
+pub async fn a_read_only_pinned_session_cannot_be_lifted_across_a_commit(target: &'static Target) {
+    use schemaic_db::Session;
+    let (scratch, t) = seeded_with_a_lift(target, "enforce_lift_pinned").await;
+    let s = Session::open_enforced(
+        &scratch.db,
+        Some(&scratch.database),
+        Some(Enforce::ReadOnly),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{}: open: {e}", target.name));
+    s.ensure_tx().await.expect("BEGIN");
+    // Whether the lift itself is refused is the server's business; what it
+    // must not do is reach the transaction after the commit.
+    let _ = s
+        .fetch_query(target.lifting_call, 100, CancellationToken::new())
+        .await;
+    let _ = s.commit().await;
+    s.ensure_tx().await.expect("the second BEGIN");
+    let got = s
+        .fetch_query(&format!("DELETE FROM {t}"), 100, CancellationToken::new())
+        .await
+        .result
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    let _ = s.commit().await;
+    s.close().await;
+    assert!(
+        got.is_err(),
+        "{}: the write after the lift ran",
+        target.name
+    );
+    assert_eq!(rows_left(&scratch, &t).await, "3", "{}", target.name);
+    scratch.teardown().await;
+}

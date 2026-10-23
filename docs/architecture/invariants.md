@@ -109,20 +109,40 @@ Re-introducing the anti-patterns these guard against is a regression:
   **On a read-only connection the verdict's `Block` is a text answer, so the session backs it.**
   `run_verdict` refuses a write by `contains_write`, a whitelist of heads, and `SELECT setval('s',
   1000)`, `SELECT lo_unlink(…)` and a `SELECT` of a function whose body deletes all open with one —
-  the hole the headless gate had (below), still open on the editor after that one was closed.
+  the hole the headless gate had (below), still open on the editor after that one was closed. On
+  PostgreSQL the verdict now refuses all three by the headless gate's function allowlist (below);
+  on MySQL/MariaDB a stored function still passes every text gate, and only the session stops it.
   **On SQL Server `contains_write` reads every word, not only a statement's head**
   (`unterminated_write_words`): T-SQL needs no `;` between statements, and its backing session is
   a transaction rolled back rather than a refusal, so `SELECT 1 COMMIT EXEC('DELETE FROM t')`
   once read as one read whose `COMMIT` ended that transaction and whose procedure's writes stuck
   (`a_sql_server_write_hidden_behind_a_read_is_still_a_write`; `ADD` is among the words, for
   `ADD SIGNATURE` and `ADD SENSITIVITY CLASSIFICATION`, a reserved word no unbracketed name can
-  be). **And a rollback is not the whole of SQL Server's read-only guarantee**, so on such a
-  connection `run_verdict` also asks `read_only_reason` (`SqlDialect::read_only_is_a_rollback`)
-  and Blocks what it refuses: a `RAISERROR … WITH LOG` or a function calling an extended procedure
-  writes nothing `contains_write` sees, and its effect outside the database outlived the
-  rolled-back transaction, measured on 2022 — the headless paths and Analyze already refused it on
-  the same connection, and the editor was the laxer gate
-  (`a_read_only_rollback_session_blocks_what_the_rollback_cannot_undo`). The missing-`WHERE` net had the
+  be). **And the session is not the whole of the read-only guarantee, on any engine**, so on such a
+  connection `run_verdict` also asks `read_only_refusal` of every statement range of every element
+  (`statement_ranges`) and Blocks what it refuses (`GuardReason::ReadOnlyRefused`). It used to ask
+  only where the session is a rollback (`SqlDialect::read_only_is_a_rollback`, SQL Server): there a
+  `RAISERROR … WITH LOG` or a function calling an extended procedure writes nothing
+  `contains_write` sees, and its effect outside the database outlived the rolled-back transaction,
+  measured on 2022 (`a_read_only_rollback_session_blocks_what_the_rollback_cannot_undo`). A real
+  read-only transaction has the same kind of hole — `pg_terminate_backend`, `dblink_exec` on a
+  connection of its own and MySQL's `GET_LOCK` act outside it — and PostgreSQL had a worse one:
+  `SELECT set_config('default_transaction_read_only', 'off', false)`, a read head naming no write
+  word, turned the session default off for every later statement on the same connection, which Run
+  All and a Manual tab's pinned session both share (verified live on 16; the session's half of
+  that fix is `schemaic-db`'s entry). The headless paths and Analyze already refused all of these
+  on the same connection, so the editor was the laxer gate on every engine but one. Now it refuses
+  what `schemaic query` and MCP `run_query` refuse — on PostgreSQL any call off
+  `PG_READ_FUNCTIONS`, a user's own function included; on MySQL/MariaDB the deny list's `SLEEP` and
+  `GET_LOCK` and the locking clauses
+  (`a_read_only_editor_refuses_what_the_headless_gate_refuses_on_every_engine`). **It is asked per
+  range, not per element, and that is load-bearing**: the editor sends a selection of several
+  statements as one element, and the headless gate's "only one statement" is about its own path
+  rather than about what is safe, so asking it of the element would refuse every multi-statement
+  selection on a read-only connection (`SELECT 1; SELECT 2` stays `Allow` in the same test); a
+  range still holding several — T-SQL with no `;` between them — is refused for it. What it still
+  does not catch is a MySQL stored function: the MySQL family answers calls by a deny list, not an
+  allowlist, so `SELECT my_func()` passes the text and its writes rest on the session. The missing-`WHERE` net had the
   same blind spot on the same engine — a bare `DELETE` below a scoped one borrowed its `WHERE` —
   and reads each statement of the range now (`sql::tsql_statements`, under `core::sql`).
   `main.rs`'s `session_enforce(connections, conn_id)` answers `Enforce::ReadOnly` for a read-only

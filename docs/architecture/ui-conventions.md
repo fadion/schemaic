@@ -770,8 +770,9 @@
     answers the `Confirm`. `ReadOnlyRefused`'s `$reason` is a `sql::ReadOnlyReason`, which the
     private `read_only_reason_text` words from `read-only-*` — `$heads` joined with `/` as core joins
     them, `$word`, `$name` and `$clause` SQL and spelt as the statement had them — so the guard bar
-    on a read-only SQL Server connection, the one place the editor asks that gate
-    (`read_only_is_a_rollback`), reads wholly in the interface's language; it used to splice
+    on a read-only connection, where the editor asks that gate of every statement on every engine
+    (it once asked only on SQL Server, `read_only_is_a_rollback`; the write-guard invariant has
+    why), reads wholly in the interface's language; it used to splice
     `read_only_reason`'s English into a translated sentence.
     `english_says_every_read_only_reason_as_core_does` holds each reason equal to `message`, bare
     and inside `ReadOnlyRefused`, over every engine's heads. The CLI keeps core's `message`, and

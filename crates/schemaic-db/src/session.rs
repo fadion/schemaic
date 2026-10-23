@@ -109,6 +109,9 @@ fn retired_error() -> DbError {
 #[derive(Clone, Copy)]
 enum Ctl {
     Begin,
+    /// A transaction that is read-only in its own right, whatever the session
+    /// default says by then.
+    BeginReadOnly,
     Commit,
     Rollback,
 }
@@ -160,6 +163,10 @@ pub struct Session {
     /// so both decided they had to `BEGIN`, and on MySQL a second `BEGIN`
     /// implicitly commits the first one's writes.
     in_tx: AtomicBool,
+    /// Opened with [`Enforce::ReadOnly`](crate::Enforce::ReadOnly), so every
+    /// transaction [`Session::ensure_tx`] opens says `READ ONLY` itself — see
+    /// [`Session::open_enforced`] for why the session default is not enough.
+    read_only: bool,
 }
 
 /// What [`Session::commit`] answers when the block was already aborted, so the
@@ -198,12 +205,23 @@ impl Session {
     /// opens on it is a read-only one, and a `SELECT setval(…)` the text gate
     /// passed is refused by the server instead of written.
     ///
-    /// It guards against a statement's *effect*, not against the person at the
-    /// keyboard: a `SET SESSION TRANSACTION READ WRITE` that reached the session
-    /// would lift it. The editor's `run_verdict` refuses that spelling on a
-    /// read-only connection before it gets here — `SET` is no read head — and
-    /// the state is decided once, at open: ticking the box on a connection whose
-    /// tab already holds a session does not reach that session.
+    /// **The session default is only where it starts.** A statement that
+    /// reached a typed `SET SESSION TRANSACTION READ WRITE` would lift it, and
+    /// so does one with a read head: PostgreSQL's
+    /// `SELECT set_config('default_transaction_read_only', 'off', false)`, or a
+    /// MySQL/MariaDB stored function that runs the `SET` — accepted by both, and
+    /// MariaDB honours it for the next statement. The text gate refuses the
+    /// typed `SET`, but not a call. So the default is not what the guard rests
+    /// on: every transaction [`Session::ensure_tx`] opens here is `READ ONLY`
+    /// in its own words, which a statement inside it cannot undo — PostgreSQL
+    /// refuses `transaction_read_only` once the transaction has run a query,
+    /// and MySQL cannot change a running transaction's access mode. A lift
+    /// inside one transaction does not reach the next, measured on all three
+    /// servers (`tests/live/enforced.rs`).
+    ///
+    /// Ticking read-only on a connection whose tab already holds a session
+    /// reaches it through the app's re-pin (`resettle_sessions`), not through
+    /// this session, whose state is decided at open.
     ///
     /// Failing to put the session in that state fails the open — no statement
     /// ever runs on a session that was only meant to be guarded.
@@ -308,6 +326,7 @@ impl Session {
             server_id: std::sync::Mutex::new(server_id),
             inner: Mutex::new(backend),
             in_tx: AtomicBool::new(false),
+            read_only: enforce == Some(crate::Enforce::ReadOnly),
         }))
     }
 
@@ -345,12 +364,17 @@ impl Session {
     async fn control_on(guard: &mut Backend, ctl: Ctl) -> Result<(), DbError> {
         let generic = match ctl {
             Ctl::Begin => "BEGIN",
+            Ctl::BeginReadOnly => "BEGIN READ ONLY",
             Ctl::Commit => "COMMIT",
             Ctl::Rollback => "ROLLBACK",
         };
         match &mut *guard {
             Backend::MySql { conn, .. } => conn
-                .query_drop(generic)
+                // `BEGIN` takes no characteristics on MySQL.
+                .query_drop(match ctl {
+                    Ctl::BeginReadOnly => "START TRANSACTION READ ONLY",
+                    _ => generic,
+                })
                 .await
                 .map_err(|e| DbError::Query(e.to_string())),
             Backend::Postgres { client } => client
@@ -360,6 +384,12 @@ impl Session {
             Backend::MsSql { client } => {
                 let sql = match ctl {
                     Ctl::Begin => "BEGIN TRANSACTION",
+                    // No read-only transaction to ask for, which is why
+                    // `open_enforced` refuses such a session; refused again
+                    // here rather than spelt as a plain one.
+                    Ctl::BeginReadOnly => {
+                        return Err(DbError::Refused(crate::DbRefusal::MsSqlReadOnlyAuto));
+                    }
                     Ctl::Commit => "WHILE @@TRANCOUNT > 0 COMMIT TRANSACTION",
                     Ctl::Rollback => "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
                 };
@@ -369,7 +399,7 @@ impl Session {
             // Rollback has nothing left to do; anything else cannot be done.
             Backend::Retired => match ctl {
                 Ctl::Rollback => Ok(()),
-                Ctl::Begin | Ctl::Commit => Err(retired_error()),
+                Ctl::Begin | Ctl::BeginReadOnly | Ctl::Commit => Err(retired_error()),
             },
         }
     }
@@ -390,7 +420,12 @@ impl Session {
         if self.in_tx.load(Ordering::SeqCst) {
             return Ok(());
         }
-        Session::control_on(&mut guard, Ctl::Begin)
+        let begin = if self.read_only {
+            Ctl::BeginReadOnly
+        } else {
+            Ctl::Begin
+        };
+        Session::control_on(&mut guard, begin)
             .await
             .map_err(begin_failed)?;
         self.in_tx.store(true, Ordering::SeqCst);
@@ -1581,6 +1616,7 @@ mod tests {
             server_id: std::sync::Mutex::new(Some(57)),
             inner: Mutex::new(Backend::Retired),
             in_tx: AtomicBool::new(true),
+            read_only: false,
         }
     }
 

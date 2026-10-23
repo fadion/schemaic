@@ -550,6 +550,20 @@ pub(crate) async fn run_batch(
             on_result(i, Err(DbError::Cancelled));
             continue;
         }
+        // **Again before every statement**, because the default is a setting a
+        // read can change: `SELECT set_config('default_transaction_read_only',
+        // 'off', false)` passes for a read and leaves every later statement on
+        // this connection read-write. A statement cannot lift its own
+        // transaction, so re-asserting it here is what holds the next one.
+        if enforce == Some(crate::Enforce::ReadOnly)
+            && let Err(e) = client
+                .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+                .await
+        {
+            stopped = true;
+            on_result(i, Err(read_only_setup_failed(&e)));
+            continue;
+        }
         let outcome = run_statement(
             db,
             &client,

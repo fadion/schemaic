@@ -192,6 +192,18 @@ pub struct Target {
     /// text is a read — what [`crate::enforced`] asks a read-only session to
     /// refuse. (Not `purge()`: `PURGE` is a reserved word on MySQL.)
     pub purging_function: &'static str,
+    /// How this server's read-headed statement tries to **lift** a read-only
+    /// session for the statements after it: a function to create first, if
+    /// the spelling needs one, and the `SELECT` that calls it. PostgreSQL's is
+    /// a builtin — `set_config('default_transaction_read_only', 'off', false)`
+    /// lands, measured on 16 — and the MySQL family's is a stored function
+    /// running `SET SESSION TRANSACTION READ WRITE`, which both servers accept
+    /// — MariaDB honouring it for the next statement, MySQL 8 for the next
+    /// transaction after a commit (measured before the fix).
+    /// [`crate::enforced`] asks every leg that the write after it is still
+    /// refused.
+    pub lifting_function: Option<&'static str>,
+    pub lifting_call: &'static str,
     /// A statement that does nothing for a given number of seconds, in this
     /// server's spelling, with `{}` where the count goes and `{marker}` where
     /// the caller's marker goes — what the cancellation test interrupts. There
@@ -281,6 +293,9 @@ pub struct Target {
 const MYSQL_PURGING_FUNCTION: &str = "CREATE FUNCTION purge_all() RETURNS INT DETERMINISTIC \
      MODIFIES SQL DATA BEGIN DELETE FROM {table}; RETURN 1; END";
 
+/// [`Target::lifting_function`] for both MySQL-family legs.
+const MYSQL_LIFTING_FUNCTION: &str = "CREATE FUNCTION lift_read_only() RETURNS INT      DETERMINISTIC BEGIN SET SESSION TRANSACTION READ WRITE; RETURN 1; END";
+
 pub static MARIADB: Target = Target {
     name: "mariadb",
     engine: Engine::MySql,
@@ -306,6 +321,8 @@ pub static MARIADB: Target = Target {
     trigger_condition: None,
     trigger_update_columns: &[],
     purging_function: MYSQL_PURGING_FUNCTION,
+    lifting_function: Some(MYSQL_LIFTING_FUNCTION),
+    lifting_call: "SELECT lift_read_only()",
     sleep_template: "SELECT SLEEP({}) /* {marker} */",
     running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%{head}', '{tail}%')",
     types: cases::MYSQL_FAMILY,
@@ -340,6 +357,8 @@ pub static MYSQL: Target = Target {
     trigger_condition: None,
     trigger_update_columns: &[],
     purging_function: MYSQL_PURGING_FUNCTION,
+    lifting_function: Some(MYSQL_LIFTING_FUNCTION),
+    lifting_call: "SELECT lift_read_only()",
     sleep_template: "SELECT SLEEP({}) /* {marker} */",
     running_sleeps_sql: "SELECT COUNT(*) FROM information_schema.PROCESSLIST \n         WHERE INFO LIKE CONCAT('%{head}', '{tail}%')",
     types: cases::MYSQL_FAMILY,
@@ -377,6 +396,8 @@ pub static POSTGRES: Target = Target {
     trigger_update_columns: &["name"],
     purging_function: "CREATE FUNCTION purge_all() RETURNS int LANGUAGE sql AS \
          $$ DELETE FROM {table}; SELECT 1 $$",
+    lifting_function: None,
+    lifting_call: "SELECT set_config('default_transaction_read_only', 'off', false)",
     sleep_template: "SELECT pg_sleep({}) /* {marker} */",
     running_sleeps_sql: "SELECT count(*) FROM pg_stat_activity \n         WHERE state = 'active' AND query LIKE '%{head}' || '{tail}%'",
     types: cases::POSTGRES,

@@ -168,7 +168,10 @@ gate read-only. What refuses them is the session (`Db::fetch_query_enforced` wit
 text, so a read-only connection's editor runs take that session too (the write-guard invariant
 lists the five paths); the gate stays in front for the one-statement count and
 for what a read-only session still allows — sleeps, locks, server-side file reads, and on
-PostgreSQL the writes that are not transactional (below). **And the
+PostgreSQL the writes that are not transactional (below) and a `set_config` that turns the
+session's read-only default off for the statements after it. On a read-only connection
+`run_verdict` asks it too, of each statement range rather than of the whole text, on every engine
+(the write-guard invariant has why it once asked only on SQL Server). **And the
 one-statement count is only as good as the server's agreement about where a statement ends.**
 `skip_noncode` assumes `\` escapes inside every quote, which a MySQL/MariaDB server stops doing
 under `NO_BACKSLASH_ESCAPES`, and under `ANSI_QUOTES` it reads `"a\"` as an identifier with no

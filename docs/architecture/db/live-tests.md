@@ -690,6 +690,16 @@ enforced paths have a case each, over the same `SELECT purge_all()` and the same
 hidden write, so the batch must answer read-then-refused). Each runs an unenforced control that
 must succeed, so the refusal is the session's and not a function that fails anyway — and the
 stream and batch controls assert the table then *is* empty.
+**Three more ask that a statement cannot lift the session for the one after it**, over
+`Target::lifting_call` — PostgreSQL's `SELECT set_config('default_transaction_read_only', 'off',
+false)`, a builtin, and on the MySQL family `SELECT lift_read_only()`, a stored function
+(`lifting_function`, created first) running `SET SESSION TRANSACTION READ WRITE`:
+`a_read_only_batch_cannot_be_lifted_for_a_later_statement` (`run_batch_enforced`, the lift then a
+plain `DELETE`), `a_read_only_text_cannot_lift_itself_for_its_next_statement` (one enforced text,
+the lift then `SELECT purge_all()`, the multi-statement query MariaDB's lift reached) and
+`a_read_only_pinned_session_cannot_be_lifted_across_a_commit` (the lift inside one `ensure_tx`
+transaction, a commit, then a `DELETE` in the next). The pinned case leaves whether the lift itself
+is refused to the server; each asserts the three rows are still there.
 `a_read_only_plan_refuses_a_write_its_planner_makes` is the plain `EXPLAIN`'s case, for the
 editor's Plan and the MCP server's `explain` at once, and its statement is the planner's rather
 than the executor's: an `IMMUTABLE` plpgsql function that `PERFORM`s `purge_all()` on

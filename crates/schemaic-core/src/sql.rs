@@ -4269,18 +4269,26 @@ pub fn run_verdict(stmts: &[String], policy: GuardPolicy) -> RunVerdict {
     if policy.read_only && writes() {
         return RunVerdict::Block(GuardReason::ReadOnly);
     }
-    // **Where the read-only session is only a rollback, the rollback is not the
-    // whole guard.** A `RAISERROR … WITH LOG`, or a function that calls an
-    // extended procedure, writes nothing `contains_write` can see, and its
-    // effect outside the database outlives the rolled-back transaction —
-    // which is why the headless paths and Analyze ask `read_only_reason` on
-    // such a connection. The editor runs the same statement against the same
-    // guarantee, so it asks the same gate; anything laxer here would be a
-    // second gate.
-    if policy.read_only && policy.dialect.read_only_is_a_rollback() {
+    // **The read-only session is not the whole guard, on any engine.** Where it
+    // is only a rollback (SQL Server), a `RAISERROR … WITH LOG` or a function
+    // calling an extended procedure outlives it; where it is a real read-only
+    // transaction, `pg_terminate_backend`, `dblink_exec` on a second
+    // connection and MySQL's `GET_LOCK` act outside it, and a `set_config`
+    // turned PostgreSQL's session default off for the statements after it.
+    // The headless paths ask `read_only_reason` of each of those, so the
+    // editor asks the same gate on the same connection — anything laxer here
+    // would be a second gate. It was asked only on the rollback engine.
+    //
+    // Of each statement rather than of each element, since the editor sends a
+    // selection of several as one, and the headless gate's "only one
+    // statement" is about its own path rather than about what is safe; a range
+    // still holding several (T-SQL with no `;` between them) is refused for it.
+    if policy.read_only {
         for s in stmts {
-            if let Err(r) = read_only_refusal(s, policy.dialect) {
-                return RunVerdict::Block(GuardReason::ReadOnlyRefused(r.reason));
+            for (lo, hi) in statement_ranges(s, policy.dialect) {
+                if let Err(r) = read_only_refusal(&s[lo..hi], policy.dialect) {
+                    return RunVerdict::Block(GuardReason::ReadOnlyRefused(r.reason));
+                }
             }
         }
     }
@@ -11470,7 +11478,7 @@ line */",
         }
         assert_eq!(v(&["SELECT * FROM t WHERE a = 1"], ms), RunVerdict::Allow);
         assert_eq!(v(&["SELECT GETDATE()"], ms), RunVerdict::Allow);
-        // Writable, or on an engine with a real read-only session, nothing moves.
+        // Writable, nothing moves.
         assert_eq!(
             v(
                 &["SELECT dbo.note()"],
@@ -11481,14 +11489,77 @@ line */",
             ),
             RunVerdict::Allow
         );
-        for d in [SqlDialect::Postgres, SqlDialect::MySql] {
-            let p = GuardPolicy {
-                read_only: true,
-                dialect: d,
-                ..open_policy()
-            };
-            assert_eq!(v(&["SELECT my_func()"], p), RunVerdict::Allow, "{d:?}");
+    }
+
+    /// **Every engine's read-only editor asks the headless gate**, not only the
+    /// one whose session is a rollback. A real read-only session refuses a
+    /// write, but not what acts outside the transaction — PostgreSQL's
+    /// `pg_terminate_backend`, `dblink_exec` on a second connection, a
+    /// `set_config` that turns the session default off for the next statement,
+    /// MySQL's `GET_LOCK` — and the editor used to pass all of them on a
+    /// connection whose MCP server and `schemaic query` refused them.
+    #[test]
+    fn a_read_only_editor_refuses_what_the_headless_gate_refuses_on_every_engine() {
+        let ro = |dialect| GuardPolicy {
+            read_only: true,
+            dialect,
+            ..open_policy()
+        };
+        let pg = ro(SqlDialect::Postgres);
+        for sql in [
+            "SELECT set_config('default_transaction_read_only', 'off', false)",
+            "SELECT pg_terminate_backend(42)",
+            "SELECT dblink_exec('dbname=x', 'DELETE FROM t')",
+            "SELECT my_func()",
+        ] {
+            assert!(
+                matches!(
+                    v(&[sql], pg),
+                    RunVerdict::Block(GuardReason::ReadOnlyRefused(_))
+                ),
+                "{sql}: {:?}",
+                v(&[sql], pg)
+            );
         }
+        let my = ro(SqlDialect::MySql);
+        for sql in ["SELECT GET_LOCK('a', 10)", "SELECT SLEEP(5)"] {
+            assert!(
+                matches!(
+                    v(&[sql], my),
+                    RunVerdict::Block(GuardReason::ReadOnlyRefused(_))
+                ),
+                "{sql}: {:?}",
+                v(&[sql], my)
+            );
+        }
+        // Reads still run — several to one run, as before, since the gate is
+        // asked of each statement rather than of the whole selection.
+        assert_eq!(
+            v(&["SELECT now(), lower(name) FROM t"], pg),
+            RunVerdict::Allow
+        );
+        assert_eq!(v(&["SELECT 1; SELECT 2"], pg), RunVerdict::Allow);
+        assert_eq!(v(&["SELECT 1; SELECT 2"], my), RunVerdict::Allow);
+        assert_eq!(v(&["SELECT 1", "SHOW search_path"], pg), RunVerdict::Allow);
+        // MySQL answers calls by a deny list, so a stored function is still a
+        // read to the text; its session is what refuses its write.
+        assert_eq!(v(&["SELECT my_func()"], my), RunVerdict::Allow);
+        // One refused statement among reads refuses the run.
+        assert!(matches!(
+            v(&["SELECT 1; SELECT pg_terminate_backend(42)"], pg),
+            RunVerdict::Block(GuardReason::ReadOnlyRefused(_))
+        ));
+        // A writable connection is asked none of it.
+        assert_eq!(
+            v(
+                &["SELECT pg_terminate_backend(42)"],
+                GuardPolicy {
+                    read_only: false,
+                    ..pg
+                }
+            ),
+            RunVerdict::Allow
+        );
     }
 
     // ── No database selected (PostgreSQL's hidden maintenance database) ──

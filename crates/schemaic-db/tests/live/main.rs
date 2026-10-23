@@ -135,6 +135,9 @@ live_suite!(
         a_read_only_plan_refuses_a_write_its_planner_makes,
         a_read_only_stream_refuses_a_write_a_select_hides,
         a_read_only_batch_refuses_a_write_a_select_hides,
+        a_read_only_batch_cannot_be_lifted_for_a_later_statement,
+        a_read_only_pinned_session_cannot_be_lifted_across_a_commit,
+        a_read_only_text_cannot_lift_itself_for_its_next_statement,
     ],
     init_sql: [
         the_init_sql_is_in_force_on_the_operations_connection,

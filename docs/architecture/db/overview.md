@@ -1023,7 +1023,25 @@ statement's own implicit transaction is the read-only one and there is no transa
 it to sit inside. None of the three can be lifted by the statement it guards: PostgreSQL refuses
 `transaction_read_only` once a transaction has taken its snapshot, which a `SELECT` has; a MySQL
 transaction's access mode cannot change while it runs, so a stored function cannot undo it from
-inside; and a `SELECT` cannot set a pragma. **SQL Server has no read-only session or transaction
+inside; and a `SELECT` cannot set a pragma. **But a statement can lift it for the statements
+after it**, and on the two servers the connection is not always the statement's own: Run All
+shares one across its statements, a Manual tab's pinned `Session` across the tab's life, and on
+MariaDB a multi-statement text through `fetch_query` is several statements on one connection.
+PostgreSQL's `SELECT set_config('default_transaction_read_only', 'off', false)` — a read head
+naming no write word — turns the session default off for every later transaction, and a
+MySQL/MariaDB stored function running `SET SESSION TRANSACTION READ WRITE` is accepted by both,
+MariaDB honouring it for the next statement and MySQL 8 for the next transaction after a commit
+(verified live on PostgreSQL 16, MySQL 8.4 and MariaDB 10.11). So the default is where the guard
+starts, not what it rests on: each path re-asserts it, or opens a transaction that says `READ
+ONLY` in its own words, before anything a lift could reach — `run_batch` and `Session::ensure_tx`
+below, and on MySQL/MariaDB `fetch_query` runs an enforced text inside a `START TRANSACTION READ
+ONLY` that is never committed (the connection closes, which rolls it back). The live tier's
+`a_read_only_batch_cannot_be_lifted_for_a_later_statement`,
+`a_read_only_pinned_session_cannot_be_lifted_across_a_commit` and
+`a_read_only_text_cannot_lift_itself_for_its_next_statement` hold the three. The editor's text
+gate now refuses PostgreSQL's spelling too — `set_config` is off `PG_READ_FUNCTIONS` — but the
+MySQL family's is a call to a function the gate cannot read, which is why the session's half has
+to hold with no gate at all. **SQL Server has no read-only session or transaction
 to ask for**, so its arm is a different kind of thing — a rollback rather than a refusal: the
 statement (or the whole batch) runs inside a `BEGIN TRANSACTION` and the connection is dropped
 without a commit, which the server rolls back, and since its DDL is transactional a table a
@@ -1036,7 +1054,9 @@ server (`OPENQUERY`, `OPENROWSET`) — rests on the text gate, which refuses eac
 switch, on SQL Server alone. **What it refuses is a transactional write, and no
 more**: on PostgreSQL a function that never calls `PreventCommandIfReadOnly` — a replication slot
 dropped or created, `pg_stat_reset` — ran on this very session live on 16.15, so those are the
-text gate's to refuse (`core::sql`'s entry). **`Enforce::AsJudged` is the lexer the gate
+text gate's to refuse (`core::sql`'s entry) — the editor's on a read-only connection as much as
+the headless paths', since `run_verdict` asks `read_only_refusal` of each statement there on
+every engine (the write-guard invariant). **`Enforce::AsJudged` is the lexer the gate
 assumed.** On a MySQL/MariaDB server whose `sql_mode` carries `NO_BACKSLASH_ESCAPES` or
 `ANSI_QUOTES`, `SELECT 'a\'; DELETE FROM t; -- '` is one `SELECT` to the gate and three statements
 to the server, and the `DELETE` runs, because `mysql_async` sends multi-statement text whether the
@@ -1080,13 +1100,25 @@ statement. `Db::run_batch_enforced` is `run_batch` (which passes `None`) for the
 All, with its one connection put in the state before the first statement: `enforce_session` after
 the open on MySQL/MariaDB, `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` after the
 connect on PostgreSQL, `PRAGMA query_only = ON` on SQLite. A connection that cannot be put in it
-fails the first statement and cancels the rest, exactly as one that cannot connect does.
+fails the first statement and cancels the rest, exactly as one that cannot connect does. **On the
+two servers the read-only default is then re-asserted before every statement** — `SET SESSION
+CHARACTERISTICS AS TRANSACTION READ ONLY` / `SET SESSION TRANSACTION READ ONLY` — because the
+statement before it may have lifted it (above), and a statement cannot change its own
+transaction's mode, so the re-assertion is what holds the next one; a failed re-assertion fails
+that statement and cancels the rest. SQLite's `query_only` is set once, a `SELECT` having no way
+to set a pragma.
 `Session::open_enforced(db, database, enforce)` is `Session::open` (which passes `None`)
 with the pinned connection put in the state **before any `BEGIN`**: `mysql::enforce_session`, now
 `pub(crate)` for it, on MySQL/MariaDB — a failure disconnects and fails the open — and `SET SESSION
-CHARACTERISTICS AS TRANSACTION READ ONLY` on PostgreSQL, so every transaction `ensure_tx` opens
-for the tab's life is a read-only one. SQL Server has no read-only transaction to hold, so there
-the `ReadOnly` open is **refused** rather than granted an unguarded session (under `mssql.rs`).
+CHARACTERISTICS AS TRANSACTION READ ONLY` on PostgreSQL. **That default is not what the session
+rests on**, since a lift inside one of the tab's transactions would reach the next: the session
+keeps a `read_only` flag from the open, and `ensure_tx` opens `Ctl::BeginReadOnly` — `BEGIN READ
+ONLY` on PostgreSQL, `START TRANSACTION READ ONLY` on MySQL/MariaDB (whose `BEGIN` takes no
+characteristics) — so every transaction for the tab's life is read-only in its own words, which
+nothing run inside it can undo (`a_read_only_pinned_session_cannot_be_lifted_across_a_commit`).
+SQL Server has no read-only transaction to hold, so there the `ReadOnly` open is **refused**
+rather than granted an unguarded session (under `mssql.rs`), and `Ctl::BeginReadOnly` is refused
+again in `control_on` rather than spelt as a plain `BEGIN TRANSACTION`.
 `Db::explain` takes a `read_only` flag, because `EXPLAIN
 ANALYZE` *executes* the statement inside a transaction it always rolls back, and the rollback is
 not the guarantee it looks like: it undoes an InnoDB write but not a MyISAM or Aria one, and on
@@ -1128,10 +1160,12 @@ flag the statement must first pass `sql::read_only_reason` — `DbError::Refused
 because that rollback cannot undo a procedure's effect outside the database, a sequence's
 advance or a remote write, which are what that gate refuses by name. The estimated plan
 (`SET SHOWPLAN_XML ON`) executes nothing and takes no guard (under `mssql.rs`). **What none of
-them guards is the person at the keyboard**: a `SET SESSION TRANSACTION READ WRITE` reaching the
-pinned session would lift it, as unticking the connection's read-only box would — though on a
-read-only connection that spelling is a `Block` first, `SET` being no read head to
-`contains_write`, which `Session::open_enforced`'s doc now says too. The pinned session's state is
+them guards is the person at the keyboard** unticking the connection's read-only box. A typed
+`SET SESSION TRANSACTION READ WRITE` reaching the pinned session would lift its default — though
+on a read-only connection that spelling is a `Block` first, `SET` being no read head to
+`contains_write` — and since `ensure_tx` opens every transaction `READ ONLY` in its own words, the
+default it lifted is no longer what the next transaction reads, which `Session::open_enforced`'s
+doc says too. The pinned session's state is
 decided when `open_session` opens it — so **making the connection read-only, or writable again,
 re-pins it**, from
 the status-bar toggle as from the form (`Connection::open_session_after`'s `AskFirst`, under
