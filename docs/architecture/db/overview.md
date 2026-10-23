@@ -1127,9 +1127,26 @@ function `pg.rs`'s SQL calls is written `pg_catalog.<name>(…)` — `format_typ
 functions, the aggregates, `now`, `left`, `string_to_array`, `pg_cancel_backend` and the rest —
 which closes the better-matching overload wherever the catalogue sits; and the reads that open
 their own client do it through `pg::connect_catalogue(db, database)` (to the database, or the
-maintenance database for `None`), which runs `put_catalog_first`, so the bare operators (`=` on
-`oid`, `LIKE`) and the catalogue relations, which no call site can qualify in passing, resolve to
-the builtins as well. Those are `fetch_databases`, `fetch_table_list`, `fetch_table_stats`,
+maintenance database for `None`), which runs `put_catalog_first`, so the bare operators whose
+exact signature `pg_catalog` has (`=` on `oid` and `name`, `||` on `text`) and the catalogue
+relations, which no call site can qualify in passing, resolve to the builtins as well. **The order
+does not close an operator `pg_catalog` has only for other types** (release review S1-L5-01 —
+this passage used to list `LIKE` among the closed ones). PostgreSQL first assumes an untyped
+literal has the other operand's type and takes an exact match if one is visible, and `pg_catalog`
+has `!~~` — `NOT LIKE` — only as `(name, text)`, so a `public.!~~(name, name)` beat the builtin in
+`user_schema_filter`'s `n.nspname NOT LIKE 'pg\_toast%'` wherever the path put `public`, and ran
+inside every introspection query that splices the filter (measured live on PostgreSQL 16). The
+filter now writes `{ns} OPERATOR(pg_catalog.!~~) '…'`. A census of `pg.rs` for an operator on
+`name` against an untyped literal found one more: `PG_LOCKS_SQL`'s `COALESCE(d.datname, '?') ||
+': relation '`, there being no `||(name, name)` in `pg_catalog` either — now
+`d.datname::pg_catalog.text`. That one could not be made to fail in a test, since the branch runs
+only for a lock held in another database, so it is pinned by an assertion on the text in
+`user_schema_filter_excludes_only_postgres_internals`. **A new bare operator in these reads is
+safe only where `pg_catalog` has its exact signature**; anywhere else, write it
+`OPERATOR(pg_catalog.…)` or give the literal's side a type. `cli/catalog.rs`'s PostgreSQL listing
+keeps a bare `NOT LIKE` on purpose: it runs through `read_only_query`, whose read gate refuses
+`OPERATOR(` and whose read-only session's shadow check refuses any operator on the path at all.
+Those are `fetch_databases`, `fetch_table_list`, `fetch_table_stats`,
 `fetch_sessions`, `fetch_locks`, `fetch_server_vars`, `kill_session`, `fetch_schema`,
 `fetch_replay_access`, `available_extensions`, `trigger_functions`, `roles`, `fetch_principals`
 and `fetch_grants`. **The path is not set to `''`**, which looks like the tighter fix: PostgreSQL

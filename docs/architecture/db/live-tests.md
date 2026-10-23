@@ -733,10 +733,13 @@ addition"), by its author's report. The four have no unenforced control beyond t
 variant and its fields are what tell it from a session that refuses everything.
 `introspection_calls_no_function_the_database_planted`, in `namespaces.rs`, is the catalogue
 reads' case (`pg::connect_catalogue`, under `schemaic-db`): it plants `public.obj_description(oid,
-text)`, `public.format_type(oid, integer)` and a `public.=` on `oid`, each recording in a table
-that it ran, has an unenforced read on a `public, pg_catalog` init-SQL path reach all three — the
-premise — then runs `fetch_schema` and `fetch_table_list` with and without that path and requires
-the record to be empty.
+text)`, `public.format_type(oid, integer)`, a `public.=` on `oid` and a `public.!~~` on `(name,
+name)`, each recording in a table that it ran, has an unenforced read on a `public, pg_catalog`
+init-SQL path reach all four — the premise — then runs `fetch_schema` and `fetch_table_list` with
+and without that path and requires the record to be empty. The `!~~` plant is release review
+S1-L5-01's: `pg_catalog` has the operator only as `(name, text)`, so the catalogue first does not
+outrank it, and the test was red (`["not_like"]`) against `user_schema_filter`'s bare `NOT LIKE`
+and green once it wrote `OPERATOR(pg_catalog.!~~)`, by the fix author's report.
 `a_read_only_session_calls_no_users_function_while_setting_itself_up`, PostgreSQL's alone too and
 registered beside it, asks the same of the setup itself, which runs while the hostile path is still
 in force: it plants a `public.set_config(text, text, boolean)` that turns

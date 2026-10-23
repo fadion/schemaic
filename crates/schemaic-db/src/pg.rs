@@ -619,8 +619,14 @@ async fn put_catalog_first(client: &Client) -> Result<(), tokio_postgres::Error>
 /// signature then wins. Every function the reads call is written
 /// `pg_catalog.`-qualified, which also closes the overload that matches more
 /// exactly than the builtin wherever the catalogue sits; this closes the rest
-/// — the bare operators (`=` on `oid`, `LIKE`), and the catalogue relations
-/// themselves — which have no spelling that qualifies them in passing.
+/// — the bare operators whose exact signature `pg_catalog` has (`=` on `oid`
+/// or `name`, `||` on `text`), and the catalogue relations themselves — which
+/// have no spelling that qualifies them in passing. **An operator `pg_catalog`
+/// lacks the exact signature of is not closed by the order**: `LIKE` on `name`
+/// is `(name, text)` there, so a planted `(name, name)` matches an untyped
+/// literal more exactly from anywhere on the path. Those are written
+/// `OPERATOR(pg_catalog.…)` or given a typed operand ([`user_schema_filter`],
+/// [`PG_LOCKS_SQL`]; release review S1-L5-01).
 ///
 /// **The user's path stays behind it, not replaced by `''`.** PostgreSQL
 /// qualifies in its output every name the path does not reach, so an empty
@@ -1638,12 +1644,19 @@ fn bytea_hex_len(text: &str) -> Option<usize> {
 ///
 /// `{ns}` is the alias of the `pg_namespace` (or `information_schema` column)
 /// holding the schema name, so the same rule can be spliced into either catalogue
-/// style of query and the five introspection queries can't drift apart.
+/// style of query and the introspection queries that splice it can't drift apart.
 fn user_schema_filter(ns: &str) -> String {
+    // `OPERATOR(pg_catalog.!~~)`, never a bare `NOT LIKE`: `pg_catalog` has
+    // the operator only as `(name, text)`, so against an untyped literal a
+    // `(name, name)` one planted anywhere on the path is the exact match and
+    // wins over the builtin whatever the path's order (release review
+    // S1-L5-01, measured on 16). `NOT IN` is `=` on `(name, name)`, which
+    // `pg_catalog` has, so the catalogue being first settles it.
     format!(
         "{ns} NOT IN ('pg_catalog', 'information_schema') \
-         AND {ns} NOT LIKE 'pg\\_toast%' AND {ns} NOT LIKE 'pg\\_temp%' \
-         AND {ns} NOT LIKE 'pg\\_toast\\_temp%'"
+         AND {ns} OPERATOR(pg_catalog.!~~) 'pg\\_toast%' \
+         AND {ns} OPERATOR(pg_catalog.!~~) 'pg\\_temp%' \
+         AND {ns} OPERATOR(pg_catalog.!~~) 'pg\\_toast\\_temp%'"
     )
 }
 
@@ -2231,13 +2244,17 @@ pub(crate) async fn fetch_server_vars(
 /// worker fails its *leader's* statement — a different session from the one a
 /// confirm would name. A lock whose pid has no `pg_stat_activity` row any more
 /// is not offered either.
+///
+/// **`d.datname` is cast to `text` before `||`**: `pg_catalog` has no
+/// `||(name, name)`, so a bare `name || '…'` would make one planted on the
+/// path the exact match — the shape of release review S1-L5-01's `NOT LIKE`.
 const PG_LOCKS_SQL: &str = "SELECT l.pid::text, \
      CASE \
        WHEN l.relation IS NOT NULL AND l.database = \
             (SELECT oid FROM pg_database WHERE datname = pg_catalog.current_database()) \
          THEN l.relation::regclass::text \
        WHEN l.relation IS NOT NULL \
-         THEN COALESCE(d.datname, '?') || ': relation ' || l.relation::text \
+         THEN COALESCE(d.datname::pg_catalog.text, '?') || ': relation ' || l.relation::text \
        WHEN l.locktype = 'transactionid' THEN 'transaction ' || l.transactionid::text \
        WHEN l.locktype = 'virtualxid' THEN 'virtual transaction ' || l.virtualxid \
        WHEN l.locktype = 'advisory' THEN 'advisory ' || l.classid::text || ':' || l.objid::text \
@@ -6461,6 +6478,10 @@ mod tests {
         assert!(!f.contains("topology"));
         // The alias is spliced everywhere, so the five queries can't diverge.
         assert_eq!(f.matches("n.nspname").count(), 4);
+        // Never a bare pattern operator on `name` (release review S1-L5-01).
+        assert!(!f.contains("LIKE"), "{f}");
+        assert_eq!(f.matches("OPERATOR(pg_catalog.!~~)").count(), 3);
+        assert!(PG_LOCKS_SQL.contains("d.datname::pg_catalog.text"));
     }
 
     // ── The statistics queries ────────────────────────────────────────────

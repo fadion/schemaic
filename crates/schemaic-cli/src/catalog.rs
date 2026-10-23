@@ -56,7 +56,10 @@ pub fn tables_sql(dialect: SqlDialect, database: Option<&str>) -> Option<String>
         // materialized views. Partitions are left out — their parent is the
         // table — and so are the system and per-session temporary schemas.
         // Without a database this would list the maintenance database's
-        // tables as though they were the connection's.
+        // tables as though they were the connection's. The bare `NOT LIKE` is
+        // on purpose, unlike `pg::user_schema_filter`'s `OPERATOR(…)`: this
+        // runs through `read_only_query`, whose gate refuses `OPERATOR(` and
+        // whose session refuses any operator a path schema defines at all.
         SqlDialect::Postgres => {
             database?;
             format!(

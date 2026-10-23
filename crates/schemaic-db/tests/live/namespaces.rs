@@ -1060,6 +1060,24 @@ pub async fn introspection_calls_no_function_the_database_planted(target: &'stat
     scratch
         .exec("CREATE OPERATOR public.= (LEFTARG = oid, RIGHTARG = oid, FUNCTION = public.oid_eq)")
         .await;
+    // **A pattern operator on `name` is shadowed from anywhere on the path**
+    // (release review S1-L5-01): `pg_catalog` has `!~~` only as `(name,
+    // text)`, so an untyped literal against `n.nspname` makes a planted
+    // `(name, name)` the exact match, ahead of the builtin whatever the order.
+    scratch
+        .exec(
+            "CREATE FUNCTION public.name_nlike(name, name) RETURNS boolean \
+             LANGUAGE plpgsql AS $$ BEGIN \
+             INSERT INTO public.calls VALUES ('not_like'); \
+             RETURN pg_catalog.namenlike($1, $2::pg_catalog.text); END $$",
+        )
+        .await;
+    scratch
+        .exec(
+            "CREATE OPERATOR public.!~~ (LEFTARG = name, RIGHTARG = name, \
+             FUNCTION = public.name_nlike)",
+        )
+        .await;
     let hostile = scratch
         .db
         .clone()
@@ -1077,7 +1095,8 @@ pub async fn introspection_calls_no_function_the_database_planted(target: &'stat
     hostile
         .fetch_query(
             Some(&scratch.database),
-            "SELECT obj_description(0, 'pg_class'), format_type(23, -1), 1::oid = 1::oid",
+            "SELECT obj_description(0, 'pg_class'), format_type(23, -1), 1::oid = 1::oid, \
+             'a'::name NOT LIKE 'b'",
             1,
             CancellationToken::new(),
         )
@@ -1085,7 +1104,7 @@ pub async fn introspection_calls_no_function_the_database_planted(target: &'stat
         .unwrap_or_else(|e| panic!("the premise: {e}"));
     assert_eq!(
         calls().await,
-        ["=", "format_type", "obj_description"],
+        ["=", "format_type", "not_like", "obj_description"],
         "the fixture does not shadow"
     );
     scratch.exec("DELETE FROM public.calls").await;
