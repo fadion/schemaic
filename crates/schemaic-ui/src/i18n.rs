@@ -1335,6 +1335,16 @@ pub fn connect_failure_text(f: &schemaic_core::model::ConnectFailure) -> String 
                 tr!("db-ssh-host-key-store-advice", store = store.as_str()),
             ]
             .join("\n"),
+            SshFailure::OpenSshHostKeyChanged { host_port, offered } => [
+                tr!(
+                    "db-ssh-openssh-key-changed",
+                    host = host_port.as_str(),
+                    key = offered.as_str()
+                ),
+                String::new(),
+                tr!("db-ssh-openssh-key-changed-advice"),
+            ]
+            .join("\n"),
             SshFailure::Route(r) => crate::connection_form::route_note_text(
                 &schemaic_core::ssh_config::RouteNote::Refused(r.clone()),
             ),
@@ -1712,6 +1722,10 @@ mod tests {
                 host_port: s("jump:22"),
                 offered: s("SHA256:new"),
                 store: s("known_hosts.json"),
+            },
+            SshFailure::OpenSshHostKeyChanged {
+                host_port: s("jump:22"),
+                offered: s("SHA256:new"),
             },
             SshFailure::Route(
                 schemaic_core::ssh_config::RouteRefusal::ConfigJumpPassword {

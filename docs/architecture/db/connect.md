@@ -1,12 +1,37 @@
 # Connecting — `db/ssh.rs`, PostgreSQL's maintenance database, init SQL
 
 SSH tunnels return a `TunnelHandle` (drop → port freed) with
-keepalives + TOFU host-key verification (`ssh_known_hosts.json`). **`russh` stays on 0.62
+keepalives + host-key verification that asks the user's own `~/.ssh/known_hosts` first and
+Schemaic's TOFU store (`ssh_known_hosts.json`) after it. **`russh` stays on 0.62
 deliberately**: 0.63 changes `Handler::check_server_key` to take a `&PublicKeyOrCertificate`
 rather than a `&ssh_key::PublicKey`, so `ssh.rs` would have to decide what a *certificate* offer
 means to a fingerprint store before it has anything to hash. That is a migration on the code that
 decides whether to trust a host, not a version bump, and it is not being done inside a dependency
 sweep.
+**`TunnelClient::check_server_key` asks OpenSSH's `known_hosts` before its own store** (security
+review S16), through russh's `keys::check_known_hosts(host, port, key)` — which is why
+`TunnelClient` carries `host` and `port` apart beside `host_port`: the file spells a non-default
+port `[host]:port` and may hash its host names, and russh matches both. Until then the tunnel kept
+a store of its own and never read the user's, so a host OpenSSH had already verified was trusted
+afresh on first sight here, with no fingerprint shown, and a key OpenSSH would have refused as
+changed was accepted. The pure `openssh_verdict` maps russh's answer: `Ok(true)` is `Known`,
+accepted without touching Schemaic's store; `Err(KeyChanged { line })` is `Changed`, refused as
+`SshFailure::OpenSshHostKeyChanged`, whose advice says to verify the fingerprint out of band
+before replacing the entry (`ssh-keygen -R`); anything else — not listed, no home
+directory, a file that cannot be opened or holds a key russh cannot parse — is `None`, and
+Schemaic's first-use trust decides exactly as before
+(`openssh_known_hosts_decides_before_schemaic_trusts_on_first_use`). What it costs is partly
+ours and partly russh's. **`Known` short-circuits Schemaic's store**, so a fingerprint recorded
+there is not consulted for a host OpenSSH vouches for. russh reports a changed key only when the recorded
+key has **the offered key's algorithm**: a host `known_hosts` lists only under another key type
+reads as not listed and falls through to trust on first use rather than being refused. Its reader
+also takes an `@revoked` or `@cert-authority` line's marker for the host pattern, so such a line
+matches nothing and a revoked key is not refused by it; and its line count skips `#` lines, which
+is why the refusal names no line — the number would run behind the file's own by the comments
+above the entry, and `ssh-keygen -R` needs none.
+**Not done**: a host neither store knows is still trusted on first sight with no fingerprint shown
+and no question asked. Asking needs a prompt from the DB layer to the UI, which the tunnel has no
+way to raise today.
 **Every failure `ssh.rs` composes is a `core::model::SshFailure`** inside
 `DbError::ConnectFailed`, built by the private `ssh_failed` — sign-in, key, agent, jump host,
 connect, bind, the route, the named instance and the host-key refusals — so the window words the
@@ -15,7 +40,7 @@ listener's `local_addr` failure, the system's text alone. `tunnel_target_refusal
 host-key `refusal_message` answer `Option<SshFailure>`, and `TunnelClient::refusal` holds one,
 so the verdict `open_tunnel` reports over russh's `UnknownKey` is that value rather than its
 paragraphs. Their tests compare the value or its `Display`, which is the old English. In the
-catalogue the two refusals are a message per paragraph, joined with line breaks by
+catalogue the three refusals are a message per paragraph, joined with line breaks by
 `i18n::connect_failure_text` since a message holds none; the changed key's out-of-band check
 and the file that re-trusts stay **one** message, `db-ssh-host-key-changed-advice`, so the order
 `a_mismatch_says_the_key_changed_and_carries_both_fingerprints` pins in English — verify first,

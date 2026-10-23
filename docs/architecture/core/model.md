@@ -195,7 +195,9 @@ of `ssh.rs`'s and `tls.rs`'s failures (under `schemaic-db`), and `SignIn(SignInF
 cloud IAM or Entra sign-in that got no token (`cloud_iam.rs`, `entra.rs`, both halves).
 `SshFailure::NoAnswer` carries an `SshPhase` — `Connect` or `Authentication` — where
 `ssh::within` used to splice the word into its string, the two host-key refusals carry the host, the fingerprints and the store's file
-name rather than the paragraphs, and `Route` holds the `ssh_config::RouteRefusal` itself.
+name rather than the paragraphs — and `OpenSshHostKeyChanged`, the refusal on the user's own
+`~/.ssh/known_hosts`, the host and the offered fingerprint, and no line (russh's count skips
+comments) — and `Route` holds the `ssh_config::RouteRefusal` itself.
 `SignInFailure` names its CLI as a `TokenCli` — `Aws`, `Gcloud`, `Azure` — whose `name()` is
 the product as a sentence says it ("AWS CLI (aws)"), passed through in every language, and a
 host or user `launch::cli_flag_value` refuses as `BadValue { field, problem }` (`SignInField`,

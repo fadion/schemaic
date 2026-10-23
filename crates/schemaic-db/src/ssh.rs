@@ -24,10 +24,12 @@
 //! The SSH transport is configured with keepalives so a dead peer is detected
 //! rather than silently reused.
 //!
-//! Security: the server host key is verified trust-on-first-use against a
-//! Schemaic-managed store (`ssh_known_hosts.json`, `host:port` → SHA256
-//! fingerprint). The first connection records the key; a later *mismatch* is
-//! refused — that's the MITM signal (review H10).
+//! Security: the server host key is checked against the user's own
+//! `~/.ssh/known_hosts` first — a listed key is accepted, a changed one refused
+//! — and otherwise verified trust-on-first-use against a Schemaic-managed store
+//! (`ssh_known_hosts.json`, `host:port` → SHA256 fingerprint). The first
+//! connection records the key; a later *mismatch* is refused — that's the MITM
+//! signal (review H10).
 //!
 //! Authentication supports password, private-key file (optionally passphrase-
 //! protected), and delegation to the running SSH agent (see [`authenticate`]).
@@ -107,6 +109,10 @@ impl Drop for TunnelHandle {
 struct TunnelClient {
     /// `"host:port"` of the SSH server, for the known-hosts lookup.
     host_port: String,
+    /// The same server apart, for OpenSSH's `known_hosts`, which spells a
+    /// non-default port `[host]:port`.
+    host: String,
+    port: u16,
     /// Filled by [`TunnelClient::check_server_key`] when it refuses a key.
     ///
     /// russh has **one** error for a rejected host key — `UnknownKey`, whose text
@@ -167,6 +173,29 @@ fn known_host_decision(
     }
 }
 
+/// What the user's own `~/.ssh/known_hosts` says about a host's key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OpenSshVerdict {
+    /// Listed, with this key: accepted without asking Schemaic's store.
+    Known,
+    /// Listed with a different key of the same type, on `line`: refused.
+    Changed { line: usize },
+}
+
+/// [`OpenSshVerdict`] from russh's reading of `known_hosts`, or `None` when it
+/// has nothing to say — the host is not listed, or the file cannot be read —
+/// and Schemaic's own first-use trust decides. Pure, so the composition has a
+/// test the filesystem does not have to take part in.
+fn openssh_verdict(answer: &Result<bool, russh::keys::Error>) -> Option<OpenSshVerdict> {
+    match answer {
+        Ok(true) => Some(OpenSshVerdict::Known),
+        Err(russh::keys::Error::KeyChanged { line }) => {
+            Some(OpenSshVerdict::Changed { line: *line })
+        }
+        Ok(false) | Err(_) => None,
+    }
+}
+
 /// What to tell the user about a refusal, or `None` when the key was accepted.
 ///
 /// This is the security control's actual output. The refusal itself has always
@@ -204,11 +233,31 @@ fn refusal_message(
 impl Handler for TunnelClient {
     type Error = russh::Error;
 
-    // Trust-on-first-use host-key verification (review H10): accept and record an
-    // unknown host's key; accept a known host only if the key still matches;
-    // refuse a changed key (the MITM signal). Fingerprints are SHA256.
+    // OpenSSH's `known_hosts` first (security review S16), then trust-on-first-use
+    // host-key verification (review H10): accept and record an unknown host's
+    // key; accept a known host only if the key still matches; refuse a changed
+    // key (the MITM signal). Fingerprints are SHA256.
     async fn check_server_key(&mut self, key: &ssh_key::PublicKey) -> Result<bool, Self::Error> {
         let fingerprint = key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
+        // **The user's own `known_hosts` first**: a host OpenSSH has verified
+        // is verified, and one whose key it records differently is refused,
+        // rather than either being trusted afresh on first sight here.
+        match openssh_verdict(&russh::keys::check_known_hosts(&self.host, self.port, key)) {
+            Some(OpenSshVerdict::Known) => return Ok(true),
+            Some(OpenSshVerdict::Changed { line }) => {
+                tracing::error!(
+                    "SSH host-key refusal for {}: ~/.ssh/known_hosts line {line} differs",
+                    self.host_port
+                );
+                *self.refusal.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(crate::SshFailure::OpenSshHostKeyChanged {
+                        host_port: self.host_port.clone(),
+                        offered: fingerprint,
+                    });
+                return Ok(false);
+            }
+            None => {}
+        }
         // Held across load → decide → insert → save, so a concurrent tunnel
         // can't read the same map and write back a version missing this host.
         // A poisoned lock means another thread panicked mid-update, which is
@@ -436,6 +485,8 @@ pub async fn open_tunnel(
         let refusal: Arc<Mutex<Option<crate::SshFailure>>> = Arc::new(Mutex::new(None));
         let handler = TunnelClient {
             host_port: host_port.clone(),
+            host: hop.host.clone(),
+            port: hop.port,
             refusal: refusal.clone(),
         };
         let via = sessions.last();
@@ -552,6 +603,7 @@ pub async fn open_tunnel(
 #[cfg(test)]
 mod tests {
     use super::{HostKeyVerdict, known_host_decision, refusal_message};
+    use super::{OpenSshVerdict, openssh_verdict};
     use super::{TUNNEL_AUTH_TIMEOUT, TUNNEL_CONNECT_TIMEOUT, ssh_failed, within};
     use crate::DbError;
     use std::collections::HashMap;
@@ -742,6 +794,28 @@ mod tests {
         .to_string();
         assert!(!msg.contains("CHANGED"), "{msg}");
         assert!(msg.contains(super::KNOWN_HOSTS_FILE), "{msg}");
+    }
+
+    /// **The user's own `~/.ssh/known_hosts` is asked first** (security review
+    /// S16). The tunnel kept a trust store of its own and never read it, so a
+    /// host OpenSSH had verified was trusted afresh on first sight here — with
+    /// no fingerprint shown — and a key OpenSSH would have refused as changed
+    /// was accepted. A host it does not list falls through to Schemaic's own
+    /// first-use trust, as does a file that cannot be read.
+    #[test]
+    fn openssh_known_hosts_decides_before_schemaic_trusts_on_first_use() {
+        use russh::keys::Error;
+        assert_eq!(openssh_verdict(&Ok(true)), Some(OpenSshVerdict::Known));
+        assert_eq!(
+            openssh_verdict(&Err(Error::KeyChanged { line: 4 })),
+            Some(OpenSshVerdict::Changed { line: 4 })
+        );
+        assert_eq!(openssh_verdict(&Ok(false)), None, "not listed");
+        assert_eq!(
+            openssh_verdict(&Err(Error::NoHomeDir)),
+            None,
+            "nothing to read"
+        );
     }
 
     #[test]

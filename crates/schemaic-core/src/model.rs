@@ -2000,6 +2000,10 @@ pub enum SshFailure {
         offered: String,
         store: String,
     },
+    /// The host's key is not the one the user's own `~/.ssh/known_hosts`
+    /// records for it. No line number: russh's count skips comment lines, so
+    /// it would send the user to the wrong one.
+    OpenSshHostKeyChanged { host_port: String, offered: String },
     /// The record of trusted host keys could not be read.
     HostKeyStoreUnreadable {
         host_port: String,
@@ -2133,6 +2137,14 @@ impl SshFailure {
                  remove this host's entry from {store} in Schemaic's config directory to record \
                  the new key.",
                 known.as_deref().unwrap_or("(no recorded key)")
+            ),
+            SshFailure::OpenSshHostKeyChanged { host_port, offered } => format!(
+                "The SSH host key {host_port} offered ({offered}) is not the one your \
+                 ~/.ssh/known_hosts records for it.\n\nThis can mean the server was rebuilt or \
+                 its key rotated — or that something is intercepting the connection. Nothing was \
+                 sent to it. Verify the new fingerprint out of band (on the server's own console, \
+                 or with whoever administers it) before trusting it. Once you have, remove the \
+                 old entry with ssh-keygen -R and connect with ssh once to record the new one."
             ),
             SshFailure::HostKeyStoreUnreadable {
                 host_port,
