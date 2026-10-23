@@ -42,6 +42,12 @@ pub enum Exit {
     /// or a connection the user has not exposed to the CLI. Nothing was sent to
     /// a server — the guard runs before the keyring is read or a tunnel opened
     /// — and retrying unchanged will refuse again.
+    ///
+    /// **One refusal comes after connecting, before the statement is sent**: a
+    /// read-only PostgreSQL session refused because a schema on its path
+    /// shadows a builtin (`NoRows::SessionRefused`). It logged in to find that
+    /// out, but your statement never ran, and retrying unchanged refuses again
+    /// — which is what a caller branches on 3 for, and why it is not 4.
     Refused = 3,
     /// The server or the connection failed. Retrying may work.
     Failed = 4,
@@ -80,7 +86,10 @@ fn exit_for_no_connection(e: &select::NoConnection) -> Exit {
 fn exit_for_no_rows(e: &query::NoRows) -> Exit {
     use query::NoRows;
     match e {
-        NoRows::Empty | NoRows::NotARead(_) | NoRows::NotPermitted(_) => Exit::Refused,
+        NoRows::Empty
+        | NoRows::NotARead(_)
+        | NoRows::NotPermitted(_)
+        | NoRows::SessionRefused(_) => Exit::Refused,
         NoRows::Failed(_) | NoRows::TimedOut(_) => Exit::Failed,
         NoRows::Indeterminate(_) => Exit::Unknown,
     }
@@ -2205,6 +2214,12 @@ mod tests {
         );
         assert_eq!(
             exit_for_no_rows(&NoRows::NotPermitted("x".into())),
+            Exit::Refused
+        );
+        // Refused after connecting, but before the statement was sent, and
+        // refused again on a retry: a guard's 3, not a server's 4.
+        assert_eq!(
+            exit_for_no_rows(&NoRows::SessionRefused("x".into())),
             Exit::Refused
         );
         assert_eq!(exit_for_no_rows(&NoRows::Failed("x".into())), Exit::Failed);

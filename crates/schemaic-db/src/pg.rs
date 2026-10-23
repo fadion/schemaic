@@ -69,7 +69,7 @@ use tokio_postgres::types::Type;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Db, DbError, FkColRow, TxScope, assemble_schema};
+use crate::{Db, DbError, DbRefusal, FkColRow, TxScope, assemble_schema};
 
 /// This module's dialect, once. Every boundary scan here is PostgreSQL's — the
 /// engine the file exists for — and spelling it out at each call site is what
@@ -476,11 +476,104 @@ pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
 /// path is read with `SHOW` — a command, not a function — the new one is built
 /// here ([`catalog_first_sql`]), and the one call made is schema-qualified
 /// with a literal argument.
-pub(crate) async fn set_up_read_only(client: &Client) -> Result<(), tokio_postgres::Error> {
+///
+/// **Then it refuses a path where a builtin's name is shadowed** (pentest
+/// round 3, V3-1) — [`shadowed_builtin_sql`]. `pg_catalog` first is not
+/// enough on its own: PostgreSQL picks the overload whose argument types
+/// match best across the *whole* path, so a `public.lower(varchar)` answers
+/// `lower(a_varchar)` wherever the catalogue sits, and the gate's yes to
+/// `lower` was about a function the database's owner wrote. Asked here, the
+/// one function every `Enforce::ReadOnly` PostgreSQL connection passes
+/// through, so it covers the reads, the batch, the plan, a pinned session and
+/// the MCP server's `sample_rows`, which has no text gate in front.
+pub(crate) async fn set_up_read_only(client: &Client) -> Result<(), DbError> {
     client
         .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
-        .await?;
-    put_catalog_first(client).await
+        .await
+        .map_err(|e| read_only_setup_failed(&e))?;
+    put_catalog_first(client)
+        .await
+        .map_err(|e| read_only_setup_failed(&e))?;
+    let rows = query_all(
+        client,
+        &shadowed_builtin_sql(schemaic_core::sql::pg_read_functions()),
+    )
+    .await
+    .map_err(|e| match e {
+        // `query_all`'s `Query` is the server's words about Schemaic's own
+        // statement, so it is told as the set-up failing, not the user's SQL.
+        DbError::Query(m) => DbError::ConnectFailed(crate::ConnectFailure::ReadOnlySetup(m)),
+        other => other,
+    })?;
+    match shadow_of(&rows) {
+        Some(refusal) => Err(DbError::Refused(refusal)),
+        None => Ok(()),
+    }
+}
+
+/// The query behind [`set_up_read_only`]'s refusal: the first object in a
+/// schema on the session's path, other than `pg_catalog`, that PostgreSQL
+/// could pick in a builtin's place — a function named like one of
+/// `functions` (the read-only gate's allowlist), or **any** operator — and
+/// that no extension owns (a `pg_depend` row with `deptype = 'e'`). Columns:
+/// schema, name, and whether it is an operator.
+///
+/// **Any operator, not only one named like a builtin**: the text gate never
+/// reads operators, so it has no list to compare them with, and every
+/// operator spelling is some builtin's. **An extension's are not refused**:
+/// `citext` puts `lower(citext)` and its operators in `public`, and refusing
+/// those would refuse read-only work on most databases that have it for
+/// something their owner did not write.
+///
+/// **It resolves nothing through the path it is checking.** Every function,
+/// operator, relation and type in it is `pg_catalog`-qualified (an operator as
+/// `OPERATOR(pg_catalog.=)`), and `functions` arrive as literals. It runs after
+/// `pg_catalog` is put first anyway, but the qualification is what makes that
+/// order irrelevant to the answer.
+///
+/// `current_schemas(true)` is the path as resolved — schemas that do not exist
+/// and a `"$user"` with no schema dropped — with `pg_catalog` and the session's
+/// temporary schema included. The temporary schema is never searched for
+/// functions or operators, and a session that has just begun has nothing in
+/// it, so leaving it in costs nothing.
+fn shadowed_builtin_sql(functions: &[&str]) -> String {
+    let names = functions
+        .iter()
+        .map(|f| schemaic_core::export::sql_literal(&Value::Str((*f).to_string()), PG))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT n.nspname::pg_catalog.text, x.name::pg_catalog.text, x.operator \
+         FROM ( \
+           SELECT p.pronamespace AS ns, p.proname AS name, false AS operator, \
+                  p.oid AS oid, 'pg_catalog.pg_proc'::pg_catalog.regclass AS cls \
+             FROM pg_catalog.pg_proc p \
+            WHERE p.proname OPERATOR(pg_catalog.=) ANY (ARRAY[{names}]::pg_catalog.name[]) \
+           UNION ALL \
+           SELECT o.oprnamespace, o.oprname, true, \
+                  o.oid, 'pg_catalog.pg_operator'::pg_catalog.regclass \
+             FROM pg_catalog.pg_operator o \
+         ) x \
+         JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) x.ns \
+         WHERE n.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' \
+           AND n.nspname OPERATOR(pg_catalog.=) ANY (pg_catalog.current_schemas(true)) \
+           AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                            WHERE d.classid OPERATOR(pg_catalog.=) x.cls \
+                              AND d.objid OPERATOR(pg_catalog.=) x.oid \
+                              AND d.deptype OPERATOR(pg_catalog.=) 'e') \
+         ORDER BY x.operator, 1, 2 LIMIT 1"
+    )
+}
+
+/// [`shadowed_builtin_sql`]'s answer as the refusal to make, or `None` for a
+/// path with nothing on it. The booleans arrive as `t`/`f`.
+fn shadow_of(rows: &[Vec<Option<String>>]) -> Option<DbRefusal> {
+    let r = rows.first()?;
+    Some(DbRefusal::ShadowedBuiltin {
+        schema: cell(r, 0),
+        name: cell(r, 1),
+        operator: cell(r, 2) == "t",
+    })
 }
 
 /// Put `pg_catalog` ahead of whatever search path the session has, resolving
@@ -575,9 +668,7 @@ pub(crate) async fn fetch_query(
     // undo it for itself: `transaction_read_only` is refused once the
     // transaction has taken its snapshot, which a `SELECT` has.
     if enforce == Some(crate::Enforce::ReadOnly) {
-        set_up_read_only(&client)
-            .await
-            .map_err(|e| read_only_setup_failed(&e))?;
+        set_up_read_only(&client).await?;
     }
     // A connection of its own, opened three lines up: no transaction to fence.
     run_statement(
@@ -612,10 +703,7 @@ pub(crate) async fn run_batch(
     // statement's implicit transaction — and any `BEGIN` the batch itself
     // issues — is then a read-only one.
     let client = match client {
-        Ok(c) if enforce == Some(crate::Enforce::ReadOnly) => set_up_read_only(&c)
-            .await
-            .map(|_| c)
-            .map_err(|e| db_err(&e)),
+        Ok(c) if enforce == Some(crate::Enforce::ReadOnly) => set_up_read_only(&c).await.map(|_| c),
         other => other,
     };
     let client = match client {
@@ -875,9 +963,7 @@ pub(crate) async fn explain(
     // A read-only measurement reads `pg_catalog` first, as every read-only
     // session does (`set_up_read_only`).
     if read_only {
-        set_up_read_only(&client)
-            .await
-            .map_err(|e| read_only_setup_failed(&e))?;
+        set_up_read_only(&client).await?;
     }
     client
         .batch_execute(if read_only {
@@ -4969,6 +5055,98 @@ mod tests {
             catalog_first_sql("a', false); DROP TABLE t; --"),
             "SELECT pg_catalog.set_config('search_path', \
              'pg_catalog, a'', false); DROP TABLE t; --', false)"
+        );
+    }
+
+    /// The names reach the shadow check as literals, a quote kept inside its
+    /// own — never spliced in as SQL.
+    #[test]
+    fn the_shadow_check_takes_its_names_as_literals() {
+        let q = shadowed_builtin_sql(&["lower", "it's"]);
+        assert!(
+            q.contains("ANY (ARRAY['lower', 'it''s']::pg_catalog.name[])"),
+            "{q}"
+        );
+    }
+
+    /// **Nothing in the check resolves through the path it is checking**: no
+    /// function, operator, relation or type is named bare. Every `(` follows a
+    /// qualified name or SQL syntax, every comparison is an
+    /// `OPERATOR(pg_catalog.…)`, and every catalogue relation is qualified.
+    #[test]
+    fn the_shadow_check_names_nothing_bare() {
+        let q = shadowed_builtin_sql(&["lower"]);
+        for bare in [
+            " = ",
+            " <> ",
+            "(current_schemas(",
+            " pg_proc ",
+            " pg_operator ",
+            " pg_namespace ",
+            " pg_depend ",
+            "::text",
+            "::name",
+            "::regclass",
+        ] {
+            assert!(!q.contains(bare), "{bare:?} unqualified in {q}");
+        }
+        for qualified in [
+            "pg_catalog.current_schemas(true)",
+            "FROM pg_catalog.pg_proc p",
+            "FROM pg_catalog.pg_operator o",
+            "JOIN pg_catalog.pg_namespace n",
+            "FROM pg_catalog.pg_depend d",
+            "OPERATOR(pg_catalog.=)",
+            "OPERATOR(pg_catalog.<>) 'pg_catalog'",
+        ] {
+            assert!(q.contains(qualified), "{qualified:?} missing from {q}");
+        }
+    }
+
+    /// What it refuses: a function of an allowlisted name or any operator, in
+    /// a schema on the resolved path other than the catalogue, that no
+    /// extension owns.
+    #[test]
+    fn the_shadow_check_spares_the_catalogue_and_extensions_only() {
+        let q = shadowed_builtin_sql(&["lower"]);
+        assert!(
+            q.contains("FROM pg_catalog.pg_operator o )"),
+            "every operator: {q}"
+        );
+        assert!(
+            q.contains("ANY (pg_catalog.current_schemas(true))"),
+            "the path as resolved: {q}"
+        );
+        assert!(
+            q.contains("d.deptype OPERATOR(pg_catalog.=) 'e'") && q.contains("NOT EXISTS"),
+            "an extension's member is spared: {q}"
+        );
+        assert!(q.ends_with("LIMIT 1"), "one is enough to refuse: {q}");
+    }
+
+    #[test]
+    fn a_path_with_nothing_on_it_is_no_refusal() {
+        assert_eq!(shadow_of(&[]), None);
+    }
+
+    #[test]
+    fn the_first_shadow_is_the_refusal() {
+        let row = |s: &str, n: &str, o: &str| vec![Some(s.into()), Some(n.into()), Some(o.into())];
+        assert_eq!(
+            shadow_of(&[row("public", "lower", "f")]),
+            Some(DbRefusal::ShadowedBuiltin {
+                schema: "public".into(),
+                name: "lower".into(),
+                operator: false,
+            })
+        );
+        assert_eq!(
+            shadow_of(&[row("app", "===", "t"), row("public", "lower", "f")]),
+            Some(DbRefusal::ShadowedBuiltin {
+                schema: "app".into(),
+                name: "===".into(),
+                operator: true,
+            })
         );
     }
 

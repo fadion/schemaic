@@ -1195,6 +1195,22 @@ pub fn db_refusal_text(r: &schemaic_core::model::DbRefusal) -> String {
         DbRefusal::CloudIamEngine => tr!("db-refused-cloud-iam-engine"),
         DbRefusal::ReadOnly(reason) => read_only_reason_text(reason),
         DbRefusal::MsSqlCancelNeedsKill => tr!("db-refused-mssql-cancel-needs-kill"),
+        DbRefusal::ShadowedBuiltin {
+            schema,
+            name,
+            operator,
+        } => match operator {
+            false => tr!(
+                "db-refused-shadowed-function",
+                schema = schema.as_str(),
+                name = name.as_str()
+            ),
+            true => tr!(
+                "db-refused-shadowed-operator",
+                schema = schema.as_str(),
+                name = name.as_str()
+            ),
+        },
         DbRefusal::BlankValue {
             row,
             column,
@@ -1829,6 +1845,16 @@ mod tests {
             DbRefusal::CloudIamEngine,
             DbRefusal::ReadOnly(ReadOnlyReason::Several),
             DbRefusal::MsSqlCancelNeedsKill,
+            DbRefusal::ShadowedBuiltin {
+                schema: s("public"),
+                name: s("lower"),
+                operator: false,
+            },
+            DbRefusal::ShadowedBuiltin {
+                schema: s("public"),
+                name: s("="),
+                operator: true,
+            },
             DbRefusal::SqliteNoFile,
             DbRefusal::SqliteMemory,
             DbRefusal::SqliteUri(s("file:x?mode=memory")),

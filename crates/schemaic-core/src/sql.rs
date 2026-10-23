@@ -5197,6 +5197,15 @@ const PG_READ_FUNCTIONS: &[&str] = &[
     "pg_logical_slot_peek_binary_changes",
 ];
 
+/// The names [`PG_READ_FUNCTIONS`] lets a read-only PostgreSQL query call —
+/// for the database layer's check that no schema on a read-only session's
+/// path holds a function of one of these names that PostgreSQL could pick in
+/// the builtin's place (`pg::set_up_read_only`). The gate answers about a
+/// *name*; that check is what makes the name mean the builtin.
+pub fn pg_read_functions() -> &'static [&'static str] {
+    PG_READ_FUNCTIONS
+}
+
 /// Unquoted words PostgreSQL's grammar puts before a `(` that is not a call's.
 ///
 /// **Only words that cannot name a function**: PostgreSQL's *reserved* and

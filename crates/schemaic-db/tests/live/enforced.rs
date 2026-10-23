@@ -12,7 +12,7 @@
 //!
 //! [`Db::fetch_query_enforced`]: schemaic_db::Db::fetch_query_enforced
 
-use schemaic_db::Enforce;
+use schemaic_db::{DbError, DbRefusal, Enforce};
 use tokio_util::sync::CancellationToken;
 
 use crate::endpoint::Target;
@@ -452,7 +452,10 @@ pub async fn a_read_only_pinned_session_cannot_be_lifted_across_a_commit(target:
 /// schema of the user's. Init SQL may set `search_path`, and so may a role's
 /// server-side default, so `SET search_path TO public, pg_catalog` let a
 /// `public.version()` stand in for the builtin. The unenforced read shows the
-/// shadow is real; the read-only one reads the builtin. PostgreSQL only.
+/// shadow is real; the read-only one never reaches it — refused now before the
+/// statement runs, since `version` is a name the read-only gate allows
+/// ([`a_read_only_session_refuses_a_path_that_shadows_a_builtin`]).
+/// PostgreSQL only.
 pub async fn a_read_only_session_reads_the_catalog_before_a_users_functions(
     target: &'static Target,
 ) {
@@ -470,40 +473,39 @@ pub async fn a_read_only_session_reads_the_catalog_before_a_users_functions(
         .db
         .clone()
         .with_init_sql("SET search_path TO public, pg_catalog");
-    let read = |enforce: Option<Enforce>| {
-        let (db, database) = (db.clone(), scratch.database.clone());
-        async move {
-            let rs = match enforce {
-                Some(e) => {
-                    db.fetch_query_enforced(
-                        Some(&database),
-                        "SELECT version()",
-                        1,
-                        CancellationToken::new(),
-                        e,
-                    )
-                    .await
-                }
-                None => {
-                    db.fetch_query(
-                        Some(&database),
-                        "SELECT version()",
-                        1,
-                        CancellationToken::new(),
-                    )
-                    .await
-                }
-            }
-            .unwrap_or_else(|e| panic!("SELECT version(): {e}"));
-            rs.cell(0, 0).expect("a value").display().to_string()
-        }
-    };
-    assert_eq!(read(None).await, "shadowed", "the fixture does not shadow");
-    let enforced = read(Some(Enforce::ReadOnly)).await;
-    assert!(
-        enforced.starts_with("PostgreSQL"),
-        "a read-only session called the user's function: {enforced}"
+    let shadowed = db
+        .fetch_query(
+            Some(&scratch.database),
+            "SELECT version()",
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("SELECT version(): {e}"));
+    assert_eq!(
+        shadowed.cell(0, 0).expect("a value").display().to_string(),
+        "shadowed",
+        "the fixture does not shadow"
     );
+    let enforced = db
+        .fetch_query_enforced(
+            Some(&scratch.database),
+            "SELECT version()",
+            1,
+            CancellationToken::new(),
+            Enforce::ReadOnly,
+        )
+        .await;
+    match enforced {
+        Err(DbError::Refused(DbRefusal::ShadowedBuiltin { schema, name, .. })) => {
+            assert_eq!((schema.as_str(), name.as_str()), ("public", "version"));
+        }
+        Ok(rs) => panic!(
+            "a read-only session ran on a shadowing path: {}",
+            rs.cell(0, 0).expect("a value").display()
+        ),
+        Err(e) => panic!("refused, but not for the shadow: {e}"),
+    }
     scratch.teardown().await;
 }
 
@@ -559,5 +561,179 @@ pub async fn a_read_only_session_calls_no_users_function_while_setting_itself_up
         .map_err(|e| e.to_string());
     assert!(got.is_err(), "a read-only session wrote");
     assert_eq!(rows_left(&scratch, &t).await, "3");
+    scratch.teardown().await;
+}
+
+/// What each way into a read-only PostgreSQL session answers for one
+/// database: a plain read, a batch, a plan and a pinned session, each opened
+/// enforced. `Ok(())` where it ran, and the error where it did not.
+async fn read_only_entries(scratch: &Scratch) -> Vec<(&'static str, Result<(), DbError>)> {
+    use schemaic_db::Session;
+    let database = Some(scratch.database.as_str());
+    let mut out = Vec::new();
+    let read = scratch
+        .db
+        .fetch_query_enforced(
+            database,
+            "SELECT 1",
+            1,
+            CancellationToken::new(),
+            Enforce::ReadOnly,
+        )
+        .await
+        .map(|_| ());
+    out.push(("read", read));
+    let mut batch = Vec::new();
+    scratch
+        .db
+        .run_batch_enforced(
+            database,
+            &["SELECT 1".to_string()],
+            1,
+            CancellationToken::new(),
+            |_, r| batch.push(r.map(|_| ())),
+            Some(Enforce::ReadOnly),
+        )
+        .await;
+    out.push(("batch", batch.remove(0)));
+    let plan = scratch
+        .db
+        .explain(database, "SELECT 1", false, true, CancellationToken::new())
+        .await
+        .map(|_| ());
+    out.push(("plan", plan));
+    let pinned = match Session::open_enforced(&scratch.db, database, Some(Enforce::ReadOnly)).await
+    {
+        Ok(s) => {
+            s.close().await;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    };
+    out.push(("pinned", pinned));
+    out
+}
+
+/// **A read-only PostgreSQL session refuses to run on a path where a
+/// builtin's name is shadowed** (pentest round 3, V3-1). The read-only gate
+/// allowlists functions by name, and PostgreSQL picks the overload that
+/// matches the call's argument types best across the whole path — so a
+/// `public.lower(varchar)` answers `lower(a_varchar)` though `pg_catalog`
+/// comes first, and the gate's yes was about a function the database's owner
+/// wrote. Every entry refuses, before the statement is sent, naming it.
+/// PostgreSQL only.
+pub async fn a_read_only_session_refuses_a_path_that_shadows_a_builtin(target: &'static Target) {
+    if target.engine != schemaic_db::Engine::Postgres {
+        return;
+    }
+    let scratch = Scratch::create(target, "enforce_shadowed_function").await;
+    scratch
+        .exec(
+            "CREATE FUNCTION public.lower(varchar) RETURNS text LANGUAGE sql \
+             AS $$ SELECT 'shadowed'::text $$",
+        )
+        .await;
+    // The premise: the plant wins even with the catalogue first on the path.
+    let premise = scratch
+        .db
+        .clone()
+        .with_init_sql("SET search_path TO pg_catalog, public")
+        .fetch_query(
+            Some(&scratch.database),
+            "SELECT lower('A'::varchar)",
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the premise: {e}"));
+    assert_eq!(
+        premise.cell(0, 0).expect("a value").display().to_string(),
+        "shadowed",
+        "the fixture does not shadow"
+    );
+    for (entry, got) in read_only_entries(&scratch).await {
+        match got {
+            Err(DbError::Refused(DbRefusal::ShadowedBuiltin {
+                schema,
+                name,
+                operator,
+            })) => assert_eq!(
+                (schema.as_str(), name.as_str(), operator),
+                ("public", "lower", false),
+                "{entry}"
+            ),
+            Ok(()) => panic!("{entry}: a read-only session ran on a shadowing path"),
+            Err(e) => panic!("{entry}: refused, but not for the shadow: {e}"),
+        }
+    }
+    scratch.teardown().await;
+}
+
+/// [`a_read_only_session_refuses_a_path_that_shadows_a_builtin`] for an
+/// operator: **any** operator outside `pg_catalog` that no extension owns,
+/// whatever its name, since the text gate does not read operators at all and
+/// an exact-signature one on a path that puts its schema first replaces the
+/// builtin outright. PostgreSQL only.
+pub async fn a_read_only_session_refuses_a_path_with_a_users_operator(target: &'static Target) {
+    if target.engine != schemaic_db::Engine::Postgres {
+        return;
+    }
+    let scratch = Scratch::create(target, "enforce_shadowed_operator").await;
+    scratch
+        .exec(
+            "CREATE FUNCTION public.always(integer, integer) RETURNS boolean \
+             LANGUAGE sql AS $$ SELECT true $$",
+        )
+        .await;
+    scratch
+        .exec(
+            "CREATE OPERATOR public.=== \
+             (LEFTARG = integer, RIGHTARG = integer, FUNCTION = public.always)",
+        )
+        .await;
+    for (entry, got) in read_only_entries(&scratch).await {
+        match got {
+            Err(DbError::Refused(DbRefusal::ShadowedBuiltin {
+                schema,
+                name,
+                operator,
+            })) => assert_eq!(
+                (schema.as_str(), name.as_str(), operator),
+                ("public", "===", true),
+                "{entry}"
+            ),
+            Ok(()) => panic!("{entry}: a read-only session ran beside a user's operator"),
+            Err(e) => panic!("{entry}: refused, but not for the operator: {e}"),
+        }
+    }
+    scratch.teardown().await;
+}
+
+/// **An extension's functions and operators are no shadow.** `citext`
+/// installs `lower(citext)` — an allowlisted name — and a dozen operators into
+/// `public`, which is where most databases have it; refusing them would refuse
+/// every read-only session on those databases for something the database's
+/// owner did not write. Skipped, saying so, where the server has no `citext`.
+/// PostgreSQL only.
+pub async fn a_read_only_session_runs_beside_an_extensions_functions(target: &'static Target) {
+    if target.engine != schemaic_db::Engine::Postgres {
+        return;
+    }
+    let scratch = Scratch::create(target, "enforce_extension_member").await;
+    let available = scratch
+        .exec("SELECT count(*) FROM pg_available_extensions WHERE name = 'citext'")
+        .await;
+    if available.cell(0, 0).expect("a count").display() == "0" {
+        eprintln!(
+            "{}: no citext on this server; the control is skipped",
+            target.name
+        );
+        scratch.teardown().await;
+        return;
+    }
+    scratch.exec("CREATE EXTENSION citext SCHEMA public").await;
+    for (entry, got) in read_only_entries(&scratch).await {
+        got.unwrap_or_else(|e| panic!("{entry}: refused beside citext: {e}"));
+    }
     scratch.teardown().await;
 }

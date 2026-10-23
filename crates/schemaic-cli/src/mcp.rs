@@ -1122,6 +1122,12 @@ fn no_rows_reply(e: crate::query::NoRows) -> (String, bool) {
         NoRows::NotARead(reason) | NoRows::NotPermitted(reason) => {
             (format!("Rejected: {reason}."), true)
         }
+        // Already a whole sentence that says the statement never ran and what
+        // the user can do; a model cannot fix it by rewriting the query.
+        NoRows::SessionRefused(reason) => (
+            format!("Rejected — not a problem with your query, so do not retry it: {reason}"),
+            true,
+        ),
         NoRows::Failed(e) => (format!("Query error: {e}"), true),
         // A read never reports `Indeterminate` — that is a write's timeout —
         // but a read-only session makes the two the same event here anyway.
@@ -2645,6 +2651,23 @@ mod tests {
             super::explain(&ep.db, None, " ; ").await,
             ("Empty query.".to_string(), true)
         );
+    }
+
+    /// **A session the read-only check refused is told as no fault of the
+    /// query**, so a model does not spend turns rewriting a statement that
+    /// never ran — the refusal's own words follow, which say what the user can
+    /// change.
+    #[test]
+    fn a_refused_session_tells_the_model_not_to_rewrite_the_query() {
+        let (text, err) = super::no_rows_reply(crate::query::NoRows::SessionRefused(
+            "Refused before your statement ran: public.lower is …".into(),
+        ));
+        assert!(err);
+        assert!(
+            text.starts_with("Rejected — not a problem with your query"),
+            "{text}"
+        );
+        assert!(text.ends_with("public.lower is …"), "{text}");
     }
 
     /// **A server's plan reaches the model as the tool writes it**: SQLite's

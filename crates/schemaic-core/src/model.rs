@@ -1518,6 +1518,15 @@ pub enum DbRefusal {
     ReadOnly(crate::sql::ReadOnlyReason),
     /// SQL Server cannot cancel another session's statement alone.
     MsSqlCancelNeedsKill,
+    /// A read-only PostgreSQL session refused before the statement ran: a
+    /// schema on its search path holds a function with the name of a builtin
+    /// the read-only gate allows, or any operator, that no extension owns —
+    /// either of which PostgreSQL can pick in the builtin's place.
+    ShadowedBuiltin {
+        schema: String,
+        name: String,
+        operator: bool,
+    },
     /// SQL Server would store `''` as `0` or `1900-01-01`: in the grid
     /// (`row` none) or an import's file row.
     BlankValue {
@@ -1601,6 +1610,28 @@ impl DbRefusal {
                                                 statement without ending the session — use Kill \
                                                 session."
                 .to_string(),
+            DbRefusal::ShadowedBuiltin {
+                schema,
+                name,
+                operator: false,
+            } => format!(
+                "Refused before your statement ran: {schema}.{name} is a function of this \
+                 database's own named like a PostgreSQL builtin that read-only queries may call, \
+                 and PostgreSQL can call it in the builtin's place, so the read-only check cannot \
+                 vouch for what a query here would run. Take {schema} off the connection's \
+                 search path, or ask the database's owner to drop or rename it."
+            ),
+            DbRefusal::ShadowedBuiltin {
+                schema,
+                name,
+                operator: true,
+            } => format!(
+                "Refused before your statement ran: {schema} holds the operator {name}, which \
+                 belongs to no extension, and PostgreSQL can use it in place of a builtin one, \
+                 so the read-only check cannot vouch for what a query here would run. Take \
+                 {schema} off the connection's search path, or ask the database's owner to drop \
+                 it."
+            ),
             DbRefusal::BlankValue {
                 row: None,
                 column,

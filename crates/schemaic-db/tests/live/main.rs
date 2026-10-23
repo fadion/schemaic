@@ -140,6 +140,9 @@ live_suite!(
         a_read_only_text_cannot_lift_itself_for_its_next_statement,
         a_read_only_session_reads_the_catalog_before_a_users_functions,
         a_read_only_session_calls_no_users_function_while_setting_itself_up,
+        a_read_only_session_refuses_a_path_that_shadows_a_builtin,
+        a_read_only_session_refuses_a_path_with_a_users_operator,
+        a_read_only_session_runs_beside_an_extensions_functions,
     ],
     init_sql: [
         the_init_sql_is_in_force_on_the_operations_connection,

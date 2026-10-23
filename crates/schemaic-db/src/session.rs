@@ -261,11 +261,10 @@ impl Session {
                 // enforced path gives: the one quote-moving setting is pinned on
                 // every connection's startup packet.
                 if enforce == Some(crate::Enforce::ReadOnly) {
-                    pg::set_up_read_only(&client)
-                        .await
-                        // The server's words about Schemaic's `SET`, not about
-                        // anything the user wrote: `Connect`, so no *AI fix*.
-                        .map_err(|e| pg::read_only_setup_failed(&e))?;
+                    // The server's words about Schemaic's `SET` come back as
+                    // `Connect`, not about anything the user wrote, so no *AI
+                    // fix*; a path that shadows a builtin as a refusal.
+                    pg::set_up_read_only(&client).await?;
                 }
                 // Best effort — a session whose pid we failed to learn still
                 // works, it just can't be recognised as ours later.

@@ -44,6 +44,13 @@ pub enum NoRows {
     /// a second statement (`sql::ReadRefusal::writes` is false). `exec` is no
     /// answer to any of them, so the message does not point there.
     NotPermitted(String),
+    /// Refused **after connecting, before the statement was sent**: the
+    /// read-only session would not be set up, because a schema on the path
+    /// holds what PostgreSQL could pick in a builtin's place
+    /// (`DbRefusal::ShadowedBuiltin`). A guard's refusal like the three above
+    /// — retrying unchanged refuses again — but not a text one, so unlike them
+    /// it has logged in to say so. Carries the refusal's words.
+    SessionRefused(String),
     /// The server refused it, or the connection failed.
     Failed(String),
     /// The deadline passed and the statement was cancelled server-side.
@@ -67,7 +74,7 @@ impl NoRows {
             NoRows::NotARead(why) => {
                 format!("refused: {why}. Only reads are taken here; use `exec` to write")
             }
-            NoRows::NotPermitted(why) => format!("refused: {why}"),
+            NoRows::NotPermitted(why) | NoRows::SessionRefused(why) => format!("refused: {why}"),
             // No prefix of our own: `DbError`'s Display already says what
             // failed ("query failed: …", "could not connect: …"), and a second
             // one printed "query failed: query failed: …".
@@ -91,8 +98,23 @@ impl NoRows {
     pub fn is_refusal(&self) -> bool {
         matches!(
             self,
-            NoRows::Empty | NoRows::NotARead(_) | NoRows::NotPermitted(_)
+            NoRows::Empty
+                | NoRows::NotARead(_)
+                | NoRows::NotPermitted(_)
+                | NoRows::SessionRefused(_)
         )
+    }
+
+    /// A read's [`schemaic_db::DbError`], as the arm it belongs to: the
+    /// read-only session's own refusal ([`NoRows::SessionRefused`]), else a
+    /// failure.
+    pub fn from_db(e: schemaic_db::DbError) -> NoRows {
+        match e {
+            schemaic_db::DbError::Refused(r @ schemaic_db::DbRefusal::ShadowedBuiltin { .. }) => {
+                NoRows::SessionRefused(r.message())
+            }
+            e => NoRows::Failed(e.to_string()),
+        }
     }
 }
 
@@ -154,7 +176,7 @@ pub async fn read_only_query(
     )
     .await
     {
-        Some(r) => r.map_err(|e| NoRows::Failed(e.to_string())),
+        Some(r) => r.map_err(NoRows::from_db),
         None => Err(NoRows::TimedOut(timeout)),
     }
 }
@@ -236,6 +258,15 @@ pub async fn read_only_export(
         .await
         .map_err(|e| NoRows::Failed(format!("the export's writer stopped: {e}")))?
         .map_err(writer_stop);
+    // The session refused before the statement was sent, so nothing was read
+    // and the `.part` is empty: told as the refusal it is, not as a failure.
+    if let Ok(Err(
+        e @ schemaic_db::DbError::Refused(schemaic_db::DbRefusal::ShadowedBuiltin { .. }),
+    )) = &read
+    {
+        let _ = std::fs::remove_file(&part);
+        return Err(NoRows::from_db(e.clone()));
+    }
     let read = match read {
         Err(_) => Err(timeout),
         Ok(r) => Ok(r.map(|_| ()).map_err(|e| e.to_string())),
@@ -368,7 +399,7 @@ pub async fn read_only_explain(
     {
         Some(r) => r
             .map(|rs| schemaic_core::plan::QueryPlan::from_result(&rs))
-            .map_err(|e| NoRows::Failed(e.to_string())),
+            .map_err(NoRows::from_db),
         None => Err(NoRows::TimedOut(timeout)),
     }
 }
@@ -490,6 +521,32 @@ mod tests {
         assert!(NoRows::NotARead("it is a DELETE".into()).is_refusal());
         assert!(!NoRows::Failed("connection reset".into()).is_refusal());
         assert!(!NoRows::TimedOut(DEFAULT_TIMEOUT).is_refusal());
+        assert!(NoRows::SessionRefused("public.lower".into()).is_refusal());
+    }
+
+    /// **A read-only session's refusal is the guard's, not the server's**: it
+    /// keeps its own arm, and so exit 3 and the refusal's words with no
+    /// "query failed:" in front, while every other database error stays a
+    /// failure.
+    #[test]
+    fn a_shadowed_builtin_is_a_refusal_and_everything_else_a_failure() {
+        use schemaic_db::{DbError, DbRefusal};
+        let refusal = DbRefusal::ShadowedBuiltin {
+            schema: "public".into(),
+            name: "lower".into(),
+            operator: false,
+        };
+        let got = NoRows::from_db(DbError::Refused(refusal.clone()));
+        assert_eq!(got, NoRows::SessionRefused(refusal.message()));
+        assert_eq!(got.message(), format!("refused: {}", refusal.message()));
+        assert_eq!(
+            NoRows::from_db(DbError::Query("relation \"t\" does not exist".into())),
+            NoRows::Failed("query failed: relation \"t\" does not exist".into())
+        );
+        assert!(matches!(
+            NoRows::from_db(DbError::Refused(DbRefusal::CommitAborted)),
+            NoRows::Failed(_)
+        ));
     }
 
     /// The refusal has to point at the subcommand that would have worked.
