@@ -4726,15 +4726,6 @@ mod tests {
         );
     }
 
-    /// The end of the chain: tables and columns named with the words that were
-    /// missing, opened through the statement the tree generates, against real
-    /// SQLite.
-    ///
-    /// **Each word is used in the position where it actually breaks**, which is
-    /// not the same position for all of them: `CAST` and `RAISE` are refused as a
-    /// bare *column* name but accepted as a table's, and `IF` is the reverse. A
-    /// first draft of this test put each one on the side it tolerates and passed
-    /// with the fix reverted.
     /// **The live check never compiles a `PRAGMA`** (security review S11).
     /// SQLite runs some pragmas while it *prepares* them, and a few of those
     /// set process-wide state (`temp_store_directory`, Windows'
@@ -4756,6 +4747,15 @@ mod tests {
         assert!(prepare_check(&db, "SELECT * FROM nowhere").await.is_err());
     }
 
+    /// The end of the chain: tables and columns named with the words that were
+    /// missing, opened through the statement the tree generates, against real
+    /// SQLite.
+    ///
+    /// **Each word is used in the position where it actually breaks**, which is
+    /// not the same position for all of them: `CAST` and `RAISE` are refused as a
+    /// bare *column* name but accepted as a table's, and `IF` is the reverse. A
+    /// first draft of this test put each one on the side it tolerates and passed
+    /// with the fix reverted.
     #[tokio::test]
     async fn a_table_named_for_a_keyword_still_opens() {
         let (keeper, db) = shared_memory("kw_named_table");

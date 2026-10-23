@@ -1520,8 +1520,9 @@ pub enum DbRefusal {
     MsSqlCancelNeedsKill,
     /// A read-only PostgreSQL session refused before the statement ran: a
     /// schema on its search path holds a function with the name of a builtin
-    /// the read-only gate allows, or any operator, that no extension owns —
-    /// either of which PostgreSQL can pick in the builtin's place.
+    /// the read-only gate allows, or any operator, that is not an extension's
+    /// own — a member a superuser owns — either of which PostgreSQL can pick in
+    /// the builtin's place.
     ShadowedBuiltin {
         schema: String,
         name: String,

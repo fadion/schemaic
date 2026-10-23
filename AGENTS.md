@@ -59,10 +59,12 @@ from `supports_change` rather than returning `true`.
 
 **The architecture document is the reference** — the module map (one entry per source file),
 the architecture invariants, the UI conventions, the Floem hazards, and the data grid end to end.
-`docs/architecture.md` is its index; the document itself is split under `docs/architecture/`, one
-file per module entry (`docs/architecture/<crate>/<module>.md`) and one per cross-cutting section
-(`invariants.md`, `ui-conventions.md`, `floem-gotchas.md`, `popup-menus.md`, `results-strip.md`,
-`data-grid.md`). Open only the file you need. A source comment citing a section of
+`docs/architecture.md` is its index; the document itself is split under `docs/architecture/` —
+module entries under `docs/architecture/<crate>/`, most in a file of their module's name
+(`<module>.md`) and the rest in a group file or their crate's `overview.md` (the index links the
+file each one lives in), and one file per cross-cutting section (`invariants.md`,
+`ui-conventions.md`, `floem-gotchas.md`, `popup-menus.md`, `results-strip.md`, `data-grid.md`).
+Open only the file you need. A source comment citing a section of
 `docs/architecture.md` by name means the file of that name. This file holds only the working rules. Keep the two disjoint: a fact about the system goes there,
 an instruction about how to work goes here.
 
@@ -235,8 +237,9 @@ start with a failing test, then the code that makes it pass.
   or `#[ignore]`d tests unless the user asks. **Reading the repository's own source is the one
   exempt kind of filesystem access**, because there the thing under test *is* a file:
   `core/tests/doc_coverage.rs` asserts every `src/*.rs` module is named somewhere in the
-  architecture files and that the index links every one of them (a new module fails it until it
-  has its file, linked from `docs/architecture.md`), and the
+  architecture files and that the index links every one of those files (a new module fails it
+  until some architecture file names it — its own or its group's, linked from
+  `docs/architecture.md`; the test checks the mention, not which file holds it), and the
   `ui::source_gate` family scans `.rs` files for a pattern an invariant forbids. That is a whole
   family, not one test — this line said "the single exception is `doc_coverage.rs`" while a
   couple of dozen source files were already doing it.

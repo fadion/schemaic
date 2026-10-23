@@ -13,8 +13,9 @@
 //! about*, not that the entry is accurate. It only has to catch the one failure
 //! that keeps recurring: a new module added and never written down.
 //!
-//! This is the one test in the workspace that reads the filesystem, because the
-//! thing under test *is* a file.
+//! It reads the filesystem because the thing under test *is* a file — the
+//! exemption AGENTS.md grants the repository's own source and docs, which the
+//! `ui::source_gate` family uses as well.
 
 use std::fs;
 use std::path::{Path, PathBuf};

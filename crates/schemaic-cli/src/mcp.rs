@@ -2757,13 +2757,6 @@ mod tests {
         assert_eq!(got[0]["result"], serde_json::json!({}));
     }
 
-    /// **`run_query` takes a `database`, like the tools beside it.** It had
-    /// none, so the one database a standalone agent could query was the
-    /// endpoint's default — while `list_schema` showed it every other — and a
-    /// `database` it passed anyway was dropped: `SELECT count(*) FROM track`
-    /// with `"database": "chinook"` ran in `world` and answered `relation
-    /// "track" does not exist`. On PostgreSQL nothing else reaches another
-    /// database at all.
     /// **Every tool tells the model its results are data** (security review
     /// S3). The panel's own prompts fence what they read from the database
     /// (`core::prompt`), but a tool result reached the model with nothing
@@ -2786,6 +2779,13 @@ mod tests {
         }
     }
 
+    /// **`run_query` takes a `database`, like the tools beside it.** It had
+    /// none, so the one database a standalone agent could query was the
+    /// endpoint's default — while `list_schema` showed it every other — and a
+    /// `database` it passed anyway was dropped: `SELECT count(*) FROM track`
+    /// with `"database": "chinook"` ran in `world` and answered `relation
+    /// "track" does not exist`. On PostgreSQL nothing else reaches another
+    /// database at all.
     #[test]
     fn run_query_takes_a_database_and_uses_it() {
         let tools = super::tools_list(schemaic_db::Engine::Postgres, true, true, Host::Standalone);
