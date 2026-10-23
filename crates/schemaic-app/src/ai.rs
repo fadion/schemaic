@@ -1193,6 +1193,9 @@ pub(crate) async fn run_inline(plan: InlinePlan) -> Result<String, String> {
     // that. `plan.cwd` is a directory created for this generation and removed
     // with it.
     cmd.current_dir(&plan.cwd);
+    // Inherited by whatever the agent's shell runs: `schemaic`'s command line
+    // then refuses to reach a connection (security review S2).
+    cmd.env(schemaic_core::AGENT_CHILD_ENV, "1");
     // **Clear before set, the same order the session path states in a comment.**
     // The two key sets are disjoint today, which is the only reason the reverse
     // order was harmless — and `OPENCODE_CONFIG_DIR`, already in the cleared
@@ -2068,6 +2071,8 @@ pub(crate) fn start_ai_session(
                 }
                 cmd.envs(seal_env.iter().map(|(k, v)| (k, v)));
                 cmd.current_dir(&child_cwd);
+                // See `run_inline`: the marker the command line refuses under.
+                cmd.env(schemaic_core::AGENT_CHILD_ENV, "1");
                 let child = cmd
                     // **Piped exactly when the prompt travels on it**, which is
                     // `Harness::prompt_on_stdin` — Codex, Copilot and Cursor,
@@ -2385,6 +2390,8 @@ pub(crate) fn start_ai_session(
             crate::agent_cli::hide_console_window(cmd.as_std_mut());
             cmd.args(args);
             cmd.current_dir(&cwd);
+            // See `run_inline`: the marker the command line refuses under.
+            cmd.env(schemaic_core::AGENT_CHILD_ENV, "1");
             cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 // Capture stderr (was discarded): a failing CLI — e.g. an expired
@@ -4301,6 +4308,15 @@ mod tests {
             body.matches("Command::new(").count(),
             body.matches("current_dir(").count(),
             "a `Command` in this file does not set a working directory"
+        );
+        // **And every agent child is marked** (security review S2), so the
+        // `schemaic` command line it or its shell runs refuses to reach a
+        // connection past the panel's tools.
+        assert_eq!(
+            body.matches("Command::new(").count(),
+            body.matches("schemaic_core::AGENT_CHILD_ENV, \"1\")")
+                .count(),
+            "a `Command` in this file spawns an agent without `AGENT_CHILD_ENV`"
         );
         // **And every spawn asks the pre-spawn verdict.** Same counting, same
         // reason: both failures it catches are unrecognisable afterwards — an

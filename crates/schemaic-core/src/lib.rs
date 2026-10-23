@@ -106,6 +106,19 @@ pub const APP_NAME: &str = "Schemaic";
 /// renaming it orphans every installed entry.
 pub const APP_ID: &str = "io.github.fadion.Schemaic";
 
+/// Set in the environment of every agent CLI the AI panel spawns, and so
+/// inherited by anything that agent's shell runs (security review S2).
+///
+/// `schemaic`'s command line reads it and refuses to reach a connection:
+/// an agent harness that keeps a shell (Codex, Antigravity) could otherwise
+/// run `schemaic exec` — a write the panel's read-only MCP tools never offer —
+/// or `schemaic query` past the panel's data level. **A speed bump, not a
+/// boundary**: a shell that knows the name can unset it, and the vendor's
+/// sandbox is what stands between it and the keyring. The panel's own MCP
+/// subprocess (`--mcp-serve`) never goes through the command line, so it is
+/// unaffected.
+pub const AGENT_CHILD_ENV: &str = "SCHEMAIC_AGENT_CHILD";
+
 /// Current app version (mirrors the workspace package version).
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 

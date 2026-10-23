@@ -214,6 +214,21 @@ There is no flag that empties that set, which is why the grade is a ceiling and 
 to-do. So `Constraint::notice` states that to the user in one line, and
 returns `None` for `Sealed` — a banner on every sealed session is how a user learns to ignore
 the two grades that mean something.
+**Both keep a shell, too, and a shell can run `schemaic` itself** (security review S2): Codex's
+under its read-only sandbox, Antigravity's as `run_command`. `schemaic exec` is a write the
+panel's read-only MCP tools never offer, and `query`, `export`, `dump` and `mcp` read past the
+panel's AI data level, on any connection the user has granted CLI access — provided the vendor's
+sandbox lets the child reach the database's socket and the OS keyring, which has not been checked
+live, no such harness being to hand. So all three agent spawns in `app/ai.rs` — `run_inline`, the
+session spawn and Antigravity's `spawn_child` — set `schemaic_core::AGENT_CHILD_ENV`
+(`SCHEMAIC_AGENT_CHILD`) to `1`, which anything the agent's shell runs inherits, and the command
+line's `dispatch` refuses every command but `version` under it with `Exit::Refused` (under
+`cli/run.rs`). **It is a speed bump, not a boundary.** A shell that knows the name can unset it,
+so what stands between the agent and the keyring is still the vendor's sandbox, and the
+plaintext `connections.json` of the keyring-unavailable fallback stays readable by the built-in
+file readers above, which no environment variable reaches. The panel's own MCP subprocess is
+unaffected: `--mcp-serve` is answered in `app/main.rs` before the command line's dispatch, so it
+never asks.
 **Cursor is the third `Restricted`, and it is reached by neither a sandbox nor a flag but by rules
 in a file** — the weakest mechanism here, which is why the grade and the notice both have to say
 so. Measured on its CLI (2026.09.23-86fc751, Windows 11, 2026-09-26): nothing empties its

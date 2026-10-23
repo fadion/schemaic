@@ -219,6 +219,17 @@ where
     }
 }
 
+/// Why `command` is refused when this process descends from an agent the AI
+/// panel spawned (`under_agent`: [`schemaic_core::AGENT_CHILD_ENV`] is set),
+/// or `None`. Every command but `version` reaches a saved connection, and the
+/// assistant's way to one is the panel's tools, at the level the user chose.
+fn agent_refusal(command: &Command, under_agent: bool) -> Option<&'static str> {
+    (under_agent && *command != Command::Version).then_some(
+        "refused: this is running under Schemaic's AI panel, whose assistant reaches \
+         the database through the panel's own tools, not the command line",
+    )
+}
+
 async fn dispatch(command: Command) -> Exit {
     // **Before the saved connections are read**: a version needs none of them,
     // and a damaged file must not stop anyone learning which build they have —
@@ -227,6 +238,13 @@ async fn dispatch(command: Command) -> Exit {
         return emit_stdout(&crate::args::version_text())
             .err()
             .unwrap_or(Exit::Ok);
+    }
+    if let Some(why) = agent_refusal(
+        &command,
+        std::env::var_os(schemaic_core::AGENT_CHILD_ENV).is_some(),
+    ) {
+        warn(why);
+        return Exit::Refused;
     }
     // A command line that cannot be printed is a usage error before anything
     // is read, the way clap's own refusals are.
@@ -1799,6 +1817,34 @@ fn default_database(flag: Option<&str>, conn: &Connection) -> Option<String> {
 mod tests {
     use super::*;
     use crate::args::Cli;
+
+    /// **Under the AI panel's agent, the command line reaches no connection**
+    /// (security review S2). A harness that keeps a shell could run `schemaic
+    /// exec` — a write the panel's MCP tools never offer — or `schemaic query`
+    /// past the panel's data level. Only `version` answers there.
+    #[test]
+    fn under_the_panels_agent_only_version_answers() {
+        let parse = |line: &[&str]| {
+            crate::args::parse_argv(
+                std::iter::once(&"schemaic")
+                    .chain(line)
+                    .map(std::ffi::OsString::from)
+                    .collect(),
+            )
+            .unwrap_or_else(|e| panic!("{line:?}: {e}"))
+            .command
+        };
+        for line in [
+            &["exec", "UPDATE t SET a = 1 WHERE id = 1", "-c", "prod"][..],
+            &["query", "SELECT 1", "-c", "prod"],
+            &["list"],
+            &["mcp", "-c", "prod"],
+        ] {
+            assert!(agent_refusal(&parse(line), true).is_some(), "{line:?}");
+            assert!(agent_refusal(&parse(line), false).is_none(), "{line:?}");
+        }
+        assert!(agent_refusal(&Command::Version, true).is_none());
+    }
 
     fn listed(tables: &[(Option<&str>, &str)]) -> schemaic_core::schema::DbSchema {
         schemaic_core::schema::DbSchema {

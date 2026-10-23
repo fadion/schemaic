@@ -187,7 +187,10 @@ every spawn path), not a spawn with no `current_dir`. That is what it used to be
 neutral: a child given no `current_dir` inherits Schemaic's own, which is where a CLI resolves
 `.claude/settings.json` and `AGENTS.md` — the very thing the directory exists to keep away from it.
 `no_agent_spawn_sets_its_working_directory_conditionally` scans `ai.rs` for the `if let Some`
-spelling the three spawn sites used to have. All three sit **ahead of the variadic `--allowedTools`/`--disallowedTools`**, which would
+spelling the three spawn sites used to have, and counts `Command::new(` against both
+`current_dir(` and `cmd.env(schemaic_core::AGENT_CHILD_ENV, "1")` — the marker the command line
+refuses under (security review S2, under `harness.rs`) — so a fourth spawn missing either shows
+up as an imbalance. All three sit **ahead of the variadic `--allowedTools`/`--disallowedTools`**, which would
 otherwise swallow a later flag's name as a tool name, and both
 `the_session_loads_no_mcp_server_and_no_config_dir_of_its_own_finding` and the test above pin that
 order. **They did not prompt — they ran.** Driving the old flag set with

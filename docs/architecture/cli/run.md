@@ -95,8 +95,17 @@ needs no saved connection, and a damaged `connections.json` must not stop anyone
 build they have — the first thing asked of someone reporting it damaged. Checked by hand with a
 corrupt file: `schemaic version` printed `schemaic 0.27.1` and exited 0, `schemaic list` 4. The
 `match` below keeps an `unreachable!` arm for it; folding `version` into that `match` like its
-peers would look tidier and put the file read back in front of it. **The output flags are
-judged next, still before the file is read**: `command.output_args()` resolved through
+peers would look tidier and put the file read back in front of it. **Under the AI panel's agent
+it is the only command that answers**: next, `agent_refusal(command, under_agent)` — pure,
+`under_agent` being whether `schemaic_core::AGENT_CHILD_ENV` is set, as it is in every agent
+child the panel spawns and so in whatever that agent's shell runs — refuses every other command
+with a `warn` and `Exit::Refused`, before anything is read or dialled, because the assistant's
+way to a connection is the panel's own tools at the level the user chose, and an agent shell
+running `schemaic exec` or `query` would step past both
+(`under_the_panels_agent_only_version_answers`, which holds `version` to answering and every
+other command to refusing only when the variable is set). It is a speed bump and not a boundary —
+a shell can unset the variable — and `ai/harness.md` says what does stand there. **The output
+flags are judged next, still before the file is read**: `command.output_args()` resolved through
 `OutputArgs::output`, and a pair that does not go together — `--no-header` with a format that
 has no header — is a `warn` and `Exit::Usage` before anything is read, the way clap's own
 refusals are. The resolved
