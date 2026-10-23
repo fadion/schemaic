@@ -229,6 +229,7 @@ live_suite!(
         generated_ddl_lands_in_the_namespace_it_was_drafted_from,
         public_ddl_does_not_land_in_the_logins_own_schema,
         public_objects_are_named_in_every_statement_that_runs,
+        introspection_calls_no_function_the_database_planted,
     ],
     views: [
         an_introspected_view_diffs_to_nothing_against_its_own_draft,

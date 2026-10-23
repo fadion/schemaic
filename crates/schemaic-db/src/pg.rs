@@ -413,7 +413,7 @@ pub(crate) async fn ping(db: &Db, timeout: Duration) -> Result<(), DbError> {
 /// that, so the expansion failure still has to read well.
 const DATABASE_LISTING: &str = "SELECT datname FROM pg_database \
      WHERE datistemplate = false AND datname <> 'postgres' \
-     AND datallowconn AND has_database_privilege(current_user, oid, 'CONNECT') \
+     AND datallowconn AND pg_catalog.has_database_privilege(current_user, oid, 'CONNECT') \
      ORDER BY datname";
 
 /// List the user databases on the server (excludes templates, the built-in
@@ -434,7 +434,7 @@ const DATABASE_LISTING: &str = "SELECT datname FROM pg_database \
 /// legitimate is cut short by bounding the whole thing at one.
 pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
     let listing = async {
-        let client = connect_maintenance(db).await?;
+        let client = connect_catalogue(db, None).await?;
         let msgs = client
             .simple_query(DATABASE_LISTING)
             .await
@@ -477,9 +477,21 @@ pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
 /// here ([`catalog_first_sql`]), and the one call made is schema-qualified
 /// with a literal argument.
 pub(crate) async fn set_up_read_only(client: &Client) -> Result<(), tokio_postgres::Error> {
-    let msgs = client
-        .simple_query("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY; SHOW search_path")
+    client
+        .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
         .await?;
+    put_catalog_first(client).await
+}
+
+/// Put `pg_catalog` ahead of whatever search path the session has, resolving
+/// no name through that path on the way — the path half of
+/// [`set_up_read_only`], and the whole of [`connect_catalogue`]'s setup.
+///
+/// Read with `SHOW`, a command rather than a function, and written with one
+/// schema-qualified call on a literal ([`catalog_first_sql`]), for the reason
+/// `set_up_read_only` gives.
+async fn put_catalog_first(client: &Client) -> Result<(), tokio_postgres::Error> {
+    let msgs = client.simple_query("SHOW search_path").await?;
     let path = msgs
         .iter()
         .find_map(|m| match m {
@@ -488,6 +500,39 @@ pub(crate) async fn set_up_read_only(client: &Client) -> Result<(), tokio_postgr
         })
         .unwrap_or_default();
     client.batch_execute(&catalog_first_sql(&path)).await
+}
+
+/// A connection for **the app's own catalogue reads** — to `database`, or the
+/// maintenance database when there is none — with `pg_catalog` first on its
+/// path ([`put_catalog_first`]).
+///
+/// Those reads run as the connecting user on a path somebody else may have
+/// written: init SQL, a role default or a database default can put `public`
+/// ahead of the catalogue, and an object there with a builtin's exact
+/// signature then wins. Every function the reads call is written
+/// `pg_catalog.`-qualified, which also closes the overload that matches more
+/// exactly than the builtin wherever the catalogue sits; this closes the rest
+/// — the bare operators (`=` on `oid`, `LIKE`), and the catalogue relations
+/// themselves — which have no spelling that qualifies them in passing.
+///
+/// **The user's path stays behind it, not replaced by `''`.** PostgreSQL
+/// qualifies in its output every name the path does not reach, so an empty
+/// path would turn `nextval('t_id_seq'::regclass)` into
+/// `nextval('public.t_id_seq'::regclass)`, `public.` onto every user type and
+/// view body — text the serial detection, the type mapping and the round-trip
+/// gates all compare. With `pg_catalog` merely moved to the front, what is
+/// visible is what was visible before, and the text is unchanged.
+///
+/// Not for a pinned `Session` (its path is the user's own, and the reads made
+/// on it — [`routines_on`], [`fetch_col_meta`], [`refetch_on`], [`blob_on`] —
+/// rely on the qualification alone), and not for user SQL or the write paths.
+pub(crate) async fn connect_catalogue(db: &Db, database: Option<&str>) -> Result<Client, DbError> {
+    let client = match database {
+        Some(d) => connect_to(db, d).await?,
+        None => connect_maintenance(db).await?,
+    };
+    put_catalog_first(&client).await.map_err(|e| db_err(&e))?;
+    Ok(client)
 }
 
 /// The statement that puts `pg_catalog` ahead of `path`, the session's current
@@ -1536,11 +1581,11 @@ fn table_list_sql() -> String {
                 CASE WHEN c.relkind IN ('v','m') THEN 'VIEW' \
                      WHEN c.relkind = 'f' THEN 'FOREIGN TABLE' \
                      ELSE 'BASE TABLE' END, \
-                COALESCE(obj_description(c.oid, 'pg_class'), ''), \
+                COALESCE(pg_catalog.obj_description(c.oid, 'pg_class'), ''), \
                 COALESCE(pn.nspname, ''), COALESCE(pc.relname, ''), \
                 CASE WHEN c.relispartition \
-                     THEN pg_get_expr(c.relpartbound, c.oid) ELSE '' END, \
-                CASE WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid) ELSE '' END \
+                     THEN pg_catalog.pg_get_expr(c.relpartbound, c.oid) ELSE '' END, \
+                CASE WHEN c.relkind = 'p' THEN pg_catalog.pg_get_partkeydef(c.oid) ELSE '' END \
          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
          LEFT JOIN pg_inherits i ON c.relispartition AND i.inhrelid = c.oid \
          LEFT JOIN pg_class pc ON pc.oid = i.inhparent \
@@ -1635,18 +1680,18 @@ fn index_list_sql() -> String {
                 CASE WHEN ix.indisprimary THEN 'PRIMARY' ELSE ic.relname END AS iname, \
                 CASE WHEN ix.indisunique THEN 0 ELSE 1 END AS non_unique, \
                 a.attname, ix.indisprimary, \
-                am.amname, pg_get_expr(ix.indpred, ix.indrelid), \
+                am.amname, pg_catalog.pg_get_expr(ix.indpred, ix.indrelid), \
                 pgc.conname, \
-                (EXISTS (SELECT 1 FROM unnest(ix.indclass::oid[]) AS q(oid) \
+                (EXISTS (SELECT 1 FROM pg_catalog.unnest(ix.indclass::oid[]) AS q(oid) \
                            JOIN pg_opclass o ON o.oid = q.oid \
                           WHERE NOT o.opcdefault) \
-                 OR EXISTS (SELECT 1 FROM unnest(ix.indoption::int2[]) AS p(opt) \
+                 OR EXISTS (SELECT 1 FROM pg_catalog.unnest(ix.indoption::int2[]) AS p(opt) \
                              WHERE opt NOT IN (0, 3)) \
                  OR (ix.indnatts > ix.indnkeyatts AND pgc.conname IS NOT NULL) \
                  OR ic.reloptions IS NOT NULL) AS lossy, \
-                pg_get_indexdef(ix.indexrelid, k.ord::int, true) AS keydef, \
+                pg_catalog.pg_get_indexdef(ix.indexrelid, k.ord::int, true) AS keydef, \
                 COALESCE((o.opt & 1) <> 0, false) AS descending, \
-                pg_get_indexdef(ix.indexrelid) AS idxdef, \
+                pg_catalog.pg_get_indexdef(ix.indexrelid) AS idxdef, \
                 k.ord > ix.indnkeyatts AS included, \
                 ic.relispartition AS inherited \
          FROM pg_index ix \
@@ -1656,8 +1701,9 @@ fn index_list_sql() -> String {
          JOIN pg_am am ON am.oid = ic.relam \
          LEFT JOIN pg_constraint pgc \
                 ON pgc.conindid = ic.oid AND pgc.contype IN ('p', 'u') \
-         JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
-         LEFT JOIN unnest(ix.indoption) WITH ORDINALITY AS o(opt, oord) ON o.oord = k.ord \
+         JOIN pg_catalog.unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
+         LEFT JOIN pg_catalog.unnest(ix.indoption) WITH ORDINALITY AS o(opt, oord) \
+                ON o.oord = k.ord \
          LEFT JOIN pg_attribute a \
                 ON a.attrelid = ix.indrelid AND a.attnum = k.attnum AND a.attnum > 0 \
          WHERE {} \
@@ -1699,7 +1745,7 @@ fn schema_sort_key(name: &str) -> (u8, String) {
 /// The PostgreSQL half of [`Db::fetch_table_list`]: the same table list the full
 /// fetch starts from, and none of the four catalogue queries after it.
 pub(crate) async fn fetch_table_list(db: &Db, database: &str) -> Result<DbSchema, DbError> {
-    let client = connect_to(db, database).await?;
+    let client = connect_catalogue(db, Some(database)).await?;
     let list = query_all(&client, &table_list_sql()).await?;
     let mut tables: Vec<TableInfo> = list
         .iter()
@@ -1742,7 +1788,7 @@ pub(crate) async fn fetch_table_list(db: &Db, database: &str) -> Result<DbSchema
 fn table_stats_sql() -> String {
     let leaves = |what: &str| {
         format!(
-            "(SELECT {what} FROM pg_partition_tree(c.oid) pt \
+            "(SELECT {what} FROM pg_catalog.pg_partition_tree(c.oid) pt \
               JOIN pg_class lc ON lc.oid = pt.relid WHERE pt.isleaf)"
         )
     };
@@ -1750,8 +1796,9 @@ fn table_stats_sql() -> String {
         "SELECT n.nspname, c.relname, \
                 CASE WHEN c.relkind = 'p' THEN {} \
                      WHEN c.reltuples < 0 THEN NULL ELSE c.reltuples::bigint END, \
-                CASE WHEN c.relkind = 'p' THEN {} ELSE pg_table_size(c.oid) END, \
-                CASE WHEN c.relkind = 'p' THEN {} ELSE pg_indexes_size(c.oid) END, \
+                CASE WHEN c.relkind = 'p' THEN {} ELSE pg_catalog.pg_table_size(c.oid) END, \
+                CASE WHEN c.relkind = 'p' THEN {} \
+                     ELSE pg_catalog.pg_indexes_size(c.oid) END, \
                 s.n_dead_tup, \
                 GREATEST(s.last_analyze, s.last_autoanalyze) \
          FROM pg_class c \
@@ -1760,11 +1807,11 @@ fn table_stats_sql() -> String {
          WHERE c.relkind IN ('r','m','p') AND {} \
          ORDER BY n.nspname, c.relname",
         leaves(
-            "CASE WHEN bool_or(lc.reltuples < 0) THEN NULL \
-                  ELSE sum(lc.reltuples)::bigint END"
+            "CASE WHEN pg_catalog.bool_or(lc.reltuples < 0) THEN NULL \
+                  ELSE pg_catalog.sum(lc.reltuples)::bigint END"
         ),
-        leaves("sum(pg_table_size(lc.oid))::bigint"),
-        leaves("sum(pg_indexes_size(lc.oid))::bigint"),
+        leaves("pg_catalog.sum(pg_catalog.pg_table_size(lc.oid))::bigint"),
+        leaves("pg_catalog.sum(pg_catalog.pg_indexes_size(lc.oid))::bigint"),
         user_schema_filter("n.nspname")
     )
 }
@@ -1787,7 +1834,8 @@ fn index_stats_sql() -> String {
     format!(
         "SELECT n.nspname, c.relname, \
                 CASE WHEN ix.indisprimary THEN 'PRIMARY' ELSE ic.relname END, \
-                CASE WHEN ic.relkind = 'I' THEN NULL ELSE pg_relation_size(ic.oid) END, \
+                CASE WHEN ic.relkind = 'I' THEN NULL \
+                     ELSE pg_catalog.pg_relation_size(ic.oid) END, \
                 si.idx_scan, \
                 ix.indisprimary, ix.indisunique \
          FROM pg_index ix \
@@ -1807,7 +1855,7 @@ fn index_stats_sql() -> String {
 /// restricted or absent, and a properties panel is not worth failing a whole
 /// fetch over.
 pub(crate) async fn fetch_table_stats(db: &Db, database: &str) -> Result<SchemaStats, DbError> {
-    let client = connect_to(db, database).await?;
+    let client = connect_catalogue(db, Some(database)).await?;
 
     let mut by_table: HashMap<(String, String), Vec<IndexStats>> = HashMap::new();
     for r in query_all_optional(&client, &index_stats_sql()).await? {
@@ -1966,14 +2014,14 @@ pub(crate) async fn count_rows(
 /// crate, and `array::from_fn` padded a short row with `None`s rather than
 /// refusing it.
 const PG_ACTIVITY_SQL: &str = "FROM ( \
-     SELECT pid, usename, host(client_addr) AS client_host, datname, state, query, \
-     EXTRACT(EPOCH FROM (now() - COALESCE(state_change, query_start, backend_start)))::float8 \
-     AS age, \
-     pg_blocking_pids(pid)::text AS blockers \
+     SELECT pid, usename, pg_catalog.host(client_addr) AS client_host, datname, state, query, \
+     EXTRACT(EPOCH FROM (pg_catalog.now() \
+     - COALESCE(state_change, query_start, backend_start)))::float8 AS age, \
+     pg_catalog.pg_blocking_pids(pid)::text AS blockers \
      FROM pg_stat_activity \
      WHERE (backend_type = 'client backend' \
      OR (backend_type IS NULL AND usename IS NOT NULL AND datname IS NOT NULL)) \
-     AND pid <> pg_backend_pid() \
+     AND pid <> pg_catalog.pg_backend_pid() \
      ) s ORDER BY (s.blockers <> '{}') DESC, \
      (s.state IS DISTINCT FROM 'idle' AND s.state IS NOT NULL) DESC, \
      s.age DESC NULLS LAST LIMIT ";
@@ -1984,7 +2032,7 @@ const PG_ACTIVITY_SQL: &str = "FROM ( \
 /// connection: which database it lands in changes nothing about the answer, and
 /// the panel has no active database to speak of.
 pub(crate) async fn fetch_sessions(db: &Db) -> Result<Vec<SessionInfo>, DbError> {
-    let client = connect_maintenance(db).await?;
+    let client = connect_catalogue(db, None).await?;
     let rows = query_all(&client, &pg_activity_sql(activity::MAX_SESSIONS + 1)).await?;
     // The fold is `activity::from_pg_rows` — where every decision about what a
     // `SessionInfo` says lives, reachable from a test with a literal row vector.
@@ -2012,10 +2060,7 @@ pub(crate) async fn fetch_sessions(db: &Db) -> Result<Vec<SessionInfo>, DbError>
 /// its oid instead — never cast, since the same oid here may be some other
 /// table.
 pub(crate) async fn fetch_locks(db: &Db) -> Result<activity::LockList, DbError> {
-    let client = match db.database() {
-        Some(d) => connect_to(db, d).await?,
-        None => connect_maintenance(db).await?,
-    };
+    let client = connect_catalogue(db, db.database()).await?;
     let rows = query_all(
         &client,
         &format!("{PG_LOCKS_SQL}{}", activity::MAX_LOCKS + 1),
@@ -2052,7 +2097,7 @@ pub(crate) async fn fetch_locks(db: &Db) -> Result<activity::LockList, DbError> 
 pub(crate) async fn fetch_server_vars(
     db: &Db,
 ) -> Result<Vec<schemaic_core::server_vars::ServerVar>, DbError> {
-    let client = connect_maintenance(db).await?;
+    let client = connect_catalogue(db, None).await?;
     let rows = query_all(
         &client,
         "SELECT name, setting || COALESCE(' ' || unit, ''), short_desc \
@@ -2086,7 +2131,7 @@ pub(crate) async fn fetch_server_vars(
 const PG_LOCKS_SQL: &str = "SELECT l.pid::text, \
      CASE \
        WHEN l.relation IS NOT NULL AND l.database = \
-            (SELECT oid FROM pg_database WHERE datname = current_database()) \
+            (SELECT oid FROM pg_database WHERE datname = pg_catalog.current_database()) \
          THEN l.relation::regclass::text \
        WHEN l.relation IS NOT NULL \
          THEN COALESCE(d.datname, '?') || ': relation ' || l.relation::text \
@@ -2095,13 +2140,13 @@ const PG_LOCKS_SQL: &str = "SELECT l.pid::text, \
        WHEN l.locktype = 'advisory' THEN 'advisory ' || l.classid::text || ':' || l.objid::text \
        ELSE l.locktype END, \
      l.locktype, l.mode, l.granted, \
-     CASE WHEN NOT l.granted THEN pg_blocking_pids(l.pid)::text END, \
+     CASE WHEN NOT l.granted THEN pg_catalog.pg_blocking_pids(l.pid)::text END, \
      COALESCE(a.backend_type = 'client backend' \
        OR (a.backend_type IS NULL AND a.usename IS NOT NULL AND a.datname IS NOT NULL), \
        false) \
      FROM pg_locks l LEFT JOIN pg_database d ON d.oid = l.database \
      LEFT JOIN pg_stat_activity a ON a.pid = l.pid \
-     WHERE l.pid IS NOT NULL AND l.pid <> pg_backend_pid() \
+     WHERE l.pid IS NOT NULL AND l.pid <> pg_catalog.pg_backend_pid() \
        AND NOT (l.locktype = 'virtualxid' AND l.granted) \
      ORDER BY l.granted, l.pid LIMIT ";
 
@@ -2120,7 +2165,9 @@ fn pg_activity_sql(limit: usize) -> String {
 /// MySQL one can (`Conn::id()`), and the pinned session needs it to recognise
 /// itself in `pg_stat_activity` — see [`Session::server_id`](crate::Session::server_id).
 pub(crate) async fn backend_pid(client: &Client) -> Option<i64> {
-    let rows = query_all(client, "SELECT pg_backend_pid()").await.ok()?;
+    let rows = query_all(client, "SELECT pg_catalog.pg_backend_pid()")
+        .await
+        .ok()?;
     opt(rows.first()?, 0)?.parse().ok()
 }
 
@@ -2136,10 +2183,10 @@ pub(crate) async fn backend_pid(client: &Client) -> Option<i64> {
 ///
 /// A missing *privilege* does raise, and that error surfaces as it always did.
 pub(crate) async fn kill_session(db: &Db, id: i64, kind: KillKind) -> Result<(), DbError> {
-    let client = connect_maintenance(db).await?;
+    let client = connect_catalogue(db, None).await?;
     let func = match kind {
-        KillKind::Query => "pg_cancel_backend",
-        KillKind::Session => "pg_terminate_backend",
+        KillKind::Query => "pg_catalog.pg_cancel_backend",
+        KillKind::Session => "pg_catalog.pg_terminate_backend",
     };
     // `id` came from the server as an integer and goes back as a decimal literal.
     let rows = query_all(&client, &format!("SELECT {func}({id})")).await?;
@@ -2161,7 +2208,7 @@ pub(crate) async fn fetch_schema(
     database: &str,
     cancel: CancellationToken,
 ) -> Result<DbSchema, DbError> {
-    let client = connect_to(db, database).await?;
+    let client = connect_catalogue(db, Some(database)).await?;
     // A dozen catalogue queries over every table of the database, so the token
     // is what stops it *on the server* rather than only abandoning the answer —
     // the same shape `count_rows` uses, and for the same reason.
@@ -2293,11 +2340,11 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         client,
         &format!(
             "SELECT n.nspname, c.relname, a.attname, \
-                    format_type(a.atttypid, a.atttypmod), \
+                    pg_catalog.format_type(a.atttypid, a.atttypmod), \
                     a.attnotnull, \
-                    pg_get_expr(ad.adbin, ad.adrelid), \
+                    pg_catalog.pg_get_expr(ad.adbin, ad.adrelid), \
                     a.attidentity, a.attgenerated, \
-                    col_description(c.oid, a.attnum), \
+                    pg_catalog.col_description(c.oid, a.attnum), \
                     co.collname, \
                     EXISTS (SELECT 1 FROM pg_depend d \
                             JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' \
@@ -2373,9 +2420,10 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              JOIN pg_class rc ON rc.oid = con.confrelid \
              JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
-             JOIN unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) ON true \
+             JOIN pg_catalog.unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) ON true \
              JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum \
-             JOIN unnest(con.confkey) WITH ORDINALITY AS fk(attnum, ord) ON fk.ord = k.ord \
+             JOIN pg_catalog.unnest(con.confkey) WITH ORDINALITY AS fk(attnum, ord) \
+                  ON fk.ord = k.ord \
              JOIN pg_attribute ra ON ra.attrelid = con.confrelid AND ra.attnum = fk.attnum \
              WHERE con.contype = 'f' AND {} \
              ORDER BY n.nspname, c.relname, con.conname, k.ord",
@@ -2454,8 +2502,8 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
     let view_all = query_all(
         client,
         &format!(
-            "SELECT n.nspname, c.relname, pg_get_viewdef(c.oid, true), \
-                    c.relkind, array_to_string(c.reloptions, ','), \
+            "SELECT n.nspname, c.relname, pg_catalog.pg_get_viewdef(c.oid, true), \
+                    c.relkind, pg_catalog.array_to_string(c.reloptions, ','), \
                     c.relispopulated \
              FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind IN ('v', 'm') AND {}",
@@ -2507,7 +2555,7 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
     let check_all = query_all(
         client,
         &format!(
-            "SELECT n.nspname, c.relname, con.conname, pg_get_constraintdef(con.oid) \
+            "SELECT n.nspname, c.relname, con.conname, pg_catalog.pg_get_constraintdef(con.oid) \
              FROM pg_constraint con \
              JOIN pg_class c ON c.oid = con.conrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -2534,7 +2582,7 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         &format!(
             "SELECT n.nspname, c.relname, t.tgname, t.tgtype::int, t.tgenabled, \
                     (t.tgconstraint <> 0)::int, t.tgfoid::regproc::text, \
-                    pg_get_triggerdef(t.oid), \
+                    pg_catalog.pg_get_triggerdef(t.oid), \
                     COALESCE(t.tgoldtable, ''), COALESCE(t.tgnewtable, '') \
              FROM pg_trigger t \
              JOIN pg_class c ON c.oid = t.tgrelid \
@@ -2565,7 +2613,8 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
              FROM pg_trigger t \
              JOIN pg_class c ON c.oid = t.tgrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
-             CROSS JOIN LATERAL unnest(string_to_array(NULLIF(t.tgattr::text, ''), ' ')) \
+             CROSS JOIN LATERAL pg_catalog.unnest( \
+                  pg_catalog.string_to_array(NULLIF(t.tgattr::text, ''), ' ')) \
                   WITH ORDINALITY AS x(attnum, ord) \
              JOIN pg_attribute a ON a.attrelid = t.tgrelid \
                                 AND a.attnum = x.attnum::smallint \
@@ -2695,7 +2744,7 @@ pub(crate) async fn fetch_replay_access(
     db: &Db,
     database: &str,
 ) -> Result<schemaic_core::access::ReplayAccess, DbError> {
-    let client = connect_to(db, database).await?;
+    let client = connect_catalogue(db, Some(database)).await?;
     Ok(schemaic_core::access::ReplayAccess {
         tables: pg_table_access(&client).await.ok(),
         routines: None,
@@ -2716,7 +2765,7 @@ async fn pg_table_access(
     let rels = query_all(
         client,
         &format!(
-            "SELECT n.nspname, c.relname, pg_get_userbyid(c.relowner), \
+            "SELECT n.nspname, c.relname, pg_catalog.pg_get_userbyid(c.relowner), \
                     (c.relacl IS NULL)::text, c.relrowsecurity::text, \
                     c.relforcerowsecurity::text \
              FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -2731,19 +2780,21 @@ async fn pg_table_access(
             "SELECT nspname, relname, attname, grantee, privilege_type, is_grantable \
              FROM ( \
                SELECT n.nspname, c.relname, NULL::name AS attname, 0 AS attnum, a.ord, \
-                      CASE WHEN a.grantee = 0 THEN NULL ELSE pg_get_userbyid(a.grantee) END \
+                      CASE WHEN a.grantee = 0 THEN NULL \
+                           ELSE pg_catalog.pg_get_userbyid(a.grantee) END \
                         AS grantee, a.privilege_type, a.is_grantable::text AS is_grantable \
                FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-               CROSS JOIN LATERAL aclexplode(c.relacl) WITH ORDINALITY \
+               CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) WITH ORDINALITY \
                  AS a(grantor, grantee, privilege_type, is_grantable, ord) \
                WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {filter} \
                UNION ALL \
                SELECT n.nspname, c.relname, t.attname, t.attnum, a.ord, \
-                      CASE WHEN a.grantee = 0 THEN NULL ELSE pg_get_userbyid(a.grantee) END, \
+                      CASE WHEN a.grantee = 0 THEN NULL \
+                           ELSE pg_catalog.pg_get_userbyid(a.grantee) END, \
                       a.privilege_type, a.is_grantable::text \
                FROM pg_attribute t JOIN pg_class c ON c.oid = t.attrelid \
                JOIN pg_namespace n ON n.oid = c.relnamespace \
-               CROSS JOIN LATERAL aclexplode(t.attacl) WITH ORDINALITY \
+               CROSS JOIN LATERAL pg_catalog.aclexplode(t.attacl) WITH ORDINALITY \
                  AS a(grantor, grantee, privilege_type, is_grantable, ord) \
                WHERE t.attnum > 0 AND NOT t.attisdropped \
                  AND c.relkind IN ('r', 'p', 'v', 'm', 'f') AND {filter} \
@@ -2755,7 +2806,8 @@ async fn pg_table_access(
         client,
         &format!(
             "SELECT n.nspname, c.relname, p.polname, p.polpermissive::text, p.polcmd::text, \
-                    pg_get_expr(p.polqual, p.polrelid), pg_get_expr(p.polwithcheck, p.polrelid) \
+                    pg_catalog.pg_get_expr(p.polqual, p.polrelid), \
+                    pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid) \
              FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE {filter} ORDER BY n.nspname, c.relname, p.polname"
@@ -2766,10 +2818,10 @@ async fn pg_table_access(
         client,
         &format!(
             "SELECT n.nspname, c.relname, p.polname, \
-                    CASE WHEN r.oid = 0 THEN NULL ELSE pg_get_userbyid(r.oid) END \
+                    CASE WHEN r.oid = 0 THEN NULL ELSE pg_catalog.pg_get_userbyid(r.oid) END \
              FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
-             CROSS JOIN LATERAL unnest(p.polroles) WITH ORDINALITY AS r(oid, ord) \
+             CROSS JOIN LATERAL pg_catalog.unnest(p.polroles) WITH ORDINALITY AS r(oid, ord) \
              WHERE {filter} ORDER BY n.nspname, c.relname, p.polname, r.ord"
         ),
     )
@@ -2875,7 +2927,7 @@ pub(crate) async fn available_extensions(
     db: &Db,
     database: &str,
 ) -> Result<Vec<schemaic_core::schema::AvailableExtension>, DbError> {
-    let client = connect_to(db, database).await?;
+    let client = connect_catalogue(db, Some(database)).await?;
     Ok(query_all(
         &client,
         "SELECT name::text, COALESCE(default_version, '')::text, \
@@ -3107,10 +3159,10 @@ async fn pg_types(client: &Client) -> Result<(Vec<EnumInfo>, Vec<DomainInfo>), D
         &format!(
             "SELECT n.nspname, t.typname, t.typtype::text, \
                     CASE WHEN t.typtype = 'd' \
-                         THEN format_type(t.typbasetype, t.typtypmod) ELSE '' END, \
-                    COALESCE(pg_get_expr(t.typdefaultbin, 0), t.typdefault, ''), \
+                         THEN pg_catalog.format_type(t.typbasetype, t.typtypmod) ELSE '' END, \
+                    COALESCE(pg_catalog.pg_get_expr(t.typdefaultbin, 0), t.typdefault, ''), \
                     t.typnotnull::int, COALESCE(co.collname, ''), \
-                    COALESCE(obj_description(t.oid, 'pg_type'), ''), \
+                    COALESCE(pg_catalog.obj_description(t.oid, 'pg_type'), ''), \
                     (t.typdefaultbin IS NOT NULL OR t.typdefault IS NOT NULL)::int, \
                     COALESCE(cn.nspname, '') \
              FROM pg_type t \
@@ -3143,7 +3195,7 @@ async fn pg_types(client: &Client) -> Result<(Vec<EnumInfo>, Vec<DomainInfo>), D
     let constraint_rows = query_all_optional(
         client,
         &format!(
-            "SELECT n.nspname, t.typname, c.conname, pg_get_constraintdef(c.oid) \
+            "SELECT n.nspname, t.typname, c.conname, pg_catalog.pg_get_constraintdef(c.oid) \
              FROM pg_constraint c \
              JOIN pg_type t ON t.oid = c.contypid \
              JOIN pg_namespace n ON n.oid = t.typnamespace \
@@ -3256,13 +3308,13 @@ async fn pg_sequences(client: &Client) -> Result<Vec<SequenceInfo>, DbError> {
     let rows = query_all_optional(
         client,
         &format!(
-            "SELECT n.nspname, c.relname, format_type(s.seqtypid, NULL), \
+            "SELECT n.nspname, c.relname, pg_catalog.format_type(s.seqtypid, NULL), \
                     s.seqstart::text, s.seqincrement::text, s.seqmin::text, \
                     s.seqmax::text, s.seqcache::text, s.seqcycle::int, \
                     COALESCE(ps.last_value::text, ''), \
                     COALESCE(dt.relname, ''), COALESCE(da.attname, ''), \
                     COALESCE(d.deptype, ''), \
-                    COALESCE(obj_description(c.oid, 'pg_class'), '') \
+                    COALESCE(pg_catalog.obj_description(c.oid, 'pg_class'), '') \
              FROM pg_sequence s \
              JOIN pg_class c ON c.oid = s.seqrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -3393,7 +3445,7 @@ pub(crate) async fn trigger_functions(
     db: &Db,
     database: &str,
 ) -> Result<Vec<RoutineInfo>, DbError> {
-    let client = connect_to(db, database).await?;
+    let client = connect_catalogue(db, Some(database)).await?;
     routines_where(&client, &trigger_function_filter()).await
 }
 
@@ -3414,7 +3466,7 @@ pub(crate) async fn trigger_functions(
 /// catalogue, and the caller may be asking in order to create a database that
 /// does not exist yet.
 pub(crate) async fn roles(db: &Db) -> Result<Vec<String>, DbError> {
-    let client = connect_maintenance(db).await?;
+    let client = connect_catalogue(db, None).await?;
     // **`left(…, 3)`, not `NOT LIKE 'pg\_%'`.** That pattern needs the backslash
     // to survive the string literal and reach `LIKE` as its escape, which is
     // true only while `standard_conforming_strings` is on. With it off — legacy,
@@ -3425,7 +3477,8 @@ pub(crate) async fn roles(db: &Db) -> Result<Vec<String>, DbError> {
     // depend on.
     let rows = query_all(
         &client,
-        "SELECT rolname FROM pg_roles WHERE left(rolname, 3) <> 'pg_' ORDER BY rolname",
+        "SELECT rolname FROM pg_roles WHERE pg_catalog.left(rolname, 3) <> 'pg_' \
+         ORDER BY rolname",
     )
     .await?;
     Ok(rows
@@ -3442,7 +3495,7 @@ pub(crate) async fn roles(db: &Db) -> Result<Vec<String>, DbError> {
 /// real privileges and "why can this account read that" is the question the
 /// browser exists to answer — and `users::from_pg_rows` sorts them last.
 pub(crate) async fn fetch_principals(db: &Db) -> Result<users::Principals, DbError> {
-    let client = connect_maintenance(db).await?;
+    let client = connect_catalogue(db, None).await?;
     let rows = query_all(&client, PG_ROLES_SQL).await?;
     let rows: Vec<PgRoleRow> = rows
         .iter()
@@ -3480,8 +3533,8 @@ pub(crate) async fn fetch_principals(db: &Db) -> Result<users::Principals, DbErr
 async fn password_policy(client: &Client) -> Option<users::PasswordPolicy> {
     let rows = query_all(
         client,
-        "SELECT current_setting('password_encryption'), \
-                current_setting('scram_iterations', true), \
+        "SELECT pg_catalog.current_setting('password_encryption'), \
+                pg_catalog.current_setting('scram_iterations', true), \
                 (SELECT setting FROM pg_catalog.pg_settings \
                   WHERE name = 'shared_preload_libraries')",
     )
@@ -3536,10 +3589,8 @@ pub(crate) async fn fetch_grants(
 ) -> Result<Grants, DbError> {
     // No database selected: the cluster-wide half is still answerable, and a
     // maintenance connection is where `fetch_principals` already stands.
-    let (client, scope) = match database {
-        Some(d) => (connect_to(db, d).await?, Some(d.to_string())),
-        None => (connect_maintenance(db).await?, None),
-    };
+    let client = connect_catalogue(db, database).await?;
+    let scope = database.map(str::to_string);
     let who = pg_str_lit(&principal.name);
     // Every ACL query compares against the role's own oid. A role that has since
     // been dropped yields NULL, which matches nothing — an empty list, not an
@@ -3565,7 +3616,7 @@ pub(crate) async fn fetch_grants(
         &client,
         &format!(
             "SELECT d.datname, a.privilege_type, a.is_grantable \
-             FROM pg_catalog.pg_database d, aclexplode(d.datacl) a \
+             FROM pg_catalog.pg_database d, pg_catalog.aclexplode(d.datacl) a \
              WHERE a.grantee = {oid} \
              ORDER BY d.datname, a.is_grantable, a.privilege_type"
         ),
@@ -3590,7 +3641,7 @@ pub(crate) async fn fetch_grants(
             &client,
             &format!(
                 "SELECT n.nspname, a.privilege_type, a.is_grantable \
-             FROM pg_catalog.pg_namespace n, aclexplode(n.nspacl) a \
+             FROM pg_catalog.pg_namespace n, pg_catalog.aclexplode(n.nspacl) a \
              WHERE a.grantee = {oid} \
              ORDER BY n.nspname, a.is_grantable, a.privilege_type"
             ),
@@ -3614,7 +3665,7 @@ pub(crate) async fn fetch_grants(
                 "SELECT n.nspname, c.relname, c.relkind, a.privilege_type, a.is_grantable \
              FROM pg_catalog.pg_class c \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-             CROSS JOIN LATERAL aclexplode(c.relacl) a \
+             CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) a \
              WHERE a.grantee = {oid} AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S') \
              ORDER BY n.nspname, c.relname, a.is_grantable, a.privilege_type"
             ),
@@ -3642,9 +3693,11 @@ pub(crate) async fn fetch_grants(
         &client,
         &format!(
             "SELECT (SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = {who}), \
-                    (SELECT count(*) FROM pg_catalog.pg_database WHERE datdba = {oid}) \
-                  + (SELECT count(*) FROM pg_catalog.pg_namespace WHERE nspowner = {oid}) \
-                  + (SELECT count(*) FROM pg_catalog.pg_class \
+                    (SELECT pg_catalog.count(*) FROM pg_catalog.pg_database \
+                     WHERE datdba = {oid}) \
+                  + (SELECT pg_catalog.count(*) FROM pg_catalog.pg_namespace \
+                     WHERE nspowner = {oid}) \
+                  + (SELECT pg_catalog.count(*) FROM pg_catalog.pg_class \
                      WHERE relowner = {oid} AND relkind IN ('r', 'p', 'v', 'm', 'f', 'S'))"
         ),
     )
@@ -3697,7 +3750,8 @@ async fn routines_where(client: &Client, filter: &str) -> Result<Vec<RoutineInfo
             "SELECT p.oid::text, s.setting \
              FROM pg_proc p \
              JOIN pg_namespace n ON n.oid = p.pronamespace \
-             CROSS JOIN LATERAL unnest(p.proconfig) WITH ORDINALITY AS s(setting, ord) \
+             CROSS JOIN LATERAL pg_catalog.unnest(p.proconfig) \
+                  WITH ORDINALITY AS s(setting, ord) \
              WHERE {filter} \
              ORDER BY p.oid, s.ord"
         ),
@@ -3715,11 +3769,11 @@ async fn routines_where(client: &Client, filter: &str) -> Result<Vec<RoutineInfo
             // `pg_get_function_arguments` prints `DEFAULT` expressions the
             // `CREATE` needs, and `…_identity_arguments` omits them because
             // `DROP`/`ALTER … RENAME` have no grammar for them.
-            "SELECT n.nspname, p.proname, pg_get_function_arguments(p.oid), \
-                    pg_get_function_result(p.oid), l.lanname, p.prosrc, \
+            "SELECT n.nspname, p.proname, pg_catalog.pg_get_function_arguments(p.oid), \
+                    pg_catalog.pg_get_function_result(p.oid), l.lanname, p.prosrc, \
                     p.provolatile, p.proisstrict::int, p.prosecdef::int, \
                     p.oid::text, p.prokind, \
-                    pg_get_function_identity_arguments(p.oid), \
+                    pg_catalog.pg_get_function_identity_arguments(p.oid), \
                     p.proparallel, p.proleakproof::int, p.procost::text, \
                     CASE WHEN p.proretset THEN p.prorows::text END \
              FROM pg_proc p \
@@ -4242,7 +4296,8 @@ fn col_meta_sql(in_list: &str) -> String {
         "SELECT a.attrelid, a.attnum, a.attname, c.relname, n.nspname, \
                 a.attnotnull, \
                 (a.attidentity <> '' OR (a.atthasdef AND \
-                    COALESCE(pg_get_expr(ad.adbin, ad.adrelid), '') LIKE 'nextval(%')) AS auto_inc, \
+                    COALESCE(pg_catalog.pg_get_expr(ad.adbin, ad.adrelid), '') \
+                    LIKE 'nextval(%')) AS auto_inc, \
                 a.atthasdef, a.attidentity, \
                 (pk.attnum IS NOT NULL) AS is_pk \
          FROM pg_attribute a \
@@ -4251,7 +4306,7 @@ fn col_meta_sql(in_list: &str) -> String {
          LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
          LEFT JOIN (SELECT i.indrelid AS relid, k.attnum \
                     FROM pg_index i, \
-                         unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) \
+                         pg_catalog.unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) \
                     WHERE i.indisprimary AND k.ord <= i.indnkeyatts) pk \
            ON pk.relid = a.attrelid AND pk.attnum = a.attnum \
          WHERE a.attrelid IN ({in_list}) AND a.attnum > 0 AND NOT a.attisdropped"
@@ -4760,7 +4815,8 @@ pub(crate) async fn fetch_blob(
 pub(crate) async fn blob_on(client: &Client, r: &BlobRef) -> Result<Option<BlobValue>, DbError> {
     let col = pg_ident(&r.column);
     let sql = format!(
-        "SELECT octet_length({col}), substring({col} from 1 for {FETCH_CAP}) FROM {} WHERE {} LIMIT 1",
+        "SELECT pg_catalog.octet_length({col}), substring({col} from 1 for {FETCH_CAP}) \
+         FROM {} WHERE {} LIMIT 1",
         pg_qname(r.schema.as_deref(), &r.table),
         where_key(&r.key),
     );
@@ -5269,11 +5325,13 @@ mod tests {
         assert_eq!(
             pg_activity_sql(51),
             "SELECT s.pid, s.usename, s.client_host, s.datname, s.state, s.query, s.age, \
-             s.blockers FROM ( SELECT pid, usename, host(client_addr) AS client_host, datname, \
-             state, query, EXTRACT(EPOCH FROM (now() - COALESCE(state_change, query_start, \
-             backend_start)))::float8 AS age, pg_blocking_pids(pid)::text AS blockers FROM \
+             s.blockers FROM ( SELECT pid, usename, pg_catalog.host(client_addr) AS client_host, \
+             datname, state, query, EXTRACT(EPOCH FROM (pg_catalog.now() - COALESCE(state_change, \
+             query_start, backend_start)))::float8 AS age, \
+             pg_catalog.pg_blocking_pids(pid)::text AS blockers FROM \
              pg_stat_activity WHERE (backend_type = 'client backend' OR (backend_type IS NULL \
-             AND usename IS NOT NULL AND datname IS NOT NULL)) AND pid <> pg_backend_pid() ) s \
+             AND usename IS NOT NULL AND datname IS NOT NULL)) \
+             AND pid <> pg_catalog.pg_backend_pid() ) s \
              ORDER BY (s.blockers <> '{}') DESC, (s.state IS DISTINCT FROM 'idle' AND s.state \
              IS NOT NULL) DESC, s.age DESC NULLS LAST LIMIT 51"
         );
@@ -6210,11 +6268,17 @@ mod tests {
     fn the_table_stats_query_sizes_a_partitioned_parent_by_its_partitions() {
         let q = table_stats_sql();
         assert!(
-            q.contains("sum(pg_table_size(lc.oid))::bigint FROM pg_partition_tree(c.oid)"),
+            q.contains(
+                "pg_catalog.sum(pg_catalog.pg_table_size(lc.oid))::bigint \
+                 FROM pg_catalog.pg_partition_tree(c.oid)"
+            ),
             "{q}"
         );
         assert!(
-            q.contains("sum(pg_indexes_size(lc.oid))::bigint FROM pg_partition_tree(c.oid)"),
+            q.contains(
+                "pg_catalog.sum(pg_catalog.pg_indexes_size(lc.oid))::bigint \
+                 FROM pg_catalog.pg_partition_tree(c.oid)"
+            ),
             "both sizes, or the split disagrees with the total: {q}"
         );
         assert!(q.contains("WHERE pt.isleaf"), "{q}");
@@ -6222,7 +6286,10 @@ mod tests {
         // through it would say "0 rows" about a full table — and summed, it
         // would subtract.
         assert!(q.contains("WHEN c.reltuples < 0 THEN NULL"), "{q}");
-        assert!(q.contains("bool_or(lc.reltuples < 0) THEN NULL"), "{q}");
+        assert!(
+            q.contains("pg_catalog.bool_or(lc.reltuples < 0) THEN NULL"),
+            "{q}"
+        );
         // Sized relkinds only, and the partitioned parent listed among them so it
         // still gets its row estimate.
         assert!(q.contains("c.relkind IN ('r','m','p')"), "{q}");
@@ -6236,7 +6303,10 @@ mod tests {
     fn the_index_stats_query_nulls_a_partitioned_indexs_size() {
         let q = index_stats_sql();
         assert!(
-            q.contains("CASE WHEN ic.relkind = 'I' THEN NULL ELSE pg_relation_size(ic.oid) END"),
+            q.contains(
+                "CASE WHEN ic.relkind = 'I' THEN NULL \
+                 ELSE pg_catalog.pg_relation_size(ic.oid) END"
+            ),
             "{q}"
         );
         // And the scan count is left unguarded on purpose: `pg_stat_all_indexes`
@@ -6401,8 +6471,8 @@ mod table_list_tests {
         let sql = table_list_sql();
         for part in [
             "pg_inherits i ON c.relispartition AND i.inhrelid = c.oid",
-            "pg_get_expr(c.relpartbound, c.oid)",
-            "WHEN c.relkind = 'p' THEN pg_get_partkeydef(c.oid)",
+            "pg_catalog.pg_get_expr(c.relpartbound, c.oid)",
+            "WHEN c.relkind = 'p' THEN pg_catalog.pg_get_partkeydef(c.oid)",
         ] {
             assert!(sql.contains(part), "{part} missing from {sql}");
         }
@@ -6514,7 +6584,7 @@ mod index_key_tests {
     fn the_index_query_reads_each_key_position_in_full() {
         let sql = index_list_sql();
         assert!(
-            sql.contains("pg_get_indexdef(ix.indexrelid, k.ord::int, true)"),
+            sql.contains("pg_catalog.pg_get_indexdef(ix.indexrelid, k.ord::int, true)"),
             "the per-position key text, which is the expression for a computed key"
         );
         assert!(
@@ -6522,7 +6592,7 @@ mod index_key_tests {
             "an expression position has no pg_attribute row to join to"
         );
         assert!(
-            sql.contains("unnest(ix.indoption) WITH ORDINALITY"),
+            sql.contains("pg_catalog.unnest(ix.indoption) WITH ORDINALITY"),
             "DESC comes from indoption, paired by ordinality rather than subscript"
         );
     }
@@ -6557,7 +6627,7 @@ mod index_key_tests {
             "a constraint's INCLUDE list is not something the model can hold"
         );
         assert!(
-            sql.contains("LEFT JOIN unnest(ix.indoption)")
+            sql.contains("LEFT JOIN pg_catalog.unnest(ix.indoption)")
                 && sql.contains("k.ord > ix.indnkeyatts AS included"),
             "a plain index's INCLUDE list is read, apart from its key"
         );
@@ -6568,7 +6638,7 @@ mod index_key_tests {
         // The whole statement, which is both the fourth answer and the text a
         // lossy index is emitted from.
         assert!(
-            sql.contains("pg_get_indexdef(ix.indexrelid) AS idxdef"),
+            sql.contains("pg_catalog.pg_get_indexdef(ix.indexrelid) AS idxdef"),
             "the server's own CREATE INDEX has to come back with the row"
         );
     }

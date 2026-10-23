@@ -1018,3 +1018,93 @@ async fn table_info_in(
         .find(|t| t.name == table && t.schema.as_deref() == ns.schema.as_deref())
         .unwrap_or_else(|| panic!("no {table:?} in {}", ns.database))
 }
+
+/// **Reading the catalogue calls no function of the database's own.** The
+/// app's introspection queries run as the connecting user, so a builtin they
+/// name bare is resolved through a path somebody else may have written to:
+/// an overload that matches more exactly than the builtin wins wherever the
+/// catalogue sits on the path (`obj_description(oid, text)` beats
+/// `(oid, name)` for an untyped literal), and an identical signature wins on a
+/// path that puts `public` first (here through init SQL; a database or role
+/// default does the same). Each planted function records that it ran.
+/// PostgreSQL only.
+pub async fn introspection_calls_no_function_the_database_planted(target: &'static Target) {
+    if target.engine != schemaic_db::Engine::Postgres {
+        return;
+    }
+    let scratch = Scratch::create(target, "ns_unshadowed_catalogue").await;
+    scratch
+        .exec("CREATE TABLE public.calls (what text NOT NULL)")
+        .await;
+    scratch
+        .exec(
+            "CREATE FUNCTION public.obj_description(oid, text) RETURNS text \
+             LANGUAGE plpgsql AS $$ BEGIN \
+             INSERT INTO public.calls VALUES ('obj_description'); RETURN NULL; END $$",
+        )
+        .await;
+    scratch
+        .exec(
+            "CREATE FUNCTION public.format_type(oid, integer) RETURNS text \
+             LANGUAGE plpgsql AS $$ BEGIN \
+             INSERT INTO public.calls VALUES ('format_type'); RETURN 'text'; END $$",
+        )
+        .await;
+    scratch
+        .exec(
+            "CREATE FUNCTION public.oid_eq(oid, oid) RETURNS boolean \
+             LANGUAGE plpgsql AS $$ BEGIN \
+             INSERT INTO public.calls VALUES ('='); RETURN pg_catalog.oideq($1, $2); END $$",
+        )
+        .await;
+    scratch
+        .exec("CREATE OPERATOR public.= (LEFTARG = oid, RIGHTARG = oid, FUNCTION = public.oid_eq)")
+        .await;
+    let hostile = scratch
+        .db
+        .clone()
+        .with_database(Some(&scratch.database))
+        .with_init_sql("SET search_path TO public, pg_catalog");
+    let calls = || async {
+        let rs = scratch
+            .exec("SELECT what FROM public.calls GROUP BY what ORDER BY what")
+            .await;
+        (0..rs.row_count())
+            .map(|r| rs.cell(r, 0).expect("a value").display().to_string())
+            .collect::<Vec<_>>()
+    };
+    // The premise: on this path, a bare call reaches every plant.
+    hostile
+        .fetch_query(
+            Some(&scratch.database),
+            "SELECT obj_description(0, 'pg_class'), format_type(23, -1), 1::oid = 1::oid",
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the premise: {e}"));
+    assert_eq!(
+        calls().await,
+        ["=", "format_type", "obj_description"],
+        "the fixture does not shadow"
+    );
+    scratch.exec("DELETE FROM public.calls").await;
+
+    for db in [
+        scratch.db.clone().with_database(Some(&scratch.database)),
+        hostile.clone(),
+    ] {
+        db.fetch_schema(&scratch.database, CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("introspecting {}: {e}", scratch.database));
+        db.fetch_table_list(&scratch.database)
+            .await
+            .unwrap_or_else(|e| panic!("listing {}: {e}", scratch.database));
+    }
+    assert_eq!(
+        calls().await,
+        Vec::<String>::new(),
+        "introspection called the database's own functions"
+    );
+    scratch.teardown().await;
+}
