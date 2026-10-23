@@ -238,7 +238,22 @@ plaintext `connections.json` of the keyring-unavailable fallback stays readable 
 file readers above, which no environment variable reaches — the same run's `view_file` read a file
 outside its cwd without a prompt. The panel's own MCP subprocess is
 unaffected: `--mcp-serve` is answered in `app/main.rs` before the command line's dispatch, so it
-never asks.
+never asks. **That made it a route of its own** (release review S3-L5-03): an agent with a shell
+could start `<exe> --mcp-serve` with an endpoint of its own making and serve *any* saved
+connection by id, `cli_access` never asked. So the panel's spawn writes a **grant** —
+`schemaic-mcp-<owner>-grant-<tag>.json`, holding the connection id, in the owner-only `ai-mcp`
+directory beside the session's other private files and removed with them — and puts its bare
+name in the endpoint blob as `"grant"`; `mcp_endpoint_from_env` asks `grant_allows` before it
+builds anything, and serves a saved connection only when the grant names the same one. A blob
+naming no saved connection needs none. An agent that reads its MCP config learns the grant and
+with it reaches the connection the panel already gave it, at that connection's own AI data level
+(`samples` is bounded by it, S2-L5-03) — nothing else; writing a grant of its own would need a
+write into the app's private directory, which is the vendor sandbox's to stop
+(`mcp_serve_serves_only_the_connection_the_app_granted`, which also pins the order in
+`mcp_endpoint_from_env` from the source). Verified on the built binary: a forged blob for a saved
+connection, and one whose grant names another, exit 2 with the refusal; the matching grant serves
+the tools; and the Claude harness in a sandboxed app answered a `list_schema` question through it,
+the grant gone from `ai-mcp` once the app closed.
 **Cursor is the third `Restricted`, and it is reached by neither a sandbox nor a flag but by rules
 in a file** — the weakest mechanism here, which is why the grade and the notice both have to say
 so. Measured on its CLI (2026.09.23-86fc751, Windows 11, 2026-09-26): nothing empties its

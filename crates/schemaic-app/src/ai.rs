@@ -288,6 +288,10 @@ pub(crate) fn mcp_endpoint_from_env() -> Result<McpEndpoint, String> {
         |p| std::fs::read_to_string(p).map_err(|e| e.to_string()),
         std::env::var("SCHEMAIC_MCP_ENDPOINT").ok().as_deref(),
     )?;
+    grant_allows(&v, |name| {
+        let dir = mcp_dir().ok_or("no private directory")?;
+        std::fs::read_to_string(dir.join(name)).map_err(|e| e.to_string())
+    })?;
     endpoint_from_blob(&v, keyring_connection)
 }
 
@@ -308,6 +312,82 @@ fn endpoint_from_blob(
         endpoint.samples &= ai_data.may_query();
     }
     Ok(endpoint)
+}
+
+/// Kind of the private file that grants one `--mcp-serve` child its saved
+/// connection ([`grant_allows`]).
+const GRANT_KIND: &str = "grant";
+
+/// Does the app's own grant cover the saved connection this blob names?
+///
+/// **`--mcp-serve` runs before the agent marker is looked at** — the panel's
+/// own MCP child inherits it — so an agent with a shell under the panel could
+/// start one with an endpoint of its making and serve **any** saved connection
+/// by id, `cli_access` never asked (release review S3-L5-03). So the panel's
+/// spawn writes a grant into [`mcp_dir`], the app's owner-only directory,
+/// naming the connection it hands the child, and puts the grant's file name in
+/// the blob; the child serves a saved connection only when that grant names
+/// the same one. An agent that reads its MCP config learns the grant, and with
+/// it reaches what the panel already gave it, nothing else.
+///
+/// A blob naming no saved connection reaches none, so it needs none. `read` is
+/// the grant file's contents by bare name, under [`mcp_dir`] — a seam so the
+/// refusal has a test.
+fn grant_allows(
+    v: &serde_json::Value,
+    read: impl Fn(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    let Some(id) = v.get("conn_id").and_then(|x| x.as_u64()) else {
+        return Ok(());
+    };
+    let refused = |why: &str| {
+        Err(format!(
+            "this database endpoint names saved connection {id}, but {why} — only the \
+             Schemaic window's AI panel may hand a connection to --mcp-serve"
+        ))
+    };
+    let Some(name) = v.get("grant").and_then(|x| x.as_str()) else {
+        return refused("carries no grant from the app");
+    };
+    // A bare name of ours, never a path: the grant is the app's directory's
+    // to vouch for, and `..` or a separator would let a blob point anywhere.
+    let ours = name.starts_with(MCP_FILE_PREFIX)
+        && name.contains(&format!("-{GRANT_KIND}-"))
+        && !name.contains(['/', '\\'])
+        && !name.contains("..");
+    if !ours {
+        return refused("its grant is not a file the app writes");
+    }
+    let granted = read(name)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|g| g.get("conn_id").and_then(|x| x.as_u64()));
+    match granted {
+        Some(g) if g == id => Ok(()),
+        Some(_) => refused("the app granted a different connection"),
+        None => refused("the app's grant could not be read"),
+    }
+}
+
+/// Write the grant [`grant_allows`] asks for, and return its path.
+fn write_grant(conn_id: u64) -> Option<PathBuf> {
+    let body = serde_json::json!({ "conn_id": conn_id }).to_string();
+    create_private(GRANT_KIND, "json", body.as_bytes())
+}
+
+/// `endpoint` (an [`endpoint_json`] blob) carrying the bare name of `grant`,
+/// the file [`write_grant`] wrote for it. Unchanged when there is none: the
+/// child then refuses to serve the saved connection, which is the failure
+/// direction to have.
+fn with_grant(endpoint: &str, grant: Option<&std::path::Path>) -> String {
+    let name = grant.and_then(|p| p.file_name()).and_then(|n| n.to_str());
+    match (serde_json::from_str::<serde_json::Value>(endpoint), name) {
+        (Ok(mut v), Some(name)) => {
+            v["grant"] = serde_json::Value::from(name);
+            v.to_string()
+        }
+        _ => endpoint.to_string(),
+    }
 }
 
 /// Resolve the endpoint blob, with the filesystem and the environment as
@@ -1801,13 +1881,19 @@ pub(crate) fn start_ai_session(
         return (tx, SessionPrivate::default());
     };
 
-    let endpoint = endpoint_json(
-        &db,
-        conn_id,
-        database.as_deref(),
-        data.may_query(),
-        schema_scope != SchemaScope::None,
-        &hidden,
+    // The child serves the saved connection only on the app's grant for it
+    // (`grant_allows`); it goes with the session's other private files.
+    let grant = write_grant(conn_id);
+    let endpoint = with_grant(
+        &endpoint_json(
+            &db,
+            conn_id,
+            database.as_deref(),
+            data.may_query(),
+            schema_scope != SchemaScope::None,
+            &hidden,
+        ),
+        grant.as_deref(),
     );
 
     // **Codex is a process per turn, not a process per conversation.** It has no
@@ -1823,7 +1909,7 @@ pub(crate) fn start_ai_session(
         // One directory for the whole session, though the children are one per
         // turn: they run the same conversation, and a directory per turn would
         // be a directory per turn left behind when the app is killed.
-        let private = SessionPrivate::of([ep_file.clone()], Some(cwd.clone()));
+        let private = SessionPrivate::of([ep_file.clone(), grant.clone()], Some(cwd.clone()));
         // **The same list Claude's `--allowedTools` gets**, so no two harnesses
         // can disagree about what this connection's access level offers.
         let allowed = ai_allowed_tools(data.may_query(), schema_scope != SchemaScope::None);
@@ -2304,7 +2390,10 @@ pub(crate) fn start_ai_session(
     // was `mcp_cfg` alone — `None` for all three of the others — so the
     // Antigravity endpoint file, plaintext password and all, was never unlinked
     // by anything.
-    let private = SessionPrivate::of([mcp_cfg.clone(), agy_ep.clone()], Some(cwd.clone()));
+    let private = SessionPrivate::of(
+        [mcp_cfg.clone(), agy_ep.clone(), grant.clone()],
+        Some(cwd.clone()),
+    );
     let agy_bin = bin.clone();
     let mcp_cfg_arg = mcp_cfg.as_ref().map(|p| p.to_string_lossy().into_owned());
     let spec = schemaic_ai::harness::TurnSpec {
@@ -4662,6 +4751,85 @@ mod tests {
             endpoint_from_blob(&blob(true), |_| Ok(saved(Some(AiData::SchemaOnly))))
                 .unwrap()
                 .schema
+        );
+    }
+
+    /// **`--mcp-serve` serves a saved connection only on the app's grant for
+    /// it** (release review S3-L5-03). It runs before the agent marker is
+    /// read, so an agent with a shell could start one with an endpoint of its
+    /// own naming any saved connection; now the blob must carry the bare name
+    /// of a grant the app wrote in its private directory, for the same id.
+    #[test]
+    fn mcp_serve_serves_only_the_connection_the_app_granted() {
+        let name = "schemaic-mcp-1-2-grant-00ff.json";
+        let blob = |id: u64, grant: Option<&str>| {
+            let mut v = serde_json::json!({ "conn_id": id });
+            if let Some(g) = grant {
+                v["grant"] = serde_json::Value::from(g);
+            }
+            v
+        };
+        let files = |n: &str| match n {
+            "schemaic-mcp-1-2-grant-00ff.json" => Ok(r#"{"conn_id":7}"#.to_string()),
+            _ => Err("no such file".to_string()),
+        };
+        assert_eq!(grant_allows(&blob(7, Some(name)), files), Ok(()));
+        // Another saved connection, the agent's own choice of id.
+        assert!(grant_allows(&blob(8, Some(name)), files).is_err());
+        // No grant, an unwritten one, or a path out of the directory.
+        assert!(grant_allows(&blob(7, None), files).is_err());
+        assert!(grant_allows(&blob(7, Some("schemaic-mcp-1-2-grant-0000.json")), files).is_err());
+        for path in [
+            "../schemaic-mcp-1-2-grant-00ff.json",
+            "sub/schemaic-mcp-1-2-grant-00ff.json",
+            "schemaic-mcp-1-2-cfg-00ff.json",
+        ] {
+            assert!(grant_allows(&blob(7, Some(path)), files).is_err(), "{path}");
+        }
+        // A blob naming no saved connection reaches none, and needs none.
+        assert_eq!(
+            grant_allows(&serde_json::json!({ "host": "h" }), |_| panic!("read")),
+            Ok(())
+        );
+        // What the panel's spawn hands the child carries the grant's bare name.
+        let db = Db::from_parts(
+            schemaic_db::Engine::Postgres,
+            "h".into(),
+            1,
+            "u".into(),
+            String::new(),
+            String::new(),
+        );
+        let out = with_grant(
+            &endpoint_json(&db, 7, None, false, true, &HashSet::new()),
+            Some(std::path::Path::new("/private/ai-mcp").join(name).as_path()),
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            (v["grant"].as_str(), v["conn_id"].as_u64()),
+            (Some(name), Some(7))
+        );
+        // And the child asks before it builds anything from the blob — read
+        // from the source, since `mcp_endpoint_from_env` reads the real
+        // environment and directory.
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("ai.rs"),
+        )
+        .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        let at = body
+            .find("pub(crate) fn mcp_endpoint_from_env()")
+            .expect("`mcp_endpoint_from_env` — this gate is stale");
+        let region = &body[at..at + body[at..].find("\n}\n").expect("its end")];
+        let asks = region
+            .find("grant_allows(&v,")
+            .expect("--mcp-serve no longer asks for the app's grant");
+        let builds = region.find("endpoint_from_blob(&v,").expect("stale");
+        assert!(
+            asks < builds,
+            "the grant is asked after the endpoint is built"
         );
     }
 

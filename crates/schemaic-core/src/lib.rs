@@ -116,7 +116,8 @@ pub const APP_ID: &str = "io.github.fadion.Schemaic";
 /// boundary**: a shell that knows the name can unset it, and the vendor's
 /// sandbox is what stands between it and the keyring. The panel's own MCP
 /// subprocess (`--mcp-serve`) never goes through the command line, so it is
-/// unaffected.
+/// unaffected — and is held instead to the app's per-session grant for the one
+/// connection it was handed (the app's `ai::grant_allows`).
 pub const AGENT_CHILD_ENV: &str = "SCHEMAIC_AGENT_CHILD";
 
 /// Current app version (mirrors the workspace package version).
