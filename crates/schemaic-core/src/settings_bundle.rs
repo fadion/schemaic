@@ -49,6 +49,7 @@ pub const PORTABLE_KEYS: &[&str] = &[
     "editor_theme",
     "ui_scale",
     "ui_language",
+    "show_resources",
     "editor_font_size",
     "tab_width",
     "soft_tabs",

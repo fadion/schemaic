@@ -187,6 +187,8 @@ settings-query-write-log-hint = Fiecare scriere pe care o rulează Schemaic sau 
 settings-appearance-ui-theme = Tema interfeței
 settings-appearance-editor-theme = Tema editorului
 settings-appearance-scale = Scara interfeței
+settings-appearance-resources = Afișează CPU și RAM în bara de stare
+settings-appearance-resources-hint = Cât timp de procesor și câtă memorie folosește Schemaic însuși. Dezactivat, nu le mai măsoară, nu doar nu le mai afișează.
 
 ## Shortcuts modal (its rows are `shortcuts.rs`'s)
 

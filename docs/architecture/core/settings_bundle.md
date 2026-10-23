@@ -17,8 +17,8 @@ default name: unlike the connection export's suffix, nothing recognises a bundle
 import's picker has no filter, and the envelope key is what `parse` checks.
 **`PORTABLE_KEYS` is an allowlist of `UiState` field names, and that it is an allowlist is the
 point**: a field added to `UiState` later stays home until somebody decides it travels, where a
-denylist would export it the day it lands. What travels is the themes and scale, the interface
-language (`ui_language` — refused, through the app's `normalise`, when it names a language this
+denylist would export it the day it lands. What travels is the themes and scale, the status bar's CPU
+and RAM readout (`show_resources`), the interface language (`ui_language` — refused, through the app's `normalise`, when it names a language this
 build does not offer, since `LanguageChoice::from_key` reads that as `system`), the editor,
 formatting, the row limit and statement timeout, `confirm_writes`, `live_validate`,
 `notify_finished`, `restore_tabs` and the assistant's effort, instructions, schema scope and

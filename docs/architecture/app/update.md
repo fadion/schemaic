@@ -21,8 +21,8 @@ which is what keeping `velo_tx` alive in `start` buys.
 `spawn_check`'s `finish` payload is `(CheckGate, Result<Option<VelopackAsset>, String>)` rather
 than the result alone: the settle handler has to know whether the gate allowed the round. The
 re-arm goes through a `Recheck` handle (`Rc<RefCell<Option<Rc<dyn Fn()>>>>`), the same
-self-holding-closure shape the terminal cursor-blink tick and `main.rs`'s
-`start_resource_monitor` use, because the closure has to be able to schedule *itself*; `start`
+self-holding-closure shape the terminal cursor-blink tick uses, because the closure has to be able
+to schedule *itself*; `start`
 clones the closure out of the cell before calling it, since that first call re-arms through the
 same cell and would otherwise run under a live `borrow()`. The timer bails when
 `state.try_get_untracked()` is `None`, following the *Floem 0.2 gotchas* rule for perpetual

@@ -2901,6 +2901,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     let ui_language = RwSignal::new(schemaic_ui::i18n::LanguageChoice::from_key(
         &ui_state.ui_language,
     ));
+    let show_resources = RwSignal::new(ui_state.show_resources);
     schemaic_ui::theme::init(
         ui_theme.get_untracked(),
         editor_theme.get_untracked(),
@@ -9097,6 +9098,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                 editor_theme: editor_theme.get_untracked().key().to_string(),
                 ui_scale: ui_scale.get_untracked().key().to_string(),
                 ui_language: ui_language.get_untracked().key().to_string(),
+                show_resources: show_resources.get_untracked(),
                 editor_font_size: editor_font.get_untracked(),
                 row_limit: row_limit.get_untracked(),
                 statement_timeout_secs: statement_timeout.get_untracked(),
@@ -9203,6 +9205,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             editor_theme.get();
             ui_scale.get();
             ui_language.get();
+            show_resources.get();
             save_ui(persist::Saving::Replacing);
         });
     }
@@ -12441,6 +12444,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         editor_theme.set(EditorThemeKind::from_key(&st.editor_theme));
         ui_scale.set(UiScale::from_key(&st.ui_scale));
         ui_language.set(schemaic_ui::i18n::LanguageChoice::from_key(&st.ui_language));
+        show_resources.set(st.show_resources);
         editor_font.set(schemaic_ui::theme::clamped_editor_font(st.editor_font_size));
         tab_width.set(schemaic_ui::theme::clamped_tab_width(st.tab_width));
         soft_tabs.set(st.soft_tabs);
@@ -15329,7 +15333,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
 
     // App-process resource usage for the status bar, sampled on a 1s timer.
     let resources = RwSignal::new(schemaic_core::resource::ResourceSample::default());
-    start_resource_monitor(resources);
+    start_resource_monitor(resources, show_resources);
 
     // One background update check per launch. Returns the "Restart to update"
     // action; both are inert (and the check never reaches the network) unless this
@@ -15874,6 +15878,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             editor_theme,
             ui_scale,
             ui_language,
+            show_resources,
             editor_font,
             tab_width,
             soft_tabs,
@@ -16346,23 +16351,58 @@ fn activity_poll(
 /// (Windows/macOS/Linux). CPU is normalized across logical cores. The first
 /// reading after a refresh is 0 (CPU% is a delta between two refreshes), so the
 /// CPU figure only becomes meaningful on the second tick — fine for a readout.
-fn start_resource_monitor(sample: RwSignal<schemaic_core::resource::ResourceSample>) {
-    use schemaic_core::resource::ResourceSample;
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-
-    let pid = Pid::from_u32(std::process::id());
+///
+/// **Runs only while `show` is on** (the *Show CPU and RAM* setting): turning it
+/// off ends the loop — no timer, no `sysinfo` refresh — rather than sampling
+/// for segments nobody can see, and turning it on starts a fresh one. Each
+/// start takes a new generation, as `activity_poll`'s do, so a loop from before
+/// an off is gone even if it was mid-wait when the setting came back on — and
+/// a fresh `System`, so its first CPU figure is that 0 rather than an average
+/// over however long the setting was off. A write of the value the setting
+/// already holds (a settings import) changes nothing: Floem's `set` notifies
+/// regardless, so the effect compares with its previous run.
+fn start_resource_monitor(
+    sample: RwSignal<schemaic_core::resource::ResourceSample>,
+    show: RwSignal<bool>,
+) {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let sys = Rc::new(RefCell::new(System::new()));
+    let pid = sysinfo::Pid::from_u32(std::process::id());
+    let generation = RwSignal::new(0_u64);
+    create_effect(move |was: Option<bool>| {
+        let on = show.get();
+        if was == Some(on) {
+            return on;
+        }
+        let next = generation.get_untracked() + 1;
+        generation.set(next);
+        if on {
+            let sys = Rc::new(RefCell::new(sysinfo::System::new()));
+            resource_tick(next, generation, sample, sys, pid, cores);
+        } else {
+            // Nothing stale for the next start to show first.
+            sample.set(schemaic_core::resource::ResourceSample::default());
+        }
+        on
+    });
+}
 
-    // Perpetual tick; reads `sample` with `try_get_untracked` and stops
-    // rescheduling once it's disposed at shutdown (else the last timer panics on
-    // a freed signal — the same rule as the terminal cursor-blink tick).
-    let tick: BlinkTick = Rc::new(RefCell::new(None));
-    let tick2 = tick.clone();
-    *tick.borrow_mut() = Some(Rc::new(move || {
-        if sample.try_get_untracked().is_none() {
+/// One second's wait, then one sample, then the next — while `generation` is
+/// still `mine`. Reads it with `try_get_untracked` so a tick due after shutdown
+/// finds the signal disposed and stops, rather than panicking on it (the same
+/// rule as the terminal cursor-blink tick).
+fn resource_tick(
+    mine: u64,
+    generation: RwSignal<u64>,
+    sample: RwSignal<schemaic_core::resource::ResourceSample>,
+    sys: Rc<RefCell<sysinfo::System>>,
+    pid: sysinfo::Pid,
+    cores: usize,
+) {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+    exec_after(Duration::from_secs(1), move |_| {
+        if generation.try_get_untracked() != Some(mine) {
             return;
         }
         {
@@ -16373,21 +16413,14 @@ fn start_resource_monitor(sample: RwSignal<schemaic_core::resource::ResourceSamp
                 ProcessRefreshKind::nothing().with_cpu().with_memory(),
             );
             if let Some(p) = s.process(pid) {
-                sample.set(ResourceSample::new(p.memory(), p.cpu_usage(), cores));
+                sample.set(schemaic_core::resource::ResourceSample::new(
+                    p.memory(),
+                    p.cpu_usage(),
+                    cores,
+                ));
             }
         }
-        let t = tick2.clone();
-        exec_after(Duration::from_secs(1), move |_| {
-            if let Some(f) = t.borrow().as_ref() {
-                f();
-            }
-        });
-    }));
-    let t = tick.clone();
-    exec_after(Duration::from_secs(1), move |_| {
-        if let Some(f) = t.borrow().as_ref() {
-            f();
-        }
+        resource_tick(mine, generation, sample, sys, pid, cores);
     });
 }
 
@@ -17209,6 +17242,62 @@ mod app_tests {
         let resettle = region("let resettle_sessions: Rc<dyn Fn(u64, OpenSession)> = {");
         assert!(resettle.contains("pinned_fate(TxAsked::Cancelled)"));
         assert!(resettle.contains("pinned_fate(TxAsked::Settled)"));
+    }
+
+    /// **Turning *Show CPU and RAM* off stops the sampling, not just the two
+    /// segments.** Each change of the setting starts a new generation, a tick
+    /// asks for its own generation before it refreshes anything, and only an
+    /// on starts a tick — so after an off no `sysinfo` refresh runs and no
+    /// timer is left waiting. Pinned by its text: the loop is a timer chain no
+    /// core test reaches.
+    #[test]
+    fn hiding_the_resource_readout_stops_its_sampling() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        let start = body
+            .find("fn start_resource_monitor(")
+            .expect("the resource monitor");
+        let monitor = &body[start..start + body[start..].find("\n}\n").expect("its end")];
+        let on = monitor
+            .find("let on = show.get();")
+            .expect("tracks the setting");
+        // A same-value write (a settings import) neither stops nor restarts it.
+        let same = monitor
+            .find("if was == Some(on) {")
+            .expect("skips a write that changes nothing");
+        let bump = monitor
+            .find("generation.set(next);")
+            .expect("a new generation");
+        let branch = monitor[bump..].find("if on {").expect("the on branch") + bump;
+        let starts = monitor[branch..]
+            .find("resource_tick(next,")
+            .expect("only an on starts a tick")
+            + branch;
+        let off = monitor[branch..].find("} else {").expect("the off branch") + branch;
+        assert!(on < same && same < bump && starts < off, "{monitor}");
+        let tick_at = body.find("fn resource_tick(").expect("the tick");
+        let tick = &body[tick_at..tick_at + body[tick_at..].find("\n}\n").expect("its end")];
+        let asks = tick
+            .find("if generation.try_get_untracked() != Some(mine) {\n            return;")
+            .expect("a tick asks for its generation");
+        let refresh = tick
+            .find("refresh_processes_specifics(")
+            .expect("the refresh");
+        assert!(asks < refresh, "{tick}");
+        assert_eq!(
+            body.matches("refresh_processes_specifics(").count(),
+            1,
+            "a second sampler would not stop with the setting"
+        );
+        assert!(
+            body.contains("start_resource_monitor(resources, show_resources);"),
+            "the monitor no longer takes the setting"
+        );
     }
 
     /// **A prompt raised while its transaction's end was in flight closes when

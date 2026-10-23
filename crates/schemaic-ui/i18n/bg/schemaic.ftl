@@ -183,6 +183,8 @@ settings-query-write-log-hint = Всеки запис, който Schemaic ил�
 settings-appearance-ui-theme = Тема на интерфейса
 settings-appearance-editor-theme = Тема на редактора
 settings-appearance-scale = Мащаб на интерфейса
+settings-appearance-resources = Показване на процесора и паметта в лентата на състоянието
+settings-appearance-resources-hint = Колко процесорно време и памет използва самият Schemaic. Изключено, той спира и да ги измерва, не само да ги показва.
 
 ## Shortcuts modal (its rows are `shortcuts.rs`'s)
 

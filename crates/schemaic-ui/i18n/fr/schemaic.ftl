@@ -183,6 +183,8 @@ settings-query-write-log-hint = Chaque écriture exécutée par Schemaic ou sche
 settings-appearance-ui-theme = Thème de l'interface
 settings-appearance-editor-theme = Thème de l'éditeur
 settings-appearance-scale = Échelle de l'interface
+settings-appearance-resources = Afficher le processeur et la mémoire dans la barre d'état
+settings-appearance-resources-hint = Le temps processeur et la mémoire qu'utilise Schemaic lui-même. Désactivé, il cesse de les mesurer, pas seulement de les afficher.
 
 ## Shortcuts modal (its rows are `shortcuts.rs`'s)
 

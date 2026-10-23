@@ -330,6 +330,10 @@ pub struct UiState {
     /// Read once at launch; a change applies on the next start.
     #[serde(default = "default_ui_language")]
     pub ui_language: String,
+    /// Show the app's own CPU and RAM in the status bar. Default: on. Off also
+    /// stops the sampling behind it, not just the two segments.
+    #[serde(default = "default_true")]
+    pub show_resources: bool,
     /// SQL-editor font size (px).
     #[serde(default = "default_editor_font")]
     pub editor_font_size: f32,
@@ -544,6 +548,7 @@ impl Default for UiState {
             editor_theme: default_editor_theme(),
             ui_scale: default_ui_scale(),
             ui_language: default_ui_language(),
+            show_resources: true,
             editor_font_size: default_editor_font(),
             row_limit: default_row_limit(),
             confirm_writes: true,
@@ -2543,6 +2548,23 @@ mod tests {
             ..UiState::default()
         });
         assert!(guides.editor_indent_guides && !guides.editor_show_whitespace);
+    }
+
+    /// The status bar's CPU and RAM readout is on for a new install and for a
+    /// file written before the setting existed, and an off survives a save.
+    #[test]
+    fn the_resource_readout_defaults_on_and_keeps_an_off() {
+        let old: UiState = serde_json::from_str("{}").expect("parses");
+        assert!(UiState::default().show_resources && old.show_resources);
+        let off: UiState = serde_json::from_str(
+            &serde_json::to_string(&UiState {
+                show_resources: false,
+                ..UiState::default()
+            })
+            .expect("serialises"),
+        )
+        .expect("parses");
+        assert!(!off.show_resources);
     }
 
     /// **`#[serde(flatten)]` changes the deserializer's shape for the whole

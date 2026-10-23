@@ -183,6 +183,8 @@ settings-query-write-log-hint = Çdo shkrim që ekzekuton Schemaic ose schemaic 
 settings-appearance-ui-theme = Tema e ndërfaqes
 settings-appearance-editor-theme = Tema e redaktorit
 settings-appearance-scale = Shkalla e ndërfaqes
+settings-appearance-resources = Shfaq CPU-në dhe RAM-in në shiritin e gjendjes
+settings-appearance-resources-hint = Sa kohë procesori dhe memorie përdor vetë Schemaic. Kur është çaktivizuar, ndalon edhe matjen e tyre, jo vetëm shfaqjen.
 
 ## Shortcuts modal (its rows are `shortcuts.rs`'s)
 

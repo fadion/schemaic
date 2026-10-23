@@ -215,6 +215,8 @@ settings-query-write-log-hint = Every write Schemaic or schemaic exec runs is ap
 settings-appearance-ui-theme = Interface theme
 settings-appearance-editor-theme = Editor theme
 settings-appearance-scale = Interface scale
+settings-appearance-resources = Show CPU and RAM in the status bar
+settings-appearance-resources-hint = How much processor time and memory Schemaic itself is using. Off, it stops measuring them as well as showing them.
 
 ## Shortcuts modal (its rows are `shortcuts.rs`'s)
 

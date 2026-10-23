@@ -6077,6 +6077,10 @@ pub struct LayoutUi {
     /// once at launch (`i18n::init`), so moving this drives nothing until the
     /// next start, and Settings says so.
     pub ui_language: RwSignal<i18n::LanguageChoice>,
+    /// The *Show CPU and RAM* setting: the status bar's two resource segments,
+    /// and the app's sampling behind them (`start_resource_monitor`), which
+    /// stops while this is off rather than running unseen.
+    pub show_resources: RwSignal<bool>,
     /// Editor font size (px); drives `theme::set_editor_font`.
     pub editor_font: RwSignal<f32>,
     /// Editor tab width (columns); drives `theme::set_editor_tab_width`.
@@ -13473,18 +13477,42 @@ fn footer(ui: Ui) -> impl IntoView {
     // render byte-identical text. The five segments above are keyed on the memos
     // declared together further up for exactly this reason; these two were
     // built later and did not get one.
-    let cpu_label = create_memo(move |_| resources.get().cpu_label());
-    let ram_label = create_memo(move |_| resources.get().ram_label());
+    // **Hidden, margin and all, while *Show CPU and RAM* is off** — the way the
+    // Tx pill and Commit/Rollback leave, so the collapse chain sees a segment
+    // of no width. The sampling behind them stops too (`start_resource_monitor`),
+    // and the memos stop reading `resources` while it is off, so the reset the
+    // off writes rebuilds nothing nobody can see.
+    let show_resources = ui.layout.show_resources;
+    let cpu_label = create_memo(move |_| {
+        if show_resources.get() {
+            resources.get().cpu_label()
+        } else {
+            String::new()
+        }
+    });
+    let ram_label = create_memo(move |_| {
+        if show_resources.get() {
+            resources.get().ram_label()
+        } else {
+            String::new()
+        }
+    });
     let cpu_seg = dyn_container(
         move || cpu_label.get(),
         move |c| footer_text(tr!("footer-cpu", value = c)),
     )
-    .style(|s| s.margin_left(theme::scaled(40.0)));
+    .style(move |s| {
+        let s = s.margin_left(theme::scaled(40.0));
+        if show_resources.get() { s } else { s.hide() }
+    });
     let ram_seg = dyn_container(
         move || ram_label.get(),
         move |r| footer_text(tr!("footer-ram", value = r)),
     )
-    .style(|s| s.margin_left(theme::scaled(15.0)));
+    .style(move |s| {
+        let s = s.margin_left(theme::scaled(15.0));
+        if show_resources.get() { s } else { s.hide() }
+    });
 
     // The schema toggle always stays (it's a control, and leftmost); every status
     // segment after it collapses right-to-left as the AI icon nears it.

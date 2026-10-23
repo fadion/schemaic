@@ -2348,7 +2348,8 @@ fn query_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
     ))
 }
 
-/// The Appearance section: the two themes and the interface scale.
+/// The Appearance section: the two themes, the interface scale, the language,
+/// and whether the status bar shows CPU and RAM.
 fn appearance_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
     let ui_theme = layout.ui_theme;
     let editor_theme = layout.editor_theme;
@@ -2387,12 +2388,20 @@ fn appearance_section(layout: LayoutUi, ring: FocusRing) -> AnyView {
         scale_dd,
     ))
     .style(ctrl);
+    let resources_row = focusable_toggle_row(
+        tr!("settings-appearance-resources"),
+        tr!("settings-appearance-resources-hint"),
+        layout.show_resources,
+        ring.clone(),
+        340,
+    );
     section_page((
         form_section_header(SettingsSection::Appearance.label()),
         ui_section,
         editor_section,
         scale_section,
         language_section(layout.ui_language, ring, 330),
+        resources_row,
     ))
 }
 

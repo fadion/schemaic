@@ -183,6 +183,8 @@ settings-query-write-log-hint = Jede schreibende Anweisung, die Schemaic oder sc
 settings-appearance-ui-theme = Oberflächen-Design
 settings-appearance-editor-theme = Editor-Design
 settings-appearance-scale = Oberflächengröße
+settings-appearance-resources = CPU und RAM in der Statusleiste anzeigen
+settings-appearance-resources-hint = Wie viel Prozessorzeit und Arbeitsspeicher Schemaic selbst belegt. Ausgeschaltet misst es beides nicht mehr, statt es nur auszublenden.
 
 ## Shortcuts modal
 

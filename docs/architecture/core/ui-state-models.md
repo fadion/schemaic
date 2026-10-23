@@ -624,7 +624,24 @@ tested (they share `history.rs`'s shape; a new one belongs here, not in the UI):
   (`a_name_beyond_ascii_matches_case_insensitively`).
 - `resource.rs` — the status bar's CPU/RAM model. `ResourceSample::new` divides `sysinfo`'s
   per-process CPU% (single-core-relative, so it exceeds 100 on a multi-core box) across the
-  logical core count to give a whole-machine 0..=100. Sampling itself stays at the app boundary.
+  logical core count to give a whole-machine 0..=100. Sampling itself stays at the app boundary,
+  and **runs only while Settings › Appearance's *Show CPU and RAM in the status bar* is on**
+  (`UiState::show_resources`, `serde`-defaulted on, so a file from before it reads on —
+  `the_resource_readout_defaults_on_and_keeps_an_off`; it travels in a settings bundle). The
+  requirement was that off stops querying the system, not merely hides the two segments, so
+  `app/main.rs`'s `start_resource_monitor(sample, show)` is no perpetual tick any more: an effect on
+  `show` bumps a `generation` on every change, and only an on starts `resource_tick`, which waits
+  1 s, returns unless the generation is still its own — `try_get_untracked`, so a disposed signal
+  at shutdown stops it too — and only then does the one `refresh_processes_specifics` and
+  reschedules itself: `activity_poll`'s shape. An off starts nothing and resets `sample` to
+  `ResourceSample::default()`, so the next on shows nothing stale first; each on takes a fresh
+  `sysinfo::System`, so its first CPU figure is not an average over the time it was off; and a
+  write of the value the setting already holds (a settings import) is skipped by comparing with
+  the effect's previous run, since Floem's `set` notifies regardless. With it off there is no
+  timer and no `sysinfo` refresh at all, and `footer`'s two memos stop reading `resources`. `app_tests::hiding_the_resource_readout_stops_its_sampling`
+  pins that order by its text — track the setting, bump, start only on an on; the generation asked
+  before the refresh — and that `main.rs` holds exactly one `refresh_processes_specifics`, since a
+  second sampler would not stop with the setting.
 - `core/update.rs` — the auto-update state model: `resource.rs`'s neighbour in spirit, and the
   pure half of the Velopack plumbing in `schemaic-app`'s `update.rs`.
   `check_gate(opt_out, installed)` answers whether a check round may run at all, and both of its

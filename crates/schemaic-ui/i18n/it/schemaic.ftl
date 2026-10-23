@@ -183,6 +183,8 @@ settings-query-write-log-hint = Ogni scrittura eseguita da Schemaic o da schemai
 settings-appearance-ui-theme = Tema dell'interfaccia
 settings-appearance-editor-theme = Tema dell'editor
 settings-appearance-scale = Scala dell'interfaccia
+settings-appearance-resources = Mostra CPU e RAM nella barra di stato
+settings-appearance-resources-hint = Quanto tempo di processore e quanta memoria usa Schemaic stesso. Disattivato, smette di misurarli oltre che di mostrarli.
 
 ## Shortcuts modal (its rows are `shortcuts.rs`'s)
 

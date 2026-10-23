@@ -5,8 +5,11 @@ Query / **Terminal** / **AI assistant** / **Appearance**, the last holding the t
 the **interface scale** and the **Language** dropdown — `language_section`, tabindex 330, with
 *The language change takes effect the next time Schemaic starts.* under it only while
 `LanguageChoice::needs_restart`, since unlike everything else on that page it applies at the
-next launch; its signal is `LayoutUi::ui_language`, persisted and mirrored by nothing live) and
-the Shortcuts reference, **and the
+next launch; its signal is `LayoutUi::ui_language`, persisted and mirrored by nothing live —
+and, after it, *Show CPU and RAM in the status bar*, a `focusable_toggle_row` at tabindex 340 over
+`LayoutUi::show_resources`, on by default; off hides `footer`'s two segments *and* stops the
+sampling behind them, which is `start_resource_monitor`'s half, under `core/ui-state-models.md`'s
+`resource.rs`) and the Shortcuts reference, **and the
 four shared controls every modal's form is
 built from**: `focusable_toggle`/`focusable_toggle_row` (the switch — Space is ours, Enter is
 floem's), `focusable_dropdown` and the picker-agnostic **`in_ring_picker`** under it — the box
@@ -344,7 +347,9 @@ free id the field takes — so it presented an open field as a closed menu, whil
 had to hide itself on a harness with no `--effort` flag. Two answers to one capability with two
 chances to disagree. `lib.rs`'s `effort_seg_for` went with them, and the 40px break that used to
 open the AI group in the bar is carried by `cpu_seg`'s own `margin_left(40)`, so the bar's
-spacing is unchanged.
+spacing is unchanged. With *Show CPU and RAM* off that margin goes with the segment — both
+`.hide()` in their style, the way the Tx pill and Commit/Rollback leave, so the collapse chain
+reads a segment of no width rather than a 40px gap holding nothing.
 **The CLI-path caption follows the harness, and switching it clears both the path and the model
 and clamps the effort.** The label is `format!("{} path", harness.label())`, and the clearing is
 not tidiness:

@@ -183,6 +183,8 @@ settings-query-write-log-hint = Elke schrijfactie die Schemaic of schemaic exec 
 settings-appearance-ui-theme = Interfacethema
 settings-appearance-editor-theme = Editorthema
 settings-appearance-scale = Interfaceschaal
+settings-appearance-resources = CPU en RAM in de statusbalk tonen
+settings-appearance-resources-hint = Hoeveel processortijd en geheugen Schemaic zelf gebruikt. Uit stopt het ook met meten, niet alleen met tonen.
 
 ## Shortcuts modal (its rows are `shortcuts.rs`'s)
 
