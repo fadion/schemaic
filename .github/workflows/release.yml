@@ -28,6 +28,12 @@ jobs:
   release:
     name: Release (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    # A tag waits for a reviewer's approval on the protected `release`
+    # environment, whose rules admit only `v*` tags, before any leg builds or
+    # publishes: a retagged action or a stolen push then still meets a human.
+    # A `workflow_dispatch` dry run names no environment, so it is not refused
+    # by that tag-only rule and runs unattended, as it publishes nothing.
+    environment: ${{ github.ref_type == 'tag' && 'release' || '' }}
     strategy:
       fail-fast: false
       matrix:
