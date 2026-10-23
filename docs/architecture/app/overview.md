@@ -26,7 +26,11 @@ confused with `ai.rs`'s `saved_db`, the MCP subprocess's.
 a terminal client or a backup or restore tool, and only under a password sign-in — **the one
 keyring read that can happen on the UI thread**, because a launch builds its command
 synchronously, and in practice a cache hit, the active connection's tree connect having read it
-already. **`with_secrets(id, then)` is the one path by which a read reaches the saved list.** It
+already. A keyring that will not answer refuses the launch in `DbRefusal::KeyringUnreadable`'s
+words — `reach_for_cli`'s `Err` arm, or a message shell for the client — where the error used to
+be dropped and the client started with an empty password and reported *Access denied* (release
+review S2-L1-04; a view-side decision with no test, since the read is the real keyring).
+**`with_secrets(id, then)` is the one path by which a read reaches the saved list.** It
 reads all three kinds on `handle.spawn_blocking` — or skips the round trip when all are known —
 then on the UI thread, through `create_ext_action`, delivers them into the `connections` signal's
 entry in one step, so no save can fall between a field being filled and its secret being marked

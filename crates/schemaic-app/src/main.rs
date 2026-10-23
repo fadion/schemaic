@@ -704,17 +704,27 @@ async fn tunnel_secrets(
 /// answered from the cache: the client opens on the active connection, whose
 /// tree connected (and read the password) when it was opened. Only a password
 /// sign-in reads it.
+///
+/// **A keyring that will not answer is the launch's refusal**, in
+/// `DbRefusal::KeyringUnreadable`'s words (release review S2-L1-04): dropped,
+/// the client started with an empty password and reported *Access denied* —
+/// the misdiagnosis that refusal exists to stop on the connect path.
 fn with_saved_password(
     mut conn: schemaic_core::connection::Connection,
-) -> schemaic_core::connection::Connection {
+) -> Result<schemaic_core::connection::Connection, String> {
     if conn.password.is_empty()
         && conn.effective_auth() == schemaic_core::connection::AuthMode::Password
-        && let Ok(Some(p)) =
-            secrets::secret(conn.id, schemaic_core::secrets::SecretKind::DbPassword)
     {
-        conn.password = p;
+        match secrets::secret(conn.id, schemaic_core::secrets::SecretKind::DbPassword) {
+            Ok(p) => conn.password = p.unwrap_or_default(),
+            Err(e) => {
+                return Err(schemaic_ui::i18n::db_refusal_text(
+                    &schemaic_core::model::DbRefusal::KeyringUnreadable(e.0),
+                ));
+            }
+        }
     }
-    conn
+    Ok(conn)
 }
 
 /// The SQL Server fourth: `sqlcmd`, the ODBC one or the Go rewrite — they
@@ -14767,7 +14777,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             }
             // Read only now, past the refusal: a launch that is refused asks
             // the keyring for nothing.
-            let conn = with_saved_password(conn);
+            let conn = match with_saved_password(conn) {
+                Ok(c) => c,
+                Err(why) => {
+                    let cfg = message_shell(&why);
+                    (install_terminal)(&cfg, None, "keyring refusal message shell");
+                    return;
+                }
+            };
             // For an SSH connection, point the client at the local tunnel
             // (127.0.0.1:<port>), not the firewalled remote host (review H11). If
             // the tunnel isn't up yet, say so rather than silently failing.
@@ -14857,7 +14874,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let tunnels = tunnels.clone();
         let tunnel_failures = tunnel_failures.clone();
         Rc::new(move |conn: Connection| {
-            let conn = with_saved_password(conn);
+            let conn = with_saved_password(conn)?;
             if !conn.uses_tunnel() {
                 return Ok(conn);
             }

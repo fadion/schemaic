@@ -12,7 +12,10 @@ The load only migrates legacy plaintext — `plaintext_on_disk`, then `sanitize_
 clearing the `.bak` that still holds the plaintext, and `absorb_stored` — since that is a
 question about the file and can stay eager, and it queues no startup `KeyringUnreadable` notice
 any more. **`secret(id, kind)` is the read, and it is blocking — for as long as a keychain prompt
-stands open — so it never runs on the UI thread.** It answers from `last_hydration`'s cache
+stands open — so it runs on a worker, with one exception**: the app's `with_saved_password`,
+which a terminal client's or a backup's launch calls on the UI thread because the launch builds
+its command synchronously; it is answered from the cache in practice, the client opening on a
+connection whose tree has already connected (`app/overview.md`). It answers from `last_hydration`'s cache
 first; otherwise it takes a separate `read_lock`, asks the cache again under it, reads the
 keyring and `record`s the answer. **The two locks are deliberate.** `last_hydration` is never
 held across a keyring read, because the app's saves take it on the UI thread and a read can sit
