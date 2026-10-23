@@ -78,6 +78,21 @@ read-only connection too, since its guard runs after the init — was one line-b
 MariaDB the value went unread the same way, and `SET @x = NEXT VALUE FOR s` advanced a sequence
 on every operation (`a_setting_takes_one_value_and_nothing_follows_it`). PostgreSQL's arm keeps
 its value lists (`search_path TO app, public`): it needs a `;` between statements.
+**`SET ROLE` takes a role list, and a checked statement holds no `;`.** The `SET ROLE` arm
+returned `Ok` for any tail once it had read `ROLE`, and on MySQL `statement_ranges` honours
+`DELIMITER`: `DELIMITER //` and then `SET ROLE a; DELETE FROM t//` was one range to `check` and
+two statements to the server, since `mysql::run_init` hands each range to `query_drop` and the
+driver runs multi-statement text. The init runs at every connect, before read-only enforcement,
+and a Schemaic connection export carries it as written — so a shared connection file could run
+any SQL on every connect. `role_list` now reads the tail whole — `DEFAULT`, `NONE`, `ALL`, `ALL
+EXCEPT` and roles, or a comma list of roles, each a bare, quoted or string name with an optional
+`@host` — and anything else is `InitWhy::OneValue`
+(`set_role_takes_a_role_list_and_nothing_after_it`). And `check` refuses a code-level `;` inside
+any one range, on every engine and before any arm reads it, also as `InitWhy::OneValue`, so the
+next arm that stops reading early cannot repeat this (`a_statement_holding_a_semicolon_is_refused`;
+a `;` inside a string is still only a value). `DELIMITER` itself is still accepted as a
+directive; it is a range it makes that holds a `;` that is refused. Don't leave that check to the
+arms: an arm's reading of its own tail is exactly what failed.
 **Each statement is tokenised, not word-scanned** — `tokens`, over `sql::statement_ranges` and
 `skip_noncode`, the one boundary lexer, with a quoted name told from a string by
 `intel::ident_quote` and **kept as a `Tok::Quoted` token rather than skipped**. Don't tidy that

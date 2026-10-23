@@ -339,7 +339,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   setting's **name on that engine's allowlist** — it was a deny list of what a guard rests on, and
   `ANSI_DEFAULTS`, `FMTONLY`, `sql_select_limit`, `TEXTSIZE`, a non-UTF-8 client character set and
   any denied name written quoted all went through it (`core::init_sql`'s entry has the lists and
-  each reason). It has **no minted request**, as
+  each reason). Nor may a checked statement hold a code-level `;`, on any engine: `SET ROLE`'s arm
+  read no further than `ROLE`, so behind a MySQL `DELIMITER` a `DELETE` could run on every connect. It has **no minted request**, as
   `read_only_reason` has none: it is asked inside the connect, by `Db::init_statements`, in each
   engine's one connect function and before any of it runs, so there is no launcher to forget it.
   It runs before the caller sees the connection and so before every `Enforce` statement, which

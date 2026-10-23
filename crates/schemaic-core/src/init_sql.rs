@@ -234,6 +234,12 @@ pub fn check(sql: &str, dialect: SqlDialect) -> Result<Vec<String>, InitRefusal>
         if toks.contains(&Tok::Punct(b'(')) {
             return Err(refused(InitWhy::CallsFunction));
         }
+        // A `;` at code level inside one range is a second statement to the
+        // server — what a MySQL `DELIMITER` arranges — so it is refused here,
+        // for every arm, rather than left to each arm's reading of its tail.
+        if toks.contains(&Tok::Punct(b';')) {
+            return Err(refused(InitWhy::OneValue));
+        }
         let rest = &toks[1..];
         let verdict = match dialect {
             SqlDialect::Sqlite => pragma(rest),
@@ -547,10 +553,37 @@ fn pragma(rest: &[Tok]) -> Result<(), InitWhy> {
 /// assignments, each checked by [`mysql_assignment`].
 fn mysql(rest: &[Tok], dialect: SqlDialect) -> Result<(), InitWhy> {
     if is_word(rest.first(), "ROLE") {
-        return Ok(());
+        return role_list(&rest[1..]);
     }
     rest.split(|t| *t == Tok::Punct(b','))
         .try_for_each(|piece| mysql_assignment(piece, dialect))
+}
+
+/// What follows MySQL's `SET ROLE`: `DEFAULT`, `NONE`, `ALL [EXCEPT roles]` or
+/// a comma list of roles, each a name — bare, quoted or a string — with an
+/// optional `@host`. Nothing else: this arm returned `Ok` for any tail, and
+/// behind a `DELIMITER` the tail could be another statement.
+fn role_list(v: &[Tok]) -> Result<(), InitWhy> {
+    let v = match v {
+        [Tok::Word(all), Tok::Word(except), rest @ ..] if all == "ALL" && except == "EXCEPT" => {
+            rest
+        }
+        [Tok::Word(w)] if matches!(w.as_str(), "DEFAULT" | "NONE" | "ALL") => return Ok(()),
+        _ => v,
+    };
+    let role = |r: &[Tok]| {
+        let name = |t: &Tok| matches!(t, Tok::Word(_) | Tok::Quoted | Tok::Str(_));
+        match r {
+            [n] => name(n),
+            [n, Tok::Punct(b'@'), h] => name(n) && name(h),
+            _ => false,
+        }
+    };
+    if !v.is_empty() && v.split(|t| *t == Tok::Punct(b',')).all(role) {
+        Ok(())
+    } else {
+        Err(InitWhy::OneValue)
+    }
 }
 
 /// One MySQL assignment: `@user = …` (a user variable, which sets nothing
@@ -888,6 +921,52 @@ mod tests {
         ] {
             assert!(check(sql, d).is_ok(), "{sql}: {:?}", check(sql, d));
         }
+    }
+
+    /// **`SET ROLE` names roles and nothing else.** Its arm returned `Ok` for
+    /// any tail, and a `DELIMITER` makes one checked range hold several real
+    /// statements, which the driver sends as a multi-statement query — so a
+    /// shared connection file could run a `DELETE` on every connect, before
+    /// the read-only guard was set.
+    #[test]
+    fn set_role_takes_a_role_list_and_nothing_after_it() {
+        for sql in [
+            "DELIMITER //\nSET ROLE a; DELETE FROM t//",
+            "SET ROLE a; DELETE FROM t",
+            "SET ROLE a = 1",
+            "SET ROLE a DELETE FROM t",
+            "SET ROLE",
+        ] {
+            assert!(check(sql, MY).is_err(), "{sql}: {:?}", check(sql, MY));
+        }
+        for sql in [
+            "SET ROLE reporting",
+            "SET ROLE 'reporting'@'%', `auditor`",
+            "SET ROLE DEFAULT",
+            "SET ROLE NONE",
+            "SET ROLE ALL",
+            "SET ROLE ALL EXCEPT admin, 'dba'@'localhost'",
+        ] {
+            assert!(check(sql, MY).is_ok(), "{sql}: {:?}", check(sql, MY));
+        }
+    }
+
+    /// **A code-level `;` inside one checked statement is refused** on every
+    /// engine: a range the boundary lexer took as one statement is then two
+    /// to the server, which is what `DELIMITER` arranges on MySQL.
+    #[test]
+    fn a_statement_holding_a_semicolon_is_refused() {
+        for (sql, d) in [
+            (
+                "DELIMITER //\nSET time_zone = '+00:00'; DELETE FROM t//",
+                MY,
+            ),
+            ("DELIMITER //\nSET @a = 1; SET @b = 2//", MY),
+        ] {
+            assert!(check(sql, d).is_err(), "{sql}: {:?}", check(sql, d));
+        }
+        // A `;` inside a string is data, not a boundary.
+        assert!(check("SET @a = 'x; y'", MY).is_ok());
     }
 
     /// The list is an allowlist of names: a setting nobody has weighed is
