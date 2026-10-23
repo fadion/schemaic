@@ -939,10 +939,7 @@ pub async fn a_read_only_session_runs_beside_an_extensions_functions(target: &'s
         .exec("SELECT count(*) FROM pg_available_extensions WHERE name = 'citext'")
         .await;
     if available.cell(0, 0).expect("a count").display() == "0" {
-        eprintln!(
-            "{}: no citext on this server; the control is skipped",
-            target.name
-        );
+        crate::endpoint::note_no_op(target, "has no citext; the control is skipped");
         scratch.teardown().await;
         return;
     }
@@ -978,9 +975,9 @@ pub async fn a_read_only_session_refuses_what_an_owner_added_to_an_extension(
         )
         .await;
     if able.cell(0, 0).expect("a value").display() != "1true" {
-        eprintln!(
-            "{}: no citext, or no right to create a role; the case is skipped",
-            target.name
+        crate::endpoint::note_no_op(
+            target,
+            "has no citext, or no right to create a role; the case is skipped",
         );
         scratch.teardown().await;
         return;
