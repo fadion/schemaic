@@ -195,7 +195,9 @@ pub async fn run(db: &Db, request: ExecRequest, timeout: Duration) -> Result<Res
     )
     .await
     {
-        Some(r) => r.map_err(|e| NoRows::Failed(e.to_string())),
+        // A standing refusal was made before the statement was sent, so it is
+        // a guard's 3 here as on the read paths, not a failure's 4.
+        Some(r) => r.map_err(NoRows::from_db),
         // Not `TimedOut`: that says "cancelled", which a write cannot promise.
         None => Err(NoRows::Indeterminate(timeout)),
     }

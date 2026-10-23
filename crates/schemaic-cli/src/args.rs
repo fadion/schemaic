@@ -45,8 +45,8 @@ const AFTER_HELP: &str = concat!(
     "  0  It ran\n",
     "  2  A usage error, or a connection, file or table that is not there; nothing was sent\n",
     "  3  A guard refused: not a read, a read-only connection, no --yes, or no CLI access; \
-     nothing was sent. Or a read-only PostgreSQL session was refused after connecting, \
-     before your statement ran\n",
+     nothing was sent. Or the connection's settings or session refused it (init SQL, \
+     transport, MySQL sql_mode, a read-only PostgreSQL path); your statement never ran\n",
     "  4  The server or the connection failed; retrying may work\n",
     "  5  A write timed out after it was sent and may have been applied; check before retrying\n",
     "  6  query --fail-on-cap: --limit cut the rows short (they were still printed)",

@@ -38,20 +38,27 @@ the refusal is about a write** (`ReadRefusal::writes`), and `gate` sorts it into
 sleep, a second statement — whose message does not: the CLI answered a `FOR UPDATE` with "use
 `exec` to write" after core's own words said it was no write
 (`refusing_what_is_no_write_does_not_name_exec`). Both exit 3. **A third refusal is the
-session's, not the text's**: a read-only PostgreSQL session refuses to open on a path where a
-schema holds what PostgreSQL could pick in a builtin's place (`DbRefusal::ShadowedBuiltin`, under
-`schemaic-db`'s `Enforce::ReadOnly`), and `NoRows::from_db` sorts that one `DbError` into
-`NoRows::SessionRefused`, carrying the refusal's own sentence, and every other into `Failed` —
-other `DbRefusal`s included (`a_shadowed_builtin_is_a_refusal_and_everything_else_a_failure`).
-`read_only_query`, `read_only_explain` and `read_only_export` all go through it — the export asks
-for the refusal *before* it stringifies the read's error for `export_verdict`, and removes the
-`.part`, which is empty since nothing was read. `is_refusal` answers `true` for it and `run.rs`
-gives it exit 3, not 4, though it has logged in to learn it: the statement never ran, and a retry
-unchanged refuses again, which is the thing a caller branches on 3 to know
+database layer's, not the text's**: a `DbError::Refused` whose `DbRefusal::stands` — made before
+the statement ran, for a reason a retry meets again. A read-only PostgreSQL session refusing to
+open on a path where a schema holds what PostgreSQL could pick in a builtin's place
+(`DbRefusal::ShadowedBuiltin`, under `schemaic-db`'s `Enforce::ReadOnly`) is one; init SQL the
+allowlist will not run, a sign-in the transport cannot carry, a MySQL session whose character set
+or `sql_mode` cannot be made safe and a plan MySQL will not make read-only are others.
+`NoRows::from_db` sorts every such one into `NoRows::DbRefused`, carrying the refusal's own
+sentence, and every other `DbError` into `Failed` — the two refusals that do not stand, the SQLite
+worker failing and a report on a `COMMIT` that was sent, included
+(`a_standing_refusal_is_a_refusal_and_everything_else_a_failure`). It was `NoRows::SessionRefused`
+and took `ShadowedBuiltin` alone, so a refused `sql_mode`, init SQL or transport reached a script
+as exit 4 — "retrying may work" — over a statement that never ran and a retry that met the same
+refusal. `read_only_query`, `read_only_explain`, `read_only_export` and `exec::run` all go through
+it — the export asks `stands` *before* it stringifies the read's error for `export_verdict`, and
+removes the `.part`, which is empty since nothing was read. `is_refusal` answers `true` for it and
+`run.rs` gives it exit 3, not 4, though some of these have logged in to learn it: the statement
+never ran, and a retry unchanged refuses again, which is the thing a caller branches on 3 to know
 (`a_guard_refusal_a_server_failure_and_an_unknown_write_exit_differently`). So `Exit::Refused`'s
-doc and the `--help` exit line now say that one refusal comes after connecting, before the
-statement is sent — 3's "nothing was sent" promise (`run.rs`'s entry) holds for every other
-refusal. **`NotARead`'s message names no
+doc and the `--help` exit line now name the database layer's standing refusals and promise only
+that the statement never ran — 3's "nothing was sent" (`run.rs`'s entry) holds for every refusal
+of the guard's own. **`NotARead`'s message names no
 subcommand but `exec`** — "Only reads are taken here" — because `query`, `explain` and `export`
 all refuse through it, and a message that said `query` told the other two's callers they had
 typed it. It is asked in the **connection's own**

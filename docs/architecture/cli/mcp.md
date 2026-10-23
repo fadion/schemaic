@@ -164,10 +164,14 @@ that got the next fix would have kept it. So this calls
 matched arm by arm into this server's own sentences, because `NoRows::message` points a refused
 write at `schemaic exec` and the assistant's route to a write is `propose_table_change` — in the
 panel; standalone it has none. Same refusal, right advice for whoever is reading it.
-`NoRows::SessionRefused` — a read-only PostgreSQL session that would not open on a path shadowing
-a builtin (`query.rs`'s entry) — answers "Rejected — not a problem with your query, so do not
-retry it: …" with the refusal's sentence, since rewriting the statement cannot get past a check
-of the path, and that sentence already says what the user can do about it.
+`NoRows::DbRefused` — a standing refusal of the database layer's, such as a read-only PostgreSQL
+session that would not open on a path shadowing a builtin (`query.rs`'s entry) — answers
+"Rejected before the query ran: …" with the refusal's sentence and no advice of its own
+(`a_database_refusal_says_the_query_never_ran`). It used to say "not a problem with your query, so
+do not retry it", which was true of the shadowing path alone: once every standing refusal took
+this arm, it told the model not to rewrite a statement MySQL would not plan read-only
+(`WritingPlan`), where a rewrite is the answer. The refusal's own sentence says what would get past
+it — the user's settings, or a different statement.
 **`run_query`'s description ends by saying what read-only is for**: it guards against mistakes
 and keeps the model from writing, and is not a security boundary against a database whose owner
 is hostile. The README says the same of `schemaic query` and the server, and names the

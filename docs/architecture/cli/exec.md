@@ -32,6 +32,12 @@ the command said it "was cancelled" and exit 4 told the script that retrying may
 answers the deadline with `NoRows::Indeterminate`, whose message says the statement may have
 been applied in whole or in part and to check before running it again, and `run.rs` gives it
 exit 5. The MCP server folds it into its timeout arm, having no write that could produce it.
+**Every other error goes through `NoRows::from_db`**, as the read paths' do, so a standing refusal
+of the database layer's — init SQL the allowlist will not run, a sign-in the transport cannot
+carry, a MySQL session whose `sql_mode` or character set cannot be made safe — is
+`NoRows::DbRefused` and exit 3, where it was exit 4 and "retrying may work" over a statement that
+never ran (`DbRefusal::stands`, under `core::model`). No test pins the mapping at this call;
+`from_db`'s own test is in `query.rs`.
 **It runs through `fetch_query_enforced`, never plain `fetch_query`**, with an `Enforce` that
 `approved` mints into a private field from the connection the verdict judged: `ReadOnly` on a
 `read_only` connection, because what the verdict lets through there is a read *to the text

@@ -44,13 +44,15 @@ pub enum NoRows {
     /// a second statement (`sql::ReadRefusal::writes` is false). `exec` is no
     /// answer to any of them, so the message does not point there.
     NotPermitted(String),
-    /// Refused **after connecting, before the statement was sent**: the
-    /// read-only session would not be set up, because a schema on the path
-    /// holds what PostgreSQL could pick in a builtin's place
-    /// (`DbRefusal::ShadowedBuiltin`). A guard's refusal like the three above
-    /// — retrying unchanged refuses again — but not a text one, so unlike them
-    /// it has logged in to say so. Carries the refusal's words.
-    SessionRefused(String),
+    /// Refused by the database layer **before the statement ran**, for a
+    /// reason a retry meets again (`DbRefusal::stands`): init SQL the
+    /// allowlist will not run, a sign-in the transport cannot carry, a MySQL
+    /// session whose character set or `sql_mode` cannot be made safe, a plan
+    /// MySQL will not make read-only, a read-only PostgreSQL session on a path
+    /// that shadows a builtin. A guard's refusal like the three above, but not
+    /// a text one — some of them have connected to find out, though the
+    /// statement never ran. Carries the refusal's words.
+    DbRefused(String),
     /// The server refused it, or the connection failed.
     Failed(String),
     /// The deadline passed and the statement was cancelled server-side.
@@ -74,7 +76,7 @@ impl NoRows {
             NoRows::NotARead(why) => {
                 format!("refused: {why}. Only reads are taken here; use `exec` to write")
             }
-            NoRows::NotPermitted(why) | NoRows::SessionRefused(why) => format!("refused: {why}"),
+            NoRows::NotPermitted(why) | NoRows::DbRefused(why) => format!("refused: {why}"),
             // No prefix of our own: `DbError`'s Display already says what
             // failed ("query failed: …", "could not connect: …"), and a second
             // one printed "query failed: query failed: …".
@@ -98,21 +100,15 @@ impl NoRows {
     pub fn is_refusal(&self) -> bool {
         matches!(
             self,
-            NoRows::Empty
-                | NoRows::NotARead(_)
-                | NoRows::NotPermitted(_)
-                | NoRows::SessionRefused(_)
+            NoRows::Empty | NoRows::NotARead(_) | NoRows::NotPermitted(_) | NoRows::DbRefused(_)
         )
     }
 
-    /// A read's [`schemaic_db::DbError`], as the arm it belongs to: the
-    /// read-only session's own refusal ([`NoRows::SessionRefused`]), else a
-    /// failure.
+    /// A statement's [`schemaic_db::DbError`], as the arm it belongs to: a
+    /// refusal that stands ([`NoRows::DbRefused`]), else a failure.
     pub fn from_db(e: schemaic_db::DbError) -> NoRows {
         match e {
-            schemaic_db::DbError::Refused(r @ schemaic_db::DbRefusal::ShadowedBuiltin { .. }) => {
-                NoRows::SessionRefused(r.message())
-            }
+            schemaic_db::DbError::Refused(r) if r.stands() => NoRows::DbRefused(r.message()),
             e => NoRows::Failed(e.to_string()),
         }
     }
@@ -258,11 +254,10 @@ pub async fn read_only_export(
         .await
         .map_err(|e| NoRows::Failed(format!("the export's writer stopped: {e}")))?
         .map_err(writer_stop);
-    // The session refused before the statement was sent, so nothing was read
-    // and the `.part` is empty: told as the refusal it is, not as a failure.
-    if let Ok(Err(
-        e @ schemaic_db::DbError::Refused(schemaic_db::DbRefusal::ShadowedBuiltin { .. }),
-    )) = &read
+    // Refused before the statement ran, so nothing was read and the `.part` is
+    // empty: told as the refusal it is, not as a failure.
+    if let Ok(Err(e @ schemaic_db::DbError::Refused(r))) = &read
+        && r.stands()
     {
         let _ = std::fs::remove_file(&part);
         return Err(NoRows::from_db(e.clone()));
@@ -521,24 +516,36 @@ mod tests {
         assert!(NoRows::NotARead("it is a DELETE".into()).is_refusal());
         assert!(!NoRows::Failed("connection reset".into()).is_refusal());
         assert!(!NoRows::TimedOut(DEFAULT_TIMEOUT).is_refusal());
-        assert!(NoRows::SessionRefused("public.lower".into()).is_refusal());
+        assert!(NoRows::DbRefused("public.lower".into()).is_refusal());
     }
 
-    /// **A read-only session's refusal is the guard's, not the server's**: it
-    /// keeps its own arm, and so exit 3 and the refusal's words with no
-    /// "query failed:" in front, while every other database error stays a
-    /// failure.
+    /// **A refusal that stands is the guard's, not the server's**: it keeps
+    /// its own arm, and so exit 3 and the refusal's words with no "query
+    /// failed:" in front — a read-only session on a shadowing path, a MySQL
+    /// session whose `sql_mode` will not pin, a plan MySQL will not make
+    /// read-only — while a refusal that does not stand, and every other
+    /// database error, stays a failure.
     #[test]
-    fn a_shadowed_builtin_is_a_refusal_and_everything_else_a_failure() {
+    fn a_standing_refusal_is_a_refusal_and_everything_else_a_failure() {
         use schemaic_db::{DbError, DbRefusal};
-        let refusal = DbRefusal::ShadowedBuiltin {
-            schema: "public".into(),
-            name: "lower".into(),
-            operator: false,
-        };
-        let got = NoRows::from_db(DbError::Refused(refusal.clone()));
-        assert_eq!(got, NoRows::SessionRefused(refusal.message()));
-        assert_eq!(got.message(), format!("refused: {}", refusal.message()));
+        for refusal in [
+            DbRefusal::ShadowedBuiltin {
+                schema: "public".into(),
+                name: "lower".into(),
+                operator: false,
+            },
+            DbRefusal::SqlMode("ANSI_QUOTES".into()),
+            DbRefusal::ClientCharset("gbk".into()),
+            DbRefusal::WritingPlan { function: false },
+        ] {
+            let got = NoRows::from_db(DbError::Refused(refusal.clone()));
+            assert_eq!(got, NoRows::DbRefused(refusal.message()));
+            assert_eq!(got.message(), format!("refused: {}", refusal.message()));
+        }
+        assert!(matches!(
+            NoRows::from_db(DbError::Refused(DbRefusal::SqliteWorker("gone".into()))),
+            NoRows::Failed(_)
+        ));
         assert_eq!(
             NoRows::from_db(DbError::Query("relation \"t\" does not exist".into())),
             NoRows::Failed("query failed: relation \"t\" does not exist".into())

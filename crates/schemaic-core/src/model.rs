@@ -1559,6 +1559,42 @@ pub enum DbRefusal {
 }
 
 impl DbRefusal {
+    /// Is this a refusal that **stands** — made before the statement ran, for
+    /// a reason that asking again unchanged meets again? The headless front
+    /// ends give these the guard's exit code (3) rather than a failure's (4):
+    /// a caller branches on 3 to stop retrying, and every one of these would
+    /// refuse a retry the same way.
+    ///
+    /// Two do not: `SqliteWorker` is the worker thread failing, which a retry
+    /// may not meet, and `CommitAborted` is a report on a `COMMIT` that was
+    /// sent. Matched without a wildcard, so a new refusal has to be placed.
+    pub fn stands(&self) -> bool {
+        match self {
+            DbRefusal::SqliteWorker(_) | DbRefusal::CommitAborted => false,
+            DbRefusal::InitSql(_)
+            | DbRefusal::Transport(_)
+            | DbRefusal::BackupInTerminal
+            | DbRefusal::SqliteNoManual
+            | DbRefusal::MsSqlReadOnlyAuto
+            | DbRefusal::ClientCharset(_)
+            | DbRefusal::SqlMode(_)
+            | DbRefusal::WritingPlan { .. }
+            | DbRefusal::WindowsBuildOnly
+            | DbRefusal::CloudIamEngine
+            | DbRefusal::ReadOnly(_)
+            | DbRefusal::MsSqlCancelNeedsKill
+            | DbRefusal::ShadowedBuiltin { .. }
+            | DbRefusal::BlankValue { .. }
+            | DbRefusal::CodePage { .. }
+            | DbRefusal::SqliteNoFile
+            | DbRefusal::SqliteMemory
+            | DbRefusal::SqliteUri(_)
+            | DbRefusal::SqliteNoColumn { .. }
+            | DbRefusal::SqliteGenerated(_)
+            | DbRefusal::SqliteSizesTooLarge { .. } => true,
+        }
+    }
+
     /// The refusal in English.
     pub fn message(&self) -> String {
         match self {
@@ -2956,6 +2992,31 @@ impl ErrorModalContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A refusal a retry meets again stands; a failure or a report does
+    /// not.** The settings and session refusals the headless reads can meet
+    /// stand, and so exit 3; the SQLite worker failing and a `COMMIT` the
+    /// server had already aborted are not refusals of the statement asked.
+    #[test]
+    fn a_refusal_stands_unless_it_is_a_failure_or_a_report() {
+        let s = |t: &str| t.to_string();
+        for standing in [
+            DbRefusal::ClientCharset(s("gbk")),
+            DbRefusal::SqlMode(s("ANSI_QUOTES")),
+            DbRefusal::WritingPlan { function: true },
+            DbRefusal::Transport(crate::connection::AuthMode::AwsIam),
+            DbRefusal::ShadowedBuiltin {
+                schema: s("public"),
+                name: s("lower"),
+                operator: false,
+            },
+            DbRefusal::SqliteNoFile,
+        ] {
+            assert!(standing.stands(), "{standing:?}");
+        }
+        assert!(!DbRefusal::SqliteWorker(s("task 7 panicked")).stands());
+        assert!(!DbRefusal::CommitAborted.stands());
+    }
 
     /// The go-to-row readers in English marks, which every test of their
     /// other decisions is written in; these shadow the glob import, and the

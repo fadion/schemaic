@@ -337,8 +337,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   `schemaic export` also ask
   it once *earlier*, through `query::gate`, before the keyring is read or a tunnel opened — as
   `schemaic exec` runs `ExecRequest::approved` before it connects — so that exit 3's "nothing was
-  sent" is true (its one stated exception is the read-only PostgreSQL session's own refusal of a
-  shadowing path, after the connect and before the statement — `cli::query`'s entry); the asking
+  sent" is true (its stated exception is the database layer's standing refusals — a read-only
+  PostgreSQL session's refusal of a shadowing path, init SQL, transport, MySQL's `sql_mode` — some
+  made after the connect, all before the statement: `DbRefusal::stands`, `cli::query`'s entry); the asking
   inside the three read functions is what keeps the early one from being
   the only check. The refusals are `rerunnable_for_export`, `script_verdict`,
   `read_only_reason` and `init_sql::check` (below); the requests are `RerunRequest`, minted against the first, `ScriptRequest`,

@@ -1123,12 +1123,10 @@ fn no_rows_reply(e: crate::query::NoRows) -> (String, bool) {
         NoRows::NotARead(reason) | NoRows::NotPermitted(reason) => {
             (format!("Rejected: {reason}."), true)
         }
-        // Already a whole sentence that says the statement never ran and what
-        // the user can do; a model cannot fix it by rewriting the query.
-        NoRows::SessionRefused(reason) => (
-            format!("Rejected — not a problem with your query, so do not retry it: {reason}"),
-            true,
-        ),
+        // The refusal's own sentence says what would get past it — the user's
+        // settings, or a different statement — so the reply only says the query
+        // never ran.
+        NoRows::DbRefused(reason) => (format!("Rejected before the query ran: {reason}"), true),
         NoRows::Failed(e) => (format!("Query error: {e}"), true),
         // A read never reports `Indeterminate` — that is a write's timeout —
         // but a read-only session makes the two the same event here anyway.
@@ -2654,21 +2652,20 @@ mod tests {
         );
     }
 
-    /// **A session the read-only check refused is told as no fault of the
-    /// query**, so a model does not spend turns rewriting a statement that
-    /// never ran — the refusal's own words follow, which say what the user can
-    /// change.
+    /// **A refusal of the database layer's says the query never ran**, then
+    /// the refusal's own words, which say what would get past it. No advice of
+    /// its own: for a shadowed builtin a rewrite is useless, for a plan MySQL
+    /// will not make read-only it is the answer.
     #[test]
-    fn a_refused_session_tells_the_model_not_to_rewrite_the_query() {
-        let (text, err) = super::no_rows_reply(crate::query::NoRows::SessionRefused(
+    fn a_database_refusal_says_the_query_never_ran() {
+        let (text, err) = super::no_rows_reply(crate::query::NoRows::DbRefused(
             "Refused before your statement ran: public.lower is …".into(),
         ));
         assert!(err);
-        assert!(
-            text.starts_with("Rejected — not a problem with your query"),
-            "{text}"
+        assert_eq!(
+            text,
+            "Rejected before the query ran: Refused before your statement ran: public.lower is …"
         );
-        assert!(text.ends_with("public.lower is …"), "{text}");
     }
 
     /// **A server's plan reaches the model as the tool writes it**: SQLite's

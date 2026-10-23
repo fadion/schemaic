@@ -189,6 +189,13 @@ and `Display` is it, so the CLI, the MCP server and the logs, which keep `to_str
 what they read before; the interface's wording is held to it by
 `english_says_every_db_refusal_as_core_does` (*The string catalogue*). The names, types and
 values inside are the user's or the server's, and a `SqliteWorker`'s text is the runtime's.
+**`stands()` says whether a refusal holds against a retry** — made before the statement ran, for
+a reason asking again unchanged meets again — and it is what the headless front ends read to give
+a refusal the guard's exit 3 rather than a failure's 4 (`NoRows::from_db`, under `cli::query`).
+Two do not stand: `SqliteWorker`, the worker thread failing, which a retry may not meet, and
+`CommitAborted`, a report on a `COMMIT` that was sent. It is matched with no wildcard, so a new
+variant has to be placed on one side rather than inherit whichever a `_` gave it
+(`a_refusal_stands_unless_it_is_a_failure_or_a_report`).
 **`ConnectFailure` is the same move for the sentences `schemaic-db` composes *around* a
 driver's, the SSH library's or the operating system's text at connect** — what
 `DbError::ConnectFailed` carries: `TimedOut`, `InitFailed { statement, error }`,

@@ -33,8 +33,10 @@ Verified against PostgreSQL 16: `--limit 2 --format jsonl` on a 4078-row table e
 without the flag and 6 with it, rows and stderr warning printed both times; `table` with the
 flag exited 6 under its capped footer; a complete result with the flag exited 0.
 **3 promises that nothing was sent, and the order of the steps is what keeps that true** — with
-one stated exception, a read-only PostgreSQL session refused after connecting and before the
-statement went (`NoRows::SessionRefused`, `query.rs`'s entry), which `Exit::Refused`'s doc and the
+one stated class of exception, the database layer's standing refusals (`NoRows::DbRefused`,
+`DbRefusal::stands`, `query.rs`'s entry) — init SQL, transport, MySQL's `sql_mode` and character
+set, a plan MySQL will not make read-only, a read-only PostgreSQL path that shadows a builtin —
+some made after connecting, all before the statement ran, which `Exit::Refused`'s doc and the
 `--help` line both name:
 select the connection, take the statement, gate it (`query::gate`) or approve it
 (`ExecRequest::approved`), and only then connect. It used to connect first, so a refusal had
@@ -158,9 +160,9 @@ no-database `hint:` when it applies, and `exit_for_no_rows`.
 **`explain` is `run_explain`, `run_query`'s order around the MCP server's `explain`**:
 `select_conn`, `statement`, `query::gate` in the connection's dialect, `connect`, then
 `query::read_only_explain` — the one function both front ends plan through, so the CLI's plan
-is the tool's, on the same read-only session behind the same gate. Refusal is exit 3 with
-nothing sent and a server failure or timeout exit 4, with the no-database `hint:`, all as
-`query`. **The plan's rows go to stdout through the ordinary renderers**, by way of the pure
+is the tool's, on the same read-only session behind the same gate. The gate's refusal is exit 3
+with nothing sent, a standing refusal of the database layer's exit 3 after connecting, and a
+server failure or timeout exit 4, with the no-database `hint:`, all as `query`. **The plan's rows go to stdout through the ordinary renderers**, by way of the pure
 `plan_rows(&QueryPlan) -> ResultSet`, so `--format` and `--no-header` mean what they mean for
 a query, and two details there are load-bearing. **The `ResultSet` is never marked
 truncated**, even when the plan was: the renderers' capped wording points at `--limit`, which
