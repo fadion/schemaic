@@ -2518,6 +2518,29 @@ mod tests {
         }
     }
 
+    /// **The keyring refusal reaches the terminal panel whole in every
+    /// language.** *Open in CLI* prints it through a message shell, whose
+    /// `launch::shell_message_text` turns an apostrophe into a space, and
+    /// English's "this connection's saved credentials" read *connection s
+    /// saved* there — French's *n'a pas pu* the same. Worded without one, so
+    /// the sanitiser has nothing to take.
+    #[test]
+    fn the_keyring_refusal_survives_the_message_shell_in_every_language() {
+        for &lang in UiLanguage::ALL {
+            let text = loader(lang)
+                .get_args(
+                    "db-refused-keyring-unreadable",
+                    HashMap::from([("error", "locked")]),
+                )
+                .replace(['\u{2068}', '\u{2069}'], "");
+            assert_eq!(
+                schemaic_core::launch::shell_message_text(&text),
+                text,
+                "{lang:?}"
+            );
+        }
+    }
+
     /// Italian, French and Spanish keyboards print their own legends; the
     /// others print English's and name only the space bar.
     #[test]

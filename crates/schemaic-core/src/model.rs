@@ -1740,7 +1740,7 @@ impl DbRefusal {
                 crate::stats::format_bytes(*file)
             ),
             DbRefusal::KeyringUnreadable(error) => format!(
-                "Schemaic could not read this connection's saved credentials from the OS \
+                "Schemaic could not read the saved credentials for this connection from the OS \
                  keyring ({error}). Nothing was deleted: unlock the keyring and try again."
             ),
         }
