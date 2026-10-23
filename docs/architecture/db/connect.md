@@ -9,26 +9,59 @@ means to a fingerprint store before it has anything to hash. That is a migration
 decides whether to trust a host, not a version bump, and it is not being done inside a dependency
 sweep.
 **`TunnelClient::check_server_key` asks OpenSSH's `known_hosts` before its own store** (security
-review S16), through russh's `keys::check_known_hosts(host, port, key)` — which is why
-`TunnelClient` carries `host` and `port` apart beside `host_port`: the file spells a non-default
-port `[host]:port` and may hash its host names, and russh matches both. Until then the tunnel kept
-a store of its own and never read the user's, so a host OpenSSH had already verified was trusted
-afresh on first sight here, with no fingerprint shown, and a key OpenSSH would have refused as
-changed was accepted. The pure `openssh_verdict` maps russh's answer: `Ok(true)` is `Known`,
-accepted without touching Schemaic's store; `Err(KeyChanged { line })` is `Changed`, refused as
+review S16). Until then the tunnel kept a store of its own and never read the user's, so a host
+OpenSSH had already verified was trusted afresh on first sight here, with no fingerprint shown,
+and a key OpenSSH would have refused as changed was accepted. `open_tunnel` reads the lines once
+per hop, before the connect, through russh's `keys::known_hosts::known_host_keys(host, port)` —
+which spells a non-default port `[host]:port` and matches hashed host names — into
+`TunnelClient::listed`, key and line number; a file that cannot be read lists nothing. Once,
+because the list answers two questions. **The first is which key the server presents**:
+`host_key_order(listed)` is russh's default `preferred.key` with the types the file holds for
+that hop moved to the front, in russh's own order among themselves — what OpenSSH does — so a
+server holding a listed key presents that one rather than a newer type nobody has verified
+(`the_listed_key_types_are_asked_for_first`). **The second is what the presented key is worth**,
+the pure `openssh_verdict(listed, offered)`: any listed key equal to the offered one, compared on
+the key data alone, is `Known`; failing that, the first line of the same type is
+`Changed { line }`; a host listed only under other types is `OtherTypeOnly`; nothing listed is
+`None`. `same_key_type` counts RSA's signature variants as the one `ssh-rsa` key the file records.
+It reads the lines itself rather than calling russh's `check_known_hosts`, because that stops at
+the first same-type line that differs — so a host listed twice after a rotation (`UpdateHostKeys`,
+a second `ssh-keyscan >>`) was refused as an interception OpenSSH connects to happily (release
+review S2-L1-02; `a_rotated_host_listed_twice_accepts_the_newer_key`).
+**The pure `host_key_decision(openssh, store, host_port, fingerprint)` is the whole composition**,
+one function so the two stores are tested *together* — each was right alone while their
+composition let a key-type downgrade through (release review S2-L5-01, Critical). A `Known` key
+used to return `Ok(true)` before Schemaic's store was touched, so a host OpenSSH vouched for was
+never pinned; an interceptor later offering a key *type* the file had no line for read as not
+listed, fell through to an empty store and was trusted on first use — and the tunnel's password
+went to it. Now `Changed` is `HostKeyVerdict::OpenSshChanged`, refused as
 `SshFailure::OpenSshHostKeyChanged`, whose advice says to verify the fingerprint out of band
-before replacing the entry (`ssh-keygen -R`); anything else — not listed, no home
-directory, a file that cannot be opened or holds a key russh cannot parse — is `None`, and
-Schemaic's first-use trust decides exactly as before
-(`openssh_known_hosts_decides_before_schemaic_trusts_on_first_use`). What it costs is partly
-ours and partly russh's. **`Known` short-circuits Schemaic's store**, so a fingerprint recorded
-there is not consulted for a host OpenSSH vouches for. russh reports a changed key only when the recorded
-key has **the offered key's algorithm**: a host `known_hosts` lists only under another key type
-reads as not listed and falls through to trust on first use rather than being refused. Its reader
-also takes an `@revoked` or `@cert-authority` line's marker for the host pattern, so such a line
-matches nothing and a revoked key is not refused by it; and its line count skips `#` lines, which
-is why the refusal names no line — the number would run behind the file's own by the comments
-above the entry, and `ssh-keygen -R` needs none.
+before replacing the entry (`ssh-keygen -R`). `OtherTypeOnly` is `OpenSshOtherType`, refused as
+`SshFailure::OpenSshKeyTypeUnlisted { host_port, offered, offered_type, listed_types }`, whose
+advice is the same order — verify out of band first, then connect with `ssh` once and accept the
+key, which adds it to the file
+(`an_other_type_refusal_names_both_types_and_verification_first`). That refusal can stand only
+because of `host_key_order`: without it a server that also holds a newer key type would present
+that one and be refused for it. `Known` is `Accept` when the store already holds this
+fingerprint and otherwise `RecordAndAccept` — pinned, **overwriting a stale pin**, since
+`known_hosts` is the user's own word and a rotation recorded there supersedes it — and `Accept`
+without writing when the store cannot be read, so the next connect asks the file again
+(`a_vouched_key_supersedes_the_pin_and_survives_an_unreadable_store`). `None` is
+`known_host_decision`, Schemaic's first-use trust
+(`a_host_known_hosts_does_not_list_is_trusted_on_first_use`). The pin is what closes the
+downgrade once the file is gone too: with `known_hosts` silent, the other type meets the store's
+`Mismatch` (`a_key_type_downgrade_on_a_host_known_hosts_lists_is_refused`). Verified live by the
+change's author against a throwaway WSL sshd: a vouched host was pinned; a file listing only ECDSA,
+against a server holding ed25519 and ECDSA, connected with the ECDSA key; two ed25519 lines with
+the second matching connected; a server offering only ECDSA to a file listing ed25519 was refused
+with the new message; and with ed25519 pinned and the file removed, that server met the
+`Mismatch`.
+What russh's reader still costs: `known_host_keys` parses every line naming the host and fails
+whole on one it cannot parse, which reads as nothing listed, as an unreadable file does. It takes
+an `@revoked` or `@cert-authority` line's marker for the host pattern, so such a line matches
+nothing and a revoked key is not refused by it; and its line count skips `#` lines, which is why
+the refusal names no line — the number would run behind the file's own by the comments above the
+entry, and `ssh-keygen -R` needs none.
 **Not done**: a host neither store knows is still trusted on first sight with no fingerprint shown
 and no question asked. Asking needs a prompt from the DB layer to the UI, which the tunnel has no
 way to raise today.
@@ -40,7 +73,7 @@ listener's `local_addr` failure, the system's text alone. `tunnel_target_refusal
 host-key `refusal_message` answer `Option<SshFailure>`, and `TunnelClient::refusal` holds one,
 so the verdict `open_tunnel` reports over russh's `UnknownKey` is that value rather than its
 paragraphs. Their tests compare the value or its `Display`, which is the old English. In the
-catalogue the three refusals are a message per paragraph, joined with line breaks by
+catalogue the four refusals are a message per paragraph, joined with line breaks by
 `i18n::connect_failure_text` since a message holds none; the changed key's out-of-band check
 and the file that re-trusts stay **one** message, `db-ssh-host-key-changed-advice`, so the order
 `a_mismatch_says_the_key_changed_and_carries_both_fingerprints` pins in English — verify first,
@@ -84,7 +117,8 @@ reads, and the tunnel would dial whatever listens on the saved port instead.
 `client::connect_stream` over a `channel_open_direct_tcpip` of the previous session's
 `into_stream()`, so the database's host need be reachable only from the last. Each hop is a
 tunnel of its own in every respect that matters for trust — its own `TunnelClient`, so the TOFU
-check runs against *its* `host:port`; its own `within` bounds, so the 20 s and 60 s above apply
+check runs against *its* `host:port`, and its own `known_hosts` lines and `client::Config`, so the
+key types asked for are *its* listed ones; its own `within` bounds, so the 20 s and 60 s above apply
 per hop and not to the route as a whole; and `authenticate` as the hop's user, which is why
 `authenticate` and `authenticate_key` take a `user` now. An unreadable route is refused before
 any I/O with `route()`'s sentence. **The jump sessions are moved into the accept loop's task**

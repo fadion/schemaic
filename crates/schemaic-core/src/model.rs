@@ -2079,6 +2079,15 @@ pub enum SshFailure {
     /// records for it. No line number: russh's count skips comment lines, so
     /// it would send the user to the wrong one.
     OpenSshHostKeyChanged { host_port: String, offered: String },
+    /// The user's own `~/.ssh/known_hosts` lists the host only under other
+    /// key types than the one it offered — the key-type downgrade an
+    /// interception would make, which OpenSSH asks about rather than accepts.
+    OpenSshKeyTypeUnlisted {
+        host_port: String,
+        offered: String,
+        offered_type: String,
+        listed_types: String,
+    },
     /// The record of trusted host keys could not be read.
     HostKeyStoreUnreadable {
         host_port: String,
@@ -2220,6 +2229,20 @@ impl SshFailure {
                  sent to it. Verify the new fingerprint out of band (on the server's own console, \
                  or with whoever administers it) before trusting it. Once you have, remove the \
                  old entry with ssh-keygen -R and connect with ssh once to record the new one."
+            ),
+            SshFailure::OpenSshKeyTypeUnlisted {
+                host_port,
+                offered,
+                offered_type,
+                listed_types,
+            } => format!(
+                "{host_port} offered a host key of type {offered_type} ({offered}), but your \
+                 ~/.ssh/known_hosts lists it only as {listed_types}.\n\nSchemaic asked for the \
+                 key type known_hosts holds, and the server did not present it. This can mean \
+                 the server was reconfigured — or that something is intercepting the connection. \
+                 Nothing was sent to it. Verify the new fingerprint out of band (on the server's \
+                 own console, or with whoever administers it) before trusting it. Once you have, \
+                 connect with ssh once and accept the key, which adds it to known_hosts."
             ),
             SshFailure::HostKeyStoreUnreadable {
                 host_port,

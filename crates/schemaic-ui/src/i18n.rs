@@ -1364,6 +1364,23 @@ pub fn connect_failure_text(f: &schemaic_core::model::ConnectFailure) -> String 
                 tr!("db-ssh-openssh-key-changed-advice"),
             ]
             .join("\n"),
+            SshFailure::OpenSshKeyTypeUnlisted {
+                host_port,
+                offered,
+                offered_type,
+                listed_types,
+            } => [
+                tr!(
+                    "db-ssh-openssh-key-type",
+                    host = host_port.as_str(),
+                    key = offered.as_str(),
+                    kind = offered_type.as_str(),
+                    listed = listed_types.as_str()
+                ),
+                String::new(),
+                tr!("db-ssh-openssh-key-type-advice"),
+            ]
+            .join("\n"),
             SshFailure::Route(r) => crate::connection_form::route_note_text(
                 &schemaic_core::ssh_config::RouteNote::Refused(r.clone()),
             ),
@@ -1745,6 +1762,12 @@ mod tests {
             SshFailure::OpenSshHostKeyChanged {
                 host_port: s("jump:22"),
                 offered: s("SHA256:new"),
+            },
+            SshFailure::OpenSshKeyTypeUnlisted {
+                host_port: s("jump:22"),
+                offered: s("SHA256:new"),
+                offered_type: s("ecdsa-sha2-nistp256"),
+                listed_types: s("ssh-ed25519"),
             },
             SshFailure::Route(
                 schemaic_core::ssh_config::RouteRefusal::ConfigJumpPassword {

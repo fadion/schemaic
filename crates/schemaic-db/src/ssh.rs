@@ -109,10 +109,13 @@ impl Drop for TunnelHandle {
 struct TunnelClient {
     /// `"host:port"` of the SSH server, for the known-hosts lookup.
     host_port: String,
-    /// The same server apart, for OpenSSH's `known_hosts`, which spells a
-    /// non-default port `[host]:port`.
-    host: String,
-    port: u16,
+    /// The keys the user's own `~/.ssh/known_hosts` lists for this server,
+    /// with their line numbers — read once, before the connect, because they
+    /// decide two things: which key types the client asks for
+    /// ([`host_key_order`]) and then what the presented key is worth
+    /// ([`openssh_verdict`]). Empty when the host is not listed or the file
+    /// cannot be read.
+    listed: Vec<(usize, ssh_key::PublicKey)>,
     /// Filled by [`TunnelClient::check_server_key`] when it refuses a key.
     ///
     /// russh has **one** error for a rejected host key — `UnknownKey`, whose text
@@ -146,8 +149,20 @@ enum HostKeyVerdict {
     /// The store exists and could not be read → refuse. **Not** the same as an
     /// empty store: this host may well be recorded in the bytes we can't parse.
     StoreUnreadable,
-    /// Unknown host → record the key, then accept (first-use trust).
+    /// Unknown host → record the key, then accept (first-use trust). Also a
+    /// host `~/.ssh/known_hosts` vouches for that Schemaic's store does not
+    /// yet record with this key: pinned here, so that a later key of another
+    /// type — which `known_hosts` cannot judge — meets a [`Self::Mismatch`]
+    /// rather than first-use trust.
     RecordAndAccept,
+    /// `~/.ssh/known_hosts` records a different key of the offered type → refuse.
+    OpenSshChanged,
+    /// `~/.ssh/known_hosts` lists the host, but only under other key types
+    /// than the one offered → refuse. The client asked for the listed types
+    /// first ([`host_key_order`]), so a server answering with another one is
+    /// either reconfigured or not the server `known_hosts` knows; OpenSSH asks
+    /// the user here, and with no one to ask, trusting it is what not to do.
+    OpenSshOtherType,
 }
 
 /// Decide how to treat `fingerprint` offered by `host_port`, given the current
@@ -173,27 +188,118 @@ fn known_host_decision(
     }
 }
 
+/// The whole host-key decision: what `~/.ssh/known_hosts` says, then
+/// Schemaic's own store. One function so the two halves are tested *together*
+/// — each was right alone while their composition let a key-type downgrade
+/// through (release review S2-L5-01): a host `known_hosts` vouched for was
+/// accepted without being pinned, so an attacker later offering a key type
+/// `known_hosts` had no line for fell through to an empty store and was
+/// trusted on first use, password and all.
+fn host_key_decision(
+    openssh: Option<OpenSshVerdict>,
+    store: Result<&HashMap<String, String>, &str>,
+    host_port: &str,
+    fingerprint: &str,
+) -> HostKeyVerdict {
+    match openssh {
+        Some(OpenSshVerdict::Changed { .. }) => HostKeyVerdict::OpenSshChanged,
+        Some(OpenSshVerdict::OtherTypeOnly) => HostKeyVerdict::OpenSshOtherType,
+        // Vouched for: accepted whatever the store holds — `known_hosts` is
+        // the user's own word, and a rotation recorded there supersedes the
+        // pin — and pinned when the store does not already say the same.
+        Some(OpenSshVerdict::Known) => match store {
+            Ok(s) if s.get(host_port).map(String::as_str) == Some(fingerprint) => {
+                HostKeyVerdict::Accept
+            }
+            Ok(_) => HostKeyVerdict::RecordAndAccept,
+            // Nothing to pin into; the next connect asks `known_hosts` again.
+            Err(_) => HostKeyVerdict::Accept,
+        },
+        None => known_host_decision(store, host_port, fingerprint),
+    }
+}
+
 /// What the user's own `~/.ssh/known_hosts` says about a host's key.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum OpenSshVerdict {
-    /// Listed, with this key: accepted without asking Schemaic's store.
+    /// Listed, with this key: accepted.
     Known,
-    /// Listed with a different key of the same type, on `line`: refused.
+    /// Listed with a different key of the same type, on `line`, and with
+    /// this key on no line: refused.
     Changed { line: usize },
+    /// Listed, but only under other key types: refused
+    /// ([`HostKeyVerdict::OpenSshOtherType`]).
+    OtherTypeOnly,
 }
 
-/// [`OpenSshVerdict`] from russh's reading of `known_hosts`, or `None` when it
-/// has nothing to say — the host is not listed, or the file cannot be read —
-/// and Schemaic's own first-use trust decides. Pure, so the composition has a
-/// test the filesystem does not have to take part in.
-fn openssh_verdict(answer: &Result<bool, russh::keys::Error>) -> Option<OpenSshVerdict> {
-    match answer {
-        Ok(true) => Some(OpenSshVerdict::Known),
-        Err(russh::keys::Error::KeyChanged { line }) => {
-            Some(OpenSshVerdict::Changed { line: *line })
-        }
-        Ok(false) | Err(_) => None,
+/// [`OpenSshVerdict`] for `offered`, given the keys `known_hosts` lists for the
+/// host, or `None` when it lists none and Schemaic's own first-use trust
+/// decides. Pure, so the decision has a test the filesystem does not take part
+/// in.
+///
+/// Any listed key equal to the offered one is a match, wherever it sits — the
+/// rule OpenSSH applies. russh's `check_known_hosts` stops at the first
+/// same-type line that differs, so a host listed twice after a key rotation
+/// (`UpdateHostKeys`, a second `ssh-keyscan >>`) was refused as an
+/// interception OpenSSH connects to happily (release review S2-L1-02).
+fn openssh_verdict(
+    listed: &[(usize, ssh_key::PublicKey)],
+    offered: &ssh_key::PublicKey,
+) -> Option<OpenSshVerdict> {
+    if listed.is_empty() {
+        return None;
     }
+    // Compared on the key alone: a comment is no part of what is trusted.
+    if listed
+        .iter()
+        .any(|(_, k)| k.key_data() == offered.key_data())
+    {
+        return Some(OpenSshVerdict::Known);
+    }
+    match listed
+        .iter()
+        .find(|(_, k)| same_key_type(&k.algorithm(), &offered.algorithm()))
+    {
+        Some((line, _)) => Some(OpenSshVerdict::Changed { line: *line }),
+        None => Some(OpenSshVerdict::OtherTypeOnly),
+    }
+}
+
+/// Whether two host-key algorithms name one kind of key. The RSA signature
+/// variants (`rsa-sha2-512`, `rsa-sha2-256`, `ssh-rsa`) all verify with the
+/// one `ssh-rsa` key `known_hosts` records.
+fn same_key_type(a: &ssh_key::Algorithm, b: &ssh_key::Algorithm) -> bool {
+    let rsa = |x: &ssh_key::Algorithm| matches!(x, ssh_key::Algorithm::Rsa { .. });
+    a == b || (rsa(a) && rsa(b))
+}
+
+/// The key types `known_hosts` lists, as the refusal names them:
+/// `ssh-ed25519, ssh-rsa`, each once, in file order.
+fn listed_types(listed: &[(usize, ssh_key::PublicKey)]) -> String {
+    let mut types: Vec<String> = Vec::new();
+    for (_, k) in listed {
+        let t = k.algorithm().as_str().to_string();
+        if !types.contains(&t) {
+            types.push(t);
+        }
+    }
+    types.join(", ")
+}
+
+/// The host-key types to ask the server for: russh's default list, with the
+/// types `known_hosts` already holds for this host moved to the front, in
+/// russh's own order among themselves — what OpenSSH does, so that a server
+/// with a listed key presents *that* key rather than a newer type nobody has
+/// verified. A host `known_hosts` does not list keeps the default order.
+fn host_key_order(listed: &[(usize, ssh_key::PublicKey)]) -> Vec<ssh_key::Algorithm> {
+    let is_listed =
+        |a: &ssh_key::Algorithm| listed.iter().any(|(_, k)| same_key_type(&k.algorithm(), a));
+    let (first, rest): (Vec<_>, Vec<_>) = russh::Preferred::DEFAULT
+        .key
+        .iter()
+        .cloned()
+        .partition(|a| is_listed(a));
+    first.into_iter().chain(rest).collect()
 }
 
 /// What to tell the user about a refusal, or `None` when the key was accepted.
@@ -208,14 +314,28 @@ fn openssh_verdict(answer: &Result<bool, russh::keys::Error>) -> Option<OpenSshV
 /// The order of the sentences is load-bearing and is asserted by a test: the
 /// out-of-band verification comes *before* the file that re-trusts, because a
 /// remedy read first is a remedy applied first.
+///
+/// `types` is the offered key's type and the types `known_hosts` lists the
+/// host under, which only [`HostKeyVerdict::OpenSshOtherType`] reports.
 fn refusal_message(
     verdict: HostKeyVerdict,
     host_port: &str,
     known: Option<&str>,
     offered: &str,
+    types: (&str, &str),
 ) -> Option<crate::SshFailure> {
     match verdict {
         HostKeyVerdict::Accept | HostKeyVerdict::RecordAndAccept => None,
+        HostKeyVerdict::OpenSshChanged => Some(crate::SshFailure::OpenSshHostKeyChanged {
+            host_port: host_port.to_string(),
+            offered: offered.to_string(),
+        }),
+        HostKeyVerdict::OpenSshOtherType => Some(crate::SshFailure::OpenSshKeyTypeUnlisted {
+            host_port: host_port.to_string(),
+            offered: offered.to_string(),
+            offered_type: types.0.to_string(),
+            listed_types: types.1.to_string(),
+        }),
         HostKeyVerdict::Mismatch => Some(crate::SshFailure::HostKeyChanged {
             host_port: host_port.to_string(),
             known: known.map(str::to_string),
@@ -236,28 +356,20 @@ impl Handler for TunnelClient {
     // OpenSSH's `known_hosts` first (security review S16), then trust-on-first-use
     // host-key verification (review H10): accept and record an unknown host's
     // key; accept a known host only if the key still matches; refuse a changed
-    // key (the MITM signal). Fingerprints are SHA256.
+    // key (the MITM signal). Fingerprints are SHA256. The composition is
+    // `host_key_decision`'s, and pure.
     async fn check_server_key(&mut self, key: &ssh_key::PublicKey) -> Result<bool, Self::Error> {
         let fingerprint = key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
-        // **The user's own `known_hosts` first**: a host OpenSSH has verified
-        // is verified, and one whose key it records differently is refused,
-        // rather than either being trusted afresh on first sight here.
-        match openssh_verdict(&russh::keys::check_known_hosts(&self.host, self.port, key)) {
-            Some(OpenSshVerdict::Known) => return Ok(true),
-            Some(OpenSshVerdict::Changed { line }) => {
-                tracing::error!(
-                    "SSH host-key refusal for {}: ~/.ssh/known_hosts line {line} differs",
-                    self.host_port
-                );
-                *self.refusal.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(crate::SshFailure::OpenSshHostKeyChanged {
-                        host_port: self.host_port.clone(),
-                        offered: fingerprint,
-                    });
-                return Ok(false);
-            }
-            None => {}
+        let openssh = openssh_verdict(&self.listed, key);
+        if let Some(OpenSshVerdict::Changed { line }) = openssh {
+            tracing::error!(
+                "SSH host-key refusal for {}: ~/.ssh/known_hosts line {line} differs",
+                self.host_port
+            );
         }
+        let offered_type = key.algorithm().as_str().to_string();
+        let listed = listed_types(&self.listed);
+        let types = (offered_type.as_str(), listed.as_str());
         // Held across load → decide → insert → save, so a concurrent tunnel
         // can't read the same map and write back a version missing this host.
         // A poisoned lock means another thread panicked mid-update, which is
@@ -270,13 +382,15 @@ impl Handler for TunnelClient {
                     &self.host_port,
                     None,
                     &fingerprint,
+                    types,
                 );
                 return Ok(false);
             }
         };
         let loaded: Result<HashMap<String, String>, String> =
             schemaic_core::persist::load_json_strict(KNOWN_HOSTS_FILE);
-        let verdict = known_host_decision(
+        let verdict = host_key_decision(
+            openssh,
             loaded.as_ref().map_err(String::as_str),
             &self.host_port,
             &fingerprint,
@@ -286,7 +400,7 @@ impl Handler for TunnelClient {
             .ok()
             .and_then(|s| s.get(&self.host_port))
             .map(String::as_str);
-        if let Some(msg) = refusal_message(verdict, &self.host_port, known, &fingerprint) {
+        if let Some(msg) = refusal_message(verdict, &self.host_port, known, &fingerprint, types) {
             // Still logged for anyone running with a console; the connection
             // error is what the user actually sees.
             tracing::error!("SSH host-key refusal for {}: {msg}", self.host_port);
@@ -295,8 +409,13 @@ impl Handler for TunnelClient {
         }
         if verdict == HostKeyVerdict::RecordAndAccept {
             tracing::info!(
-                "SSH host {} not seen before; trusting key {fingerprint} (TOFU)",
-                self.host_port
+                "SSH host {}: recording key {fingerprint} ({})",
+                self.host_port,
+                if openssh.is_some() {
+                    "~/.ssh/known_hosts vouches for it"
+                } else {
+                    "not seen before, trusted on first use"
+                }
             );
             let mut store = loaded.unwrap_or_default();
             store.insert(self.host_port.clone(), fingerprint);
@@ -453,12 +572,18 @@ pub async fn open_tunnel(
         return Err(ssh_failed(why));
     }
     // Keepalives so a dropped SSH session is detected instead of the local port
-    // being reused against a dead tunnel forever (review H9).
-    let config = Arc::new(client::Config {
-        keepalive_interval: Some(Duration::from_secs(30)),
-        keepalive_max: 3,
-        ..Default::default()
-    });
+    // being reused against a dead tunnel forever (review H9). Per hop, because
+    // the host-key types asked for are that hop's (`host_key_order`).
+    let config_for = |listed: &[(usize, ssh_key::PublicKey)]| {
+        let mut preferred = russh::Preferred::default();
+        preferred.key = host_key_order(listed).into();
+        Arc::new(client::Config {
+            keepalive_interval: Some(Duration::from_secs(30)),
+            keepalive_max: 3,
+            preferred,
+            ..Default::default()
+        })
+    };
     // Every SSH server on the way, jump hosts first (`SshTunnel::route`). The
     // first is dialled over TCP; each later one over a `direct-tcpip` channel
     // of the one before it, as `ssh -J` does — so the database's host need be
@@ -483,14 +608,18 @@ pub async fn open_tunnel(
     for hop in &route {
         let host_port = format!("{}:{}", hop.host, hop.port);
         let refusal: Arc<Mutex<Option<crate::SshFailure>>> = Arc::new(Mutex::new(None));
+        // A file that cannot be read lists nothing, as before: Schemaic's own
+        // store decides. (russh reads it whole, so one line it cannot parse
+        // does the same.)
+        let listed =
+            russh::keys::known_hosts::known_host_keys(&hop.host, hop.port).unwrap_or_default();
+        let config = config_for(&listed);
         let handler = TunnelClient {
             host_port: host_port.clone(),
-            host: hop.host.clone(),
-            port: hop.port,
+            listed,
             refusal: refusal.clone(),
         };
         let via = sessions.last();
-        let config = config.clone();
         let connect = async {
             let connected = match via {
                 None => client::connect(config, (hop.host.as_str(), hop.port), handler).await,
@@ -603,7 +732,7 @@ pub async fn open_tunnel(
 #[cfg(test)]
 mod tests {
     use super::{HostKeyVerdict, known_host_decision, refusal_message};
-    use super::{OpenSshVerdict, openssh_verdict};
+    use super::{OpenSshVerdict, host_key_decision, host_key_order, listed_types, openssh_verdict};
     use super::{TUNNEL_AUTH_TIMEOUT, TUNNEL_CONNECT_TIMEOUT, ssh_failed, within};
     use crate::DbError;
     use std::collections::HashMap;
@@ -757,6 +886,7 @@ mod tests {
             "jump.example:22",
             Some("SHA256:old"),
             "SHA256:new",
+            ("", ""),
         )
         .expect("a refusal must be explainable")
         .to_string();
@@ -789,6 +919,7 @@ mod tests {
             "jump.example:22",
             None,
             "SHA256:new",
+            ("", ""),
         )
         .expect("a refusal must be explainable")
         .to_string();
@@ -796,25 +927,191 @@ mod tests {
         assert!(msg.contains(super::KNOWN_HOSTS_FILE), "{msg}");
     }
 
-    /// **The user's own `~/.ssh/known_hosts` is asked first** (security review
-    /// S16). The tunnel kept a trust store of its own and never read it, so a
-    /// host OpenSSH had verified was trusted afresh on first sight here — with
-    /// no fingerprint shown — and a key OpenSSH would have refused as changed
-    /// was accepted. A host it does not list falls through to Schemaic's own
-    /// first-use trust, as does a file that cannot be read.
+    /// Throwaway public keys, made with `ssh-keygen` for these tests alone.
+    const ED25519_A: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJOyoUorGIUOSsuhZzBRy6bq9keEmDSlyLaNmnYOkDe+";
+    const ED25519_B: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEjGGxxO+yW8ySSgwb1L8VpavZoMkH1IJ/fWI6oDckvC";
+    const ECDSA_P256: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBMPFoHp28GtqqNzjo0AeO8Msrrmkm4Nt8F8RSP5CV6YxES90ReiEIMSYyBIgohEu9ewoAQDBjX3YnLpNfLj18v0=";
+    const RSA: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQDgDhUIYiI5V/KnCegKCXXTl9SwpAp6og+mBQnkMr9yx1DCakox80jWUHMaHywi1MmXSOvpndIJQt8LGMDPoCTebDVn1kalu2khLIsTs3gPv/kcKqTfLWjA3PsuMVP6A/pTnAD7a7tYW1OPJmyrTi5YxGQSWKyt/8vGTe52TyeyZQ==";
+
+    fn key(openssh: &str) -> ssh_key::PublicKey {
+        ssh_key::PublicKey::from_openssh(openssh).unwrap()
+    }
+
+    fn fp(openssh: &str) -> String {
+        key(openssh)
+            .fingerprint(ssh_key::HashAlg::Sha256)
+            .to_string()
+    }
+
+    /// The whole decision for `offered`, as `check_server_key` composes it.
+    fn decide(
+        listed: &[(usize, &str)],
+        store: &HashMap<String, String>,
+        offered: &str,
+    ) -> HostKeyVerdict {
+        let listed: Vec<_> = listed.iter().map(|(l, k)| (*l, key(k))).collect();
+        host_key_decision(
+            openssh_verdict(&listed, &key(offered)),
+            Ok(store),
+            "bastion:22",
+            &fp(offered),
+        )
+    }
+
+    /// **A host `known_hosts` vouches for is pinned, and a key of a type it
+    /// does not list is refused** (release review S2-L5-01, Critical). The
+    /// vouched host was accepted without touching Schemaic's store, so an
+    /// attacker later offering ECDSA — which `known_hosts`, listing ed25519
+    /// alone, could not judge — fell through to an empty store and was
+    /// trusted on first use, and the tunnel's password went to them.
     #[test]
-    fn openssh_known_hosts_decides_before_schemaic_trusts_on_first_use() {
-        use russh::keys::Error;
-        assert_eq!(openssh_verdict(&Ok(true)), Some(OpenSshVerdict::Known));
+    fn a_key_type_downgrade_on_a_host_known_hosts_lists_is_refused() {
+        let empty = store(&[]);
+        let listed = [(3, ED25519_A)];
+        // The real server, first connect: accepted, and pinned.
         assert_eq!(
-            openssh_verdict(&Err(Error::KeyChanged { line: 4 })),
+            decide(&listed, &empty, ED25519_A),
+            HostKeyVerdict::RecordAndAccept
+        );
+        // The interception, on any connect: refused, store or no store.
+        assert_eq!(
+            decide(&listed, &empty, ECDSA_P256),
+            HostKeyVerdict::OpenSshOtherType
+        );
+        let pinned = store(&[("bastion:22", &fp(ED25519_A))]);
+        assert_eq!(
+            decide(&listed, &pinned, ECDSA_P256),
+            HostKeyVerdict::OpenSshOtherType
+        );
+        // And once pinned, a vouched-for key is simply accepted.
+        assert_eq!(decide(&listed, &pinned, ED25519_A), HostKeyVerdict::Accept);
+        // With `known_hosts` silent, the pin alone refuses the other type.
+        assert_eq!(decide(&[], &pinned, ECDSA_P256), HostKeyVerdict::Mismatch);
+    }
+
+    /// **A host listed twice under one type accepts either key** (release
+    /// review S2-L1-02), as OpenSSH does after a rotation; russh's own check
+    /// stopped at the first same-type line that differed and called it an
+    /// interception. A key on no line, with a same-type line, is still the
+    /// changed key, naming the first such line.
+    #[test]
+    fn a_rotated_host_listed_twice_accepts_the_newer_key() {
+        let listed = [(3, ED25519_A), (9, ED25519_B)];
+        let listed: Vec<_> = listed.iter().map(|(l, k)| (*l, key(k))).collect();
+        assert_eq!(
+            openssh_verdict(&listed, &key(ED25519_B)),
+            Some(OpenSshVerdict::Known)
+        );
+        assert_eq!(
+            openssh_verdict(&listed, &key(ED25519_A)),
+            Some(OpenSshVerdict::Known)
+        );
+        let one = [(4, key(ED25519_A))];
+        assert_eq!(
+            openssh_verdict(&one, &key(ED25519_B)),
             Some(OpenSshVerdict::Changed { line: 4 })
         );
-        assert_eq!(openssh_verdict(&Ok(false)), None, "not listed");
         assert_eq!(
-            openssh_verdict(&Err(Error::NoHomeDir)),
+            decide(&[(4, ED25519_A)], &store(&[]), ED25519_B),
+            HostKeyVerdict::OpenSshChanged
+        );
+    }
+
+    /// **The user's own `~/.ssh/known_hosts` is asked first** (security review
+    /// S16), and a host it does not list falls through to Schemaic's own
+    /// first-use trust — as does a file that cannot be read, which lists
+    /// nothing.
+    #[test]
+    fn a_host_known_hosts_does_not_list_is_trusted_on_first_use() {
+        assert_eq!(openssh_verdict(&[], &key(ED25519_A)), None);
+        assert_eq!(
+            decide(&[], &store(&[]), ED25519_A),
+            HostKeyVerdict::RecordAndAccept
+        );
+    }
+
+    /// `known_hosts` vouching is the user's word over the store's pin: a
+    /// rotation recorded there re-pins, and an unreadable store neither blocks
+    /// the vouched key nor gets overwritten.
+    #[test]
+    fn a_vouched_key_supersedes_the_pin_and_survives_an_unreadable_store() {
+        let stale = store(&[("bastion:22", &fp(ED25519_A))]);
+        assert_eq!(
+            decide(&[(1, ED25519_B)], &stale, ED25519_B),
+            HostKeyVerdict::RecordAndAccept
+        );
+        assert_eq!(
+            host_key_decision(
+                Some(OpenSshVerdict::Known),
+                Err("bad json"),
+                "bastion:22",
+                "SHA256:x"
+            ),
+            HostKeyVerdict::Accept
+        );
+    }
+
+    /// **The types `known_hosts` holds are asked for first**, as OpenSSH
+    /// does, so a server with a listed key presents that one — which is what
+    /// lets the other-type refusal stand without refusing a server that also
+    /// has a newer key type. RSA's signature variants count as the one
+    /// `ssh-rsa` key; an unlisted host keeps russh's order.
+    #[test]
+    fn the_listed_key_types_are_asked_for_first() {
+        use ssh_key::Algorithm;
+        let default = russh::Preferred::DEFAULT.key.to_vec();
+        assert_eq!(host_key_order(&[]), default);
+        let order = host_key_order(&[(1, key(RSA))]);
+        assert_eq!(order.len(), default.len());
+        let rsa = |a: &Algorithm| matches!(a, Algorithm::Rsa { .. });
+        let first_other = order.iter().position(|a| !rsa(a)).unwrap();
+        assert!(first_other > 0 && order[..first_other].iter().all(rsa));
+        assert!(order[first_other..].iter().all(|a| !rsa(a)), "{order:?}");
+        let order = host_key_order(&[(1, key(ECDSA_P256)), (2, key(ED25519_A))]);
+        assert_eq!(
+            order[0],
+            Algorithm::Ed25519,
+            "russh's own order among the listed"
+        );
+        assert_eq!(
+            order[1],
+            Algorithm::Ecdsa {
+                curve: ssh_key::EcdsaCurve::NistP256
+            }
+        );
+    }
+
+    #[test]
+    fn an_other_type_refusal_names_both_types_and_verification_first() {
+        let msg = refusal_message(
+            HostKeyVerdict::OpenSshOtherType,
+            "bastion:22",
             None,
-            "nothing to read"
+            "SHA256:new",
+            ("ecdsa-sha2-nistp256", "ssh-ed25519"),
+        )
+        .expect("a refusal must be explainable")
+        .to_string();
+        assert!(
+            msg.contains("ecdsa-sha2-nistp256") && msg.contains("ssh-ed25519"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("SHA256:new") && msg.contains("bastion:22"),
+            "{msg}"
+        );
+        let verify = msg
+            .find("erify")
+            .expect("must ask for out-of-band checking");
+        let remedy = msg
+            .find("connect with ssh")
+            .expect("must say how to re-trust");
+        assert!(verify < remedy, "{msg}");
+        assert_eq!(
+            listed_types(&[(1, key(ED25519_A)), (2, key(RSA)), (3, key(ED25519_B))]),
+            "ssh-ed25519, ssh-rsa"
         );
     }
 
@@ -822,7 +1119,7 @@ mod tests {
     fn an_accepted_key_has_nothing_to_explain() {
         for v in [HostKeyVerdict::Accept, HostKeyVerdict::RecordAndAccept] {
             assert_eq!(
-                refusal_message(v, "h:22", Some("SHA256:a"), "SHA256:a"),
+                refusal_message(v, "h:22", Some("SHA256:a"), "SHA256:a", ("", "")),
                 None
             );
         }

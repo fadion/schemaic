@@ -210,7 +210,8 @@ cloud IAM or Entra sign-in that got no token (`cloud_iam.rs`, `entra.rs`, both h
 `ssh::within` used to splice the word into its string, the two host-key refusals carry the host, the fingerprints and the store's file
 name rather than the paragraphs — and `OpenSshHostKeyChanged`, the refusal on the user's own
 `~/.ssh/known_hosts`, the host and the offered fingerprint, and no line (russh's count skips
-comments) — and `Route` holds the `ssh_config::RouteRefusal` itself.
+comments), and `OpenSshKeyTypeUnlisted`, a host that file lists only under other key types, those
+and the offered type besides — and `Route` holds the `ssh_config::RouteRefusal` itself.
 `SignInFailure` names its CLI as a `TokenCli` — `Aws`, `Gcloud`, `Azure` — whose `name()` is
 the product as a sentence says it ("AWS CLI (aws)"), passed through in every language, and a
 host or user `launch::cli_flag_value` refuses as `BadValue { field, problem }` (`SignInField`,
