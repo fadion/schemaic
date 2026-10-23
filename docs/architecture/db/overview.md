@@ -224,6 +224,18 @@ Refresh — and that is a widening of the rule above, stated rather than slipped
 as `kill_session` is, for being the call made when somebody is looking at a server, which is
 when a dark one is likeliest, and a modal sitting on *Loading…* for the OS connect timeout is
 the failure the deadline exists to bound.
+**`fetch_table` also reads on a read-only session, on every connection, writable or not** —
+`Enforce::ReadOnly` in all four arms: `pg::fetch_table` passes it down `pg::fetch_query`,
+`mysql::fetch_table`, `mssql::fetch_table` and SQLite's arm take `fetch_query_enforced`, and on
+SQL Server that is the always-rolled-back transaction (`fetch_query_enforced`, below). Its
+`SELECT * … LIMIT n` is generated, so no text gate ever reads it, and the name the monitor polls
+may be a view whose body calls a function that writes: on an ordinary session that write ran on
+every tick, every two seconds for as long as the modal was open — on a read-only connection too,
+which is the hole this closes (security review S8). On a writable connection it is a change of
+behaviour as well as a guard, and a deliberate one: a monitored view whose body writes no longer
+writes because somebody is watching it. Nothing pins the four arms' `Enforce` —
+`every_reachability_path_is_bounded_by_a_timeout` reads this method for its deadline, not its
+session — so the `Read-only on every connection` comments at each arm are the only marker.
 **`Db::fetch_locks` is Server Activity's *Locks* view**, gated on `supports_activity` like
 `fetch_sessions` and one query per engine. Each engine asks for `MAX_LOCKS + 1` rows ordered
 waits first, so the server's own cut keeps the waits, and each leaves out its own session; the

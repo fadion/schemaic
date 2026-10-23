@@ -6202,7 +6202,15 @@ pub(crate) async fn fetch_table(
         order_by_clause(order_by, ident),
         limit
     );
-    db.fetch_query(Some(database), &sql, limit, cancel).await
+    // Read-only on every connection — see `Db::fetch_table`.
+    db.fetch_query_enforced(
+        Some(database),
+        &sql,
+        limit,
+        cancel,
+        crate::Enforce::ReadOnly,
+    )
+    .await
 }
 
 /// Validate `stmt` by preparing it and throwing the prepared statement away.

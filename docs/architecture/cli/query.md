@@ -22,7 +22,8 @@ allows: sleeps, locks, server-side file reads, PostgreSQL's non-transactional wr
 `read_only_query`'s `Enforce::ReadOnly` to `Enforce::None` passed the whole suite, because
 in-memory SQLite has no statement that passes its gate and writes. So
 `ui/source_gate.rs`'s `every_headless_read_runs_on_a_read_only_session` reads this file and
-`mcp.rs` instead — forbidding plain `.fetch_query(` and `.stream_query(` in both, and requiring
+`mcp.rs` instead (and `dump.rs`, whose generated reads meet no text gate at all) — forbidding
+plain `.fetch_query(` and `.stream_query(` in each, and requiring
 `Enforce::ReadOnly` inside the argument list of every `.fetch_query_enforced(` and
 `.stream_query_enforced(` call, both needles counted toward its floor. A **locking read** (`FOR UPDATE`, `FOR NO KEY
 UPDATE`, `LOCK IN SHARE MODE`, and the shared `FOR SHARE`/`FOR KEY SHARE` no deny-list word

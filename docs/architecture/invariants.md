@@ -318,7 +318,19 @@ Re-introducing the anti-patterns these guard against is a regression:
   count — which that session also pins, on MySQL/MariaDB, to the lexer the gate counted with (see
   `schemaic-db`'s entry for the `sql_mode` smuggle that closed). That session half is pinned by
   source, as the editor's is — `every_headless_read_runs_on_a_read_only_session` — since dropping
-  it to `Enforce::None` kept every behavioural test green. **`read_only_reason` has no minted
+  it to `Enforce::None` kept every behavioural test green.
+  **A generated read needs the session half more, not less, because it has no text half at all**
+  (security review S8). The Live Monitor's `Db::fetch_table`, `schemaic dump` and the folder
+  export (`cli/dump.rs`), and AI Fill's and Seed's `SELECT … LIMIT 20` sample in `main.rs` each
+  build a `SELECT` the app wrote, which no gate reads — and the name it reads may be a view whose
+  body calls a function that writes, so on an ordinary session every one of them ran that write,
+  the monitor every two seconds, **on a read-only connection too**. All of them now read on
+  `Enforce::ReadOnly` on **every** connection, writable or not, since none of them is meant to
+  write anything (on SQL Server, the always-rolled-back transaction); `Db::copy_rows`' source read
+  already did, for the same reason. The dump's reads are in
+  `every_headless_read_runs_on_a_read_only_session`'s file list, and the AI samples have their own
+  source gate in `main.rs`, `the_ai_sample_reads_run_on_a_read_only_session`; `fetch_table`'s four
+  arms have none (`schemaic-db`'s entry). **`read_only_reason` has no minted
   request**: it is enforced inside `read_only_query`, `read_only_export` and `read_only_explain`
   themselves, and the
   refusals and the requests are two separate lists. `schemaic query`, `schemaic explain` and

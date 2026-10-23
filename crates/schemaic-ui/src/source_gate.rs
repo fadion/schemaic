@@ -650,7 +650,14 @@ mod headless_read_session_gate {
     /// `session_enforce` gate.
     #[test]
     fn every_headless_read_runs_on_a_read_only_session() {
-        for file in ["schemaic-cli/query.rs", "schemaic-cli/mcp.rs"] {
+        // `dump.rs` too (security review S8): its `SELECT`s are generated, so
+        // no text gate reads them, and a view's body can call a function that
+        // writes.
+        for file in [
+            "schemaic-cli/query.rs",
+            "schemaic-cli/mcp.rs",
+            "schemaic-cli/dump.rs",
+        ] {
             let body = super::workspace_source(file);
             assert!(
                 !body.contains(".fetch_query("),

@@ -3268,7 +3268,15 @@ pub(crate) async fn fetch_table(
         crate::order_by_clause(order_by, |c| schemaic_core::export::ident_sql(c, MS))
     );
     let sql = schemaic_core::sql::limited_select(MS, "*", &rest, limit);
-    db.fetch_query(Some(database), &sql, limit, cancel).await
+    // Read-only on every connection — see `Db::fetch_table`.
+    db.fetch_query_enforced(
+        Some(database),
+        &sql,
+        limit,
+        cancel,
+        crate::Enforce::ReadOnly,
+    )
+    .await
 }
 
 /// The statement's plan: one XML document per planned statement, as a result

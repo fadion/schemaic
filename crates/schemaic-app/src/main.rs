@@ -13841,7 +13841,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     let sample = if ai_data.may_query() {
                         let token = CancellationToken::new();
                         let sql = sample_sql(db.engine(), &source, &pk_cols);
-                        match db.fetch_query(Some(&database), &sql, 20, token).await {
+                        // Read-only whatever the connection: a generated
+                        // `SELECT` meets no text gate, and the source may be
+                        // a view whose body writes (security review S8).
+                        match db
+                            .fetch_query_enforced(
+                                Some(&database),
+                                &sql,
+                                20,
+                                token,
+                                schemaic_db::Enforce::ReadOnly,
+                            )
+                            .await
+                        {
                             Ok(rs) => sample_rows(&rs),
                             Err(_) => Vec::new(), // empty/unsampleable → DDL-only prompt
                         }
@@ -13943,7 +13955,19 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     let sample = if ai_data.may_query() {
                         let token = CancellationToken::new();
                         let sql = sample_sql(db.engine(), &source, &pk_cols);
-                        match db.fetch_query(Some(&database), &sql, 20, token).await {
+                        // Read-only whatever the connection: a generated
+                        // `SELECT` meets no text gate, and the source may be
+                        // a view whose body writes (security review S8).
+                        match db
+                            .fetch_query_enforced(
+                                Some(&database),
+                                &sql,
+                                20,
+                                token,
+                                schemaic_db::Enforce::ReadOnly,
+                            )
+                            .await
+                        {
                             Ok(rs) => sample_rows(&rs),
                             Err(_) => Vec::new(), // empty/unsampleable → DDL-only prompt
                         }
@@ -16557,6 +16581,32 @@ mod app_tests {
             .find(".commit_writes(")
             .expect("`commit_edits` no longer commits — this gate is stale");
         assert!(asks < writes, "the question comes after the write");
+    }
+
+    /// **The AI fill and seed samples read on a read-only session** (security
+    /// review S8). Their `SELECT … LIMIT 20` is generated, so no text gate
+    /// reads it, and the table it names may be a view whose body calls a
+    /// function that writes — on a read-only connection too.
+    #[test]
+    fn the_ai_sample_reads_run_on_a_read_only_session() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        let samples = body
+            .matches("sample_sql(db.engine(), &source, &pk_cols)")
+            .count();
+        assert_eq!(samples, 2, "the fill and seed samples — this gate is stale");
+        for (at, _) in body.match_indices("sample_sql(db.engine(), &source, &pk_cols)") {
+            let read = &body[at..at + 600];
+            assert!(
+                read.contains("fetch_query_enforced(") && read.contains("Enforce::ReadOnly"),
+                "an AI sample read runs on an ordinary session:\n{read}"
+            );
+        }
     }
 
     /// **EXPLAIN ANALYZE refuses a writing statement at the run** (security

@@ -719,13 +719,14 @@ pub(crate) async fn fetch_table(
         crate::order_by_clause(order_by, pg_ident),
         limit
     );
+    // Read-only on every connection — see `Db::fetch_table`.
     fetch_query(
         db,
         Some(database),
         &sql,
         &mut crate::RowDest::Capped(limit),
         cancel,
-        None,
+        Some(crate::Enforce::ReadOnly),
     )
     .await
 }

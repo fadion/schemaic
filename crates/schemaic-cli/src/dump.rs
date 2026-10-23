@@ -210,8 +210,17 @@ pub async fn run(
                 {
                     break;
                 }
+                // Read-only whatever the connection: a dump only reads, and a
+                // view's body may call a function that writes (security review S8).
                 match db
-                    .stream_query(Some(&database), &select, chunk_rows, token.clone(), row_tx)
+                    .stream_query_enforced(
+                        Some(&database),
+                        &select,
+                        chunk_rows,
+                        token.clone(),
+                        row_tx,
+                        Some(schemaic_db::Enforce::ReadOnly),
+                    )
                     .await
                 {
                     Ok(n) => rows_so_far += n,
@@ -430,13 +439,15 @@ pub async fn run_files(
         let writer = handle.spawn_blocking(move || {
             write_one(&w_part, &w_path, row_rx, format, dialect, source, w_token)
         });
+        // Read-only whatever the connection, as the `.sql` dump's reads are.
         let read = db
-            .stream_query(
+            .stream_query_enforced(
                 Some(&req.database),
                 &step.select,
                 chunk_rows,
                 token.clone(),
                 row_tx,
+                Some(schemaic_db::Enforce::ReadOnly),
             )
             .await;
         let written = writer.await;

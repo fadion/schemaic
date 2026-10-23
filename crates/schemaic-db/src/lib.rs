@@ -1337,6 +1337,12 @@ impl Db {
     /// reorders and the updated row is logged as *deleted* while an untouched one
     /// is logged as *inserted*. Pass the row-identity key; `None` only when the
     /// table has none, where the monitor can't track changes anyway.
+    ///
+    /// **Read-only on every connection** (`Enforce::ReadOnly`), writable or
+    /// not: the monitor only reads, and the name it polls may be a view whose
+    /// body calls a function that writes, which on an ordinary session would
+    /// write every two seconds — on a read-only connection too, since this
+    /// `SELECT` passes no text gate (security review S8).
     pub async fn fetch_table(
         &self,
         database: &str,
@@ -1374,7 +1380,9 @@ impl Db {
                         order_by_clause(order_by, ident_sqlite),
                         limit
                     );
-                    return self.fetch_query(None, &sql, limit, cancel).await;
+                    return self
+                        .fetch_query_enforced(None, &sql, limit, cancel, Enforce::ReadOnly)
+                        .await;
                 }
                 Engine::MySql => {
                     mysql::fetch_table(self, database, schema, table, order_by, limit, cancel).await
