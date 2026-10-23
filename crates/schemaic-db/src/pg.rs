@@ -466,9 +466,45 @@ pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
 /// `public.version()` stand in for the builtin on a read-only connection.
 /// Putting `pg_catalog` in front changes nothing for any other path: it is
 /// where PostgreSQL searches it anyway when the path leaves it out.
-pub(crate) const READ_ONLY_SESSION_SQL: &str = "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY; \
-     SELECT set_config('search_path', CASE WHEN current_setting('search_path') = '' \
-     THEN 'pg_catalog' ELSE 'pg_catalog, ' || current_setting('search_path') END, false)";
+///
+/// **Setting it up resolves no name through the path it is correcting.** That
+/// path is still in force while the setup runs, so whatever the setup named
+/// bare was the user's to supply: the statement this replaced called
+/// `set_config`, `current_setting`, `||` and `=` unqualified, and a
+/// `public.set_config` ran in place of the builtin, left `public` first and
+/// turned the read-only default off for the user's statement after it. So the
+/// path is read with `SHOW` — a command, not a function — the new one is built
+/// here ([`catalog_first_sql`]), and the one call made is schema-qualified
+/// with a literal argument.
+pub(crate) async fn set_up_read_only(client: &Client) -> Result<(), tokio_postgres::Error> {
+    let msgs = client
+        .simple_query("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY; SHOW search_path")
+        .await?;
+    let path = msgs
+        .iter()
+        .find_map(|m| match m {
+            SimpleQueryMessage::Row(r) => r.get(0).map(str::to_string),
+            _ => None,
+        })
+        .unwrap_or_default();
+    client.batch_execute(&catalog_first_sql(&path)).await
+}
+
+/// The statement that puts `pg_catalog` ahead of `path`, the session's current
+/// `search_path` as `SHOW` gives it. The path reaches the server as a literal
+/// (`export::sql_literal`), never spliced in as list syntax: it is whatever
+/// text a role default or init SQL set, and is not to be trusted to parse.
+fn catalog_first_sql(path: &str) -> String {
+    let path = if path.trim().is_empty() {
+        "pg_catalog".to_string()
+    } else {
+        format!("pg_catalog, {path}")
+    };
+    format!(
+        "SELECT pg_catalog.set_config('search_path', {}, false)",
+        schemaic_core::export::sql_literal(&Value::Str(path), SqlDialect::Postgres)
+    )
+}
 
 /// Connect (to `database`, or the maintenance db if unscoped) and run one
 /// statement.
@@ -494,8 +530,7 @@ pub(crate) async fn fetch_query(
     // undo it for itself: `transaction_read_only` is refused once the
     // transaction has taken its snapshot, which a `SELECT` has.
     if enforce == Some(crate::Enforce::ReadOnly) {
-        client
-            .batch_execute(READ_ONLY_SESSION_SQL)
+        set_up_read_only(&client)
             .await
             .map_err(|e| read_only_setup_failed(&e))?;
     }
@@ -532,8 +567,7 @@ pub(crate) async fn run_batch(
     // statement's implicit transaction — and any `BEGIN` the batch itself
     // issues — is then a read-only one.
     let client = match client {
-        Ok(c) if enforce == Some(crate::Enforce::ReadOnly) => c
-            .batch_execute(READ_ONLY_SESSION_SQL)
+        Ok(c) if enforce == Some(crate::Enforce::ReadOnly) => set_up_read_only(&c)
             .await
             .map(|_| c)
             .map_err(|e| db_err(&e)),
@@ -794,10 +828,9 @@ pub(crate) async fn explain(
     };
     // `BEGIN` isn't a preparable statement, so it goes through `batch_execute`.
     // A read-only measurement reads `pg_catalog` first, as every read-only
-    // session does (`READ_ONLY_SESSION_SQL`).
+    // session does (`set_up_read_only`).
     if read_only {
-        client
-            .batch_execute(READ_ONLY_SESSION_SQL)
+        set_up_read_only(&client)
             .await
             .map_err(|e| read_only_setup_failed(&e))?;
     }
@@ -4851,6 +4884,37 @@ pub(crate) async fn refetch_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The read-only setup's one call is qualified and its path a literal.**
+    /// A bare `set_config` resolved through the hostile path it was correcting.
+    #[test]
+    fn catalog_first_sql_qualifies_its_call_and_puts_the_catalog_first() {
+        assert_eq!(
+            catalog_first_sql("\"$user\", public"),
+            "SELECT pg_catalog.set_config('search_path', 'pg_catalog, \"$user\", public', false)"
+        );
+    }
+
+    #[test]
+    fn catalog_first_sql_on_an_empty_path_is_the_catalog_alone() {
+        for empty in ["", "  "] {
+            assert_eq!(
+                catalog_first_sql(empty),
+                "SELECT pg_catalog.set_config('search_path', 'pg_catalog', false)"
+            );
+        }
+    }
+
+    /// The path is text a role default or init SQL chose; a quote in it stays
+    /// inside the literal rather than ending it.
+    #[test]
+    fn catalog_first_sql_keeps_a_quote_in_the_path_inside_the_literal() {
+        assert_eq!(
+            catalog_first_sql("a', false); DROP TABLE t; --"),
+            "SELECT pg_catalog.set_config('search_path', \
+             'pg_catalog, a'', false); DROP TABLE t; --', false)"
+        );
+    }
 
     /// A synthetic chain, because a `tokio_postgres::Error` cannot be built by
     /// hand — and the property under test is the walk, not the driver.

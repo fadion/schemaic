@@ -107,9 +107,10 @@ statements run *after* the init SQL, inside each operation, so a transaction set
 missed is overridden there — and so is the one listed setting a read-only gate rests on:
 `search_path` is on `POSTGRES_SETTINGS` with whatever list the user writes, `public, pg_catalog`
 included, and on a read-only
-PostgreSQL session `pg::READ_ONLY_SESSION_SQL` puts `pg_catalog` back in front of it, since the
+PostgreSQL session `pg::set_up_read_only` puts `pg_catalog` back in front of it, since the
 gates' builtin allowlist means the builtin only while `pg_catalog` is searched first (security
-review S24, under `schemaic-db`'s `Enforce::ReadOnly`). A writable connection keeps the path as
+review S24, under `schemaic-db`'s `Enforce::ReadOnly`) — and does it naming nothing bare, since
+the path it corrects is the one its own call would resolve through. A writable connection keeps the path as
 written. SQL Server's connect turns `IMPLICIT_TRANSACTIONS` off after
 any init. But the lexing the text gate rests on is in place *before* enforcement runs, and no
 enforcement statement re-sets the client character set — which is what `SET NAMES gbk`

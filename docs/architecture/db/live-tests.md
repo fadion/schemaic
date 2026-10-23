@@ -705,9 +705,17 @@ which function a bare name reaches rather than whether a write lands: it creates
 `public.version()` answering `'shadowed'`, gives the connection the init SQL `SET search_path TO
 public, pg_catalog`, and has plain `fetch_query` return `'shadowed'` — the premise, so a fixture
 that fails to shadow fails here — before `fetch_query_enforced` with `Enforce::ReadOnly` must
-return the builtin's `PostgreSQL …`. It was red on PostgreSQL 16 before
-`pg::READ_ONLY_SESSION_SQL` put `pg_catalog` first, by its author's report; the other three paths
-that run that setup have no case of their own.
+return the builtin's `PostgreSQL …`. It was red on PostgreSQL 16 before the read-only setup put
+`pg_catalog` first, by its author's report; the other three paths that run that setup
+(`pg::set_up_read_only`) have no case of their own.
+`a_read_only_session_calls_no_users_function_while_setting_itself_up`, PostgreSQL's alone too and
+registered beside it, asks the same of the setup itself, which runs while the hostile path is still
+in force: it plants a `public.set_config(text, text, boolean)` that turns
+`default_transaction_read_only` off, gives the connection the same init SQL, has an unenforced
+`SELECT set_config('application_name', 'x', false)` fail to answer `x` — the premise, that the
+bare name reaches the plant — and then has an enforced `DELETE` refused with the three rows still
+there. It failed against the setup that called `set_config` by its bare name ("a read-only
+session wrote"), by the fix author's report.
 `a_read_only_plan_refuses_a_write_its_planner_makes` is the plain `EXPLAIN`'s case, for the
 editor's Plan and the MCP server's `explain` at once, and its statement is the planner's rather
 than the executor's: an `IMMUTABLE` plpgsql function that `PERFORM`s `purge_all()` on

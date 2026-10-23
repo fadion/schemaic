@@ -261,8 +261,7 @@ impl Session {
                 // enforced path gives: the one quote-moving setting is pinned on
                 // every connection's startup packet.
                 if enforce == Some(crate::Enforce::ReadOnly) {
-                    client
-                        .batch_execute(pg::READ_ONLY_SESSION_SQL)
+                    pg::set_up_read_only(&client)
                         .await
                         // The server's words about Schemaic's `SET`, not about
                         // anything the user wrote: `Connect`, so no *AI fix*.

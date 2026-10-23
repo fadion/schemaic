@@ -139,6 +139,7 @@ live_suite!(
         a_read_only_pinned_session_cannot_be_lifted_across_a_commit,
         a_read_only_text_cannot_lift_itself_for_its_next_statement,
         a_read_only_session_reads_the_catalog_before_a_users_functions,
+        a_read_only_session_calls_no_users_function_while_setting_itself_up,
     ],
     init_sql: [
         the_init_sql_is_in_force_on_the_operations_connection,

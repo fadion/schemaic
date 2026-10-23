@@ -1034,7 +1034,7 @@ ONLY` on PostgreSQL, `SET SESSION TRANSACTION READ ONLY` on MySQL/MariaDB, `PRAG
 on SQLite. On PostgreSQL it is the session default rather than a `BEGIN READ ONLY`, so the
 statement's own implicit transaction is the read-only one and there is no transaction of ours for
 it to sit inside. **And on PostgreSQL the same setup puts `pg_catalog` first on the search path**
-— both are `pg::READ_ONLY_SESSION_SQL`, the one string every read-only PostgreSQL session is made
+— both are `pg::set_up_read_only`, the one function every read-only PostgreSQL session is made
 with: `fetch_query`'s enforced path, `run_batch`'s setup, `Session::open_enforced` and the
 read-only `EXPLAIN ANALYZE` ahead of its `BEGIN READ ONLY` (security review S24). The read-only
 gates allowlist builtin functions by bare name, and a bare name is the builtin only while
@@ -1044,10 +1044,26 @@ schema of the user's — init SQL may set `search_path`, and so may a role's def
 a read-only connection. So the setup reads the session's path and sets it to `pg_catalog, ` ahead
 of it (`set_config(…, false)`, for the session), or to `pg_catalog` alone when it is empty.
 Prepending changes nothing for a path that leaves `pg_catalog` out, since PostgreSQL searches it
-first then anyway. The live `a_read_only_session_reads_the_catalog_before_a_users_functions`
-pins it, on `fetch_query_enforced` alone — red on PostgreSQL 16 before the change, by its
-author's report. `run_batch`'s re-assertion before each statement (below) is the transaction
-characteristics only; the path is set once. None of the three can be lifted by the statement it guards: PostgreSQL refuses
+first then anyway. **The setup resolves no name through the path it is correcting**, because that
+path is still in force while it runs, so anything it names bare is the user's to supply. It was
+one string, `READ_ONLY_SESSION_SQL`, which built the new path server-side with `set_config`,
+`current_setting`, `||` and `=` all unqualified — and a planted `public.set_config(text, text,
+boolean)` ran in place of the builtin, kept `public` first, and turned
+`default_transaction_read_only` off, so the user's next statement on the "read-only" session wrote
+(found by an external pentest; the earlier shadowing probes had shadowed `lower` and `abs`, never
+the setup's own functions). Now the path is read with `SHOW search_path` — a command, not a
+function — over the simple protocol in the same round trip as the `SET SESSION CHARACTERISTICS`,
+the new path is built in Rust (`catalog_first_sql`, pure, with three unit tests in `pg.rs`), and
+the one call sent is `pg_catalog.set_config('search_path', <literal>, false)`, schema-qualified,
+the path an `export::sql_literal` string rather than list syntax spliced in, since it is whatever
+text a role default or init SQL set. Don't tidy that call back to a bare `set_config`, nor move
+the path-building back into SQL: either reopens it. The live
+`a_read_only_session_reads_the_catalog_before_a_users_functions` pins the path, and
+`a_read_only_session_calls_no_users_function_while_setting_itself_up` the setup, both on
+`fetch_query_enforced` alone — the first red on PostgreSQL 16 before S24's change, by its author's
+report, the second red against the bare-name setup, by the fix author's report.
+`run_batch`'s re-assertion before each statement (below) is the transaction characteristics only;
+the path is set once. None of the three can be lifted by the statement it guards: PostgreSQL refuses
 `transaction_read_only` once a transaction has taken its snapshot, which a `SELECT` has; a MySQL
 transaction's access mode cannot change while it runs, so a stored function cannot undo it from
 inside; and a `SELECT` cannot set a pragma. **But a statement can lift it for the statements
@@ -1128,7 +1144,7 @@ mechanism.** `Db::stream_query_enforced` is `stream_query` with an `Enforce` dow
 `run_to` — `stream_query` is it with `None` — for the *All rows* export, which re-runs the tab's
 statement. `Db::run_batch_enforced` is `run_batch` (which passes `None`) for the auto-commit Run
 All, with its one connection put in the state before the first statement: `enforce_session` after
-the open on MySQL/MariaDB, `READ_ONLY_SESSION_SQL` (the read-only default and `pg_catalog`
+the open on MySQL/MariaDB, `pg::set_up_read_only` (the read-only default and `pg_catalog`
 first, above) after the connect on PostgreSQL, `PRAGMA query_only = ON` on SQLite. A connection that cannot be put in it
 fails the first statement and cancels the rest, exactly as one that cannot connect does. **On the
 two servers the read-only default is then re-asserted before every statement** — `SET SESSION
@@ -1140,7 +1156,7 @@ to set a pragma.
 `Session::open_enforced(db, database, enforce)` is `Session::open` (which passes `None`)
 with the pinned connection put in the state **before any `BEGIN`**: `mysql::enforce_session`, now
 `pub(crate)` for it, on MySQL/MariaDB — a failure disconnects and fails the open — and
-`pg::READ_ONLY_SESSION_SQL` on PostgreSQL. **That default is not what the session
+`pg::set_up_read_only` on PostgreSQL. **That default is not what the session
 rests on**, since a lift inside one of the tab's transactions would reach the next: the session
 keeps a `read_only` flag from the open, and `ensure_tx` opens `Ctl::BeginReadOnly` — `BEGIN READ
 ONLY` on PostgreSQL, `START TRANSACTION READ ONLY` on MySQL/MariaDB (whose `BEGIN` takes no
@@ -1154,7 +1170,7 @@ ANALYZE` *executes* the statement inside a transaction it always rolls back, and
 not the guarantee it looks like: it undoes an InnoDB write but not a MyISAM or Aria one, and on
 PostgreSQL `setval`/`nextval` are never rolled back, so a measured `SELECT setval(…)` moved the
 sequence for good. With the flag, `mysql::explain_in_rolled_back_tx` opens `START TRANSACTION READ
-ONLY` and `pg::explain` opens `BEGIN READ ONLY`, which refuse both — after `READ_ONLY_SESSION_SQL`,
+ONLY` and `pg::explain` opens `BEGIN READ ONLY`, which refuse both — after `set_up_read_only`,
 so the measured statement reads `pg_catalog` first as every read-only session does. **Plain `EXPLAIN` takes the
 flag too, because planning is not inert**, and this entry used to say it was untouched: MySQL and
 MariaDB run a stored function to materialise a derived table or fold a constant while planning,

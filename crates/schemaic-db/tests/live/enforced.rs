@@ -506,3 +506,58 @@ pub async fn a_read_only_session_reads_the_catalog_before_a_users_functions(
     );
     scratch.teardown().await;
 }
+
+/// **Setting a read-only session up resolves no name through the user's
+/// path.** The statement that puts `pg_catalog` first runs while the path it
+/// is correcting is still in force, so any function or operator it calls by a
+/// bare name is the user's to supply. A `public.set_config` there ran in place
+/// of the builtin, kept `public` first, and turned the read-only default off,
+/// so the next statement — the user's — wrote. PostgreSQL only.
+pub async fn a_read_only_session_calls_no_users_function_while_setting_itself_up(
+    target: &'static Target,
+) {
+    if target.engine != schemaic_db::Engine::Postgres {
+        return;
+    }
+    let (scratch, t) = seeded(target, "enforce_setup_unshadowed").await;
+    scratch
+        .exec(
+            "CREATE FUNCTION public.set_config(text, text, boolean) RETURNS text \
+             LANGUAGE plpgsql AS $$ BEGIN \
+             PERFORM pg_catalog.set_config('default_transaction_read_only', 'off', false); \
+             RETURN pg_catalog.current_setting('search_path'); END $$",
+        )
+        .await;
+    let db = scratch
+        .db
+        .clone()
+        .with_init_sql("SET search_path TO public, pg_catalog");
+    let shadowed = db
+        .fetch_query(
+            Some(&scratch.database),
+            "SELECT set_config('application_name', 'x', false)",
+            1,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the unenforced call: {e}"));
+    assert_ne!(
+        shadowed.cell(0, 0).expect("a value").display().to_string(),
+        "x",
+        "the fixture does not shadow"
+    );
+    let got = db
+        .fetch_query_enforced(
+            Some(&scratch.database),
+            &format!("DELETE FROM {t}"),
+            100,
+            CancellationToken::new(),
+            Enforce::ReadOnly,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    assert!(got.is_err(), "a read-only session wrote");
+    assert_eq!(rows_left(&scratch, &t).await, "3");
+    scratch.teardown().await;
+}
