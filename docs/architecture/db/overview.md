@@ -1191,8 +1191,9 @@ connection the user's own work holds — `fetch_col_meta`, the provenance read `
 makes on the statement's connection, and `blob_on`/`refetch_on` on a pinned `Session` — and
 `fetch_blob` and `refetch_rows`, which connect with plain `connect_to`, rest on the qualification
 alone, so on them a bare operator or relation name still resolves through the user's path. User
-SQL and the write paths (`fetch_query`, `run_batch`, `run_script`, `run_ddl`, the write-back,
-`count_rows`) keep the path as written. The live `introspection_calls_no_function_the_database_planted`
+SQL and the write paths (`fetch_query`, `run_batch`, `run_script`, `run_ddl`, the write-back)
+keep the path as written; `count_rows`, on an `Enforce::Generated` session since release review
+S1-L5-04, has `pg_catalog` first like every read-only session. The live `introspection_calls_no_function_the_database_planted`
 pins both halves on `fetch_schema` and `fetch_table_list`.
 `run_batch`'s re-assertion before each statement (below) is the transaction characteristics only;
 the path is set once. None of the three can be lifted by the statement it guards: PostgreSQL refuses
@@ -1520,9 +1521,14 @@ newer). `warming_a_disposed_slot_does_nothing` panics rather than fails against 
 **`count_rows` takes a `CancellationToken` like every other unbounded operation.** It was the one
 that didn't, and the scan it starts is a full one: closing the modal abandoned the *answer* while
 the query ran on for minutes holding a connection, and reopening offered the button again, so N
-opens stacked N concurrent scans. Each engine cancels its own way — MySQL `KILL QUERY` from a
-second connection, PostgreSQL `cancel_token`, SQLite the interrupt handle, which is why its count
-no longer goes through `with_conn` (the handle has to reach the async side before the scan starts).
+opens stacked N concurrent scans. It is `fetch_query_enforced(…, Enforce::Generated)` now, on
+every engine, so the token is the read path's own — MySQL `KILL QUERY` from a second connection,
+PostgreSQL `cancel_token`, SQLite the interrupt handle, SQL Server an attention — and the four
+engine-specific counts are gone. **`Generated` because the properties modal offers it for a
+view** (release review S1-L5-04): the count ran on a plain session, so a view whose body calls a
+function that writes wrote, on a read-only connection as on any other, no text gate seeing a
+view's body; such a view now fails to count, on every connection
+(`counting_a_view_runs_no_write_its_body_makes`, red on all three server legs before).
 The app holds one token beside `properties_counting`, cancels it whenever the modal's target
 changes (Escape, the ✕, the backdrop, reopening elsewhere) and offers **Cancel** beside the spinner;
 a cancelled count is not reported as a failure, since the estimate the user already had is what the

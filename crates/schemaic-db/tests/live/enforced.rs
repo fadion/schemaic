@@ -314,6 +314,50 @@ pub async fn a_read_only_stream_refuses_a_write_a_select_hides(target: &'static 
     scratch.teardown().await;
 }
 
+/// ***Count rows* reads on a session that refuses writes** (release review
+/// S1-L5-04). The properties modal offers it for a view, and its generated
+/// `SELECT COUNT(*)` ran on a plain session, so a view whose body calls a
+/// function that writes wrote — on a connection marked read-only as on any
+/// other, since no text gate sees a view's body.
+pub async fn counting_a_view_runs_no_write_its_body_makes(target: &'static Target) {
+    let (scratch, t) = seeded(target, "enforce_count_view").await;
+    let view = scratch.qualified("purging_view");
+    scratch
+        .exec(&format!("CREATE VIEW {view} AS SELECT purge_all() AS n"))
+        .await;
+    let ns = scratch.namespace_ref();
+    let got = scratch
+        .db
+        .count_rows(
+            &scratch.database,
+            ns.schema.as_deref(),
+            "purging_view",
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        got.is_err(),
+        "{}: counting the view ran its write",
+        target.name
+    );
+    assert_eq!(rows_left(&scratch, &t).await, "3", "{}", target.name);
+    // And a table still counts.
+    assert_eq!(
+        scratch
+            .db
+            .count_rows(
+                &scratch.database,
+                ns.schema.as_deref(),
+                "keep",
+                CancellationToken::new()
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}: counting a table: {e}", target.name)),
+        3
+    );
+    scratch.teardown().await;
+}
+
 /// **Run All on a read-only connection** shares one connection across its
 /// statements, and that connection refuses the hidden write; the same batch
 /// unenforced runs it, so the refusal is the session's.

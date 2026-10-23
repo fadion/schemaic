@@ -2034,30 +2034,6 @@ pub(crate) async fn fetch_table_stats(db: &Db, database: &str) -> Result<SchemaS
     Ok(SchemaStats::new(tables))
 }
 
-/// The PostgreSQL half of [`Db::count_rows`].
-pub(crate) async fn count_rows(
-    db: &Db,
-    database: &str,
-    sql: &str,
-    cancel: CancellationToken,
-) -> Result<u64, DbError> {
-    let client = connect_to(db, database).await?;
-    // A full scan on a large table, so the token is what stops it *on the server*
-    // rather than only abandoning the answer — see `Db::count_rows`.
-    let token = client.cancel_token();
-    let rows = tokio::select! {
-        r = query_all(&client, sql) => r?,
-        _ = cancel.cancelled() => {
-            cancel_query(db, &token).await;
-            return Err(DbError::Cancelled);
-        }
-    };
-    rows.first()
-        .and_then(|r| opt(r, 0))
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| DbError::Query("COUNT(*) returned no row".into()))
-}
-
 /// `pg_stat_activity`, narrowed to the sessions a person opened.
 ///
 /// `backend_type = 'client backend'` drops the checkpointer, the WAL writer, the

@@ -328,7 +328,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   the monitor every two seconds, **on a read-only connection too**. All of them now read on
   `Enforce::Generated` on **every** connection, writable or not, since none of them is meant to
   write anything (on SQL Server, the always-rolled-back transaction) — as do `Db::copy_rows`'
-  source read and the MCP server's `sample_rows`, for the same reason. **`Generated`, not
+  source read, the MCP server's `sample_rows` and `Db::count_rows` (offered for a view by the
+  properties modal; release review S1-L5-04), for the same reason. **`Generated`, not
   `ReadOnly`, because `ReadOnly` is the session for a statement a gate judged** (release review
   S1-L1-02): it also asks the checks that keep that judgement true — PostgreSQL's refusal of a path
   where a builtin's name is shadowed, MySQL's `sql_mode` pin and character-set read-back — and

@@ -4,7 +4,7 @@
 connect (following **one** routing redirect, which is how Azure SQL's
 gateway hands a client to the node that serves its database), `ping`, the database list,
 `fetch_query` and `run_batch` (with `Enforce`, above), `prepare_check`, `fetch_table_list` and
-`fetch_schema`, the monitor's `fetch_table`, `count_rows` (`COUNT_BIG`), table statistics from
+`fetch_schema`, the monitor's `fetch_table`, `count_rows` (`COUNT_BIG`, through `fetch_query`), table statistics from
 `sys.dm_db_partition_stats`, Server Activity, `run_script`, and the grid's write-back —
 `commit_writes`, `refetch_rows` and `fetch_blob` (below) — `import_rows` (below), and `run_ddl`,
 for the table changes `supports_change` admits (below), a Manual tab's pinned `Session`

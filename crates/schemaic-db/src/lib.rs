@@ -2117,6 +2117,14 @@ impl Db {
     /// and left the scan running on the server for minutes, holding its connection,
     /// with nothing anywhere able to stop it — and reopening offered the button
     /// again, so N opens stacked N concurrent full scans on a production server.
+    /// The token is [`Db::fetch_query_enforced`]'s, which stops the statement on
+    /// the server.
+    ///
+    /// **On a session that refuses writes** (`Enforce::Generated`, release
+    /// review S1-L5-04), on every connection: the properties modal offers it for
+    /// a view, and a view's body can call a function that writes — which a
+    /// plain session ran, on a connection marked read-only as on any other,
+    /// since no text gate sees a view's body. Such a view now fails to count.
     pub async fn count_rows(
         &self,
         database: &str,
@@ -2125,12 +2133,15 @@ impl Db {
         cancel: CancellationToken,
     ) -> Result<u64, DbError> {
         let sql = count_rows_sql(schema, table, self.engine.dialect());
-        match self.engine {
-            Engine::Postgres => pg::count_rows(self, database, &sql, cancel).await,
-            Engine::Sqlite => sqlite::count_rows(self, &sql, cancel).await,
-            Engine::MySql => mysql::count_rows(self, database, &sql, cancel).await,
-            Engine::MsSql => mssql::count_rows(self, database, &sql, cancel).await,
-        }
+        let rs = self
+            .fetch_query_enforced(Some(database), &sql, 1, cancel, Enforce::Generated)
+            .await?;
+        let text = rs
+            .cell(0, 0)
+            .map(|c| c.text().to_string())
+            .unwrap_or_default();
+        text.parse()
+            .map_err(|_| DbError::Query(format!("the count came back as {text:?}, not a number")))
     }
 
     /// Every session currently connected to this server, with the lock waits

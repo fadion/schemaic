@@ -2419,40 +2419,6 @@ pub(crate) async fn fetch_table_list(db: &Db) -> Result<DbSchema, DbError> {
     .await
 }
 
-/// The SQLite half of [`Db::count_rows`].
-///
-/// SQLite's only row figure. [`fetch_table_stats`] answers sizes and no rows —
-/// SQLite keeps no estimate — so the exact count is not a fallback here, it is
-/// the only row figure there is.
-pub(crate) async fn count_rows(
-    db: &Db,
-    sql: &str,
-    cancel: CancellationToken,
-) -> Result<u64, DbError> {
-    refuse_if_cancelled(&cancel)?;
-    let sql = sql.to_string();
-    let db = db.clone();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    // Not `with_conn`: a full scan has to be interruptible, and the handle has to
-    // reach the async side before the scan starts — the same shape `fetch_query`
-    // uses, and the reason `count_rows` takes a token at all.
-    let work = tokio::task::spawn_blocking(move || {
-        let conn = open(&db)?;
-        let _ = tx.send(conn.get_interrupt_handle());
-        conn.query_row(&sql, [], |r| r.get::<_, i64>(0))
-            .map(|n| n.max(0) as u64)
-            .map_err(query_err)
-    });
-    let interrupt = rx.await.ok();
-    tokio::select! {
-        r = work => r.map_err(|e| DbError::Refused(crate::DbRefusal::SqliteWorker(e.to_string())))?,
-        _ = cancel.cancelled() => {
-            if let Some(h) = interrupt { h.interrupt(); }
-            Err(DbError::Cancelled)
-        }
-    }
-}
-
 /// The largest file [`fetch_table_stats`] measures.
 ///
 /// `dbstat` has no catalogue to read: it walks every page of every b-tree, so

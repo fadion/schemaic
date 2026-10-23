@@ -6213,31 +6213,6 @@ pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
         .map_err(|_| DbError::ConnectFailed(crate::ConnectFailure::TimedOut))?
 }
 
-/// `SELECT COUNT(*)` — the exact count, killable from a second connection.
-pub(crate) async fn count_rows(
-    db: &Db,
-    database: &str,
-    sql: &str,
-    cancel: CancellationToken,
-) -> Result<u64, DbError> {
-    let mut conn = db.open(Some(database), false).await?;
-    // The connection id, so a second connection can KILL the scan — the same
-    // shape `fetch_query` uses, and the only thing that actually stops work
-    // already running on the server.
-    let conn_id = conn.id();
-    let out = tokio::select! {
-        r = conn.query_first::<u64, _>(sql) => r
-            .map_err(|e| DbError::Query(e.to_string()))
-            .and_then(|n| n.ok_or_else(|| DbError::Query("COUNT(*) returned no row".into()))),
-        _ = cancel.cancelled() => {
-            kill_query(db, conn_id).await;
-            Err(DbError::Cancelled)
-        }
-    };
-    let _ = conn.disconnect().await;
-    out
-}
-
 /// One table's first `limit` rows, for the Live Monitor.
 ///
 /// The caller bounds this — [`crate::Db::fetch_table`] wraps the whole dispatch,

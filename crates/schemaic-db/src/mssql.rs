@@ -3399,24 +3399,6 @@ async fn plan_documents(
     Ok(docs)
 }
 
-/// The exact row count, from `stats::count_rows_sql`'s `COUNT_BIG(*)`.
-/// Cancelled on the server by an attention, like a query.
-pub(crate) async fn count_rows(
-    db: &Db,
-    database: &str,
-    sql: &str,
-    cancel: CancellationToken,
-) -> Result<u64, DbError> {
-    let mut client = connect(db, Some(database)).await?;
-    let rs = run_statement(&mut client, sql, &mut RowDest::Capped(1), &cancel).await?;
-    let text = rs
-        .cell(0, 0)
-        .map(|c| c.text().to_string())
-        .unwrap_or_default();
-    text.parse()
-        .map_err(|_| DbError::Query(format!("the count came back as {text:?}, not a number")))
-}
-
 /// Each partitioned table — its heap or clustered index on a partition scheme
 /// — with the scheme, its function, the function's side (`RANGE RIGHT` is
 /// 1) and the partitioning column: `(schema, table, scheme, function, right,
