@@ -288,10 +288,24 @@ pub(crate) fn mcp_endpoint_from_env() -> Result<McpEndpoint, String> {
         |p| std::fs::read_to_string(p).map_err(|e| e.to_string()),
         std::env::var("SCHEMAIC_MCP_ENDPOINT").ok().as_deref(),
     )?;
-    let saved = saved_db(&v, keyring_connection)?;
-    let mut endpoint = endpoint_from_value(&v);
-    if let Some(db) = saved {
+    endpoint_from_blob(&v, keyring_connection)
+}
+
+/// The endpoint a parsed blob describes, with the saved connection it names
+/// (looked up by `lookup`) deciding what the blob cannot be trusted with: the
+/// `Db` itself ([`saved_db`]), and an upper bound on `samples`, which is that
+/// connection's `AiData` rather than anything the session chose (release
+/// review S2-L5-03) — as `schemaic mcp`'s `Endpoint::standalone` takes it.
+/// Narrowing only: a blob's `false` stays false.
+fn endpoint_from_blob(
+    v: &serde_json::Value,
+    lookup: impl Fn(u64) -> Result<schemaic_core::connection::Connection, String>,
+) -> Result<McpEndpoint, String> {
+    let saved = saved_db(v, lookup)?;
+    let mut endpoint = endpoint_from_value(v);
+    if let Some((db, ai_data)) = saved {
         endpoint.db = db;
+        endpoint.samples &= ai_data.may_query();
     }
     Ok(endpoint)
 }
@@ -355,7 +369,7 @@ fn endpoint_blob(
 fn saved_db(
     v: &serde_json::Value,
     lookup: impl Fn(u64) -> Result<schemaic_core::connection::Connection, String>,
-) -> Result<Option<Db>, String> {
+) -> Result<Option<(Db, schemaic_core::connection::AiData)>, String> {
     let Some(id) = v.get("conn_id").and_then(|x| x.as_u64()) else {
         return Ok(None);
     };
@@ -370,7 +384,10 @@ fn saved_db(
     } else {
         None
     };
-    Ok(Some(Db::connect(&saved, tunnel)))
+    Ok(Some((
+        Db::connect(&saved, tunnel),
+        saved.ai_data.unwrap_or_default(),
+    )))
 }
 
 /// [`saved_db`]'s real lookup: the saved connection `id`, hydrated from
@@ -4575,7 +4592,7 @@ mod tests {
             "conn_id": 42, "host": "evil.example", "port": 1, "user": "root",
             "engine": "mysql", "tls": null, "init_sql": "", "auth": "Password",
         });
-        let db = saved_db(&forged, lookup(saved.clone())).unwrap().unwrap();
+        let (db, _) = saved_db(&forged, lookup(saved.clone())).unwrap().unwrap();
         let (host, port, user, pass, _) = db.parts();
         assert_eq!(
             (host, port, user, pass),
@@ -4588,7 +4605,7 @@ mod tests {
         saved.ssh.enabled = true;
         saved.ssh.host = "bastion.example".into();
         let tunnelled = serde_json::json!({ "conn_id": 42, "host": "evil.example", "port": 40123 });
-        let db = saved_db(&tunnelled, lookup(saved.clone()))
+        let (db, _) = saved_db(&tunnelled, lookup(saved.clone()))
             .unwrap()
             .unwrap();
         assert_eq!(db.parts().0, "127.0.0.1");
@@ -4603,6 +4620,48 @@ mod tests {
             saved_db(&serde_json::json!({ "host": "h" }), |_| panic!("looked up"))
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// **The saved connection's data level bounds what the blob may ask for**
+    /// (release review S2-L5-03). `samples` is the connection's `AiData`, not
+    /// the session's choice: the app writes `false` for a `SchemaOnly`
+    /// connection, and anything able to rewrite the endpoint could write
+    /// `true` and have the subprocess offer `run_query` and sample rows on a
+    /// connection the user limited to its schema. `schemaic mcp` already took
+    /// it from the saved connection; now the panel's subprocess does too —
+    /// narrowing only, so a blob's `false` stays false.
+    #[test]
+    fn the_saved_data_level_bounds_the_blobs_samples() {
+        use schemaic_core::connection::{AiData, Connection};
+        let saved = |ai: Option<AiData>| -> Connection {
+            let mut c: Connection = serde_json::from_value(serde_json::json!({
+                "id": 42, "name": "app", "db_type": "PostgreSQL", "host": "db.example",
+                "port": 5432, "user": "app", "password": "",
+            }))
+            .expect("a saved connection");
+            c.ai_data = ai;
+            c
+        };
+        let blob = |samples: bool| serde_json::json!({ "conn_id": 42, "samples": samples, "schema": true });
+        let ask = |ai, samples| {
+            endpoint_from_blob(&blob(samples), |_| Ok(saved(ai)))
+                .unwrap()
+                .samples
+        };
+        assert!(
+            !ask(Some(AiData::SchemaOnly), true),
+            "a forged blob widened it"
+        );
+        assert!(!ask(Some(AiData::OnRequest), true));
+        assert!(!ask(None, true), "the default level is not Full");
+        assert!(ask(Some(AiData::Full), true));
+        assert!(!ask(Some(AiData::Full), false), "a blob may narrow");
+        // The schema flag is the session's, and passes as written.
+        assert!(
+            endpoint_from_blob(&blob(true), |_| Ok(saved(Some(AiData::SchemaOnly))))
+                .unwrap()
+                .schema
         );
     }
 

@@ -1115,16 +1115,21 @@ password to the keyring left everything around it in the blob — host, port, us
 plan, sign-in mode, init SQL, signing target — so whatever could rewrite the endpoint file, or set
 `$SCHEMAIC_MCP_ENDPOINT`, could have the subprocess fetch the saved password from the keyring and
 send it to a host of its own with TLS off, attach init SQL of its own to the session, or (with the
-data levels above) widen what it reads. `saved_db(v, lookup) -> Result<Option<Db>, String>` now
-answers a blob that carries a `conn_id` with `Db::connect(&saved, tunnel)` — how `main.rs`
+data levels above) widen what it reads. `saved_db(v, lookup) -> Result<Option<(Db, AiData)>, String>`
+now answers a blob that carries a `conn_id` with `Db::connect(&saved, tunnel)` — how `main.rs`
 builds the app's own `Db`, less the lazy password source, `keyring_connection` having read the
 password into `saved` already — so all of those are the saved connection's. The blob supplies only what
 the saved connection cannot know, the local port of the app's SSH tunnel, and only when
 `saved.uses_tunnel()`; a tunnelled connection whose blob has no port is refused, and the blob's
-`host` is never read, because `Db::connect` writes `127.0.0.1` for a tunnel itself. What stays the
-blob's is the session's choice rather than the connection's: the selected `database`, `samples`,
-`schema` and `hidden` (`the_subprocess_connects_where_the_saved_connection_points`, which hands it
-a forged host, port, user, engine and init SQL and gets the saved ones back). **The residual**: the
+`host` is never read, because `Db::connect` writes `127.0.0.1` for a tunnel itself
+(`the_subprocess_connects_where_the_saved_connection_points`, which hands it a forged host, port,
+user, engine and init SQL and gets the saved ones back). **`samples` is bounded by the saved
+connection too**: it is that connection's `AiData::may_query`, not a session choice, so
+`endpoint_from_blob` — the composition `mcp_endpoint_from_env` runs — ANDs the blob's flag with it,
+narrowing only, as `schemaic mcp`'s `Endpoint::standalone` derives it outright (release review
+S2-L5-03, `the_saved_data_level_bounds_the_blobs_samples`; before it a rewritten `"samples": true`
+offered `run_query` on a `SchemaOnly` connection). What stays the blob's is the session's choice:
+the selected `database`, `schema` and `hidden`. **The residual**: the
 tunnel port is still the blob's, so a same-user process that rewrites it can point the subprocess
 at a loopback listener of its own. **The sign-in mode is the saved connection's, and an Entra or
 cloud IAM token does not cross at all**: the subprocess asks the CLI for its own token through its
