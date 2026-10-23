@@ -11826,9 +11826,10 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             // time** (release review S3-L2-05): `apply` can run after a
             // settle's COMMIT lands, and two clicks inside it each toggled, so
             // a user who clicked "read-only" twice ended writable.
-            let Some(target) = connections
-                .with_untracked(|cs| cs.iter().find(|c| c.id == id).map(|c| !c.read_only))
-            else {
+            let Some(target) = connections.with_untracked(|cs| {
+                schemaic_core::connection::by_id(cs, id)
+                    .map(|c| !schemaic_core::connection::read_only_ref(Some(c)))
+            }) else {
                 return;
             };
             let apply: Rc<dyn Fn()> = Rc::new(move || {
