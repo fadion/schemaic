@@ -283,7 +283,7 @@ pub(crate) fn mcp_endpoint_from_env() -> Result<McpEndpoint, String> {
     // world-readable — so it gets a path instead and the endpoint stays in a
     // file of its own. Neither holds the password any more: the blob names the
     // saved connection, and `saved_db` builds the `Db` from it, keyring and all.
-    let mut v = endpoint_blob(
+    let v = endpoint_blob(
         endpoint_file_arg(&std::env::args().collect::<Vec<_>>()).as_deref(),
         |p| std::fs::read_to_string(p).map_err(|e| e.to_string()),
         std::env::var("SCHEMAIC_MCP_ENDPOINT").ok().as_deref(),

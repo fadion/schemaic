@@ -209,6 +209,9 @@ type EndTxFn = Rc<dyn Fn(usize, bool, Option<Rc<dyn Fn()>>)>;
 /// (a tab isn't closed, a mode isn't switched). It is `Some` for the one caller
 /// that has already told a modal work is under way and has to take that back.
 type GuardTxFn = Rc<dyn Fn(usize, Rc<dyn Fn()>, Option<Rc<dyn Fn()>>)>;
+/// `settle_before_read_only`'s shape — `(connection id, what to do once every
+/// open Manual transaction on it is settled, what to do on a Cancel)`.
+type SettleBeforeFn = Rc<dyn Fn(u64, Rc<dyn Fn()>, Rc<dyn Fn()>)>;
 /// The same shape, for the guard that asks about a tab's **unsaved `.sql` file**
 /// before closing it — so `guard_close` can compose the two and drop into every
 /// place that already takes a [`GuardTxFn`].
@@ -2080,6 +2083,27 @@ fn settle_schema(
     }
 }
 
+/// Is the session a statement ran on (`ran_on`, `None` for an auto-commit
+/// run) **still the one tab `tab_id` holds** when its result lands?
+///
+/// The transaction pill folds each statement's outcome, and a fold is about
+/// the connection the statement ran on. A re-pin while the tab's first
+/// statement was in flight — ticking read-only, which reads that tab as
+/// having nothing open — replaced the session under it, and the fold then
+/// marked the new, empty session `Open`: a Commit offered, and reported, over
+/// work the old connection's rollback had already undone (security review
+/// S21). A fold for a session the tab no longer holds is dropped.
+fn still_pinned(
+    sessions: &HashMap<usize, Arc<Session>>,
+    tab_id: usize,
+    ran_on: Option<&Arc<Session>>,
+) -> bool {
+    match ran_on {
+        None => true,
+        Some(s) => sessions.get(&tab_id).is_some_and(|cur| Arc::ptr_eq(cur, s)),
+    }
+}
+
 /// Re-pin a Manual tab whose stale session was kept for the transaction it
 /// held (`PinnedFate::RepinWhenTxEnds`, `owed` by tab id) — once that
 /// transaction has ended, by Commit, Roll back, or a statement typed in the
@@ -3532,6 +3556,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let record_history = record_history.clone();
         let finish_history = finish_history.clone();
         let log_write = log_write.clone();
+        let sessions = sessions.clone();
         Rc::new(move |sql: String, is_view: bool, into: Option<u64>| {
             if sql.trim().is_empty() {
                 return;
@@ -3645,6 +3670,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
             let tx_sql = sql.clone();
             let engine = tx_engine(&db);
             let dialect = dialect_of(&db);
+            let (sessions_now, ran_on) = (sessions.clone(), session.clone());
             let finish_history = finish_history.clone();
             let refresh_after_run = refresh_after_run.clone();
             let ddl_owed = ddl_owed.clone();
@@ -3677,10 +3703,14 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                         let aborted = matches!(tab.tx.get_untracked(), TxState::Poisoned { .. });
                         log_landed(&log_write, conn_id, dialect, entry, &state, aborted);
                     }
-                    // Fold the transaction state first, and unconditionally: it
-                    // tracks the *connection*, so it stays true even when a newer run
-                    // has superseded this one for display purposes.
-                    if let Some(stmt) = stmt {
+                    // Fold the transaction state first, whatever run the tab now
+                    // shows: it tracks the *connection*, so it stays true even when
+                    // a newer run has superseded this one for display purposes.
+                    // The one condition is that the tab still holds that
+                    // connection (`still_pinned`).
+                    if let Some(stmt) = stmt
+                        && still_pinned(&sessions_now.borrow(), id, ran_on.as_ref())
+                    {
                         tab.tx
                             .update(|t| *t = t.on_statement(engine, &tx_sql, stmt));
                     }
@@ -4238,6 +4268,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
         let ddl_owed = ddl_owed.clone();
         let (repin_owed, repin_late) = (repin_owed.clone(), repin_late.clone());
         let log_write = log_write.clone();
+        let sessions = sessions.clone();
         Rc::new(move |stmts: Vec<String>| {
             let stmts: Vec<String> = stmts.into_iter().filter(|s| !s.trim().is_empty()).collect();
             if stmts.is_empty() {
@@ -4297,6 +4328,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                     return;
                 }
             };
+            let (sessions_now, ran_on) = (sessions.clone(), session.clone());
             let database = tab.database.get_untracked();
             // Record each statement (oldest first, so the batch lands newest-last).
             let conn_id = tab.conn_id.get_untracked();
@@ -4377,8 +4409,13 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
                             log_landed(&log_write, conn_id, dialect, entry.clone(), state, before);
                         }
                     }
+                    // Only while the tab still holds the connection they ran
+                    // on (`still_pinned`).
+                    let pinned = still_pinned(&sessions_now.borrow(), id, ran_on.as_ref());
                     for (sql, stmt) in tx_stmts.iter().zip(&outcomes) {
-                        if let Some(stmt) = stmt {
+                        if let Some(stmt) = stmt
+                            && pinned
+                        {
                             tab.tx.update(|t| *t = t.on_statement(engine, sql, *stmt));
                         }
                     }
@@ -11541,7 +11578,7 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // (`Connection::ticks_read_only`). Asked after, as other stale-session
     // edits are, a Cancel kept the writable session for the rest of its
     // transaction on a connection the whole UI called read-only.
-    let settle_before_read_only: Rc<dyn Fn(u64, Rc<dyn Fn()>, Rc<dyn Fn()>)> = {
+    let settle_before_read_only: SettleBeforeFn = {
         let guard_tx = guard_tx.clone();
         Rc::new(
             move |id: u64, proceed: Rc<dyn Fn()>, cancelled: Rc<dyn Fn()>| {
@@ -16581,6 +16618,36 @@ mod app_tests {
             .find(".commit_writes(")
             .expect("`commit_edits` no longer commits — this gate is stale");
         assert!(asks < writes, "the question comes after the write");
+    }
+
+    /// **A statement's outcome folds into the pill only for the session it ran
+    /// on** (security review S21): a re-pin while it was in flight replaced
+    /// the session, and the fold marked the new, empty one `Open`. Both runs
+    /// guard their fold with `still_pinned`.
+    #[test]
+    fn a_run_folds_its_outcome_only_into_the_session_it_ran_on() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("main.rs"),
+        )
+        .expect("this file's own source");
+        let body = schemaic_ui::source_gate::production_code(&src);
+        for head in [
+            "let run_query_core: Rc<dyn Fn(String, bool, Option<u64>)> = {",
+            "let run_all: Rc<dyn Fn(Vec<String>)> = {",
+        ] {
+            let at = body
+                .find(head)
+                .unwrap_or_else(|| panic!("`{head}` — stale"));
+            let end = at + body[at..].find("\n    };").expect("the end of the closure");
+            let region = &body[at..end];
+            let guard = region
+                .find("still_pinned(&sessions_now.borrow(), id, ran_on.as_ref())")
+                .unwrap_or_else(|| panic!("`{head}` folds without asking `still_pinned`"));
+            let fold = region.find(".on_statement(").expect("the fold — stale");
+            assert!(guard < fold, "`{head}`: the guard comes after the fold");
+        }
     }
 
     /// **The AI fill and seed samples read on a read-only session** (security

@@ -319,6 +319,19 @@ settles first, its Cancel saving the rest of the edit with `read_only = false` a
 draft's `read_only` back, so the read-only change alone is not saved. Unticking goes straight
 through, as before. `the_read_only_toggle_resettles_pinned_sessions` pins both routes' asking
 `ticks_read_only` and going through the settle, and the form's `writable.read_only = false`.
+**A re-pin can land under a statement still in flight, so a run's fold asks whether the tab still
+holds the session it ran on.** `TxState` is folded only when an operation finishes, so a tab whose
+*first* statement is still running reads as having nothing open, and the settle re-pins it at
+once; the old connection's rollback undoes the statement, and its result then arrived and was
+folded — before the supersede check, deliberately, since the pill tracks the connection — moving
+the tab from Idle to `Open` over the new, empty session: Commit and Rollback offered, and
+reported, over work that was already gone (security review S21). Each run now captures
+`(sessions_now, ran_on)` at launch, and `run_query_core` and `run_all` fold only under
+`still_pinned(sessions, tab_id, ran_on)` — `true` for an auto-commit run, which has no session to
+lose, and otherwise `Arc::ptr_eq` against the tab's current entry in `sessions`. A fold for a
+session the tab no longer holds is dropped; the write log and the history are not, being about
+the run. `a_run_folds_its_outcome_only_into_the_session_it_ran_on` is a source gate over both
+closures, asking for the guard ahead of the `.on_statement(` fold.
 `open_session` is built after the run actions that ask, so it is reached through `repin_late`, a
 `LateAction`. `tx_prompt` holds one question, so the prompts are chained one tab at a time, the
 way `run_ddl` chains its blockers. The AI session is on the same list
