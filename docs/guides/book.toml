@@ -1,0 +1,22 @@
+[book]
+title = "Schemaic guide"
+description = "How to use Schemaic, the native SQL editor for MySQL, MariaDB, PostgreSQL, SQLite and SQL Server."
+authors = ["Fadion Dashi"]
+language = "en"
+src = "src"
+
+[build]
+# A page named in SUMMARY.md but missing on disk is an error, not a blank page
+# mdBook quietly creates.
+create-missing = false
+
+[output.html]
+site-url = "/schemaic/guide/"
+git-repository-url = "https://github.com/fadion/schemaic"
+edit-url-template = "https://github.com/fadion/schemaic/edit/main/docs/guides/{path}"
+default-theme = "light"
+preferred-dark-theme = "navy"
+no-section-label = true
+
+[output.html.search]
+enable = true

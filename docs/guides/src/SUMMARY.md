@@ -1,0 +1,45 @@
+# Summary
+
+[Introduction](README.md)
+
+# Using Schemaic
+
+- [Getting started](getting-started/README.md)
+- [Connections](connections/README.md)
+  - [Signing in and TLS](connections/sign-in.md)
+  - [SSH tunnels](connections/ssh.md)
+  - [Safeguards](connections/safeguards.md)
+  - [Importing connections](connections/import.md)
+- [Query editor](query-editor/README.md)
+  - [Writing SQL](query-editor/writing-sql.md)
+  - [History and snippets](query-editor/history-and-snippets.md)
+  - [Query plans](query-editor/query-plans.md)
+  - [SQL files](query-editor/sql-files.md)
+- [Results grid](results-grid/README.md)
+  - [Editing data](results-grid/editing.md)
+  - [Copying and exporting](results-grid/exporting.md)
+  - [Charts](results-grid/chart.md)
+  - [Comparing results](results-grid/compare.md)
+- [Schema](schema/README.md)
+  - [Designing a table](schema/table-designer.md)
+  - [ER diagram](schema/er-diagram.md)
+  - [Live monitor](schema/live-monitor.md)
+  - [Comparing schemas](schema/compare.md)
+- [Users and access](users/README.md)
+  - [Granting and revoking](users/privileges.md)
+- [Import and dump](import-export/README.md)
+  - [Importing a file into a table](import-export/import-file.md)
+  - [Running a SQL script](import-export/run-script.md)
+  - [Exporting](import-export/export.md)
+  - [Back up and restore](import-export/backup.md)
+- [AI assistant](ai/README.md)
+  - [Data access](ai/data-access.md)
+- [Command line](cli/README.md)
+  - [Reading and exporting](cli/reading.md)
+  - [Running writes](cli/exec.md)
+  - [MCP server](cli/mcp.md)
+
+# Reference
+
+- [Engine differences](reference/engines.md)
+- [Keyboard shortcuts](reference/shortcuts.md)
