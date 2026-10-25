@@ -267,6 +267,13 @@ Arch:
 sudo pacman -S --needed libxkbcommon wayland libxcb libx11 pkgconf
 ```
 
+## User guide
+
+The [user guide](https://fadion.github.io/schemaic/guide/) covers finding your way round a
+database, the query editor and results grid, designing tables, users and access, import and dump,
+the AI assistant and the command line, plus what differs between the engines. It describes the
+latest release, and its source is in [`docs/guides/`](docs/guides/).
+
 ## Licence
 
 MIT, see [LICENSE](LICENSE). Third-party notices are in
