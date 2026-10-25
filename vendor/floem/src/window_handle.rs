@@ -79,6 +79,9 @@ pub(crate) struct WindowHandle {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub(crate) context_menu: RwSignal<Option<(Menu, Point)>>,
     dropper_file: Option<PathBuf>,
+    // schemaic patch (PATCHES.md): `WindowConfig::show_after_first_frame`,
+    // until `init_renderer` has shown the window.
+    show_on_first_frame: bool,
 }
 
 impl WindowHandle {
@@ -90,6 +93,7 @@ impl WindowHandle {
         apply_default_theme: bool,
         size: Option<LogicalSize<f64>>,
         font_embolden: f32,
+        show_on_first_frame: bool,
     ) -> Self {
         let scope = Scope::new();
         let window_id = window.id();
@@ -173,6 +177,7 @@ impl WindowHandle {
             context_menu,
             last_pointer_down: None,
             dropper_file: None,
+            show_on_first_frame,
         };
         window_handle.app_state.set_root_size(size.get_untracked());
         if let Some(theme) = theme.get_untracked() {
@@ -197,6 +202,13 @@ impl WindowHandle {
         }
         // Now that the renderer is initialized, draw the first frame
         self.render_frame();
+        // schemaic patch (PATCHES.md): and only now show a window that asked
+        // to be seen with a frame in it.
+        if std::mem::take(&mut self.show_on_first_frame) {
+            if let Some(window) = self.window.as_ref() {
+                window.set_visible(true);
+            }
+        }
     }
 
     pub fn event(&mut self, event: Event) {

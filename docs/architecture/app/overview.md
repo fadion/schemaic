@@ -692,7 +692,9 @@ the 600 ms save debounce left `tabs.json` holding the **previous** save, whose `
 dot, reporting itself as matching disk. Confidently wrong is worse than stale. The snapshot is
 built by one closure (`session_snapshot`) shared with the debounced effect, because the builder
 that runs at quit is the one nobody watches.
-**The listener then ends the process itself, with `floem::quit_app()` after its three flushes.**
+**The listener then ends the process itself, with `floem::quit_app()` after its four flushes** —
+the session, the schema filter, the reopen ring (below) and the window's size and place, whose
+`place.flush()` is the only write of `window.json` (`core/window_place.rs`'s entry).
 The vendored Floem's `AppHandle::close_window` exits the event loop once the last window is gone
 on every platform but macOS, where nothing does: closing the window left the process in the menu
 bar, and *Restart to update* (`app/update.rs`) waited for an exit only the menu bar's *Quit*

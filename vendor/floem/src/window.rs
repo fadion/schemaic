@@ -15,6 +15,8 @@ use crate::view::IntoView;
 pub struct WindowConfig {
     pub(crate) size: Option<Size>,
     pub(crate) position: Option<Point>,
+    // schemaic patch (PATCHES.md): `position` is in device pixels.
+    pub(crate) position_is_physical: bool,
     pub(crate) show_titlebar: bool,
     pub(crate) transparent: bool,
     pub(crate) fullscreen: Option<Fullscreen>,
@@ -25,6 +27,9 @@ pub struct WindowConfig {
     pub(crate) app_id: Option<String>,
     pub(crate) enabled_buttons: WindowButtons,
     pub(crate) resizable: bool,
+    // schemaic patch (PATCHES.md): created hidden, shown once its first frame
+    // is drawn.
+    pub(crate) show_after_first_frame: bool,
     pub(crate) undecorated: bool,
     pub(crate) undecorated_shadow: bool,
     pub(crate) window_level: WindowLevel,
@@ -40,6 +45,7 @@ impl Default for WindowConfig {
         Self {
             size: None,
             position: None,
+            position_is_physical: false,
             show_titlebar: true,
             transparent: false,
             fullscreen: None,
@@ -48,6 +54,7 @@ impl Default for WindowConfig {
             app_id: None,
             enabled_buttons: WindowButtons::all(),
             resizable: true,
+            show_after_first_frame: false,
             undecorated: false,
             undecorated_shadow: false,
             window_level: WindowLevel::Normal,
@@ -75,6 +82,20 @@ impl WindowConfig {
     #[inline]
     pub fn position(mut self, position: Point) -> Self {
         self.position = Some(position);
+        self.position_is_physical = false;
+        self
+    }
+
+    /// Sets a desired initial position for the window in device pixels, which
+    /// winit places exactly. A logical [`Self::position`] is converted with the
+    /// scale of whichever monitor the window is created on, which on a setup
+    /// with mixed scales need not be the monitor it is meant for.
+    ///
+    /// schemaic patch (PATCHES.md); not in upstream Floem 0.2.0.
+    #[inline]
+    pub fn physical_position(mut self, position: Point) -> Self {
+        self.position = Some(position);
+        self.position_is_physical = true;
         self
     }
 
@@ -171,6 +192,22 @@ impl WindowConfig {
     #[inline]
     pub fn resizable(mut self, resizable: bool) -> Self {
         self.resizable = resizable;
+        self
+    }
+
+    /// Creates the window hidden and shows it once its first frame has been
+    /// drawn, so it never appears blank — in the OS's default background, while
+    /// the GPU is still being acquired — or at a size it is about to leave. A
+    /// size, maximize or position applied in the turn that creates the window
+    /// is in place before it is seen.
+    ///
+    /// The default is `false`: shown at creation. Ignored where the platform has
+    /// no hidden state (Wayland), which shows the window at creation regardless.
+    ///
+    /// schemaic patch (PATCHES.md); not in upstream Floem 0.2.0.
+    #[inline]
+    pub fn show_after_first_frame(mut self, show_after_first_frame: bool) -> Self {
+        self.show_after_first_frame = show_after_first_frame;
         self
     }
 

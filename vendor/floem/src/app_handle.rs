@@ -282,6 +282,7 @@ impl ApplicationHandle {
         #[allow(unused_variables)] WindowConfig {
             size,
             position,
+            position_is_physical,
             show_titlebar,
             transparent,
             fullscreen,
@@ -290,6 +291,7 @@ impl ApplicationHandle {
             app_id,
             enabled_buttons,
             resizable,
+            show_after_first_frame,
             undecorated,
             undecorated_shadow,
             window_level,
@@ -309,6 +311,9 @@ impl ApplicationHandle {
             .with_window_level(window_level)
             .with_window_icon(window_icon)
             .with_resizable(resizable)
+            // schemaic patch (PATCHES.md): `WindowConfig::show_after_first_frame`
+            // — `WindowHandle::init_renderer` shows it.
+            .with_visible(!show_after_first_frame)
             .with_enabled_buttons(enabled_buttons);
 
         #[cfg(target_arch = "wasm32")]
@@ -336,7 +341,15 @@ impl ApplicationHandle {
         };
 
         if let Some(Point { x, y }) = position {
-            window_builder = window_builder.with_position(LogicalPosition::new(x, y));
+            // schemaic patch (PATCHES.md): `WindowConfig::physical_position`.
+            window_builder = if position_is_physical {
+                window_builder.with_position(floem_winit::dpi::PhysicalPosition::new(
+                    x.round() as i32,
+                    y.round() as i32,
+                ))
+            } else {
+                window_builder.with_position(LogicalPosition::new(x, y))
+            };
         }
 
         if let Some(logical_size) = logical_size {
@@ -448,6 +461,7 @@ impl ApplicationHandle {
             apply_default_theme,
             logical_size,
             font_embolden,
+            show_after_first_frame,
         );
         self.window_handles.insert(window_id, window_handle);
     }

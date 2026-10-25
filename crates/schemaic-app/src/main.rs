@@ -99,6 +99,7 @@ use schemaic_core::model::{
     CommitDone, GridWrite, ModalError, QueryState, RefetchRequest, ResultSet,
 };
 use schemaic_core::monitor::{Snapshot, TickAction, diff_snapshots};
+use schemaic_core::window_place;
 
 /// Outcome of a background connect + schema-load task: `(tunnel port, tunnel
 /// handle, databases listed)` on success, or which step failed and why.
@@ -382,8 +383,29 @@ fn main() -> std::process::ExitCode {
     // resize behaviour. `undecorated` would throw those away too, on the one
     // platform where they still work.
     let chrome = schemaic_core::window_chrome::Chrome::current();
+    let app = Application::new();
+    // **The window as it was left** (`core::window_place`), fitted to the
+    // monitors present now — floem takes a size and position only here, at
+    // creation. With nothing saved, 1280×820 wherever the OS puts it.
+    let saved_place = persist::load_json::<Option<window_place::WindowPlace>>(window_place::FILE);
+    let restored = saved_place.as_ref().map(|saved| {
+        let primary = app.primary_monitor();
+        let monitors: Vec<window_place::Monitor> = app
+            .available_monitors()
+            .map(|m| window_place::Monitor {
+                x: f64::from(m.position().x),
+                y: f64::from(m.position().y),
+                width: f64::from(m.size().width),
+                height: f64::from(m.size().height),
+                scale: m.scale_factor(),
+                primary: primary.as_ref() == Some(&m),
+            })
+            .collect();
+        window_place::restore(saved, &monitors, chrome)
+    });
+    let [width, height] = restored.map_or([1280.0, 820.0], |r| [r.place.width, r.place.height]);
     let mut config = WindowConfig::default()
-        .size(Size::new(1280.0, 820.0))
+        .size(Size::new(width, height))
         .show_titlebar(false)
         // Windows only, and a no-op elsewhere: keeps the DWM drop shadow (and
         // with it the window's visual edge) behind a frameless window.
@@ -396,9 +418,26 @@ fn main() -> std::process::ExitCode {
     if let Some(icon) = app_icon() {
         config = config.window_icon(icon);
     }
+    match restored.and_then(|r| r.position) {
+        Some(window_place::LaunchPosition::Device([x, y])) => {
+            config = config.physical_position(floem::kurbo::Point::new(x, y));
+        }
+        Some(window_place::LaunchPosition::Points([x, y])) => {
+            config = config.position(floem::kurbo::Point::new(x, y));
+        }
+        None => {}
+    }
+    // Where the OS would show the window before it is sized and placed, and
+    // blank in its default white until the GPU is ready, it is created hidden
+    // and floem shows it with its first frame drawn
+    // (`Chrome::shows_window_before_sizing`).
+    config = config.show_after_first_frame(chrome.shows_window_before_sizing());
+    let launch = WindowLaunch {
+        opened: restored.map(|r| r.place),
+        size: Size::new(width, height),
+    };
 
-    Application::new()
-        .window(move |id| app_view(handle.clone(), id), Some(config))
+    app.window(move |id| app_view(handle.clone(), id, launch), Some(config))
         .run();
 
     drop(rt);
@@ -2284,8 +2323,20 @@ fn owning_tab_of(
         })
 }
 
-fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> impl IntoView {
+fn app_view(
+    handle: tokio::runtime::Handle,
+    window: floem::window::WindowId,
+    launch: WindowLaunch,
+) -> impl IntoView {
     let cx = Scope::current();
+    // `WindowConfig` has no maximized flag; the window's own update queue does,
+    // and drains it at the end of the event-loop turn that creates the window —
+    // before the GPU is ready, so before floem shows a window created hidden
+    // (`show_after_first_frame`). A hidden window maximized stays hidden (winit
+    // re-hides it), and is first seen already maximized over its normal bounds.
+    if launch.opened.is_some_and(|p| p.maximized) {
+        floem::WindowIdExt::maximized(&window, true);
+    }
 
     // Persisted UI state. Loaded up here because the connection migration below
     // reads the *old* global AI flag out of it; tab restore further down needs it
@@ -15955,17 +16006,122 @@ fn app_view(handle: tokio::runtime::Handle, window: floem::window::WindowId) -> 
     // from the Dock. `quit_app` comes after the flushes, which are synchronous,
     // so it cuts nothing short; elsewhere the loop is already exiting and the
     // extra request is harmless.
+    //
+    // **And the window's size and place**, which only this flush writes — see
+    // `WindowPlaceTracker`.
+    let place = WindowPlaceTracker::new(window, launch);
     {
+        use floem::event::{Event, EventListener};
         use floem::views::Decorators;
-        schemaic_ui::workspace(ui, window).on_event_cont(
-            floem::event::EventListener::WindowClosed,
-            move |_| {
+        let (on_resize, on_move) = (place.clone(), place.clone());
+        schemaic_ui::workspace(ui, window)
+            .on_event_cont(EventListener::WindowResized, move |e| {
+                if let Event::WindowResized(size) = e {
+                    on_resize.resized(*size);
+                }
+            })
+            .on_event_cont(EventListener::WindowMoved, move |_| on_move.settle())
+            .on_event_cont(EventListener::WindowClosed, move |_| {
                 flush_session();
                 flush_filter();
                 flush_closed();
+                place.flush();
                 floem::quit_app();
-            },
-        )
+            })
+    }
+}
+
+/// What `main` opened the window with, for `app_view`.
+#[derive(Clone, Copy)]
+struct WindowLaunch {
+    /// `window.json` fitted to the monitors present (`Restored::place`) — the
+    /// tracker's starting normal bounds, and whether to open maximized.
+    opened: Option<window_place::WindowPlace>,
+    /// The content size the window was created at.
+    size: Size,
+}
+
+/// The window's normal bounds this session, sampled for `window.json`
+/// (`core::window_place`).
+///
+/// **Sampled on a settle, not on the event.** On Windows the move that
+/// maximizing causes is reported before winit has set the window's maximized
+/// flag, so reading the flag inside the move handler records the maximized
+/// bounds as the normal ones. 300 ms after the last move or resize the flag is
+/// settled; a burst (a drag) samples once — each event cancels the timer the
+/// one before it set, so a drag holds one timer rather than one per step. The
+/// close samples again, for a move whose settle had not fired.
+#[derive(Clone)]
+struct WindowPlaceTracker {
+    window: floem::window::WindowId,
+    tracker: Rc<Cell<window_place::Tracker>>,
+    /// The content size, logical px, as the last `WindowResized` reported it —
+    /// the one size floem reports on every platform, Wayland included — or the
+    /// launch size until one does.
+    size: Rc<Cell<Size>>,
+    pending: Rc<Cell<Option<floem::action::TimerToken>>>,
+}
+
+impl WindowPlaceTracker {
+    fn new(window: floem::window::WindowId, launch: WindowLaunch) -> Self {
+        Self {
+            window,
+            tracker: Rc::new(Cell::new(window_place::Tracker::new(launch.opened))),
+            size: Rc::new(Cell::new(launch.size)),
+            pending: Rc::new(Cell::new(None)),
+        }
+    }
+
+    fn resized(&self, size: Size) {
+        self.size.set(size);
+        self.settle();
+    }
+
+    fn settle(&self) {
+        if let Some(token) = self.pending.take() {
+            token.cancel();
+        }
+        let this = self.clone();
+        let token = exec_after(Duration::from_millis(300), move |_| {
+            this.pending.set(None);
+            let (live, shown) = this.sample();
+            let mut t = this.tracker.get();
+            t.observe(live, shown);
+            this.tracker.set(t);
+        });
+        self.pending.set(Some(token));
+    }
+
+    fn sample(&self) -> (window_place::WindowPlace, window_place::Shown) {
+        use floem::WindowIdExt;
+        let size = self.size.get();
+        let shown = if self.window.is_minimized() {
+            window_place::Shown::Minimized
+        } else if self.window.is_maximized() {
+            window_place::Shown::Maximized
+        } else {
+            window_place::Shown::Normal
+        };
+        let live = window_place::WindowPlace {
+            position: self
+                .window
+                .position_on_screen_including_frame()
+                .map(|p| [p.x, p.y]),
+            width: size.width,
+            height: size.height,
+            scale: self.window.scale(),
+            maximized: false,
+        };
+        (live, shown)
+    }
+
+    /// Writes `window.json` — unless the window was minimized all session and
+    /// no earlier one left a place to keep.
+    fn flush(&self) {
+        let (live, shown) = self.sample();
+        if let Some(place) = self.tracker.get().closing(live, shown) {
+            persist::save_json(window_place::FILE, &Some(place));
+        }
     }
 }
 

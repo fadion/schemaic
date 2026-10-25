@@ -22,7 +22,8 @@ the next candidate and finally to `None` is what the callers already handle.
 `UiState`/`ui_state.json` is the original tenant and
 `tabs.json`, `connections.json`, `history.json`, `chats.json`, `snippets.json`,
 `favorites.json`, `db_colors.json`, `diagrams.json`, `search_history.json`, `accepted.json`,
-`ssh_known_hosts.json` and `closed_tabs.json` all arrived behind it. Every decision in it is pure and testable because
+`ssh_known_hosts.json`, `closed_tabs.json` and `window.json` (`core/window_place.rs`) all
+arrived behind it. Every decision in it is pure and testable because
 **the filesystem is an argument**: `FileStore` is the seam `write_bytes` and `read_bytes` take,
 the way `secrets::SecretStore` does for the keyring and for the same reason. What had no test
 was never `classify` or `sibling` but the *composition* — that what a save produces is what a

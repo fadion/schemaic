@@ -139,6 +139,35 @@ impl Chrome {
             Host::Windows | Host::Linux => 0.0,
         }
     }
+
+    /// Does the OS lay windows out in one space of points across every monitor,
+    /// rather than in device pixels?
+    ///
+    /// macOS does: winit hands `WindowConfig::position` to it as points
+    /// unconverted, and reports each monitor's device pixels at that monitor's
+    /// own scale. Windows and X11 lay monitors out in device pixels and convert a
+    /// logical position with the scale of the monitor the window is created on,
+    /// so there a position is launched in device pixels instead —
+    /// `window_place::LaunchPosition`. (Wayland reports no window position at all.)
+    pub const fn places_windows_in_points(self) -> bool {
+        matches!(self.host, Host::MacOs)
+    }
+
+    /// Does the OS show a new window before winit has sized, maximized and
+    /// placed it — so the window has to be created hidden and shown once it
+    /// has a frame (floem's `WindowConfig::show_after_first_frame`)?
+    ///
+    /// Windows does: winit's Win32 backend makes the window visible first, at
+    /// the system's default size, and only then applies the requested size,
+    /// the maximize and the position. A window taller than that default shows
+    /// the strip it grows into black, a window restored maximized is seen at
+    /// its normal bounds and then maximizing, and every window is blank white —
+    /// the window class's background — until the GPU has drawn a frame.
+    /// Wayland is the reason this is not simply always on: it has no hidden
+    /// state, and winit ignores the request there.
+    pub const fn shows_window_before_sizing(self) -> bool {
+        matches!(self.host, Host::Windows)
+    }
 }
 
 impl Default for Chrome {
@@ -246,6 +275,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn only_windows_shows_a_window_before_sizing_it() {
+        assert!(Chrome::of(Host::Windows).shows_window_before_sizing());
+        assert!(!Chrome::of(Host::MacOs).shows_window_before_sizing());
+        assert!(!Chrome::of(Host::Linux).shows_window_before_sizing());
+    }
+
+    #[test]
+    fn only_macos_places_windows_in_points() {
+        assert!(Chrome::of(Host::MacOs).places_windows_in_points());
+        assert!(!Chrome::of(Host::Windows).places_windows_in_points());
+        assert!(!Chrome::of(Host::Linux).places_windows_in_points());
     }
 
     #[test]

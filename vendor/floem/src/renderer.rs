@@ -149,7 +149,16 @@ impl<W: wgpu::WindowHandle> Renderer<W> {
             #[cfg(not(feature = "vello"))]
             Renderer::Vger(r) => r.resize(size.width as u32, size.height as u32, scale),
             Renderer::TinySkia(r) => r.resize(size.width as u32, size.height as u32, scale),
-            Renderer::Uninitialized { .. } => {}
+            // schemaic patch (PATCHES.md): kept, as `set_scale` keeps its
+            // scale — the renderer is built from these once the GPU is ready,
+            // and a resize dropped here leaves the surface at the launch size.
+            Renderer::Uninitialized {
+                scale: old_scale,
+                size: old_size,
+            } => {
+                *old_scale = scale;
+                *old_size = size;
+            }
         }
     }
 
@@ -386,5 +395,23 @@ impl<W: wgpu::WindowHandle> floem_renderer::Renderer for Renderer<W> {
             Renderer::TinySkia(r) => r.finish(),
             Renderer::Uninitialized { .. } => None,
         }
+    }
+}
+
+// schemaic patch (PATCHES.md): a resize before the GPU is ready is kept.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn a_resize_before_the_gpu_is_ready_is_the_size_it_starts_at() {
+        let mut r: Renderer<Arc<dyn wgpu::WindowHandle>> = Renderer::Uninitialized {
+            scale: 1.0,
+            size: Size::new(1280.0, 820.0),
+        };
+        r.resize(1.5, Size::new(3840.0, 2088.0));
+        assert_eq!(r.size(), Size::new(3840.0, 2088.0));
+        assert_eq!(r.scale(), 1.5);
     }
 }

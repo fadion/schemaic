@@ -80,6 +80,13 @@
   a Mac the process outlived its one window and *Restart to update* waited on it. The app's
   `WindowClosed` listener calls `floem::quit_app()` after its flushes (*app/main.rs*); don't drop
   it as redundant because the platform you test on exits without it.
+- **On Windows, the move that maximizing causes arrives before the window knows it is maximized.**
+  `WM_WINDOWPOSCHANGED` — Floem's `WindowMoved` — is reported before the `WM_SIZE` in which winit
+  sets its maximized flag, so `is_maximized()` read inside the move handler says *normal* and the
+  screen's bounds get recorded as the window's own. `WindowPlaceTracker` (*app/main.rs*) samples
+  on a 300 ms trailing settle after the last move or resize instead, and once more at the close;
+  don't move the read back into the event because it looks more immediate
+  (`core/window_place.rs`'s entry).
 - **One `on_scroll` per scroll** — setting it twice clobbers. `autohide` sets its own; a scroll
   needing custom `on_scroll` must inline `autohide_state()` (results grid + AI convo).
   `autohide_tracking` is `autohide` plus publishing the visible rect into a signal, from the same

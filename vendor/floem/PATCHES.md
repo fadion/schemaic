@@ -175,3 +175,60 @@ was intermittent.
 `views` still keeps a removed view's entry. Evicting it as well would change
 when a removed view's closures are dropped, which is a wider change than this
 crash needs.
+
+### 9. A resize before the GPU is ready is the size the renderer starts at
+
+**Why.** The renderer is built asynchronously: until the GPU resources arrive
+it is `Renderer::Uninitialized { scale, size }`, and the real one is then made
+from those two fields. `set_scale` updated its field while uninitialized, but
+`resize` was a no-op there, so a window resized in that interval got a surface
+at the size it was *requested* at, with the rest of the window black until the
+next resize. Schemaic hit this once it began reopening the window as it was
+left (`core/window_place.rs`): a window restored maximized is maximized in the
+event-loop turn that creates it, and a tall one is resized by Windows during
+creation, so both drew their first frame — and every frame after, until the
+user minimized and restored — at the launch size.
+
+**What.** `src/renderer.rs`, `Renderer::resize`: the `Uninitialized` arm stores
+the scale and size, as `set_scale`'s does. Tested in that file
+(`a_resize_before_the_gpu_is_ready_is_the_size_it_starts_at`, which `cargo
+test -p floem --lib` runs; the workspace's `cargo test` does not reach
+`vendor/`).
+
+### 10. `WindowConfig::show_after_first_frame` — first seen with a frame in it
+
+**Why.** winit's Win32 backend makes a new window visible *before* it applies
+the requested size, maximize and position, and the GPU is acquired
+asynchronously after that, so a new window was first seen at the system's
+default size and blank in the window class's white background. Schemaic reopens
+its window as it was left (`core/window_place.rs`): a tall window showed the
+strip it grew into black, one restored maximized was seen at its normal bounds
+and then maximizing, and every launch flashed white before the first frame.
+eframe solves the same thing the same way: hidden until the first frame.
+
+**What.** `src/window.rs`: a `show_after_first_frame` field (default `false`)
+and its setter. `src/app_handle.rs`, `new_window`: the builder gets
+`with_visible(!show_after_first_frame)`, and the flag goes to
+`WindowHandle::new`. `src/window_handle.rs`: a `show_on_first_frame` field, and
+`init_renderer` — where the renderer is built once the GPU is ready and the
+first frame drawn — shows the window after that frame, once. Anything queued in
+the creation turn (the app's maximize) has been applied by then, and a hidden
+window winit maximizes stays hidden. The app asks for it only where the host
+shows a window before sizing it (`Chrome::shows_window_before_sizing`, Windows),
+since Wayland has no hidden state. Not unit-tested: the decision lives in a
+`WindowHandle`, which needs a real window and GPU.
+
+### 11. `WindowConfig::physical_position` — a position in device pixels
+
+**Why.** `WindowConfig::position` is logical, and winit converts a logical
+position with the scale of whichever monitor the window is created on — on
+Windows the one the shell launched it on, on X11 the one under the pointer —
+which need not be the monitor it is meant for. Schemaic reopens its window where
+it was left (`core/window_place.rs`); on a setup with mixed scales a position
+saved on one monitor was re-expressed at a guessed scale and could open the
+window off-screen.
+
+**What.** `src/window.rs`: a `position_is_physical` field (default `false`) and
+the `WindowConfig::physical_position` setter; `position` clears the flag.
+`src/app_handle.rs`, `new_window`: a physical position goes to the builder as
+winit's `PhysicalPosition`, rounded, which winit places exactly.
