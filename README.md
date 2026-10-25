@@ -31,31 +31,39 @@ schema-aware intelligence, built to feel instant.
 - **SQL editor.** Highlighting, schema-aware completion, inline predictions of
   the next words (a keyword's partner, a join's foreign-key condition, the
   columns to group by, the rest of a line you ran before) that Tab accepts,
-  diagnostics from a real per-dialect parser, formatting, snippets, and `:name`
-  parameters you fill in before the run. Open, save and run `.sql` files.
+  diagnostics from a real per-dialect parser with quick fixes on Alt+Enter,
+  formatting, snippets, and `:name` parameters you fill in before the run. Open,
+  save and run `.sql` files.
 - **Results grid.** Edit cells and write them back, add, duplicate and delete
   rows, filter and sort on the server, freeze columns, and paste a block from a
-  spreadsheet. Binary cells preview as images or hex. Export to CSV, JSON, SQL,
-  Markdown, HTML or Excel.
-- **Transactions.** A per-tab manual mode with explicit commit and rollback, and
-  an optional statement timeout.
+  spreadsheet. Binary cells preview as images or hex. Chart a result as bars, a
+  line or a histogram, compare two results row by row, and export to CSV, JSON,
+  SQL, Markdown, HTML or Excel.
+- **Transactions.** A per-tab manual mode with explicit commit and rollback on
+  every engine but SQLite, an optional statement timeout, and a log of every
+  write Schemaic ran.
 - **Schema editing.** A visual table designer, editors for views, triggers,
-  routines, sequences and types, and create and drop for databases and schemas.
-  Every change is previewed as SQL first.
+  routines, events, sequences and types (and SQL Server's synonyms and XML schema
+  collections), and create and drop for databases and schemas. Every change is
+  previewed as SQL first, and a rename's preview shows what uses the object.
 - **Compare schemas.** Diff two databases on the same engine and apply the
   differences you tick as one migration.
 - **Import and export.** Load CSV, TSV, JSON or Excel into a table, with every
   problem reported before a row is written. Dump a database, schema or table to
-  one `.sql` file or a file per table.
+  one `.sql` file or a file per table, back up and restore with the engine's own
+  tools, and copy a table to another database or connection.
 - **Users and activity.** Accounts, roles and grants; live sessions with lock
-  waits, *Kill session* and *Cancel query*; and a Live Monitor that streams a
-  table's inserts, updates and deletes.
-- **Navigate.** A schema browser with favourites and table sizes, query history,
-  `EXPLAIN` plans, find-anywhere, and an ER diagram.
-- **Connect.** Direct, over SSH, or with TLS. SQL Server signs in with a SQL
-  login, Windows or Microsoft Entra. Bring your connections over from a URL,
-  DBeaver, DataGrip, `~/.my.cnf` or `~/.pgpass`. Per-connection colours,
-  environment badges and a read-only mode.
+  waits, *Kill session* and *Cancel query*; server locks and variables; and a
+  Live Monitor that streams a table's inserts, updates and deletes.
+- **Navigate.** A schema browser with favourites, table sizes and partitions,
+  query history, `EXPLAIN` plans, find-anywhere across names and definitions,
+  and an ER diagram.
+- **Connect.** Direct, over SSH (with `~/.ssh/config` hosts and jump hosts), or
+  with TLS. SQL Server signs in with a SQL login, Windows or Microsoft Entra, and
+  RDS and Cloud SQL with the cloud's IAM. Bring your connections over from a URL,
+  DBeaver, DataGrip and the other JetBrains IDEs, `~/.my.cnf`, `~/.pgpass`,
+  `~/.pg_service.conf` or the database containers Docker is running.
+  Per-connection colours, environment badges, init SQL and a read-only mode.
 - **Terminal.** An embedded shell, and a one-click `mysql`, `psql`, `sqlite3` or
   `sqlcmd` session on the active connection.
 - **AI assistant.** Drives your own Claude Code, Codex, Antigravity, OpenCode,
@@ -66,6 +74,10 @@ schema-aware intelligence, built to feel instant.
   as you allow per connection.
 - **Themes.** Dark and light themes, editor colour schemes, and an interface
   scale up to 160%.
+- **Languages.** The interface in English, German, French, Spanish, Italian,
+  Dutch, Romanian, Bulgarian and Albanian. The translations are machine-drafted,
+  and corrections are welcome; the command line, the MCP server and everything
+  sent to an AI model stay English.
 
 ### Accessibility
 
@@ -98,6 +110,10 @@ schemaic exec "UPDATE orders SET state = 'sent' WHERE id = 7" -c prod
   rows unless you raise `--limit`.
 - `explain` shows a read's query plan and flags what looks slow. It plans the
   statement without running it.
+- `export` streams a read's whole result into a JSON, CSV, SQL, Markdown, HTML
+  or Excel file, with no row cap.
+- `dump` writes a database, or the tables you name, to a `.sql` file that
+  recreates them: structure and rows, or either alone.
 - `compare` prints the SQL that would make one database's structure match
   another's, on the same connection or across two of the same engine. It runs
   nothing.
