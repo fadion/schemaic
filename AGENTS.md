@@ -79,9 +79,21 @@ decisions already taken, its non-goals, its phases and the traps worth knowing b
 Read a feature's entry before working on it, and follow what it has decided rather than
 re-deciding it; a decision that turns out wrong is changed there, with the user, not worked around
 in the code. When a phase lands, its facts move into the architecture files in the same change and
-the phase is deleted from the roadmap rather than ticked off. Keep the three disjoint: a fact about
-the system goes in `docs/architecture/`, an instruction about how to work goes in this file,
-planned work goes in `docs/roadmap.md`.
+the phase is deleted from the roadmap rather than ticked off.
+
+**`docs/guides/` is the user guide** — an mdBook for the people using the app, published under
+`guide/` on the GitHub Pages site by `pages.yml` at every release, beside the package repositories
+(one Pages site per repository, so it can't deploy on its own). It is not exhaustive by design: a
+section's overview page and a sub-page per feature where people need help. **A change a user would
+notice updates its guide page in the same change**, as with the architecture document — a new
+menu entry, a renamed label, a feature that now works on another engine. Many changes need none.
+Bold in the guide is reserved for interface labels spelled exactly as the `en-GB` catalogue spells
+them, and `core/tests/guide_labels.rs` fails on one the interface doesn't have — it is what turns
+a renamed label into a red test rather than a guide that quietly lies.
+
+Keep the four disjoint: a fact about how the system works goes in `docs/architecture/`, how a user
+does something goes in `docs/guides/`, an instruction about how to work goes in this file, planned
+work goes in `docs/roadmap.md`.
 
 ## Delegate the reading
 

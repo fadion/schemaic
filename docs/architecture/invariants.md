@@ -2229,15 +2229,22 @@ Re-introducing the anti-patterns these guard against is a regression:
   keeps asking for them for as long as Schemaic is installed — so moving one stops updates for
   every existing install, silently, with no route back to those users, exactly as a channel rename
   does. `Origin`+`Suite` is additionally the string an unattended-upgrades user pins as
-  `"Schemaic:stable"`. Three guards divide the work, all in `pages.yml` and all blocking the
+  `"Schemaic:stable"`. **The user guide shares that site, under `guide/`, for the same reason**:
+  a repository gets one Pages site, so a second workflow deploying the guide alone would replace
+  `/deb` and `/rpm` with it and orphan every install by another route. `pages.yml` builds it into
+  the one deployment instead, in a bounded step allowed to fail, so a guide that will not build
+  ships the site without `guide/` rather than holding back the packages; `book.toml`'s
+  `site-url = "/schemaic/guide/"` is a fourth copy of the base path, compared by the URL step
+  below (`app::update` has the rest). Three guards divide the work, all in `pages.yml` and all blocking the
   deploy. `verify-site.py`'s `check_client_config` pins the keyring path, `Suites: stable` and the
   `/deb` and `/rpm` segments against each *built site* — the artefact, after it exists. The host is
   parameterised through `SCHEMAIC_REPO_URL` precisely so a site can be built and installed from at
   `http://localhost:8000`, so it cannot be pinned there; it is pinned instead in the *source*, by
   the `Check the repository URL agrees everywhere` step, which compares `install.sh`'s `SITE`,
-  `build-site.sh`'s default and the workflow's own `SCHEMAIC_REPO_URL` against one literal and
-  fails if any drifts. That is the same shape as the channel guard and has the same limit: it
-  catches one of the three moving, not a deliberate edit of all four. **That step now carries the
+  `build-site.sh`'s default, the workflow's own `SCHEMAIC_REPO_URL` and the path in the guide's
+  `site-url` against one literal and fails if any drifts. That is the same shape as the channel
+  guard and has the same limit: it catches one of the four moving, not a deliberate edit of all
+  five. **That step now carries the
   other source-side identity values too**, the invariant having claimed guards for them that did not
   exist. The keyring path `Signed-By` names has **five** copies — `install.sh`, `build-site.sh`
   twice (the deb822 source and the one-line one), `index.html.in` and `verify-site.py` — of which it

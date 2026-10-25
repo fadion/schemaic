@@ -159,6 +159,50 @@ the only ordering that is true, because the site is built by downloading the rel
 just made. Failing there retracts nothing — the Release is complete and every direct download
 still works; it means the repositories describe the previous version until `workflow_dispatch`
 on the Pages workflow rebuilds them.
+**The site carries the user guide too, under `guide/`, in the same deployment — because a
+repository gets one Pages site.** A second workflow deploying the guide on its own would replace
+the whole site with it, the package repositories included, so `pages.yml`'s `Build the user
+guide` step runs `docs/guides/build.sh site/guide` after `Build the site` (which empties `site`
+first) and writes nothing outside `guide/`; `index.html.in`'s landing page links to it. The
+script downloads a pinned mdBook (0.4.52), checks its sha256 and builds the book in
+`docs/guides/`. Called from `release.yml` it is built from the tagged commit, so the published
+guide describes the release people are running rather than `main`; the `workflow_dispatch` repair
+path builds it from whatever ref the run was dispatched on — not necessarily a tag — which is the
+price of keeping one repair button, and a ref older than the guide has no `build.sh`, so the step
+skips with a notice. **The guide never holds back the packages.** A stalled or failed mdBook
+download, or a guide that will not build, would otherwise leave apt and dnf users without a
+release that is already on GitHub, so the step is `continue-on-error`, and a build failure warns,
+removes `site/guide` and lets the site ship without `guide/`. **The bound is a `timeout 240`
+around the script, inside the step**, with the step's `timeout-minutes: 6` only as a backstop: a
+step killed by its own timeout runs nothing after, so the cleanup would be skipped and a
+half-written `guide/` would ship. Whenever `guide/index.html` is absent — a failure, or a ref that
+predates the guide — the step also deletes the landing page's link to it, the paragraph
+`index.html.in` fences between `<!-- guide-link: … -->` and `<!-- /guide-link -->`. The script's `curl` carries `--connect-timeout 20 --max-time 120` as well as
+`--retry 3`, because `--retry` does not retry a transfer that hangs rather than fails. Since a
+broken guide no longer stops anything here, `ci.yml`'s `guide` job, running the same script on
+every push, is where breakage is meant to be seen. `book.toml`'s `site-url =
+"/schemaic/guide/"` — what the guide's absolute links and 404 page are built against — is a fourth
+copy of the Pages base path, and `Check the repository URL agrees everywhere` compares it with the
+expected URL alongside the other three. What the guide *says* is held by
+`core/tests/guide_labels.rs`, which reads the repository's own files. Every `**bold**` span in
+the guide's prose must be an interface label. Prose is read per paragraph block, so a label
+wrapped over two lines is read whole; fences of ```` ``` ```` or `~~~` of any length are dropped,
+and code spans close on a backtick run of the same length, as CommonMark has it. A label matches a
+message in the en-GB catalogue — select variants (`[one]`, `*[other]`) included, since a plural
+label lives only there — with a placeable standing for any non-empty text; a message with fewer
+than two literal letters is ignored outright, and one with placeables matches only when its own
+literal letters are at least half the label's, because without that `{ $n } rows` vouched for
+*Delete all rows*. Failing the catalogue, the label may be a string literal in `schemaic-ui`'s or
+`schemaic-app`'s source, counted only before a file's first `#[cfg(test)]` and only for a label
+starting in upper case, since a test fixture or a lower-case key is not something the interface
+shows. Every relative link must resolve to a file inside `docs/guides/src` — a link out to the
+README resolves in the repository and 404s on the site — and every page must be in `SUMMARY.md`
+outside an HTML comment, which is all mdBook publishes. `no_kbd_holds_a_literal_backtick` refuses
+`` <kbd>` `` (write `&#96;`): the backtick opens a code span that swallows the rest of the
+paragraph, hiding that prose from the label check too. A match says the label *exists*, not that
+the sentence around it is true, and a message ending in a placeable is still looser than an exact
+one — `Create { $kind }` accepts any text in that position, though now only up to twice its own
+six letters in all.
 **`install.sh`'s `debian` and `rpm` families now add the repository and install from it**, and
 the old single-package bodies survive as `install_deb_direct` / `install_rpm_direct` — reached
 by `SCHEMAIC_NO_REPO=1`, and for rpm automatically on a machine with neither `dnf` nor

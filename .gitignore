@@ -56,3 +56,7 @@ Session.vim
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# mdBook output when the user guide is built locally (`mdbook build docs/guides`).
+# CI builds it with docs/guides/build.sh into a folder of its own.
+/docs/guides/book/

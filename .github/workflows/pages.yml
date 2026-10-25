@@ -115,7 +115,9 @@ jobs:
       # silently, and with no route back to those users to tell them. It lives
       # in three files that have no reason to be edited together, and a drift
       # between them would publish a repository at one URL while telling people
-      # to add another. So the three are compared rather than trusted.
+      # to add another. So the three are compared rather than trusted — and a
+      # fourth, the user guide's `site-url` in docs/guides/book.toml, which
+      # carries the URL's path rather than the whole of it.
       #
       # Changing the URL deliberately means changing it in all three *and*
       # here — which is the friction, not an oversight.
@@ -130,6 +132,11 @@ jobs:
             || { echo "::error::packaging/repo/build-site.sh does not default to ${expected}"; fail=1; }
           grep -q "^ *SCHEMAIC_REPO_URL: ${expected}$" .github/workflows/pages.yml \
             || { echo "::error::this workflow does not build for ${expected}"; fail=1; }
+          # The user guide's absolute links and its 404 page are built for the
+          # same base path, under guide/.
+          guide_path="${expected#https://*/}"
+          grep -q "^site-url = \"/${guide_path}/guide/\"$" docs/guides/book.toml \
+            || { echo "::error::docs/guides/book.toml's site-url is not /${guide_path}/guide/"; fail=1; }
 
           # The **keyring path** is the same kind of value and had the same
           # number of copies: it is written into every user's source list as
@@ -194,6 +201,48 @@ jobs:
           # it.
           SCHEMAIC_EXPECT_VERSION: ${{ inputs.expect_version }}
         run: bash packaging/repo/build-site.sh site
+
+      # The user guide rides in the same deployment because a repository gets
+      # one Pages site, and a second workflow deploying the guide alone would
+      # replace the package repositories with it. Built after build-site.sh,
+      # which empties `site` first, and into `guide/` only — nothing the
+      # repositories own. Called from release.yml it is built from the tagged
+      # commit, so it describes the release people are running; the
+      # `workflow_dispatch` repair path builds whatever ref it was dispatched
+      # on, which is the price of keeping one repair button.
+      #
+      # **It never holds back the packages.** A stalled or failed mdBook
+      # download, or a guide that will not build, would otherwise leave apt and
+      # dnf users without a release that is already on GitHub — so the step is
+      # bounded, allowed to fail, and a failure ships the site without `guide/`
+      # and says so. ci.yml's `guide` job builds the same script on every push,
+      # so a broken guide is seen there first. A ref older than the guide (a
+      # repair dispatched on an old tag) has no script, and skips it.
+      #
+      # The bound is `timeout` *inside* the script, not only the step's
+      # `timeout-minutes`: a step killed by its own timeout runs nothing after,
+      # so the cleanup would never happen and a half-written guide/ would ship.
+      # Whatever the outcome, the landing page's link is dropped unless the
+      # guide's index is really there.
+      - name: Build the user guide
+        timeout-minutes: 6
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          status=0
+          if [ ! -f docs/guides/build.sh ]; then
+            echo "::notice::this ref predates the user guide; publishing without it"
+          elif ! timeout 240 bash docs/guides/build.sh site/guide; then
+            echo "::warning::the user guide did not build; the site is published without guide/"
+            rm -rf site/guide
+            status=1
+          fi
+          if [ ! -f site/guide/index.html ]; then
+            sed -i '/<!-- guide-link:/,/<!-- \/guide-link -->/d' site/index.html
+            ! grep -q 'href="guide/"' site/index.html \
+              || { echo "::error::the landing page still links to a guide that is not there"; status=1; }
+          fi
+          exit "$status"
 
       # **The published fingerprint is an identity value too**, and the one
       # the packaging README designates *the* independent channel: "a

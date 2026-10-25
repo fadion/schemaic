@@ -80,6 +80,20 @@ jobs:
       - name: License / advisory policy
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
 
+  # The user guide is published by pages.yml at release time, in the same
+  # deployment as the package repositories — so a guide that fails to build
+  # there holds back the packages too. Building it here on every push is what
+  # keeps that from first being noticed during a release. Its labels, links and
+  # table of contents are checked by `core/tests/guide_labels.rs` in `test`.
+  guide:
+    name: User guide
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the guide
+        run: bash docs/guides/build.sh "${RUNNER_TEMP}/guide"
+
   test:
     name: Build & test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

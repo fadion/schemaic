@@ -57,6 +57,11 @@
     <span class="version">Latest: __VERSION__.</span>
   </p>
 
+  <!-- guide-link: pages.yml removes this paragraph when the guide is not published -->
+  <p id="guide-link">New to Schemaic? The <a href="guide/">user guide</a> covers finding your way
+  round a database, designing tables, the ER diagram and more.</p>
+  <!-- /guide-link -->
+
   <p>The one-line way in, on any Linux, is the installer script — it detects the
   distribution, adds the right repository below, and installs:</p>
   <pre><code>curl -fsSL https://raw.githubusercontent.com/fadion/schemaic/main/install.sh | bash</code></pre>
