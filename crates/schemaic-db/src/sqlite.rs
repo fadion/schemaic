@@ -1730,7 +1730,7 @@ pub(crate) async fn run_script(
         let cancel = loop_cancel;
         let conn = match open(&db) {
             Ok(c) => c,
-            Err(e) => return (ExecEnd::Connect(e.to_string()), 0),
+            Err(e) => return (e.script_connect_end(), 0),
         };
         let _ = tx.send(conn.get_interrupt_handle());
         let mut ran = 0usize;

@@ -1160,13 +1160,16 @@ pub enum ScriptFailure {
     ReaderStopped(String),
     /// [`ReadEnd::NoTerminator`].
     NoTerminator,
+    /// [`ExecEnd::Refused`]: a refusal that stands, in Schemaic's words —
+    /// retrying unchanged refuses again.
+    Refused(String),
 }
 
 impl ScriptFailure {
     /// The failure in English.
     pub fn message(&self) -> String {
         match self {
-            ScriptFailure::Said(s) => s.clone(),
+            ScriptFailure::Said(s) | ScriptFailure::Refused(s) => s.clone(),
             ScriptFailure::Changed => "This file changed on disk after it was read, so the \
                                        summary above is not what would run. Choose it again."
                 .to_string(),
@@ -1179,6 +1182,21 @@ impl ScriptFailure {
                 .to_string(),
         }
     }
+}
+
+/// Is this piece of a script — what the runner sent as one — **a batch of
+/// several statements**? Only on T-SQL, where a piece is a `GO` batch: SQL
+/// Server goes on past a statement-terminating error inside one, so when it
+/// fails, statements of it before and after the error may have been applied,
+/// and "N statements ran before it" counts batches, not statements.
+pub fn piece_is_batch(sql: &str, dialect: SqlDialect) -> bool {
+    pieces_are_batches(dialect) && crate::sql::tsql_statements(sql, dialect).len() > 1
+}
+
+/// Does a script on `dialect` run as `GO` batches — so that a count of what
+/// ran is a count of batches, not statements?
+pub fn pieces_are_batches(dialect: SqlDialect) -> bool {
+    dialect.batch_separator()
 }
 
 /// How the executing half of a run ended — the server side.
@@ -1194,6 +1212,12 @@ pub enum ExecEnd {
     },
     /// The connection could not be opened at all, so nothing ran.
     Connect(String),
+    /// The connection was refused by a rule that stands — init SQL the
+    /// allowlist will not run, a session that cannot be made safe — so
+    /// nothing ran, and retrying unchanged refuses again. Apart from
+    /// [`ExecEnd::Connect`] so the command line can exit 3 for it, as it does
+    /// for the same refusal on every other command.
+    Refused(String),
     /// The executor saw the cancellation itself, mid-statement.
     Cancelled,
 }
@@ -1250,6 +1274,7 @@ pub fn run_outcome(read: ReadEnd, exec: ExecEnd, ran: usize) -> RunOutcome {
         (ReadEnd::ReaderStopped(e), _) => failed(ScriptFailure::ReaderStopped(e), None),
         (ReadEnd::NoTerminator, _) => failed(ScriptFailure::NoTerminator, None),
         (_, ExecEnd::Connect(e)) => failed(ScriptFailure::Said(e), None),
+        (_, ExecEnd::Refused(e)) => failed(ScriptFailure::Refused(e), None),
         (_, ExecEnd::Failed { message, sql, line }) => {
             failed(ScriptFailure::Said(message), Some((sql, line)))
         }

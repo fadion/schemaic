@@ -1542,6 +1542,24 @@ fn read_stdin(what: &str, example: &str) -> Result<String, Exit> {
     Ok(text)
 }
 
+/// [`read_stdin`]'s bytes, undecoded — for a script, whose reader decodes
+/// UTF-16 and replaces an invalid byte as it does a file's.
+fn read_stdin_bytes(what: &str, example: &str) -> Result<Vec<u8>, Exit> {
+    if std::io::stdin().is_terminal() {
+        warn(&format!(
+            "{what} is read from a pipe, and stdin is a terminal; pipe it in \
+             (e.g. `{example}`)"
+        ));
+        return Err(Exit::Usage);
+    }
+    let mut bytes = Vec::new();
+    if let Err(e) = std::io::stdin().read_to_end(&mut bytes) {
+        warn(&format!("could not read {what} from stdin: {e}"));
+        return Err(Exit::Usage);
+    }
+    Ok(bytes)
+}
+
 /// Statement text read from a pipe or a file, with a byte-order mark taken
 /// off the front.
 ///
@@ -1635,14 +1653,86 @@ fn statement(
             "-p {name} is not used: the statement has no :{name}"
         ));
     }
-    let on_command_line = matches!(source, SqlSource::Text(_)) || !params.is_empty();
-    if on_command_line && schemaic_core::sql::carries_credential(&bound, dialect) {
-        warn(
-            "this statement carries a password, which the command line puts in the \
-             process list and your shell's history; pass `-` and pipe it on stdin instead",
-        );
+    if let Some(on_argv) = credential_on_argv(&source, &text, &bound, !params.is_empty(), dialect) {
+        warn(on_argv.warning());
     }
     Ok(bound)
+}
+
+/// Which part of the command line a credential in what runs came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CredentialOnArgv {
+    /// The statement itself was the argument.
+    Statement,
+    /// A `-p` value put it there — wherever the statement came from.
+    Param,
+}
+
+impl CredentialOnArgv {
+    /// The sentence for stderr, with the advice that actually takes it off
+    /// the command line.
+    fn warning(self) -> &'static str {
+        match self {
+            CredentialOnArgv::Statement => {
+                "this statement carries a password, which the command line puts in the \
+                 process list and your shell's history; pass `-` and pipe it on stdin instead"
+            }
+            CredentialOnArgv::Param => {
+                "a -p value puts a password in this statement, and the command line puts it \
+                 in the process list and your shell's history; write it into the statement \
+                 and pipe that on stdin with `-` instead"
+            }
+        }
+    }
+}
+
+/// Is a credential in what runs **on the command line** — and through which
+/// part of it? `template` is the text before `-p` values went in, `bound`
+/// after.
+///
+/// **Asked of where the credential came from, not of whether any `-p` was
+/// given.** Any `-p` used to make the whole statement "on the command line",
+/// so a password in a file or on stdin was blamed on argv, and the advice —
+/// pipe it on stdin — left a password given through `-p` exactly where it
+/// was. One predicate for every path that takes SQL from argv, `exec
+/// --script`'s text among them, which never asked.
+///
+/// `carries_credential` reads a statement's **shape** (`IDENTIFIED BY`, `WITH
+/// PASSWORD`), so `IDENTIFIED BY :pw` carries one in the template too; what
+/// tells a `-p` secret from a written one is whether the statement of that
+/// shape holds a placeholder.
+fn credential_on_argv(
+    source: &SqlSource<'_>,
+    template: &str,
+    bound: &str,
+    has_params: bool,
+    dialect: schemaic_core::intel::SqlDialect,
+) -> Option<CredentialOnArgv> {
+    use schemaic_core::sql::{carries_credential, statement_ranges};
+    if !carries_credential(bound, dialect) {
+        return None;
+    }
+    let (mut written, mut through_param) = (false, false);
+    for (lo, hi) in statement_ranges(template, dialect) {
+        let stmt = &template[lo..hi];
+        if carries_credential(stmt, dialect) {
+            if has_params && !schemaic_core::params::scan(stmt, dialect).is_empty() {
+                through_param = true;
+            } else {
+                written = true;
+            }
+        }
+    }
+    // A raw `-p` value can bring the whole shape with it, into a template that
+    // had none.
+    let shape_from_param = has_params && !written && !through_param;
+    if through_param || shape_from_param {
+        Some(CredentialOnArgv::Param)
+    } else if written && matches!(source, SqlSource::Text(_)) {
+        Some(CredentialOnArgv::Statement)
+    } else {
+        None
+    }
 }
 
 /// `sql` with its `:name` placeholders replaced by the `-p` values, and the
@@ -2144,6 +2234,61 @@ enum ScriptInput {
     Bytes(Vec<u8>),
 }
 
+/// The script `source` names, with the name it is reported under — or the
+/// exit that says why not. `pipe` opens a `-f` path and answers `None` for a
+/// regular file, or **the whole of anything else** — a pipe, `/dev/stdin`, a
+/// `<(…)` — read once here; `stdin` reads stdin's bytes. Both are parameters
+/// so a test reaches this without a file or a pipe.
+///
+/// **A non-regular file is read once, as stdin is.** A regular file is read
+/// twice — the database scan, then the run, checked between — and a pipe
+/// read twice is empty the second time: the run reported "0 statements ran",
+/// exit 0, over a migration it never applied, or "changed on disk" while the
+/// producer was still writing. A named FIFO's second open blocked outright.
+///
+/// **Stdin is bytes, as a file is**, so the reader's UTF-16 and invalid-byte
+/// handling reaches it too: a `- < dump.sql` used to be refused as "not valid
+/// UTF-8" when `-f dump.sql` ran. And **a script given as the argument is
+/// warned about** when it carries a credential, as any statement is.
+fn script_input(
+    source: SqlSource<'_>,
+    password_stdin: bool,
+    dialect: schemaic_core::intel::SqlDialect,
+    pipe: impl FnOnce(&std::path::Path) -> std::io::Result<Option<Vec<u8>>>,
+    stdin: impl FnOnce() -> Result<Vec<u8>, Exit>,
+) -> Result<(String, ScriptInput), Exit> {
+    Ok(match source {
+        SqlSource::File(path) => {
+            let name = path.display().to_string();
+            match pipe(path) {
+                Ok(None) => (name, ScriptInput::File(path.into())),
+                Ok(Some(bytes)) => (name, ScriptInput::Bytes(bytes)),
+                Err(e) => {
+                    warn(&format!("could not read the script {name}: {e}"));
+                    return Err(Exit::Usage);
+                }
+            }
+        }
+        SqlSource::Stdin if password_stdin => {
+            warn(
+                "the script and --password-stdin cannot both come from stdin; \
+                 leave the password to the OS keyring, or pass the script with -f",
+            );
+            return Err(Exit::Usage);
+        }
+        SqlSource::Stdin => ("stdin".to_string(), ScriptInput::Bytes(stdin()?)),
+        SqlSource::Text(text) => {
+            if let Some(on_argv) = credential_on_argv(&source, text, text, false, dialect) {
+                warn(on_argv.warning());
+            }
+            (
+                "the command line".to_string(),
+                ScriptInput::Bytes(text.as_bytes().to_vec()),
+            )
+        }
+    })
+}
+
 /// `schemaic exec --script`: a whole `.sql` file on one connection, through
 /// [`exec::ScriptRequest`] — `sql::script_verdict`, the app's gate for a file
 /// — and `Db::run_script`, the app's runner.
@@ -2166,29 +2311,29 @@ async fn run_script(
     };
     let conn = &*conn;
     let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
-    let (name, input) = match sql.source() {
-        SqlSource::File(path) => (path.display().to_string(), ScriptInput::File(path.into())),
-        SqlSource::Stdin if target.conn.password_stdin => {
-            warn(
-                "the script and --password-stdin cannot both come from stdin; \
-                 leave the password to the OS keyring, or pass the script with -f",
-            );
-            return Exit::Usage;
-        }
-        SqlSource::Stdin => match read_stdin(
-            "the script",
-            "schemaic exec --script -c … --yes - < migration.sql",
-        ) {
-            Ok(text) => (
-                "stdin".to_string(),
-                ScriptInput::Bytes(sql_text(text).into_bytes()),
-            ),
-            Err(exit) => return exit,
+    let (name, input) = match script_input(
+        sql.source(),
+        target.conn.password_stdin,
+        dialect,
+        |path| {
+            let mut file = std::fs::File::open(path)?;
+            if file.metadata()?.is_file() {
+                Ok(None)
+            } else {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut bytes)?;
+                Ok(Some(bytes))
+            }
         },
-        SqlSource::Text(text) => (
-            "the command line".to_string(),
-            ScriptInput::Bytes(text.as_bytes().to_vec()),
-        ),
+        || {
+            read_stdin_bytes(
+                "the script",
+                "schemaic exec --script -c … --yes - < migration.sql",
+            )
+        },
+    ) {
+        Ok(v) => v,
+        Err(exit) => return exit,
     };
     let database = database_for(target, conn);
     let request = match exec::ScriptRequest::approved(conn, database.as_deref(), &name, yes) {
@@ -2309,7 +2454,7 @@ async fn run_script(
         .unwrap_or_else(|e| ReadEnd::ReaderStopped(e.to_string()));
     let outcome = schemaic_core::script::run_outcome(read_end, exec_end, ran);
     append_to_write_log(&entry.ended_script(&name, &outcome), dialect);
-    for line in script_report(&outcome, timeout) {
+    for line in script_report(&outcome, timeout, dialect) {
         warn(&line);
     }
     script_exit(&outcome)
@@ -2335,14 +2480,25 @@ fn append_to_write_log(
 /// **Every ending says how many statements ran**, the failures most of all: a
 /// script is not transactional unless the file said so, and that count is the
 /// answer to "how much of it happened?".
-fn script_report(outcome: &schemaic_core::script::RunOutcome, timeout: Duration) -> Vec<String> {
-    use schemaic_core::script::RunOutcome;
-    let ran = |n: usize| {
-        format!(
-            "{n} {} ran",
-            schemaic_core::text::plural(n, "statement", "statements")
-        )
+///
+/// **On SQL Server the count is of batches**, which is what the runner sends
+/// one at a time — a script with no `GO` is one — and a failed batch of
+/// several statements is said as one: SQL Server carries on past a
+/// statement's error inside a batch, so some of it may have been applied, on
+/// either side of the error. "0 statements ran before it" over a table the
+/// batch had created sent the reader back to re-run what had landed.
+fn script_report(
+    outcome: &schemaic_core::script::RunOutcome,
+    timeout: Duration,
+    dialect: schemaic_core::intel::SqlDialect,
+) -> Vec<String> {
+    use schemaic_core::script::{RunOutcome, piece_is_batch, pieces_are_batches};
+    let (one, many) = if pieces_are_batches(dialect) {
+        ("batch", "batches")
+    } else {
+        ("statement", "statements")
     };
+    let ran = |n: usize| format!("{n} {} ran", schemaic_core::text::plural(n, one, many));
     match outcome {
         RunOutcome::Done { ran: n } => vec![ran(*n)],
         RunOutcome::Cancelled { ran: n } => vec![format!(
@@ -2356,11 +2512,31 @@ fn script_report(outcome: &schemaic_core::script::RunOutcome, timeout: Duration)
             ran: n,
             at,
         } => {
-            let mut lines = vec![failure.message()];
+            let mut lines = vec![match failure {
+                // Core's sentence is the app modal's, which has a summary
+                // above it to choose again; a command line has neither.
+                schemaic_core::script::ScriptFailure::Changed => {
+                    "the file changed on disk between the database check and the run, \
+                     so none of it was run; run it again"
+                        .to_string()
+                }
+                failure => failure.message(),
+            }];
             if let Some((sql, line)) = at {
                 let head: String = sql.chars().take(200).collect();
                 let cut = if head.len() < sql.len() { "…" } else { "" };
-                lines.push(format!("the statement on line {line} failed: {head}{cut}"));
+                if piece_is_batch(sql, dialect) {
+                    lines.push(format!(
+                        "the batch starting on line {line} failed: {head}{cut}"
+                    ));
+                    lines.push(
+                        "SQL Server carries on past an error inside a batch, so statements \
+                         of this one, before and after the error, may have been applied"
+                            .to_string(),
+                    );
+                } else {
+                    lines.push(format!("the {one} on line {line} failed: {head}{cut}"));
+                }
             }
             // Nothing to say about "before it" when nothing ran and no
             // statement failed — a connect that failed, a file not readable.
@@ -2382,6 +2558,12 @@ fn script_exit(outcome: &schemaic_core::script::RunOutcome) -> Exit {
     use schemaic_core::script::RunOutcome;
     match outcome {
         RunOutcome::Done { .. } => Exit::Ok,
+        // A refusal that stands is 3 here as on every other command:
+        // retrying unchanged refuses again.
+        RunOutcome::Failed {
+            failure: schemaic_core::script::ScriptFailure::Refused(_),
+            ..
+        } => Exit::Refused,
         RunOutcome::Failed { .. } => Exit::Failed,
         RunOutcome::Cancelled { .. } => Exit::Unknown,
     }
@@ -3347,7 +3529,7 @@ mod tests {
         use schemaic_core::script::{RunOutcome, ScriptFailure};
         let t = Duration::from_secs(60);
         assert_eq!(
-            script_report(&RunOutcome::Done { ran: 1 }, t),
+            script_report(&RunOutcome::Done { ran: 1 }, t, LITE),
             vec!["1 statement ran"]
         );
         let failed = script_report(
@@ -3357,12 +3539,233 @@ mod tests {
                 at: Some(("INSERT INTO nope VALUES (2)".into(), 3)),
             },
             t,
+            LITE,
         );
         assert_eq!(failed[0], "no such table: nope");
         assert!(failed[1].contains("line 3") && failed[1].contains("INSERT INTO nope"));
         assert!(failed[2].starts_with("2 statements ran"), "{failed:?}");
-        let stopped = script_report(&RunOutcome::Cancelled { ran: 4 }, t);
+        let stopped = script_report(&RunOutcome::Cancelled { ran: 4 }, t, LITE);
         assert!(stopped[0].contains("60s") && stopped[0].contains("4 statements"));
+    }
+
+    const LITE: schemaic_core::intel::SqlDialect = schemaic_core::intel::SqlDialect::Sqlite;
+
+    /// **On SQL Server a failed batch of several statements is said as a
+    /// batch**, some of which may have been applied — not "0 statements ran
+    /// before it" over a table the batch created. The count is of batches.
+    #[test]
+    fn a_failed_tsql_batch_is_said_as_a_batch() {
+        use schemaic_core::script::{RunOutcome, ScriptFailure};
+        let ms = schemaic_core::intel::SqlDialect::MsSql;
+        let batch = "CREATE TABLE a (id int PRIMARY KEY);\nINSERT INTO a VALUES (1);\n\
+                     INSERT INTO a VALUES (1);\nINSERT INTO a VALUES (2);";
+        let lines = script_report(
+            &RunOutcome::Failed {
+                failure: ScriptFailure::Said("Violation of PRIMARY KEY".into()),
+                ran: 0,
+                at: Some((batch.into(), 1)),
+            },
+            Duration::from_secs(60),
+            ms,
+        );
+        assert!(
+            lines[1].starts_with("the batch starting on line 1"),
+            "{lines:?}"
+        );
+        assert!(lines[2].contains("may have been applied"), "{lines:?}");
+        assert!(lines[3].starts_with("0 batches ran"), "{lines:?}");
+        // One statement is no batch to explain.
+        let one = script_report(
+            &RunOutcome::Failed {
+                failure: ScriptFailure::Said("x".into()),
+                ran: 1,
+                at: Some(("INSERT INTO a VALUES (1)".into(), 4)),
+            },
+            Duration::from_secs(60),
+            ms,
+        );
+        assert!(one[1].starts_with("the batch on line 4"), "{one:?}");
+        assert!(one.iter().all(|l| !l.contains("may have been applied")));
+    }
+
+    /// **A changed file is said in the command line's words** — there is no
+    /// summary above it and nothing to choose.
+    #[test]
+    fn a_changed_script_names_no_summary() {
+        use schemaic_core::script::{RunOutcome, ScriptFailure};
+        let lines = script_report(
+            &RunOutcome::Failed {
+                failure: ScriptFailure::Changed,
+                ran: 0,
+                at: None,
+            },
+            Duration::from_secs(60),
+            LITE,
+        );
+        assert!(
+            !lines[0].contains("summary") && !lines[0].contains("Choose"),
+            "{lines:?}"
+        );
+    }
+
+    /// **A refusal that stands exits 3 on `exec --script`**, as it does on
+    /// every other command; a connect that failed stays 4.
+    #[test]
+    fn a_standing_refusal_exits_refused_on_a_script() {
+        use schemaic_core::script::{ExecEnd, ReadEnd, run_outcome};
+        let refused = run_outcome(ReadEnd::Eof, ExecEnd::Refused("init SQL".into()), 0);
+        assert_eq!(script_exit(&refused), Exit::Refused);
+        let failed = run_outcome(ReadEnd::Eof, ExecEnd::Connect("no route".into()), 0);
+        assert_eq!(script_exit(&failed), Exit::Failed);
+    }
+
+    /// **Argv is blamed only for what came from argv**: a password in a file
+    /// or on stdin is not, an unrelated `-p` changes nothing, and a password
+    /// given through `-p` gets the advice that actually takes it off the
+    /// command line.
+    #[test]
+    fn a_credential_is_blamed_on_the_part_of_argv_it_came_from() {
+        let my = schemaic_core::intel::SqlDialect::MySql;
+        let file = std::path::Path::new("f.sql");
+        let literal = "CREATE USER u IDENTIFIED BY 'pw'";
+        let on = |source: SqlSource<'_>, template: &str, bound: &str, params: bool| {
+            credential_on_argv(&source, template, bound, params, my)
+        };
+        assert_eq!(
+            on(SqlSource::Text(literal), literal, literal, false),
+            Some(CredentialOnArgv::Statement)
+        );
+        assert_eq!(on(SqlSource::File(file), literal, literal, false), None);
+        assert_eq!(on(SqlSource::File(file), literal, literal, true), None);
+        assert_eq!(on(SqlSource::Stdin, literal, literal, true), None);
+        let template = "CREATE USER u IDENTIFIED BY :pw";
+        let bound = "CREATE USER u IDENTIFIED BY 's3cret'";
+        for source in [
+            SqlSource::Text(template),
+            SqlSource::Stdin,
+            SqlSource::File(file),
+        ] {
+            assert_eq!(
+                on(source, template, bound, true),
+                Some(CredentialOnArgv::Param)
+            );
+        }
+        assert!(CredentialOnArgv::Param.warning().contains("-p"));
+        assert_eq!(
+            on(SqlSource::Text("SELECT 1"), "SELECT 1", "SELECT 1", false),
+            None
+        );
+    }
+
+    /// **`exec --script` reads its input once where once is all there is**:
+    /// a `-f` that is not a regular file comes back as bytes, a regular one
+    /// as a path to read twice; stdin's bytes are kept undecoded, so a UTF-16
+    /// script reads as `-f` reads it; and the argument is warned about like
+    /// any statement.
+    #[test]
+    fn a_scripts_input_is_read_once_unless_it_is_a_regular_file() {
+        let my = schemaic_core::intel::SqlDialect::MySql;
+        let path = std::path::Path::new("/dev/stdin");
+        let no_stdin = || -> Result<Vec<u8>, Exit> { unreachable!() };
+        let (name, input) = script_input(
+            SqlSource::File(path),
+            false,
+            my,
+            |_| Ok(Some(b"select 1;".to_vec())),
+            no_stdin,
+        )
+        .unwrap();
+        assert_eq!(name, path.display().to_string());
+        assert!(matches!(input, ScriptInput::Bytes(ref b) if b == b"select 1;"));
+        let (_, input) =
+            script_input(SqlSource::File(path), false, my, |_| Ok(None), no_stdin).unwrap();
+        assert!(matches!(input, ScriptInput::File(_)));
+        assert_eq!(
+            script_input(
+                SqlSource::File(path),
+                false,
+                my,
+                |_| Err(std::io::Error::other("gone")),
+                no_stdin
+            )
+            .err(),
+            Some(Exit::Usage)
+        );
+        // UTF-16LE with its BOM, as Windows PowerShell 5.1's `>` writes it.
+        let utf16: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain("USE other;\n".encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let (_, input) = script_input(
+            SqlSource::Stdin,
+            false,
+            my,
+            |_| unreachable!(),
+            || Ok(utf16.clone()),
+        )
+        .unwrap();
+        let ScriptInput::Bytes(bytes) = input else {
+            panic!("stdin is bytes")
+        };
+        let switches = schemaic_core::script::database_switches(&bytes[..], my).unwrap();
+        assert_eq!(switches.len(), 1, "the reader decoded UTF-16");
+        assert_eq!(
+            script_input(SqlSource::Stdin, true, my, |_| unreachable!(), no_stdin).err(),
+            Some(Exit::Usage)
+        );
+    }
+
+    /// **The guards run before the connection is dialled**, on both new
+    /// write paths — each case here would fail differently (a connect error,
+    /// a missing file) if the guard came later. The host does not resolve.
+    #[tokio::test]
+    async fn the_write_paths_refuse_before_they_connect_or_read() {
+        let url = |u: &str, read_only: bool| Target {
+            conn: ConnArgs {
+                url: Some(u.to_string()),
+                read_only,
+                ..Default::default()
+            },
+            database: None,
+        };
+        let script = |text: &str| SqlArgs {
+            sql: Some(text.to_string()),
+            file: None,
+        };
+        let t = Duration::from_secs(5);
+        let host = "mysql://u@no-such-host.invalid/shop";
+        // A script that leaves the database it was judged on.
+        let (writable, read_only) = (url(host, false), url(host, true));
+        let (leave, delete) = (
+            script("USE other; DELETE FROM t;"),
+            script("DELETE FROM t;"),
+        );
+        assert_eq!(
+            run_script(&[], &writable, &leave, true, t).await,
+            Exit::Refused
+        );
+        // A read-only connection, and a script without --yes.
+        assert_eq!(
+            run_script(&[], &read_only, &delete, true, t).await,
+            Exit::Refused
+        );
+        assert_eq!(
+            run_script(&[], &writable, &delete, false, t).await,
+            Exit::Refused
+        );
+        // An import into a read-only connection, or with no database: refused
+        // before the file — which does not exist — is opened.
+        let reading = crate::import::Reading::default();
+        let load = || ImportLoad {
+            path: std::path::Path::new("no-such-file-7c1d.csv"),
+            table: "t",
+            reading: &reading,
+            maps: &[],
+            skips: &[],
+        };
+        assert_eq!(run_import(&[], &read_only, load(), t).await, Exit::Refused);
+        let no_db = url("mysql://u@no-such-host.invalid", false);
+        assert_eq!(run_import(&[], &no_db, load(), t).await, Exit::Refused);
     }
 
     /// **A URL that carries a password is refused**, and never repeated —

@@ -361,7 +361,7 @@ fn run_script(ctx: &ScriptCtx) {
 fn script_failure_text(f: &schemaic_core::script::ScriptFailure) -> String {
     use schemaic_core::script::ScriptFailure;
     match f {
-        ScriptFailure::Said(s) => s.clone(),
+        ScriptFailure::Said(s) | ScriptFailure::Refused(s) => s.clone(),
         ScriptFailure::Changed => tr!("script-changed-since-read"),
         ScriptFailure::ReaderStopped(e) => tr!("script-reader-stopped", error = e.as_str()),
         ScriptFailure::NoTerminator => tr!("script-no-terminator"),

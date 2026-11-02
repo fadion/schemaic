@@ -185,6 +185,17 @@ impl DbError {
         }
     }
 
+    /// How a script run ends when its connection could not be opened for
+    /// this reason: a refusal that stands ([`DbRefusal::stands`]) apart from
+    /// a connect that failed, as every other path keeps them apart.
+    pub(crate) fn script_connect_end(&self) -> schemaic_core::script::ExecEnd {
+        use schemaic_core::script::ExecEnd;
+        match self {
+            DbError::Refused(r) if r.stands() => ExecEnd::Refused(self.to_string()),
+            _ => ExecEnd::Connect(self.to_string()),
+        }
+    }
+
     /// A write path's failure with what its rollback achieved — see
     /// [`DbError::Write`].
     pub(crate) fn write(
@@ -227,6 +238,26 @@ impl DbError {
 mod modal_source_tests {
     use super::{DbError, DbRefusal};
     use schemaic_core::model::ErrorSource;
+
+    /// **A script's connect refused by a rule that stands is a refusal**, so
+    /// `exec --script` exits 3 for it as `exec` does — not a failed connect,
+    /// whose 4 says retrying may work.
+    #[test]
+    fn a_standing_refusal_ends_a_script_as_refused() {
+        use schemaic_core::script::ExecEnd;
+        assert!(matches!(
+            DbError::Refused(DbRefusal::BackupInTerminal).script_connect_end(),
+            ExecEnd::Refused(_)
+        ));
+        assert!(matches!(
+            DbError::Refused(DbRefusal::CommitAborted).script_connect_end(),
+            ExecEnd::Connect(_)
+        ));
+        assert!(matches!(
+            DbError::Connect("refused".into()).script_connect_end(),
+            ExecEnd::Connect(_)
+        ));
+    }
 
     #[test]
     fn only_a_statements_failure_is_offered_a_fix() {

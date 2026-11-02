@@ -3867,7 +3867,7 @@ pub(crate) async fn run_script(
     use schemaic_core::script::ExecEnd;
     let mut client = match connect(db, Some(database)).await {
         Ok(c) => c,
-        Err(e) => return (ExecEnd::Connect(e.to_string()), 0),
+        Err(e) => return (e.script_connect_end(), 0),
     };
     let mut ran = 0usize;
     let end = loop {
