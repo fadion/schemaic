@@ -230,6 +230,9 @@ clap = { version = "4", default-features = false, features = [
     # on every invocation.
     "env",
 ] }
+# `schemaic completions <shell>`: the scripts are generated from the parser
+# above, so a new flag is completed without anyone writing it down twice.
+clap_complete = { version = "4.6", default-features = false }
 
 # Errors / logging / serde
 thiserror = "2"

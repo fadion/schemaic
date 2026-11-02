@@ -43,7 +43,7 @@ field of each one's own, so `--no-header` is on all of them at once
 (`no_header_is_on_every_row_printing_subcommand`).
 `OutputArgs::output()` is `format::Output::new`, and whether the pair goes together is judged
 there rather than by clap; `Command::output_args()` hands it to `run.rs`, `None` for `version`,
-`mcp`, `export`, `dump` and `compare` — `export` and `dump` write their rows to a file, `export`
+`completions`, `mcp`, `export`, `dump` and `compare` — `export` and `dump` write their rows to a file, `export`
 in a format of its own, and `compare` prints a script rather than rows, so none of the three
 has a stdout format to judge.
 **`explain` is `query`'s inputs and nothing a read does not take**: `SqlArgs`, `Target` and
@@ -116,7 +116,8 @@ used to, took as well (`a_piped_password_loses_a_bom_and_one_line_ending`).
 carrying a password belongs: argv sits in the process list while the command runs and in the
 shell's history afterwards, the exposure the app keeps such statements out of its own history
 for, so an argv statement `sql::carries_credential` recognises is run but warned about on
-stderr, and one from stdin or a file is not, being in neither. Stdin has one reader, so stdin
+stderr, and one from stdin or a file is not, being in neither — unless a `-p` was given, since
+its value is in argv whatever the statement's source. Stdin has one reader, so stdin
 (either spelling) together with `--password-stdin` is a usage error rather than a guess at which
 came first. **A file is still one statement**, not a script: several hit the guards they would
 as an argument — `exec`'s `NotRun::Several`, `query`'s gate — and nothing here goes near
@@ -131,6 +132,23 @@ first). Both readers go through `read_source`, which takes them as parameters so
 composition is tested too (`a_file_or_pipe_source_reads_without_its_bom`). `--timeout`'s six `default_value_t`s read
 `query::DEFAULT_TIMEOUT` through `DEFAULT_TIMEOUT_SECS`, not a second literal beside it
 (`exec_defaults_to_the_shared_timeout`).
+**`-p`/`--param` is `ParamArgs`, flattened beside `SqlArgs` into the same four commands, and kept
+out of it on purpose**: `SqlArgs`'s group admits exactly one member, so a `-p` inside it would
+make "a statement and a parameter" a parse error. It is the app's parameters bar on the command
+line — a repeatable `NAME[:KIND]=VALUE`, or `NAME:null`, parsed by `parse_param` into a
+`core::params::Binding`. The kinds are `text` (the default), `number`, `null` and `sql`, the last
+being `ParamValue::Raw`, put in as written for `ORDER BY :col`. **The kind is spelled before the
+`=`, never guessed from the value**: `42` is as often a zip code or an id kept as text as it is a
+number, and a guess that emitted it bare would change what a `WHERE` matches; text is the default
+because it is the one kind that cannot carry SQL, being quoted. Only the first `=` splits, so a
+value keeps every later one and may be empty. A leading `:` on the name is accepted, since that is
+how the statement spells it, and the name must be one the statement could spell —
+`sql::is_word_start` then `is_word_byte`, the scanner's own definitions
+(`a_param_is_text_unless_its_kind_says_otherwise`,
+`a_params_value_keeps_every_later_equals_and_may_be_empty`,
+`a_params_name_may_carry_the_statements_colon`, `a_malformed_param_is_refused`,
+`each_statement_command_takes_repeated_params`). Parsing a `-p` decides nothing about the
+statement: binding it, and every refusal that depends on the statement, is `run.rs`'s `bind`.
 **`ConnArgs` is `Target` without the database** — `-c` and `--password-stdin`, flattened into
 `Target { conn, database }` for `query`, `explain`, `export`, `dump`, `exec`, `tables` and `describe`, and taken alone by the
 two subcommands with
@@ -172,7 +190,7 @@ app's own binary a new subcommand does not reach the CLI until its name is added
 `databases` and `ping` were, and `tables` and `describe` after them — the test was seen red
 until both names went in (`every_subcommand_routes_to_the_cli`) — and `mcp`, which is not
 the app's `--mcp-serve` above though both start the one server, and `export` after it,
-`dump` after that, `explain` after that, and `compare` after that.
+`dump` after that, `explain` after that, `compare` after that, and `completions` after that.
 `schemaic.com` calls
 `run::main` without asking, so a missing name shows everywhere except through it. **That test
 and `the_help_text_names_every_subcommand` read the names off clap's `Command`**
@@ -185,3 +203,13 @@ app's own binary it **opened the GUI** instead of answering. The test now names 
 watched fail before the name went in. `Command::Version` takes no arguments and prints
 `version_text`, which is clap's own `render_version()`, so the subcommand and the flag are one
 answer rather than two that agree today (`version_prints_what_the_flag_prints`).
+**`completions <shell>` prints a shell completion script** for bash, zsh, fish, elvish or
+powershell — the positional is `clap_complete::Shell`, so any other name, or none, is a parse
+error (`completions_take_each_shell_by_its_name`). `completion_script` generates it from
+`<Cli as CommandFactory>::command()` under the bin name `schemaic`: the parser itself rather than
+a list beside it, so a subcommand or flag added to `Cli` is completed without being named a
+second time — the same reason the routing test reads its names off clap's `Command`
+(`every_completion_script_names_every_subcommand`). **It is static: commands and flags only, never
+saved connection names.** Completing those would mean running a subprocess on every Tab press,
+and that was deliberately not taken. Like `version` it touches no connection, which is why
+`run.rs` answers it before the saved connections are read.

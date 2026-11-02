@@ -326,7 +326,7 @@ Antigravity, OpenCode, Copilot and Cursor out of their own configuration with `-
 beside it. So the ordering between them is free, and this way the protocol stream stays clean
 whichever of the six opened it.
 **The headless-CLI branch sits between those two, and being *before* Velopack is the load-bearing
-part.** `schemaic list`/`databases`/`ping`/`tables`/`describe`/`query`/`explain`/`export`/`dump`/`compare`/`exec`/`mcp`/`version` return from `main` ahead of the hook, the file
+part.** `schemaic list`/`databases`/`ping`/`tables`/`describe`/`query`/`explain`/`export`/`dump`/`compare`/`exec`/`mcp`/`version`/`completions` return from `main` ahead of the hook, the file
 logger, the fonts and Floem: none of that belongs in a one-shot command, and `auto_apply_on_startup` is free
 to find a staged package and exit-and-relaunch the process — which is safe for a launch that has
 read no session state and is not safe in the middle of a command whose output someone is piping.

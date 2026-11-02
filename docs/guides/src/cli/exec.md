@@ -8,7 +8,8 @@ schemaic exec "UPDATE orders SET state = 'sent' WHERE id = 7" -c prod -d shop
 schemaic exec - -c prod -d shop < change.sql
 ```
 
-It takes one statement, given [the same three ways](reading.md#giving-the-statement) as `query`.
+It takes one statement, given [the same three ways](reading.md#giving-the-statement) as `query`,
+with its `:name` placeholders [filled in by `-p`](reading.md#filling-in-parameters).
 Several statements are refused rather than half-run — run them one at a time, so a failure
 part-way isn't something you have to piece back together.
 

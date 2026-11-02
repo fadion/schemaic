@@ -231,7 +231,7 @@ mode by the model, which made no call, so that is not proven; and Linux and macO
 writes instead, so the answer may differ. All three agent spawns in `app/ai.rs` — `run_inline`, the
 session spawn and Antigravity's `spawn_child` — set `schemaic_core::AGENT_CHILD_ENV`
 (`SCHEMAIC_AGENT_CHILD`) to `1`, which anything the agent's shell runs inherits, and the command
-line's `dispatch` refuses every command but `version` under it with `Exit::Refused` (under
+line's `dispatch` refuses every command but `version` and `completions` under it with `Exit::Refused` (under
 `cli/run.rs`). **It is a speed bump, not a boundary.** A shell that knows the name can unset it,
 so what stands between the agent and the keyring is still the vendor's sandbox, and the
 plaintext `connections.json` of the keyring-unavailable fallback stays readable by the built-in

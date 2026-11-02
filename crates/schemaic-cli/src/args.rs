@@ -133,6 +133,8 @@ pub enum Command {
         #[command(flatten)]
         sql: SqlArgs,
         #[command(flatten)]
+        params: ParamArgs,
+        #[command(flatten)]
         target: Target,
         #[command(flatten)]
         output: OutputArgs,
@@ -158,6 +160,8 @@ pub enum Command {
         #[command(flatten)]
         sql: SqlArgs,
         #[command(flatten)]
+        params: ParamArgs,
+        #[command(flatten)]
         target: Target,
         #[command(flatten)]
         output: OutputArgs,
@@ -173,6 +177,8 @@ pub enum Command {
     Export {
         #[command(flatten)]
         sql: SqlArgs,
+        #[command(flatten)]
+        params: ParamArgs,
         #[command(flatten)]
         target: Target,
         /// The file to write.
@@ -247,6 +253,8 @@ pub enum Command {
         #[command(flatten)]
         sql: SqlArgs,
         #[command(flatten)]
+        params: ParamArgs,
+        #[command(flatten)]
         target: Target,
         #[command(flatten)]
         output: OutputArgs,
@@ -272,6 +280,29 @@ pub enum Command {
     },
     /// Print the version — the same line as `--version`.
     Version,
+    /// Print a shell completion script for bash, zsh, fish, elvish or
+    /// powershell.
+    ///
+    /// Commands and flags only: saved connection names are not completed.
+    /// For bash, `schemaic completions bash > ~/.local/share/bash-completion/completions/schemaic`;
+    /// for PowerShell, `schemaic completions powershell | Out-String | Invoke-Expression`
+    /// in your profile.
+    Completions {
+        /// The shell to write the script for.
+        shell: clap_complete::Shell,
+    },
+}
+
+/// The completion script for `shell`, generated from the parser itself — so
+/// a flag added to [`Cli`] is completed without being listed a second time.
+pub fn completion_script(shell: clap_complete::Shell) -> String {
+    let mut cmd = <Cli as clap::CommandFactory>::command();
+    let mut out = Vec::new();
+    clap_complete::generate(shell, &mut cmd, "schemaic", &mut out);
+    // clap_complete writes the script as text; it is ASCII in every shell's
+    // generator, and the lossy decode is only there so a future change to that
+    // can never panic the CLI.
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// [`Target`] for `mcp`: a connection and a database, and **no
@@ -354,7 +385,8 @@ impl Command {
             | Command::Dump { .. }
             | Command::Compare { .. }
             | Command::Mcp { .. }
-            | Command::Version => None,
+            | Command::Version
+            | Command::Completions { .. } => None,
         }
     }
 }
@@ -373,6 +405,84 @@ pub struct SqlArgs {
     /// statement: a whole script is not what this runs.
     #[arg(short = 'f', long, value_name = "PATH")]
     pub file: Option<std::path::PathBuf>,
+}
+
+/// Values for the statement's `:name` placeholders — the app's parameters
+/// bar, on the command line.
+///
+/// **Apart from [`SqlArgs`]**, whose group admits exactly one member: a `-p`
+/// inside it would make "a statement and a parameter" a parse error.
+#[derive(clap::Args, Debug, Default, PartialEq, Eq)]
+pub struct ParamArgs {
+    /// Set a `:name` placeholder: `name=text`, `name:number=42`, `name:null`,
+    /// or `name:sql=created_at` for SQL put in as written (a column for
+    /// `ORDER BY :col`). Repeat for each. Text is quoted for the engine; the
+    /// guard reads the statement with the values in it.
+    #[arg(
+        short = 'p',
+        long = "param",
+        value_name = "NAME[:KIND]=VALUE",
+        value_parser = parse_param
+    )]
+    pub params: Vec<schemaic_core::params::Binding>,
+}
+
+/// One `-p`: `NAME[:KIND]=VALUE`, or `NAME:null`.
+///
+/// **The kind is spelled before the `=`, never guessed from the value.** `42`
+/// is as often a zip code or an id kept as text as it is a number, and a
+/// guess that emitted it bare would change what a `WHERE` matches. Text is
+/// the default because it is the kind that cannot carry SQL: it is quoted.
+///
+/// A leading `:` on the name is accepted, since that is how the statement
+/// spells it.
+pub fn parse_param(s: &str) -> Result<schemaic_core::params::Binding, String> {
+    use schemaic_core::params::{Binding, ParamKind, ParamValue};
+    use schemaic_core::sql::{is_word_byte, is_word_start};
+    let (head, value) = match s.split_once('=') {
+        Some((h, v)) => (h, Some(v)),
+        None => (s, None),
+    };
+    let head = head.strip_prefix(':').unwrap_or(head);
+    let (name, kind) = match head.split_once(':') {
+        Some((n, k)) => (n, Some(k)),
+        None => (head, None),
+    };
+    let named = name.as_bytes().first().is_some_and(|&b| is_word_start(b))
+        && name.bytes().all(is_word_byte);
+    if !named {
+        return Err(format!(
+            "'{name}' is not a parameter name; write it as the statement does, \
+             without the colon: -p id=42"
+        ));
+    }
+    let kind = match kind {
+        None | Some("text") => ParamKind::Text,
+        Some("number") => ParamKind::Number,
+        Some("null") => ParamKind::Null,
+        Some("sql") => ParamKind::Raw,
+        Some(other) => {
+            return Err(format!(
+                "unknown kind '{other}'; use text, number, null or sql"
+            ));
+        }
+    };
+    let value = match (kind, value) {
+        (ParamKind::Null, None) => ParamValue::Null,
+        (ParamKind::Null, Some(_)) => {
+            return Err(format!("{name}:null takes no value; drop the '='"));
+        }
+        (_, None) => {
+            return Err(format!(
+                "no value for '{name}'; write {name}=<value>, or {name}:null"
+            ));
+        }
+        (kind, Some(v)) => ParamValue::of(kind, v),
+    };
+    Ok(Binding {
+        name: name.to_string(),
+        value: Some(value),
+    })
 }
 
 /// [`SqlArgs`], resolved to the one place it names.
@@ -539,6 +649,7 @@ pub fn wants_cli(argv: &[String]) -> bool {
                 | "exec"
                 | "mcp"
                 | "version"
+                | "completions"
                 | "help"
                 | "--help"
                 | "-h"
@@ -608,6 +719,168 @@ mod tests {
                 !wants_cli(&argv(&["schemaic", flag])),
                 "`{flag}` belongs to the app, not the CLI"
             );
+        }
+    }
+
+    fn bound(
+        name: &str,
+        value: schemaic_core::params::ParamValue,
+    ) -> schemaic_core::params::Binding {
+        schemaic_core::params::Binding {
+            name: name.to_string(),
+            value: Some(value),
+        }
+    }
+
+    #[test]
+    fn a_param_is_text_unless_its_kind_says_otherwise() {
+        use schemaic_core::params::ParamValue;
+        assert_eq!(
+            parse_param("id=42"),
+            Ok(bound("id", ParamValue::Text("42".into())))
+        );
+        assert_eq!(
+            parse_param("id:text=42"),
+            Ok(bound("id", ParamValue::Text("42".into())))
+        );
+        assert_eq!(
+            parse_param("id:number=42"),
+            Ok(bound("id", ParamValue::Number("42".into())))
+        );
+        assert_eq!(
+            parse_param("gone:null"),
+            Ok(bound("gone", ParamValue::Null))
+        );
+        assert_eq!(
+            parse_param("col:sql=created_at DESC"),
+            Ok(bound("col", ParamValue::Raw("created_at DESC".into())))
+        );
+    }
+
+    /// Only the first `=` splits: the rest is the value, as typed — a URL's
+    /// query string, an expression, an empty string.
+    #[test]
+    fn a_params_value_keeps_every_later_equals_and_may_be_empty() {
+        use schemaic_core::params::ParamValue;
+        assert_eq!(
+            parse_param("q=a=b&c=d"),
+            Ok(bound("q", ParamValue::Text("a=b&c=d".into())))
+        );
+        assert_eq!(
+            parse_param("e:sql=x = 1"),
+            Ok(bound("e", ParamValue::Raw("x = 1".into())))
+        );
+        assert_eq!(
+            parse_param("s="),
+            Ok(bound("s", ParamValue::Text(String::new())))
+        );
+    }
+
+    #[test]
+    fn a_params_name_may_carry_the_statements_colon() {
+        use schemaic_core::params::ParamValue;
+        assert_eq!(
+            parse_param(":id=7"),
+            Ok(bound("id", ParamValue::Text("7".into())))
+        );
+    }
+
+    #[test]
+    fn a_malformed_param_is_refused() {
+        for bad in [
+            "id",         // no value and not null
+            "id:number",  // a kind with no value
+            "id:null=x",  // null with a value
+            "id:float=1", // no such kind
+            "=1",         // no name
+            "1id=1",      // not a name the statement could spell
+            "a b=1",      // nor this
+            ":=1",        // a colon and nothing else
+        ] {
+            assert!(parse_param(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn each_statement_command_takes_repeated_params() {
+        use schemaic_core::params::ParamValue;
+        for sub in ["query", "explain", "exec", "export"] {
+            let mut line = vec![
+                "schemaic",
+                sub,
+                "SELECT :a, :b",
+                "-c",
+                "x",
+                "-p",
+                "a=1",
+                "--param",
+                "b:null",
+            ];
+            if sub == "export" {
+                line.extend(["-o", "out.csv"]);
+            }
+            let params = match parse(&line)
+                .unwrap_or_else(|e| panic!("{sub}: {e}"))
+                .command
+            {
+                Command::Query { params, .. }
+                | Command::Explain { params, .. }
+                | Command::Exec { params, .. }
+                | Command::Export { params, .. } => params.params,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(
+                params,
+                vec![
+                    bound("a", ParamValue::Text("1".into())),
+                    bound("b", ParamValue::Null)
+                ],
+                "{sub}"
+            );
+        }
+    }
+
+    #[test]
+    fn completions_take_each_shell_by_its_name() {
+        for (name, shell) in [
+            ("bash", clap_complete::Shell::Bash),
+            ("zsh", clap_complete::Shell::Zsh),
+            ("fish", clap_complete::Shell::Fish),
+            ("elvish", clap_complete::Shell::Elvish),
+            ("powershell", clap_complete::Shell::PowerShell),
+        ] {
+            assert_eq!(
+                parse(&["schemaic", "completions", name]).unwrap().command,
+                Command::Completions { shell },
+                "{name}"
+            );
+        }
+        assert!(parse(&["schemaic", "completions"]).is_err());
+        assert!(parse(&["schemaic", "completions", "cmd"]).is_err());
+    }
+
+    /// Generated from the parser, so every subcommand is in every script —
+    /// a new one cannot be left out of completion the way it could be left
+    /// out of a hand-written list.
+    #[test]
+    fn every_completion_script_names_every_subcommand() {
+        let names: Vec<String> = <Cli as clap::CommandFactory>::command()
+            .get_subcommands()
+            .map(|s| s.get_name().to_string())
+            .collect();
+        for shell in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Fish,
+            clap_complete::Shell::Elvish,
+            clap_complete::Shell::PowerShell,
+        ] {
+            let script = completion_script(shell);
+            for name in &names {
+                assert!(script.contains(name.as_str()), "{shell}: {name}");
+            }
+            // Not `--connection`: fish spells a long option `-l connection`.
+            assert!(script.contains("connection"), "{shell}");
         }
     }
 
@@ -732,6 +1005,7 @@ mod tests {
         .unwrap();
         let Command::Explain {
             sql,
+            params: _,
             target,
             output,
             timeout,

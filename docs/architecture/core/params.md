@@ -66,6 +66,11 @@ unit-tested.
 The UI half: `Tab::params` is the bar's store (session-only — no `SavedTab` field, and
 `ParamValue` has no `Serialize` derive), `editor_pane::params_bar` renders one row per distinct
 name under the editor, and `guarded_run`/`guarded_run_all` in `schemaic-app` substitute with it.
+**The headless CLI is `substitute`'s second caller** — `-p`/`--param` on `query`, `explain`,
+`export` and `exec`, bound in `cli/run.rs`'s `bind` before any of its gates reads the statement.
+It calls `substitute`, not `prepare_run`, and feeds the result to the gates it already had —
+`query::gate` for the reads, `ExecRequest::approved` (which asks `run_verdict` itself) for
+`exec`. A substitution of its own there would be a second answer to what a placeholder is.
 Rows are keyed by **name**, not value, so typing into a field never rebuilds the field being
 typed into. **The names are read once typing settles** (150 ms, a generation retiring the
 asks it overtook), not per keystroke: `params::names` scans the whole document, measured 9.7 /

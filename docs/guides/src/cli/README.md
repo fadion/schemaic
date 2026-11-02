@@ -26,6 +26,22 @@ schemaic exec "UPDATE orders SET state = 'sent' WHERE id = 7" -c prod -d shop
 `schemaic list` shows the connections the command may use; `schemaic list --all` shows the rest
 too, with a `cli access` column, so you can see why one you expected is missing.
 
+## Tab completion
+
+`schemaic completions <shell>` prints a completion script for `bash`, `zsh`, `fish`, `elvish` or
+`powershell`. It completes the commands and their flags, not your connection names. Save it
+where your shell looks for completions, then open a new terminal:
+
+| Shell      | Where it goes                                                                       |
+|------------|-------------------------------------------------------------------------------------|
+| bash       | `schemaic completions bash > ~/.local/share/bash-completion/completions/schemaic` (needs the `bash-completion` package) |
+| zsh        | A file named `_schemaic` in a folder on your `$fpath`: `schemaic completions zsh > <folder>/_schemaic` |
+| fish       | `schemaic completions fish > ~/.config/fish/completions/schemaic.fish`              |
+| PowerShell | Add `schemaic completions powershell \| Out-String \| Invoke-Expression` to your `$PROFILE` |
+
+The script comes from the version that printed it, so print it again after an update that adds a
+command or a flag.
+
 ## Picking a connection and database
 
 Every command that reaches a server takes `-c` (`--connection`) and, where it runs in a database,
@@ -59,6 +75,7 @@ password from a pipe instead: `cat pw.txt | schemaic ping -c prod --password-std
 | `exec`       | Runs one statement that writes                                               |
 | `mcp`        | Serves a connection to an AI agent over MCP                                  |
 | `version`    | Prints the version                                                           |
+| `completions` | Prints a tab-completion script for your shell                                |
 
 `schemaic <command> --help` gives every flag. Each command that waits on a server takes
 `--timeout`, in seconds: 30 by default, two minutes for `compare`, an hour for `export` and

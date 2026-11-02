@@ -53,6 +53,24 @@ command until something killed it. Measured after the fix, an unreachable SSH ho
 connect, 60 s to authenticate — the `ssh.rs` entry has why), so this wrapper is no longer the
 only thing between a silent endpoint and a hung command. It stays: `--timeout` may be shorter
 than either, and whichever bound is shorter answers first.
+**"Take the statement" binds its `-p` values, so every gate after it reads what the engine will
+be sent.** `statement` — shared by `query`, `explain`, `export` and `exec` — reads the source and
+returns it through `bind`, which is `core::params::substitute`, the app's substitution rather than
+a second one: the same scan decides what is a placeholder, and the same rendering quotes text and
+refuses a number that is not one. `query::gate`, `ExecRequest::approved` and the write log's entry
+therefore all hold the bound statement, never the template — the composition that makes the `sql`
+kind safe, since a raw value can turn a read into a write and a gate shown `SELECT 1; :x` would
+pass what the engine runs as `SELECT 1; DELETE FROM t`
+(`the_statement_the_gates_read_has_the_values_in_it`, seen red against `statement` returning the
+template). **A placeholder with no `-p` is refused, never sent as written** — on MySQL `:id` is a
+syntax error at best — and so is a name given twice, since which of two values wins is not
+something to leave to argument order; both, and a `number` that is not one, are a `warn` and
+`Exit::Usage` before anything is gated or dialled (`a_statement_missing_a_param_is_a_usage_error`,
+`bind_refuses_a_placeholder_with_no_value`, `bind_refuses_a_name_given_twice`,
+`bind_refuses_a_number_that_is_not_one`). A `-p` the statement never asks for is only a warning on
+stderr, and the statement runs (`bind_reports_a_param_the_statement_never_asks_for`). The
+credential warning reads the bound text, and fires for a statement from stdin or a file too once a
+`-p` was given, its value being in argv.
 **Every byte of data goes through `emit`, never `print!`**, which panics when the write fails:
 `schemaic list | head -3` exited 101 — no code the contract names — with a panic message on the
 stderr an agent reads as the diagnosis. A `BrokenPipe` is a quiet `Exit::Ok`, the reader having
@@ -100,15 +118,19 @@ needs no saved connection, and a damaged `connections.json` must not stop anyone
 build they have — the first thing asked of someone reporting it damaged. Checked by hand with a
 corrupt file: `schemaic version` printed `schemaic 0.27.1` and exited 0, `schemaic list` 4. The
 `match` below keeps an `unreachable!` arm for it; folding `version` into that `match` like its
-peers would look tidier and put the file read back in front of it. **Under the AI panel's agent
-it is the only command that answers**: next, `agent_refusal(command, under_agent)` — pure,
+peers would look tidier and put the file read back in front of it. **`completions` is answered
+right after it, for the same reason** — a completion script is the parser's own shape and needs
+no connection — and shares that `unreachable!` arm. **Under the AI panel's agent these two are
+the only commands that answer**: next, `agent_refusal(command, under_agent)` — pure,
 `under_agent` being whether `schemaic_core::AGENT_CHILD_ENV` is set, as it is in every agent
 child the panel spawns and so in whatever that agent's shell runs — refuses every other command
 with a `warn` and `Exit::Refused`, before anything is read or dialled, because the assistant's
 way to a connection is the panel's own tools at the level the user chose, and an agent shell
 running `schemaic exec` or `query` would step past both
-(`under_the_panels_agent_only_version_answers`, which holds `version` to answering and every
-other command to refusing only when the variable is set). It is a speed bump and not a boundary —
+(`under_the_panels_agent_only_version_and_completions_answer`, which holds `version` and
+`completions` to answering and every other command to refusing only when the variable is set).
+`agent_refusal` exempts the two by its own answer, not only by `dispatch` returning them first, so
+moving the refusal above the early returns would change nothing. It is a speed bump and not a boundary —
 a shell can unset the variable — and `ai/harness.md` says what does stand there. **The output
 flags are judged next, still before the file is read**: `command.output_args()` resolved through
 `OutputArgs::output`, and a pair that does not go together — `--no-header` with a format that
@@ -294,7 +316,10 @@ as the editor (`core::write_log`). `log_entry` stamps a `Source::Cli` entry unde
 connection's saved name only when `write_log::is_logged` answers for the statement, because
 `exec` runs reads too and the log has no business holding them — though it errs toward a
 write, a `SELECT` of a writing function included on PostgreSQL and SQL Server — not on the
-MySQL family or SQLite (under `write_log.rs`). It is stamped after
+MySQL family or SQLite (under `write_log.rs`). The statement it records is the bound one, so a
+`text` or `number` `-p` is a literal there and masked as any literal is unless the user turned
+values on; a `sql` value is recorded as the code it became.
+It is stamped after
 `connect`, so a refusal or a connection that failed leaves no line, nothing having been sent.
 `log_exec` ends it through `Entry::landed`, `exec::run`'s answer mapped by `exec_ran` — rows
 affected, the message on a failure, and **`Unknown` for `NoRows::Indeterminate`** — exit 5's

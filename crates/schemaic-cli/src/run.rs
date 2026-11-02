@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use schemaic_core::connection::Connection;
 use schemaic_core::model::{Column, ResultSet, Value};
+use schemaic_core::params::Binding;
 use schemaic_core::secrets::SecretKind;
 use schemaic_core::sql::NoDatabaseFailure;
 use schemaic_db::Db;
@@ -233,10 +234,12 @@ where
 
 /// Why `command` is refused when this process descends from an agent the AI
 /// panel spawned (`under_agent`: [`schemaic_core::AGENT_CHILD_ENV`] is set),
-/// or `None`. Every command but `version` reaches a saved connection, and the
-/// assistant's way to one is the panel's tools, at the level the user chose.
+/// or `None`. Every command but `version` and `completions` reaches a saved
+/// connection, and the assistant's way to one is the panel's tools, at the
+/// level the user chose.
 fn agent_refusal(command: &Command, under_agent: bool) -> Option<&'static str> {
-    (under_agent && *command != Command::Version).then_some(
+    let reaches_a_connection = !matches!(command, Command::Version | Command::Completions { .. });
+    (under_agent && reaches_a_connection).then_some(
         "refused: this is running under Schemaic's AI panel, whose assistant reaches \
          the database through the panel's own tools, not the command line",
     )
@@ -248,6 +251,13 @@ async fn dispatch(command: Command) -> Exit {
     // the first thing to ask when reporting that it is damaged.
     if command == Command::Version {
         return emit_stdout(&crate::args::version_text())
+            .err()
+            .unwrap_or(Exit::Ok);
+    }
+    // A completion script is the parser's own shape: no connection, so it is
+    // answered here for the same reason as the version.
+    if let Command::Completions { shell } = command {
+        return emit_stdout(&crate::args::completion_script(shell))
             .err()
             .unwrap_or(Exit::Ok);
     }
@@ -281,7 +291,9 @@ async fn dispatch(command: Command) -> Exit {
         }
     };
     match command {
-        Command::Version => unreachable!("`version` is answered before the file is read"),
+        Command::Version | Command::Completions { .. } => {
+            unreachable!("`version` and `completions` are answered before the file is read")
+        }
         Command::List { all, output: _ } => list(&file.connections, all, out),
         Command::Databases {
             conn,
@@ -325,6 +337,7 @@ async fn dispatch(command: Command) -> Exit {
         }
         Command::Query {
             sql,
+            params,
             target,
             output: _,
             limit,
@@ -335,6 +348,7 @@ async fn dispatch(command: Command) -> Exit {
                 &file.connections,
                 &target,
                 &sql,
+                &params.params,
                 out,
                 limit,
                 fail_on_cap,
@@ -344,6 +358,7 @@ async fn dispatch(command: Command) -> Exit {
         }
         Command::Explain {
             sql,
+            params,
             target,
             output: _,
             timeout,
@@ -352,6 +367,7 @@ async fn dispatch(command: Command) -> Exit {
                 &file.connections,
                 &target,
                 &sql,
+                &params.params,
                 out,
                 Duration::from_secs(timeout),
             )
@@ -359,6 +375,7 @@ async fn dispatch(command: Command) -> Exit {
         }
         Command::Exec {
             sql,
+            params,
             target,
             output: _,
             yes,
@@ -368,6 +385,7 @@ async fn dispatch(command: Command) -> Exit {
                 &file.connections,
                 &target,
                 &sql,
+                &params.params,
                 out,
                 yes,
                 Duration::from_secs(timeout),
@@ -376,6 +394,7 @@ async fn dispatch(command: Command) -> Exit {
         }
         Command::Export {
             sql,
+            params,
             target,
             output,
             format,
@@ -385,6 +404,7 @@ async fn dispatch(command: Command) -> Exit {
                 &file.connections,
                 &target,
                 &sql,
+                &params.params,
                 &output,
                 format.as_deref(),
                 Duration::from_secs(timeout),
@@ -831,6 +851,7 @@ async fn run_export(
     conns: &[Connection],
     target: &Target,
     sql: &SqlArgs,
+    params: &[Binding],
     output: &std::path::Path,
     format: Option<&str>,
     timeout: Duration,
@@ -859,7 +880,7 @@ async fn run_export(
         Ok(c) => c,
         Err(exit) => return exit,
     };
-    let sql = match statement(sql, target, conn) {
+    let sql = match statement(sql, params, target, conn) {
         Ok(s) => s,
         Err(exit) => return exit,
     };
@@ -1292,9 +1313,20 @@ fn read_source(
 /// it. An argument that carries a credential is run, but said — it is in the
 /// process list for as long as the command runs and in the shell's history
 /// after, the exposure the app keeps such statements out of its own history for.
-/// Stdin and a file are neither, so they are not warned about.
-fn statement(sql: &SqlArgs, target: &Target, conn: &Connection) -> Result<String, Exit> {
-    let sql = match sql.source() {
+/// Stdin and a file are neither, so they are not warned about — unless a `-p`
+/// put the credential back on the command line.
+///
+/// **What comes back has its `-p` values in it** ([`bind`]), so every gate
+/// after this — `query`'s read gate, `exec`'s guard, the write log — reads the
+/// statement the engine will be sent, never the template.
+fn statement(
+    sql: &SqlArgs,
+    params: &[Binding],
+    target: &Target,
+    conn: &Connection,
+) -> Result<String, Exit> {
+    let source = sql.source();
+    let text = match source {
         SqlSource::Stdin if target.conn.password_stdin => {
             warn(
                 "the statement and --password-stdin cannot both come from stdin; \
@@ -1303,21 +1335,74 @@ fn statement(sql: &SqlArgs, target: &Target, conn: &Connection) -> Result<String
             );
             return Err(Exit::Usage);
         }
-        SqlSource::Text(sql) => sql,
-        source => {
-            return read_source(source, read_sql_file, || {
-                read_stdin("the statement", "schemaic exec -c … - < change.sql")
-            });
-        }
+        SqlSource::Text(sql) => sql.to_string(),
+        source => read_source(source, read_sql_file, || {
+            read_stdin("the statement", "schemaic exec -c … - < change.sql")
+        })?,
     };
     let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
-    if schemaic_core::sql::carries_credential(sql, dialect) {
+    let (bound, unused) = bind(&text, params, dialect).map_err(|why| {
+        warn(&why);
+        Exit::Usage
+    })?;
+    for name in unused {
+        warn(&format!(
+            "-p {name} is not used: the statement has no :{name}"
+        ));
+    }
+    let on_command_line = matches!(source, SqlSource::Text(_)) || !params.is_empty();
+    if on_command_line && schemaic_core::sql::carries_credential(&bound, dialect) {
         warn(
             "this statement carries a password, which the command line puts in the \
              process list and your shell's history; pass `-` and pipe it on stdin instead",
         );
     }
-    Ok(sql.to_string())
+    Ok(bound)
+}
+
+/// `sql` with its `:name` placeholders replaced by the `-p` values, and the
+/// names given that it never asks for — or why it cannot be sent.
+///
+/// **The app's substitution, not a second one** (`params::substitute`): the
+/// same scan decides what is a placeholder, and the same rendering quotes text
+/// and refuses a number that is not one.
+///
+/// **A placeholder with no `-p` is refused**, never sent as written: on
+/// MySQL `:id` is a syntax error at best, and on SQL Server a `:` line can be
+/// a sqlcmd command. A name given twice is refused too — which of two values
+/// "wins" is not something to leave to argument order.
+fn bind(
+    sql: &str,
+    params: &[Binding],
+    dialect: schemaic_core::intel::SqlDialect,
+) -> Result<(String, Vec<String>), String> {
+    use schemaic_core::params::{ParamError, names, substitute};
+    for (i, p) in params.iter().enumerate() {
+        if params[..i].iter().any(|q| q.name == p.name) {
+            return Err(format!("-p {} is given twice", p.name));
+        }
+    }
+    let bound = substitute(sql, params, dialect).map_err(|e| match e {
+        ParamError::Missing(missing) => {
+            let list = missing
+                .iter()
+                .map(|n| format!(":{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "no value for {list}; pass -p {}=<value> (or {}:null)",
+                missing[0], missing[0]
+            )
+        }
+        other => other.to_string(),
+    })?;
+    let asked = names(sql, dialect);
+    let unused = params
+        .iter()
+        .filter(|p| !asked.contains(&p.name))
+        .map(|p| p.name.clone())
+        .collect();
+    Ok((bound, unused))
 }
 
 /// Hydrate `conn` and open it, tunnel included — **only after the guard has
@@ -1404,10 +1489,12 @@ fn emit_rows(rs: &ResultSet, out: Output) -> Result<(), Exit> {
 /// **Select, gate, then connect.** A refused statement exits 3, which promises
 /// nothing reached a server; opening first meant a loop on a refusal made a
 /// real SSH login each time round.
+#[allow(clippy::too_many_arguments)]
 async fn run_query(
     conns: &[Connection],
     target: &Target,
     sql: &SqlArgs,
+    params: &[Binding],
     out: Output,
     limit: usize,
     fail_on_cap: bool,
@@ -1417,7 +1504,7 @@ async fn run_query(
         Ok(c) => c,
         Err(exit) => return exit,
     };
-    let sql = match statement(sql, target, conn) {
+    let sql = match statement(sql, params, target, conn) {
         Ok(s) => s,
         Err(exit) => return exit,
     };
@@ -1458,6 +1545,7 @@ async fn run_explain(
     conns: &[Connection],
     target: &Target,
     sql: &SqlArgs,
+    params: &[Binding],
     out: Output,
     timeout: Duration,
 ) -> Exit {
@@ -1465,7 +1553,7 @@ async fn run_explain(
         Ok(c) => c,
         Err(exit) => return exit,
     };
-    let sql = match statement(sql, target, conn) {
+    let sql = match statement(sql, params, target, conn) {
         Ok(s) => s,
         Err(exit) => return exit,
     };
@@ -1680,6 +1768,7 @@ async fn run_exec(
     conns: &[Connection],
     target: &Target,
     sql: &SqlArgs,
+    params: &[Binding],
     out: Output,
     yes: bool,
     timeout: Duration,
@@ -1688,7 +1777,7 @@ async fn run_exec(
         Ok(c) => c,
         Err(exit) => return exit,
     };
-    let sql = match statement(sql, target, conn) {
+    let sql = match statement(sql, params, target, conn) {
         Ok(s) => s,
         Err(exit) => return exit,
     };
@@ -1829,13 +1918,15 @@ fn default_database(flag: Option<&str>, conn: &Connection) -> Option<String> {
 mod tests {
     use super::*;
     use crate::args::Cli;
+    use schemaic_core::intel::SqlDialect;
 
     /// **Under the AI panel's agent, the command line reaches no connection**
     /// (security review S2). A harness that keeps a shell could run `schemaic
     /// exec` — a write the panel's MCP tools never offer — or `schemaic query`
-    /// past the panel's data level. Only `version` answers there.
+    /// past the panel's data level. Only `version` and `completions` answer
+    /// there — neither reaches a connection.
     #[test]
-    fn under_the_panels_agent_only_version_answers() {
+    fn under_the_panels_agent_only_version_and_completions_answer() {
         let parse = |line: &[&str]| {
             crate::args::parse_argv(
                 std::iter::once(&"schemaic")
@@ -1856,6 +1947,7 @@ mod tests {
             assert!(agent_refusal(&parse(line), false).is_none(), "{line:?}");
         }
         assert!(agent_refusal(&Command::Version, true).is_none());
+        assert!(agent_refusal(&parse(&["completions", "bash"]), true).is_none());
     }
 
     fn listed(tables: &[(Option<&str>, &str)]) -> schemaic_core::schema::DbSchema {
@@ -2346,6 +2438,115 @@ mod tests {
         .unwrap();
         c.database = database.to_string();
         c
+    }
+
+    fn param(s: &str) -> Binding {
+        crate::args::parse_param(s).unwrap()
+    }
+
+    #[test]
+    fn bind_substitutes_each_kind_as_the_app_does() {
+        let (sql, unused) = bind(
+            "SELECT * FROM t WHERE a = :a AND b = :b AND c IS :c ORDER BY :col",
+            &[
+                param("a=it's"),
+                param("b:number=42"),
+                param("c:null"),
+                param("col:sql=created_at"),
+            ],
+            SqlDialect::MySql,
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM t WHERE a = 'it''s' AND b = 42 AND c IS NULL ORDER BY created_at"
+        );
+        assert!(unused.is_empty());
+    }
+
+    #[test]
+    fn bind_leaves_a_statement_without_placeholders_alone() {
+        assert_eq!(
+            bind("SELECT a::text, @x := 1", &[], SqlDialect::Postgres),
+            Ok(("SELECT a::text, @x := 1".to_string(), vec![]))
+        );
+    }
+
+    /// **Never sent with the placeholder in it.** Every name missing is named,
+    /// with the flag that would supply it.
+    #[test]
+    fn bind_refuses_a_placeholder_with_no_value() {
+        let why = bind("SELECT :a, :b", &[param("a=1")], SqlDialect::MySql).unwrap_err();
+        assert!(why.contains(":b") && !why.contains(":a,"), "{why}");
+        assert!(why.contains("-p b="), "{why}");
+    }
+
+    #[test]
+    fn bind_refuses_a_number_that_is_not_one() {
+        let why = bind(
+            "SELECT :n",
+            &[param("n:number=1 OR 1=1")],
+            SqlDialect::MySql,
+        )
+        .unwrap_err();
+        assert!(why.contains(":n"), "{why}");
+    }
+
+    #[test]
+    fn bind_refuses_a_name_given_twice() {
+        let why = bind(
+            "SELECT :a",
+            &[param("a=1"), param("a=2")],
+            SqlDialect::MySql,
+        )
+        .unwrap_err();
+        assert!(why.contains("twice"), "{why}");
+    }
+
+    #[test]
+    fn bind_reports_a_param_the_statement_never_asks_for() {
+        assert_eq!(
+            bind(
+                "SELECT :a",
+                &[param("a=1"), param("typo=2")],
+                SqlDialect::MySql
+            ),
+            Ok(("SELECT '1'".to_string(), vec!["typo".to_string()]))
+        );
+    }
+
+    /// **The guard reads the bound statement** — the composition `bind` alone
+    /// cannot pin. A raw value that turns a read into a write must reach
+    /// `query`'s gate as the write it is; with `statement` handing back the
+    /// template, the gate would pass `SELECT :x` and the engine would run a
+    /// `DELETE`.
+    #[test]
+    fn the_statement_the_gates_read_has_the_values_in_it() {
+        let sql = SqlArgs {
+            sql: Some("SELECT 1; :x".to_string()),
+            file: None,
+        };
+        let bound = statement(
+            &sql,
+            &[param("x:sql=DELETE FROM t")],
+            &target(None),
+            &conn("shop"),
+        )
+        .unwrap();
+        assert_eq!(bound, "SELECT 1; DELETE FROM t");
+        assert!(query::gate(&bound, SqlDialect::MySql).is_err());
+    }
+
+    #[test]
+    fn a_statement_missing_a_param_is_a_usage_error() {
+        let sql = SqlArgs {
+            sql: Some("SELECT :x".to_string()),
+            file: None,
+        };
+        assert_eq!(
+            statement(&sql, &[], &target(None), &conn("shop")),
+            Err(Exit::Usage)
+        );
     }
 
     fn target(database: Option<&str>) -> Target {

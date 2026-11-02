@@ -131,30 +131,6 @@ with a sync script.
 
 ## CLI
 
-### Shell completions
-
-Generate bash, zsh, fish, elvish and PowerShell completions with `clap_complete`, from a
-`completions <shell>` subcommand. Add it to the `wants_cli` allowlist.
-
-- **Decided:** static only. Saved connection names are not completed: that would run a
-  subprocess on every Tab press.
-
-### `--param name=value`
-
-The app has `:name` parameters (`core::params`), but the CLI cannot bind them.
-
-- **Decided:** `-p/--param`, repeatable, on `query`, `exec` and `export`. The value's kind is
-  spelled before the `=`, matching the app's four kinds:
-  - `-p name=value` is text, quoted as a literal.
-  - `-p name:number=42` is a number, refused if it isn't one.
-  - `-p name:null` is NULL.
-  - `-p name:sql=created_at` is raw SQL, which is what makes `ORDER BY :col` work.
-- **Decided:** substitution goes through the same function the app's run does
-  (`params::prepare_run`'s substitution), before any guard, so every gate reads the statement as
-  it will be sent. That is also what makes the raw kind safe.
-- **Trap:** a statement with placeholders and no `-p` for one of them is refused as a usage error,
-  never sent with the placeholder in it.
-
 ### Run a `.sql` script
 
 `schemaic compare` prints a migration, but nothing in the CLI can apply it: `exec` refuses more

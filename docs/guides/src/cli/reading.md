@@ -18,6 +18,33 @@ It must be a single statement; a whole script is refused. Pass a statement that 
 with `-` on stdin, so it doesn't land in your shell history. A statement can't come from stdin
 together with `--password-stdin`, since stdin has only one reader.
 
+## Filling in parameters
+
+A statement can carry `:name` placeholders, as in the editor's
+[parameters](../query-editor/README.md#running-sql). Give each one a value with `-p`
+(`--param`), repeated once per name:
+
+```sh
+schemaic query "SELECT * FROM orders WHERE customer_id = :id AND state = :state" -c prod -d shop -p id:number=7 -p state=sent
+schemaic query -f report.sql -c prod -d shop -p col:sql=created_at
+```
+
+| Written                  | Goes in as                                                                 |
+|--------------------------|----------------------------------------------------------------------------|
+| `-p name=value`          | Text, quoted for the engine                                                |
+| `-p name:number=42`      | A number; a value that isn't one is refused                                |
+| `-p name:null`           | `NULL`                                                                     |
+| `-p name:sql=created_at` | SQL, put in as written — for what isn't a value, like the column in `ORDER BY :col` |
+
+Only the first `=` splits, so a value may contain `=`. Quote the whole `-p` for your shell when
+the value has spaces.
+
+A placeholder with no `-p`, or a name given twice, stops the command with exit code 2 before
+anything is sent. A `-p` the statement doesn't use is only warned about on stderr. The checks
+below read the statement with the values in, so a `:sql` value that writes is refused by `query`
+just as if you'd typed it into the statement. A password in a `-p` value lands in your shell
+history as one in the statement would, and gets the same warning on stderr.
+
 ## Only reads
 
 These commands accept only a statement that reads, such as a `SELECT`, and refuse anything else

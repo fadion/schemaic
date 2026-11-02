@@ -35,7 +35,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   `params::ParamValue::Raw` expands to arbitrary SQL, so a guard shown `SELECT … WHERE x = :p`
   would be reading a statement the engine never receives while `…; DELETE FROM t` is the one it
   does. A parameter with no value stops the run before the guard is consulted at all, as a hard
-  hold with no "Run anyway": there is nothing to judge yet.
+  hold with no "Run anyway": there is nothing to judge yet. **The headless CLI's `-p` is the
+  second instance**: `cli/run.rs`'s `statement` returns the text with its values bound through
+  `params::substitute`, so `query::gate`, `ExecRequest::approved` and the write log all read the
+  statement the engine is sent, and a placeholder with no `-p` is a usage error, never sent
+  (`the_statement_the_gates_read_has_the_values_in_it`, seen red against the template).
   **And the verdict is about a *target* as well as a statement, which is the half that was missing.**
   `guard_policy` reads the active tab's connection, its `read_only`, its dialect and whether it has a
   database, while the connection gate can hold the run for `PING_TIMEOUT` — five seconds spent

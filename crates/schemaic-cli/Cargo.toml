@@ -21,6 +21,7 @@ schemaic-core = { workspace = true }
 schemaic-conn = { workspace = true }
 schemaic-db = { workspace = true }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 # The MCP server's JSON-RPC, and the reason test connections are built through
 # serde rather than as struct literals — a new `Connection` field does not send
 # anyone editing fixtures here.
