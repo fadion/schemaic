@@ -562,8 +562,8 @@ async fn run_compare(
     // No `--password-stdin` here: with two connections it would be unclear
     // whose password it was, so both come from the keyring.
     let conn_args = |c: &str| ConnArgs {
-        connection: c.to_string(),
-        password_stdin: false,
+        connection: Some(c.to_string()),
+        ..Default::default()
     };
     let (target_args, source_args) = (
         conn_args(sides.connection),
@@ -577,6 +577,7 @@ async fn run_compare(
         Ok(c) => c,
         Err(exit) => return exit,
     };
+    let (target, source) = (&*target, &*source);
     let (Some(target_db), Some(source_db)) = (
         default_database(sides.database, target),
         default_database(sides.source_database, source),
@@ -672,6 +673,7 @@ async fn run_dump(
         Ok(c) => c,
         Err(exit) => return exit,
     };
+    let conn = &*conn;
     let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
     let Some(database) = database_for(target, conn) else {
         warn("a dump needs a database: name one with -d");
@@ -927,6 +929,7 @@ async fn run_export(
         Ok(c) => c,
         Err(exit) => return exit,
     };
+    let conn = &*conn;
     let sql = match statement(sql, params, target, conn) {
         Ok(s) => s,
         Err(exit) => return exit,
@@ -956,7 +959,7 @@ async fn run_export(
         Err(e) => {
             warn(&e.message());
             if let Some(how) = no_database_failure(database.as_deref(), &e, dialect) {
-                hint(&no_database_hint(&target.conn.connection, how));
+                hint(&no_database_hint_for(&target.conn, how));
             }
             exit_for_no_rows(&e)
         }
@@ -982,13 +985,14 @@ async fn run_export(
 /// served, which is the first question when a tool is missing.
 async fn serve_mcp(conns: &[Connection], target: &McpTarget) -> Exit {
     let args = ConnArgs {
-        connection: target.connection.clone(),
-        password_stdin: false,
+        connection: Some(target.connection.clone()),
+        ..Default::default()
     };
     let conn = match select_conn(conns, &args) {
         Ok(c) => c,
         Err(exit) => return exit,
     };
+    let conn = &*conn;
     let (db, _tunnel) = match connect(conn, &args, query::DEFAULT_TIMEOUT).await {
         Ok(v) => v,
         Err(exit) => return exit,
@@ -1160,6 +1164,7 @@ async fn databases(conns: &[Connection], args: &ConnArgs, out: Output, timeout: 
         Ok(c) => c,
         Err(exit) => return exit,
     };
+    let conn = &*conn;
     let (db, _tunnel) = match connect(conn, args, timeout).await {
         Ok(v) => v,
         Err(exit) => return exit,
@@ -1204,6 +1209,7 @@ async fn ping(conns: &[Connection], args: &ConnArgs, out: Output, timeout: Durat
         Ok(c) => c,
         Err(exit) => return exit,
     };
+    let conn = &*conn;
     let (db, _tunnel) = match connect(conn, args, timeout).await {
         Ok(v) => v,
         Err(exit) => return exit,
@@ -1273,14 +1279,84 @@ fn no_database_hint(connection: &str, how: NoDatabaseFailure) -> String {
     )
 }
 
-/// The saved connection `args` names, or the exit that says why not. No
-/// secret is read and nothing is dialled: this is the half of opening a
-/// connection the guard can run after, and before anything reaches a server.
-fn select_conn<'a>(conns: &'a [Connection], args: &ConnArgs) -> Result<&'a Connection, Exit> {
-    select::select(conns, &args.connection).map_err(|e| {
-        warn(&e.message());
-        exit_for_no_connection(&e)
-    })
+/// Where a `--url` connection's password may come from when it is not piped.
+/// Read for a `--url` only: a saved connection's password is the keyring's.
+const PASSWORD_ENV: &str = "SCHEMAIC_PASSWORD";
+
+/// [`no_database_hint`] for the connection `args` names: a saved one echoed
+/// back by name, a `--url` told to name its database there or with `-d`.
+fn no_database_hint_for(args: &ConnArgs, how: NoDatabaseFailure) -> String {
+    match args.source() {
+        Ok(crate::args::ConnSource::Url(_)) => {
+            let why = match how {
+                NoDatabaseFailure::RanElsewhere => {
+                    "the URL names no database, so the statement ran in the server's \
+                     maintenance database"
+                }
+                NoDatabaseFailure::Refused => "the URL names no database",
+            };
+            format!("{why}; pass -d <database>, or end the URL with /<database>")
+        }
+        Ok(crate::args::ConnSource::Saved(name)) => no_database_hint(name, how),
+        Err(_) => no_database_hint("<connection>", how),
+    }
+}
+
+/// The connection `args` names, or the exit that says why not. No secret is
+/// read and nothing is dialled: this is the half of opening a connection the
+/// guard can run after, and before anything reaches a server.
+///
+/// **A saved connection is borrowed; a `--url` is built here**
+/// ([`one_off_connection`]) and never saved.
+fn select_conn<'a>(
+    conns: &'a [Connection],
+    args: &ConnArgs,
+) -> Result<std::borrow::Cow<'a, Connection>, Exit> {
+    match args.source() {
+        Err(why) => {
+            warn(&why);
+            Err(Exit::Usage)
+        }
+        Ok(crate::args::ConnSource::Saved(name)) => select::select(conns, name)
+            .map(std::borrow::Cow::Borrowed)
+            .map_err(|e| {
+                warn(&e.message());
+                exit_for_no_connection(&e)
+            }),
+        Ok(crate::args::ConnSource::Url(url)) => one_off_connection(url, args.read_only)
+            .map(std::borrow::Cow::Owned)
+            .map_err(|why| {
+                warn(&why);
+                Exit::Usage
+            }),
+    }
+}
+
+/// The connection a `--url` describes, built for this one command.
+///
+/// **A URL that carries a password is refused**, never used and never
+/// repeated: argv is readable by every process on the machine and lands in the
+/// shell's history, which is the exposure the rest of this CLI keeps a
+/// password out of. `--password-stdin` or `SCHEMAIC_PASSWORD` carries it.
+///
+/// **CLI access is implied** — the person typed the connection; the flag
+/// exists to keep a *saved* connection out of reach until they say so. Its
+/// read-only flag is `--read-only`'s, and its AI data level stays the
+/// default, which no CLI command but `mcp` reads.
+fn one_off_connection(url: &str, read_only: bool) -> Result<Connection, String> {
+    let mut conn = schemaic_core::conn_import::parse_url(url)
+        .map_err(|e| format!("--url: {}", e.message()))?;
+    if !conn.password.is_empty() {
+        return Err(
+            "--url carries a password, which the command line puts in the process \
+                    list and your shell's history; take it out of the URL and give it with \
+                    --password-stdin or SCHEMAIC_PASSWORD"
+                .to_string(),
+        );
+    }
+    conn.cli_access = true;
+    conn.read_only = read_only;
+    Ok(conn)
 }
 
 /// All of stdin, for `what` — refusing a terminal rather than waiting on it.
@@ -1480,18 +1556,31 @@ async fn connect(
         None
     };
     let mut conn = conn.clone();
-    // The password `--password-stdin` supplies is not asked of the keyring at
-    // all, so a locked one has nothing to report about it.
-    let supplied: &[SecretKind] = if piped.is_some() {
-        &[SecretKind::DbPassword]
+    // `source()`, the question `select_conn` asked, rather than whether a URL
+    // is set: the two must agree on which kind of connection this is.
+    if matches!(args.source(), Ok(crate::args::ConnSource::Url(_))) {
+        // **A `--url` connection was never saved, so the keyring holds
+        // nothing of it** — and its id is the parser's placeholder, which
+        // could name another connection's entries there. Its password is the
+        // pipe's, or `SCHEMAIC_PASSWORD`'s: an environment variable is not
+        // argv, and a CI job's secret store hands one over that way.
+        conn.password = piped
+            .or_else(|| std::env::var(PASSWORD_ENV).ok())
+            .unwrap_or_default();
     } else {
-        &[]
-    };
-    for notice in schemaic_conn::secrets::hydrate_for_cli(&mut conn, supplied) {
-        warn(&notice);
-    }
-    if let Some(password) = piped {
-        conn.password = password;
+        // The password `--password-stdin` supplies is not asked of the
+        // keyring at all, so a locked one has nothing to report about it.
+        let supplied: &[SecretKind] = if piped.is_some() {
+            &[SecretKind::DbPassword]
+        } else {
+            &[]
+        };
+        for notice in schemaic_conn::secrets::hydrate_for_cli(&mut conn, supplied) {
+            warn(&notice);
+        }
+        if let Some(password) = piped {
+            conn.password = password;
+        }
     }
     // `uses_tunnel`, the one answer every tunnel site asks: a SQLite
     // connection with a leftover SSH block has no server to tunnel to.
@@ -1551,6 +1640,7 @@ async fn run_query(
         Ok(c) => c,
         Err(exit) => return exit,
     };
+    let conn = &*conn;
     let sql = match statement(sql, params, target, conn) {
         Ok(s) => s,
         Err(exit) => return exit,
@@ -1578,7 +1668,7 @@ async fn run_query(
         Err(e) => {
             warn(&e.message());
             if let Some(how) = no_database_failure(database.as_deref(), &e, dialect) {
-                hint(&no_database_hint(&target.conn.connection, how));
+                hint(&no_database_hint_for(&target.conn, how));
             }
             exit_for_no_rows(&e)
         }
@@ -1600,6 +1690,7 @@ async fn run_explain(
         Ok(c) => c,
         Err(exit) => return exit,
     };
+    let conn = &*conn;
     let sql = match statement(sql, params, target, conn) {
         Ok(s) => s,
         Err(exit) => return exit,
@@ -1629,7 +1720,7 @@ async fn run_explain(
         Err(e) => {
             warn(&e.message());
             if let Some(how) = no_database_failure(database.as_deref(), &e, dialect) {
-                hint(&no_database_hint(&target.conn.connection, how));
+                hint(&no_database_hint_for(&target.conn, how));
             }
             exit_for_no_rows(&e)
         }
@@ -1701,12 +1792,13 @@ async fn run_catalog(
     timeout: Duration,
 ) -> Result<ResultSet, Exit> {
     let conn = select_conn(conns, &target.conn)?;
+    let conn = &*conn;
     let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
     let database = database_for(target, conn);
     let Some(sql) = sql(dialect, database.as_deref()) else {
         warn(&format!("`{what}` needs a database to look in"));
-        hint(&no_database_hint(
-            &target.conn.connection,
+        hint(&no_database_hint_for(
+            &target.conn,
             NoDatabaseFailure::Refused,
         ));
         return Err(Exit::Usage);
@@ -1772,7 +1864,7 @@ async fn describe(
     if rs.row_count() == 0 {
         let conn = select_conn(conns, &target.conn).ok();
         let place = conn
-            .and_then(|c| database_for(target, c))
+            .and_then(|c| database_for(target, &c))
             .map(|db| format!(" in {db}"))
             .unwrap_or_default();
         warn(&format!("no table or view named '{table}'{place}"));
@@ -1824,6 +1916,7 @@ async fn run_exec(
         Ok(c) => c,
         Err(exit) => return exit,
     };
+    let conn = &*conn;
     let sql = match statement(sql, params, target, conn) {
         Ok(s) => s,
         Err(exit) => return exit,
@@ -1837,8 +1930,8 @@ async fn run_exec(
         Err(e) => {
             warn(&e.message());
             if refused_for_no_database(&e) {
-                hint(&no_database_hint(
-                    &target.conn.connection,
+                hint(&no_database_hint_for(
+                    &target.conn,
                     NoDatabaseFailure::Refused,
                 ));
             }
@@ -1873,7 +1966,7 @@ async fn run_exec(
         Err(e) => {
             warn(&e.message());
             if let Some(how) = no_database_failure(database.as_deref(), &e, dialect) {
-                hint(&no_database_hint(&target.conn.connection, how));
+                hint(&no_database_hint_for(&target.conn, how));
             }
             exit_for_no_rows(&e)
         }
@@ -1909,6 +2002,7 @@ async fn run_script(
         Ok(c) => c,
         Err(exit) => return exit,
     };
+    let conn = &*conn;
     let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
     let (name, input) = match sql.source() {
         SqlSource::File(path) => (path.display().to_string(), ScriptInput::File(path.into())),
@@ -1940,8 +2034,8 @@ async fn run_script(
         Err(e) => {
             warn(&e.message());
             if refused_for_no_database(&e) {
-                hint(&no_database_hint(
-                    &target.conn.connection,
+                hint(&no_database_hint_for(
+                    &target.conn,
                     NoDatabaseFailure::Refused,
                 ));
             }
@@ -2166,6 +2260,7 @@ async fn run_import(
         Ok(c) => c,
         Err(exit) => return exit,
     };
+    let conn = &*conn;
     // **An import is a write**, and the app offers none on a read-only
     // connection; there is no `--yes` for it, as there is none for an INSERT.
     if conn.read_only {
@@ -2177,8 +2272,8 @@ async fn run_import(
     }
     let Some(database) = database_for(target, conn) else {
         warn("`import` needs a database to load into");
-        hint(&no_database_hint(
-            &target.conn.connection,
+        hint(&no_database_hint_for(
+            &target.conn,
             NoDatabaseFailure::Refused,
         ));
         return Exit::Refused;
@@ -3110,6 +3205,62 @@ mod tests {
         assert!(stopped[0].contains("60s") && stopped[0].contains("4 statements"));
     }
 
+    /// **A URL that carries a password is refused**, and never repeated —
+    /// the message names the flags, not the URL.
+    #[test]
+    fn a_url_with_a_password_is_refused() {
+        let why = one_off_connection("postgresql://app:s3cret@pg.example/shop", false).unwrap_err();
+        assert!(!why.contains("s3cret"), "{why}");
+        assert!(why.contains("SCHEMAIC_PASSWORD"), "{why}");
+        // A JDBC query string is a password too.
+        assert!(
+            one_off_connection("jdbc:mysql://pg.example/shop?user=app&password=x", false).is_err()
+        );
+    }
+
+    /// The person typed it, so CLI access is theirs to give; read-only is
+    /// `--read-only`'s, and nothing else is invented.
+    #[test]
+    fn a_url_connection_has_cli_access_and_the_read_only_asked_for() {
+        let c = one_off_connection("postgresql://app@pg.example:5433/shop", true).unwrap();
+        assert!(c.cli_access && c.read_only);
+        assert_eq!(
+            (c.host.as_str(), c.port, c.user.as_str()),
+            ("pg.example", 5433, "app")
+        );
+        assert_eq!(c.default_database(), Some("shop"));
+        assert!(
+            !one_off_connection("mysql://app@h/db", false)
+                .unwrap()
+                .read_only
+        );
+        assert!(one_off_connection("not a url", false).is_err());
+    }
+
+    /// **The composition**: `select_conn` builds a `--url` connection and
+    /// never looks in the saved list for it, and refuses both sources at once.
+    #[test]
+    fn select_conn_takes_a_url_or_a_name_but_not_both() {
+        let saved = [conn("shop")];
+        let url = ConnArgs {
+            url: Some("mysql://app@h/other".to_string()),
+            ..Default::default()
+        };
+        let c = select_conn(&saved, &url).unwrap();
+        assert!(matches!(c, std::borrow::Cow::Owned(_)));
+        assert_eq!(c.default_database(), Some("other"));
+        let both = ConnArgs {
+            connection: Some("1".to_string()),
+            url: Some("mysql://app@h/other".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(select_conn(&saved, &both).unwrap_err(), Exit::Usage);
+        assert_eq!(
+            select_conn(&saved, &ConnArgs::default()).unwrap_err(),
+            Exit::Usage
+        );
+    }
+
     fn param(s: &str) -> Binding {
         crate::args::parse_param(s).unwrap()
     }
@@ -3222,8 +3373,8 @@ mod tests {
     fn target(database: Option<&str>) -> Target {
         Target {
             conn: ConnArgs {
-                connection: "1".to_string(),
-                password_stdin: false,
+                connection: Some("1".to_string()),
+                ..Default::default()
             },
             database: database.map(str::to_string),
         }

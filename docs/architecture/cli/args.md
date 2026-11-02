@@ -75,7 +75,7 @@ point too — and `--source-connection` (defaulting to `-c`'s, in `run.rs`) and
 `--source-database` (`non_blank`, defaulting to that connection's own) the one it should come
 to match, so two databases on one server is the short form. `-t`/`--table` repeats, as
 `dump`'s does. **No `--password-stdin`**: with two connections it would be unclear whose
-password it was, so both sides come from the keyring. **No `OutputArgs`**, since what it prints
+password it was, so both sides come from the keyring. It takes no `--url` either. **No `OutputArgs`**, since what it prints
 is a script, not rows. Its `--timeout` is `COMPARE_TIMEOUT_SECS`, 120 s, because two whole
 catalogues are read and a large one takes longer than one statement's 30 s
 (`compare_takes_a_target_a_source_and_tables`, which holds `--password-stdin` and `--format`
@@ -176,15 +176,31 @@ how the statement spells it, and the name must be one the statement could spell 
 `a_params_name_may_carry_the_statements_colon`, `a_malformed_param_is_refused`,
 `each_statement_command_takes_repeated_params`). Parsing a `-p` decides nothing about the
 statement: binding it, and every refusal that depends on the statement, is `run.rs`'s `bind`.
-**`ConnArgs` is `Target` without the database** — `-c` and `--password-stdin`, flattened into
+**`ConnArgs` is `Target` without the database** — `-c` or `--url`, `--read-only` and
+`--password-stdin`, flattened into
 `Target { conn, database }` for `query`, `explain`, `export`, `dump`, `exec`, `import`, `tables` and `describe`, and taken alone by the
 two subcommands with
 no database to run in: `databases` lists the names `-d` takes, and `ping` asks whether the
 server answers at all, so neither has a `-d` and passing one is a parse error
 (`databases_has_no_database_flag`, `ping_takes_a_connection_and_the_reachability_timeout`).
 `run.rs`'s `select_conn` and `connect` take `&ConnArgs`, which is what lets every subcommand
-above share them — and `compare`, which has no `ConnArgs` of its own, build one per side with
-`password_stdin: false` to use them too.
+above share them — and `compare` and `mcp`, which have no `ConnArgs` of their own, build one with
+only `connection` set (`..Default::default()`, which `ConnArgs` derives for them) to use them
+too; neither takes `--url`.
+**`--url` (`SCHEMAIC_URL`) is a connection given rather than saved**, for a container or a CI job
+with no Schemaic setup — `postgresql://user@host/db`, `mysql://…`, `sqlserver://…`, `sqlite:path`,
+whatever `core::conn_import::parse_url` reads. `-c` is `required_unless_present = "url"` and
+`conflicts_with = "url"`, and **`ConnArgs::source()` is what decides, returning
+`ConnSource::{Saved, Url}` or the sentence that says why not**. Exactly one source: **both is
+refused, not ranked**, because either may arrive from the environment, and an exported variable
+quietly beating a typed flag — or the other way round — is a write landing on a connection the
+person at the keyboard did not name. `--read-only` beside a saved connection is refused there too:
+a saved connection's read-only flag is the app's to set, and a CLI flag beside it would be a second
+answer to the same question. That check lives in `source()` rather than in a clap `requires`
+because, per the change's author, `requires` on the flattened flag was not enforced
+(`read_only_needs_a_url`; the composition is `run.rs`'s
+`select_conn_takes_a_url_or_a_name_but_not_both`). What `run.rs` does with a URL — refusing one
+that carries a password, and never asking the keyring — is under `run.rs`.
 **`ping`'s `--timeout` defaults to `PING_TIMEOUT_SECS`, not `DEFAULT_TIMEOUT_SECS`** — it is
 `schemaic_db::PING_TIMEOUT`, five seconds, the bound after which the app's own health check
 says *Disconnected*, so the CLI and the app agree on when a host is dead; the 30 s statement
@@ -202,7 +218,9 @@ request; the flag is absent rather than present and refusing. `-c` and `-d` keep
 no output flags, since nothing here prints rows
 (`mcp_takes_a_connection_and_a_database_and_nothing_from_stdin`, which holds `--password-stdin`,
 `--format` and `--limit` to parse errors). The cost is the headless case `--password-stdin`
-exists for: a connection whose password the keyring cannot serve has no `schemaic mcp`.
+exists for: a connection whose password the keyring cannot serve has no `schemaic mcp`. Nor does
+`McpTarget` take `--url` yet — and a one-off connection's AI data level, the one field only
+`mcp` reads, is left at its default (`run.rs`'s `one_off_connection`).
 **`wants_cli` is the routing predicate, and it is an allowlist of the *first* argument rather
 than "are there any arguments".** This binary is re-invoked with argv by things that are not the
 CLI — the Velopack installer and updater (`--veloapp-install`, `--veloapp-updated`,

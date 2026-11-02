@@ -593,12 +593,28 @@ pub struct Target {
 
 /// Which connection, and how to authenticate to it — [`Target`] without the
 /// database, for the one subcommand that has none to run in.
-#[derive(clap::Args, Debug, PartialEq, Eq)]
+#[derive(clap::Args, Debug, Default, PartialEq, Eq)]
 pub struct ConnArgs {
     /// Saved connection, by id or by name — or `#<id>`, which is only ever
     /// the id.
-    #[arg(short = 'c', long, env = "SCHEMAIC_CONNECTION")]
-    pub connection: String,
+    #[arg(
+        short = 'c',
+        long,
+        env = "SCHEMAIC_CONNECTION",
+        required_unless_present = "url",
+        conflicts_with = "url"
+    )]
+    pub connection: Option<String>,
+    /// A connection given here rather than saved — `postgresql://user@host/db`,
+    /// `mysql://…`, `sqlserver://…` or `sqlite:path` — for a container or CI
+    /// job with no Schemaic setup. Never saved. It may not carry a password:
+    /// give that with --password-stdin or SCHEMAIC_PASSWORD.
+    #[arg(long, env = "SCHEMAIC_URL", value_name = "URL")]
+    pub url: Option<String>,
+    /// With --url: refuse writes on it, as a saved connection marked read-only
+    /// does.
+    #[arg(long)]
+    pub read_only: bool,
     /// Read the connection's password from stdin instead of the OS keyring.
     ///
     /// **For the headless case the keyring cannot serve.** Linux's Secret
@@ -607,6 +623,45 @@ pub struct ConnArgs {
     /// there.
     #[arg(long)]
     pub password_stdin: bool,
+}
+
+/// Which connection [`ConnArgs`] names: a saved one, or a one-off URL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnSource<'a> {
+    Saved(&'a str),
+    Url(&'a str),
+}
+
+impl ConnArgs {
+    /// The connection asked for, or why the command line names none — or two.
+    ///
+    /// **Both is refused, not ranked.** Either may arrive from the
+    /// environment (`SCHEMAIC_CONNECTION`, `SCHEMAIC_URL`), and an exported
+    /// variable quietly beating a typed flag — or the other way round — is a
+    /// write landing on a connection the person at the keyboard did not name.
+    pub fn source(&self) -> Result<ConnSource<'_>, String> {
+        match (self.connection.as_deref(), self.url.as_deref()) {
+            // A saved connection's read-only flag is the app's to set; a CLI
+            // flag beside it would be a second answer to the same question.
+            (Some(_), None) if self.read_only => Err(
+                "--read-only is for a --url connection; a saved one is made read-only \
+                 in Schemaic"
+                    .to_string(),
+            ),
+            (Some(name), None) => Ok(ConnSource::Saved(name)),
+            (None, Some(url)) => Ok(ConnSource::Url(url)),
+            (None, None) => Err(
+                "no connection: name a saved one with -c (or SCHEMAIC_CONNECTION), \
+                 or give one with --url (or SCHEMAIC_URL)"
+                    .to_string(),
+            ),
+            (Some(_), Some(_)) => Err(
+                "both a saved connection (-c or SCHEMAIC_CONNECTION) and a --url \
+                 (or SCHEMAIC_URL) were given; give one"
+                    .to_string(),
+            ),
+        }
+    }
 }
 
 /// `--database`'s parser: a name, never a blank.
@@ -975,6 +1030,32 @@ mod tests {
         );
     }
 
+    /// `--read-only` belongs to a `--url`: a saved connection's flag is the
+    /// app's to set, and a CLI flag that loosened or tightened it would be a
+    /// second answer.
+    #[test]
+    fn read_only_needs_a_url() {
+        let saved = parse(&["schemaic", "query", "SELECT 1", "-c", "x", "--read-only"]).unwrap();
+        let Command::Query { target, .. } = saved.command else {
+            panic!("expected a query");
+        };
+        assert!(target.conn.source().is_err());
+        let cli = parse(&[
+            "schemaic",
+            "query",
+            "SELECT 1",
+            "--url",
+            "mysql://u@h/d",
+            "--read-only",
+        ])
+        .unwrap();
+        let Command::Query { target, .. } = cli.command else {
+            panic!("expected a query");
+        };
+        assert_eq!(target.conn.source(), Ok(ConnSource::Url("mysql://u@h/d")));
+        assert!(target.conn.read_only);
+    }
+
     #[test]
     fn a_delimiter_is_one_character_or_tab() {
         assert_eq!(parse_delimiter(";"), Ok(b';'));
@@ -1096,7 +1177,7 @@ mod tests {
                     other => panic!("{other:?}"),
                 };
                 assert_eq!(got.source(), SqlSource::Text(sql));
-                assert_eq!(target.conn.connection, "prod");
+                assert_eq!(target.conn.connection.as_deref(), Some("prod"));
                 assert_eq!(
                     output.format,
                     Format::Json,
@@ -1159,7 +1240,7 @@ mod tests {
             panic!("expected an explain");
         };
         assert_eq!(sql.source(), SqlSource::Text("SELECT 1"));
-        assert_eq!(target.conn.connection, "prod");
+        assert_eq!(target.conn.connection.as_deref(), Some("prod"));
         assert_eq!(target.database.as_deref(), Some("shop"));
         assert_eq!(output.format, Format::Json);
         assert_eq!(timeout, crate::query::DEFAULT_TIMEOUT.as_secs());
@@ -1239,7 +1320,7 @@ mod tests {
         let Command::Ping { conn, timeout, .. } = cli.command else {
             panic!("expected a ping");
         };
-        assert_eq!(conn.connection, "prod");
+        assert_eq!(conn.connection.as_deref(), Some("prod"));
         assert_eq!(timeout, schemaic_db::PING_TIMEOUT.as_secs());
         let err = parse(&["schemaic", "ping", "-c", "1", "-d", "app"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
@@ -1263,7 +1344,7 @@ mod tests {
         else {
             panic!("expected tables");
         };
-        assert_eq!(target.conn.connection, "prod");
+        assert_eq!(target.conn.connection.as_deref(), Some("prod"));
         assert_eq!(target.database.as_deref(), Some("shop"));
         assert_eq!(limit, DEFAULT_LIMIT);
         assert_eq!(timeout, crate::query::DEFAULT_TIMEOUT.as_secs());
@@ -1425,7 +1506,7 @@ mod tests {
             panic!("expected a query");
         };
         assert_eq!(sql.source(), SqlSource::Text("SELECT 1"));
-        assert_eq!(target.conn.connection, "prod");
+        assert_eq!(target.conn.connection.as_deref(), Some("prod"));
         assert_eq!(target.database, None);
     }
 
@@ -1462,8 +1543,8 @@ mod tests {
             cli.command,
             Command::Databases {
                 conn: ConnArgs {
-                    connection: "prod".to_string(),
-                    password_stdin: false,
+                    connection: Some("prod".to_string()),
+                    ..Default::default()
                 },
                 output: OutputArgs {
                     format: Format::Table,

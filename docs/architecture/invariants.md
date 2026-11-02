@@ -1007,6 +1007,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   entry has the whole of it, including the executing harness it does not stop). And a subprocess that cannot read the file it was pointed at **refuses** rather than
   defaulting — `ai::mcp_endpoint_from_env` returns `Err`, because the fallback was a
   `127.0.0.1:3306` endpoint with every access gate back on. Don't add new plaintext-secret surfaces.
+  **`schemaic --url` puts a URL on argv, and squares with this by refusing any that carries a
+  credential**: `cli/run.rs`'s `one_off_connection` refuses a URL whose parse filled the password
+  — a userinfo or a JDBC `?password=` alike — without repeating it, and the password comes from
+  `--password-stdin` or the `SCHEMAIC_PASSWORD` environment variable, neither of which is argv
+  (`a_url_with_a_password_is_refused`). The URL is input, parsed once into a `Connection` that
+  then goes through `connect` like any other — never the connection's identity, and never saved.
   **"Never in a log" includes a log the environment asked for.** `app::logging`'s
   `log_directives`/`filter_for` append `russh=warn`, `russh_cryptovec=warn` and `russh_util=warn`
   *after* whatever `RUST_LOG` said, because `RUST_LOG` **replaces** the default filter rather than
@@ -1084,6 +1090,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   `with_secrets`, once per connection per session, and a connect's as its own error,
   `DbRefusal::KeyringUnreadable`). A refused *delete* is the third case and is reported only for a
   secret this session actually read a value out of or wrote. See `core/secrets.rs` and `conn/secrets.rs`.
+  **A `schemaic --url` connection has no keyring entry, and is no exception to this**: it is never
+  saved, so there is no secret to persist and no `connections.json` row to blank. `cli/run.rs`'s
+  `connect` never asks the keyring for it — its id is `parse_url`'s placeholder `0`, which could
+  name another connection's entries there — and its password, from `--password-stdin` or
+  `SCHEMAIC_PASSWORD`, lives only in the process for the one command.
 - **Own per-entity signals in a child `Scope`; dispose it *deferred*.** A `Tab`/`ConnNode` creates
   its signals in `parent.create_child()`; removal disposes that scope via
   `exec_after(Duration::ZERO, …)` — one tick later, after the keyed `dyn_container` has unmounted

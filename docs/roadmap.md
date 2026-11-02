@@ -129,22 +129,6 @@ with a sync script.
   and merge them.
 - **Open:** cross-engine sync, or same engine only, as schema compare is today?
 
-## CLI
-
-### A one-off connection
-
-For containers and CI, where there is no GUI to save a connection in. Saving one from the CLI is
-ruled out twice over: the app owns `connections.json` while it runs and would overwrite the CLI's
-addition on its next save, and a container usually has no OS keyring to hold the password.
-
-- **Decided:** a connection given on the command line and never saved: `--url` (or
-  `SCHEMAIC_URL`) in place of `-c`, parsed by `conn_import`'s URL parser.
-- **Decided:** the URL may not carry a password; one that does is refused, since argv is visible
-  to every process. The password comes from `--password-stdin` or `SCHEMAIC_PASSWORD`.
-- **Decided:** it is read-write unless `--read-only` is given, and its AI data level is
-  `--ai-data`, defaulting to schema only. CLI access is implied: the user typed the connection.
-- **Non-goal:** `connection add` and `connection import`. The app already imports.
-
 ## MCP server
 
 ### Audit log of agent calls
@@ -166,6 +150,9 @@ connection.
 - **Decided:** repeat `-c`. The first is the default for a tool called without a `connection`
   argument; `list_connections` names the rest. There is no `--all`: each client config names
   exactly what it exposes.
+- **Decided:** `--url` works here as on the other commands, with `--ai-data` for its data level,
+  defaulting to schema only — the one CLI command that reads the level. Its password comes from
+  `SCHEMAIC_PASSWORD` only: stdin is the protocol's.
 - **Trap:**
   - Each connection still needs CLI access.
   - The `AiData` level is read per connection, not once for the server.

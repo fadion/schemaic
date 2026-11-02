@@ -46,7 +46,7 @@ already read the keyring and logged in over SSH, and a loop on a refusal made a 
 each time round. That is why opening is two functions: `select_conn` reads no secret and dials
 nothing, and `connect` is the half that does. `connect` hands back the `TunnelHandle` alongside
 the `Db` because dropping it closes the tunnel, and it hydrates and patches a *clone* of the
-**saved** connection, so the guard's subject is what the user configured — for `exec`, the
+**saved** connection (or of the `--url`'s, below), so the guard's subject is what the user configured — for `exec`, the
 connection `ExecRequest` carries, so what is dialled is what was judged. **The tunnel is
 bounded by `--timeout` in a `tokio::time::timeout` of its own**, because the statement's
 deadline never covered it: an SSH endpoint that accepts TCP and never sends a banner held the
@@ -55,6 +55,30 @@ command until something killed it. Measured after the fix, an unreachable SSH ho
 connect, 60 s to authenticate — the `ssh.rs` entry has why), so this wrapper is no longer the
 only thing between a silent endpoint and a hung command. It stays: `--timeout` may be shorter
 than either, and whichever bound is shorter answers first.
+**A `--url` connection takes the same two steps, and is built rather than looked up.**
+`select_conn` returns a `Cow<'a, Connection>`: `Borrowed` for a saved one, through
+`select::select` and its CLI-access gate exactly as before, and `Owned` for a URL, through
+`one_off_connection(url, read_only)` — `core::conn_import::parse_url`, then three decisions.
+**A URL that carries a password is refused**, exit 2, and the password is never repeated
+(a JDBC `?password=` counts, `parse_url` having read it into the same field): argv is readable
+by every process on the machine and lands in the shell's history, the exposure the rest of this
+CLI keeps a password out of, so the message points at `--password-stdin` and `SCHEMAIC_PASSWORD`
+instead (`a_url_with_a_password_is_refused`). **`cli_access` is `true`** — the person typed the
+connection, and the flag exists to keep a *saved* one out of reach until they say so — `read_only`
+is `--read-only`'s, and the AI data level stays the default, since only `mcp` reads it and `mcp`
+takes no `--url` (`a_url_connection_has_cli_access_and_the_read_only_asked_for`). Every caller
+then shadows `let conn = &*conn;`, so nothing downstream knows which it got. In `connect`, **a
+`--url` connection never asks the keyring**: it was never saved, so the keyring holds nothing of
+it, and its id is the parser's placeholder `0`, which could name another connection's entries
+there. Its password is the pipe's, else the `SCHEMAIC_PASSWORD` environment variable
+(`PASSWORD_ENV` — an environment variable is not argv, and a CI secret store hands one over that
+way), else empty; a saved connection ignores that variable and is hydrated through
+`hydrate_for_cli` as before. Nothing about a URL connection is saved. The no-database hint goes
+through `no_database_hint_for(&ConnArgs, how)`, which for a URL says to pass `-d` or end the URL
+with `/<database>` — `schemaic databases -c <name>`, the saved form's advice, names nothing a URL
+user has. Smoke-tested by the change's author against an empty profile: a `sqlite:` URL query, a
+MariaDB `mysql://` URL with `SCHEMAIC_PASSWORD`, a password-carrying URL refused, and
+`--read-only` refusing a `DELETE` with exit 3, nothing written to the profile.
 **"Take the statement" binds its `-p` values, so every gate after it reads what the engine will
 be sent.** `statement` — shared by `query`, `explain`, `export` and `exec` — reads the source and
 returns it through `bind`, which is `core::params::substitute`, the app's substitution rather than

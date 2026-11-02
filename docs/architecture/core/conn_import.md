@@ -174,6 +174,11 @@ Both used to import as an ordinary ticked row whose host was the sub-protocol or
 name, the database lost (`a_jdbc_sub_protocol_is_not_the_host`,
 `a_host_less_pgjdbc_url_is_localhost`) — and since project discovery reads every project the
 IDE lists, they arrived without the user picking the file.
+**`schemaic --url` is `parse_url`'s one caller outside an import** (`cli/run.rs`'s
+`one_off_connection`), so whatever it accepts is what the CLI accepts. There the `id: 0` is never
+replaced, which is why the CLI never asks the keyring for that connection, and a parse that
+fills `password` — a userinfo or a JDBC `?password=` alike — is refused rather than used, the
+password being on argv; `cli/run.md` has both.
 **SQL Server has a grammar of its own, and it is not a URL's.** `engine_for_scheme` takes
 `sqlserver` (JDBC, Prisma) and `mssql` (SQLAlchemy's `mssql+pyodbc`, node) as `MSSQL`, and jTDS's
 `jdbc:jtds:sqlserver://` has its `jtds:` stripped under the `jdbc:` one. What follows is

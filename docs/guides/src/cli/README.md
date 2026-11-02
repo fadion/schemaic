@@ -3,7 +3,8 @@
 The `schemaic` command runs SQL against your saved connections without opening the window. It
 never takes a credential: the connection comes from your saved list and its password from the OS
 keyring, so a script, a cron job or an AI agent can be handed a connection *name* instead of a
-password.
+password. Where nothing is saved, [`--url`](#a-connection-without-saving-it) names a
+connection on the spot — still with no password on the command line.
 
 ```sh
 schemaic list
@@ -57,6 +58,31 @@ Every command that reaches a server takes `-c` (`--connection`) and, where it ru
 
 Where there is no keyring to read — over SSH, in a container — `--password-stdin` reads the
 password from a pipe instead: `cat pw.txt | schemaic ping -c prod --password-stdin`.
+
+## A connection without saving it
+
+In a container or a CI job, where Schemaic isn't set up, give the connection with `--url` (or
+`SCHEMAIC_URL`) in place of `-c`. Every command that takes `-c` takes it, except `compare` and
+`mcp`, which need saved connections.
+
+```sh
+schemaic query "SELECT count(*) FROM people" --url "sqlite:/data/app.db" --format csv
+SCHEMAIC_PASSWORD="$DB_PASSWORD" schemaic query "SELECT 1" --url "mysql://app@db.example:3306/shop"
+```
+
+- *Forms.* `postgresql://user@host:port/db`, `mysql://` or `mariadb://`, `sqlserver://` and
+  `sqlite:path`; a SQL Server `Server=…;` connection string, a JDBC URL and a `DATABASE_URL=…`
+  line work too — the same forms as pasting a URL into the app.
+- *No password in the URL.* One that carries a password is refused (exit 2), since a command
+  line ends up in the process list and your shell history. Pipe it with `--password-stdin` or set
+  `SCHEMAIC_PASSWORD`, which is read only for a `--url` connection.
+- *Nothing is saved*, and the keyring isn't touched. **CLI access** doesn't apply: you typed the
+  connection yourself.
+- *Read-only.* Add `--read-only` to refuse writes as a saved read-only connection does (exit 3).
+  It only goes with `--url`; a saved connection is made read-only in the app.
+- *A database.* If the URL names none, pass `-d` or end the URL with `/<database>`.
+- `-c` and `--url` together are refused, even when one comes from the environment — unset the
+  variable you don't mean.
 
 ## The commands
 
