@@ -627,6 +627,29 @@ impl MissingIndex {
             ..Default::default()
         }
     }
+
+    /// Add this suggestion to a table's draft as a new index — the one edit
+    /// both [`suggestion_ddl`] and the app's *Create index* make, so how a
+    /// suggestion becomes an index is decided once.
+    pub fn add_to(&self, draft: &mut crate::ddl::TableDraft) {
+        draft
+            .indexes
+            .push(crate::ddl::IndexDraft::new(self.index_info()));
+    }
+}
+
+/// Does this engine report its index sizes only per table — some table has
+/// index bytes, and no index has a figure of its own? MySQL's
+/// `INDEX_LENGTH` is one number for all of a table's indexes. An empty index
+/// ranking means *that* only when this holds; otherwise it means there are
+/// no indexes to rank.
+pub fn index_sizes_per_table_only(stats: &SchemaStats) -> bool {
+    let tables = stats.tables();
+    tables.iter().any(|t| t.index_bytes.unwrap_or(0) > 0)
+        && !tables
+            .iter()
+            .flat_map(|t| &t.indexes)
+            .any(|i| i.bytes.is_some())
 }
 
 /// The DMV's column list — `[a], [b]]c], [d]` — as names. A `]` inside a
@@ -678,9 +701,7 @@ pub fn suggestion_ddl(
     target: impl Into<crate::ddl::Target>,
 ) -> String {
     let mut draft = crate::ddl::TableDraft::from_table(table);
-    draft
-        .indexes
-        .push(crate::ddl::IndexDraft::new(m.index_info()));
+    m.add_to(&mut draft);
     let cs = crate::ddl::diff(table, &draft, target);
     if cs.is_empty() {
         return String::new();
@@ -1052,6 +1073,20 @@ mod tests {
         assert_eq!(indexes[0].index.as_deref(), Some("ix_a"));
         let (one, _) = largest(&SchemaStats::new(vec![tstat("x", vec![])]), 0);
         assert!(one.is_empty());
+    }
+
+    #[test]
+    fn only_a_table_wide_index_figure_means_sizes_are_per_table() {
+        let mut my = tstat("t", vec![istat("ix", Some(1), None)]);
+        my.index_bytes = Some(16_384);
+        assert!(index_sizes_per_table_only(&SchemaStats::new(vec![my])));
+        // PostgreSQL: a figure per index.
+        let mut pg = tstat("t", vec![istat("ix", Some(1), Some(8_192))]);
+        pg.index_bytes = Some(8_192);
+        assert!(!index_sizes_per_table_only(&SchemaStats::new(vec![pg])));
+        // A database with no indexes at all is not the per-table case.
+        let bare = tstat("t", vec![]);
+        assert!(!index_sizes_per_table_only(&SchemaStats::new(vec![bare])));
     }
 
     #[test]

@@ -49,6 +49,7 @@ mod chart_view;
 pub use chart_view::ChartTarget;
 mod result_diff_view;
 pub use result_diff_view::DiffTarget;
+mod perf_view;
 mod routine_editor;
 mod schema_tree;
 mod script_view;
@@ -5335,6 +5336,9 @@ pub struct SchemaActions {
     /// variables viewer, into `overlay.server_vars_state`. Asked by the
     /// viewer on opening and on every Variables | Status switch.
     pub server_vars: Rc<dyn Fn(VarsTarget, schemaic_core::server_vars::VarKind)>,
+    /// Fetch one of the Performance view's lists into `overlay.perf_state`.
+    /// Asked by the view on opening, on a switch and on a new statement order.
+    pub perf: Rc<dyn Fn(PerfTarget, PerfView, schemaic_core::workload::StatementOrder)>,
     /// Toggle the schema tree's size column, persisting the choice. Switching it
     /// on is what makes the app fetch statistics for the expanded databases.
     pub toggle_table_sizes: Rc<dyn Fn()>,
@@ -5679,6 +5683,64 @@ pub enum VarsState {
     /// Distinct from an empty `Loaded`, which would read as "no settings".
     Unsupported,
     /// The fetch failed (message shown in the viewer's body).
+    Failed(String),
+}
+
+/// The connection and database the **Performance** view is open on
+/// ([`perf_view`](crate::perf_view)), captured at open for [`VarsTarget`]'s
+/// reason. `database` is where the per-database reads look (index health,
+/// sizes, PostgreSQL's extension, SQL Server's Query Store); `None` is a
+/// connection with no database chosen, which those views say.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PerfTarget {
+    pub conn_id: u64,
+    pub name: String,
+    pub database: Option<String>,
+    pub dialect: SqlDialect,
+}
+
+/// Which of the Performance view's three lists is showing. Each is its own
+/// fetch, asked on a switch, as the Server variables viewer's lists are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PerfView {
+    #[default]
+    Statements,
+    Indexes,
+    Sizes,
+}
+
+/// One Performance list's answer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PerfData {
+    /// The ranked statements, or which source is missing.
+    Statements(schemaic_core::workload::StatementReport),
+    /// [`schemaic_core::workload::index_health`]'s findings, whether usage was
+    /// counted at all, and — where the engine records them — the missing
+    /// indexes (`missing_error` when that one read failed and the rest did
+    /// not).
+    Indexes {
+        findings: Vec<schemaic_core::workload::IndexFinding>,
+        counted: bool,
+        missing: Vec<schemaic_core::workload::MissingIndex>,
+        missing_error: Option<String>,
+    },
+    /// [`schemaic_core::workload::largest`]'s two rankings, and whether an
+    /// empty index ranking is the engine reporting sizes per table
+    /// ([`schemaic_core::workload::index_sizes_per_table_only`]) rather than a
+    /// database with no indexes.
+    Sizes {
+        tables: Vec<schemaic_core::workload::SizeEntry>,
+        indexes: Vec<schemaic_core::workload::SizeEntry>,
+        per_table: bool,
+    },
+}
+
+/// The Performance view's body.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum PerfState {
+    #[default]
+    Loading,
+    Loaded(Rc<PerfData>),
     Failed(String),
 }
 
@@ -6464,6 +6526,15 @@ pub struct OverlayUi {
     /// faster than a slow server answers must not leave the list showing
     /// whichever answer happened to land last.
     pub server_vars_generation: RwSignal<u64>,
+    /// The Performance view: `Some(target)` opens it, and the list showing
+    /// (`perf_view`, ranked by `perf_order` for statements) is fetched into
+    /// `perf_state`, guarded by `perf_generation` as `server_vars_generation`
+    /// guards its list.
+    pub perf: RwSignal<Option<PerfTarget>>,
+    pub perf_view: RwSignal<PerfView>,
+    pub perf_order: RwSignal<schemaic_core::workload::StatementOrder>,
+    pub perf_state: RwSignal<PerfState>,
+    pub perf_generation: RwSignal<u64>,
     /// The snippet whose body is being edited, or `None`. One at a time, like
     /// every other editor here.
     pub snippet_edit: RwSignal<Option<u64>>,

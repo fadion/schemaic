@@ -569,7 +569,8 @@ TABLE k` and `DROP TABLE people`, with "destructive: people — Drops the table 
 it."
 **The four performance tools — `top_statements`, `index_health`, `table_sizes` and
 `current_locks` — are the MCP half of the roadmap's *Workload and performance insight*, on the
-backend its app view is meant to share** (`core::workload`, rendered by `cli/perf.rs`). They are
+backend its app view shares** (`core::workload`, rendered by `cli/perf.rs`; the view is
+`ui/perf_view.rs`). They are
 advertised on every engine and answer for an absent source rather than being withheld: on SQLite
 `top_statements` says the engine keeps no statement statistics and `current_locks` that it has no
 server sessions (`activity::supports_activity`, asked before the read), while `index_health` and
@@ -585,8 +586,9 @@ and the list is short by default. `current_locks` takes no arguments and is `Db:
 Server Activity's *Locks* read, saying when the list was capped and when the server lists
 contended locks only; its description sends the model to the user, and the panel's *Kill
 session*, for a session that should end. `table_sizes {database?, limit?}` is `workload::largest`
-over `fetch_table_stats`, and says the engine reports index sizes per table rather than printing
-an empty second table. `index_health {database?}` reads the database's schema (`with_deadline`)
+over `fetch_table_stats`, and rather than printing an empty second table says which empty it is —
+the engine reports index sizes per table, or the database has none — by
+`workload::index_sizes_per_table_only`, the question the app's view asks too. `index_health {database?}` reads the database's schema (`with_deadline`)
 and its stats and prints `workload::index_health`'s findings and `perf::usage_note`, and its
 description tells the model to say "unused since …", never "never used". **On SQL Server
 (`supports_missing_index_hints`) it then appends `Db::fetch_missing_indexes`' top `PERF_ROWS` as a

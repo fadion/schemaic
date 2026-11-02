@@ -1554,8 +1554,8 @@ Only a **vacant** slot is warmed — `Idle` or `Unavailable`, never `Loading` (a
 will land) and never `Loaded` (substituting one reading for another with nothing to say which is
 newer). `warming_a_disposed_slot_does_nothing` panics rather than fails against the old body.
 **`Db::fetch_top_statements` and `Db::fetch_missing_indexes` are the workload reads**
-(`core::workload`) — the MCP server's `top_statements` and `index_health` today, and the roadmap's
-app view when it is built; the size ranking and index health beside them read nothing new, sweeping
+(`core::workload`) — the MCP server's `top_statements` and `index_health`, and the app's
+*Performance* view (`ui/perf_view.rs`); the size ranking and index health beside them read nothing new, sweeping
 `fetch_table_stats` and `fetch_schema`. Both ask a capability before anything is dialled —
 `supports_statement_stats`, false on SQLite, answering `Unavailable::NotSupported`; and
 `supports_missing_index_hints`, SQL Server only, answering an empty list elsewhere, which is why

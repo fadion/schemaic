@@ -77,7 +77,8 @@ entry because a connection whose tree already fills the panel leaves no blank sp
 right-click. In the gear it sits **above** `Create database` — a read entry before a write one,
 skeleton group 2 before group 4. It shipped below it, which is the cross-group inversion
 `menu_order_gate` exists to catch and cannot see in this menu, so the gear now reads Refresh ·
-Collapse all · Users and privileges · Server variables · Create database · Show table sizes. The
+Collapse all · Users and privileges · Server variables · Performance · Create database · Show
+table sizes. The
 entry
 is **absent** where the engine has no accounts at all (`users::supports_users` — SQLite) and with
 no saved connection (`ctx.exists`), and **dimmed on a down connection but not on a read-only

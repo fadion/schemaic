@@ -193,7 +193,8 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   menus in the app are outside it, both of which then shipped the inversion it was written to catch.
   The SCHEMA gear put `Create database` (group 4) *above* `Users and privileges` (group 2), and the
   tree's blank-space menu did the same; the gear now runs Refresh · Collapse all · Users and
-  privileges · Server variables · Create database · Show table sizes, and the blank-space menu
+  privileges · Server variables · Performance · Create database · Show table sizes, and the
+  blank-space menu
   carries its own half of
   the gate in `schema_tree::blank_space_is_a_subsequence_of_the_skeleton`, asserted over the entry
   **values** rather than over the source, since unlike the context menus those entries are data,
@@ -488,8 +489,8 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   publishing its box from `on_move`/`on_resize` — with the menu hung below the row's whole box
   (`PopupAnchor::BelowBox`) rather than at a content corner, and the cursor a
   `core::activity::RowKey` because that list is rebuilt and re-sorted on every poll.
-  The grid's cell and header menus, the editor's, the tab strip's and the connection list's still
-  need a right-click.
+  The grid's cell and header menus, the editor's, the tab strip's, the connection list's and the
+  Performance view's statement rows (*Copy statement*) still need a right-click.
   The tree's route is worth reading before copying it: focus lives on the tree **container**, never
   on a row, so a key arriving there knows neither which row it is about nor where that row is. Both
   ride on the per-row effect that already existed to scroll the cursor into view — `Nav::cursor_menu`

@@ -45,13 +45,11 @@ The entries below are grouped by surface and ordered roughly cheapest first with
 None of their decisions has been taken yet. What an entry lists under *Open* is for the user to
 settle before work starts, and the traps are the ones known today.
 
-They ship in this order, one release each. Releases 1 and 2 merge if 2 turns out small. The
-headless release before them has landed.
+They ship in this order, one release each. The headless and performance releases before them
+have landed.
 
-1. **Performance:** *Workload and performance insight* with the MCP performance tools, which share
-   its backend.
-2. **Data and editor:** *Compare and sync table data*, the custom keymap and the two chart kinds.
-3. **DuckDB**, alone. A new engine answers every capability predicate and needs its own read-only
+1. **Data and editor:** *Compare and sync table data*, the custom keymap and the two chart kinds.
+2. **DuckDB**, alone. A new engine answers every capability predicate and needs its own read-only
    allowlist, so it gets a release with nothing else in it.
 
 ## Desktop app
@@ -83,31 +81,6 @@ It is far cheaper than Oracle. ClickHouse would come after DuckDB.
   (`read_csv`, `read_parquet`, `COPY … TO`) read and write the *client's* filesystem, so they need
   their own entries. `COPY … TO` is a write.
 - **Open:** a file-backed database only, or also in-memory sessions over loose files?
-
-### Workload and performance insight
-
-Server Activity shows *who* is running and what they are waiting on, but not *why it's slow*. Table
-statistics (`core::stats`) already cover one table at a time: its sizes, row counts, dead rows and
-free space, and per-index usage with `IndexStats::is_unused`. What is missing is the server-wide
-view. This is shared with the MCP performance tools below, so build the backend once in
-`schemaic-db` and `schemaic-core`, reusing `core::stats` rather than reading the same figures twice.
-
-- **Sources:**
-  - `pg_stat_statements`.
-  - MySQL and MariaDB `performance_schema` statement digests.
-  - SQL Server Query Store, plus the missing-index DMVs.
-- **Views:**
-  - Top statements by total and mean time.
-  - Unused and duplicate indexes across the whole database, not one table at a time.
-  - The largest tables and indexes, ranked.
-- **Trap:** each source may be absent:
-  - `pg_stat_statements` is an extension that might not be installed.
-  - `performance_schema` can be off.
-  - Query Store has to be turned on per database.
-
-  Ask a capability of the live server and explain what is missing; don't show an empty view.
-- **Trap:** suggesting an index produces DDL. That goes through the normal preview modal and is
-  never run silently.
 
 ### Compare and sync table data
 

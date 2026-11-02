@@ -4,11 +4,10 @@
 one (`core/ui-state-models.md`): which statements a server has spent most on, which indexes
 nothing reads or another index already covers, which tables and indexes are largest, and — on
 SQL Server — which indexes the optimiser recorded as missing. It is the backend of the roadmap's
-*Workload and performance insight*, and today it has one front end: the MCP server's four
-performance tools (`cli/mcp.rs`, rendered by `cli/perf.rs`). **The app view the module's doc and
-`Db::fetch_top_statements`' rustdoc call the *Performance* view does not exist yet**; when it is
-built it ranks with these functions rather than a second time, so an agent and a person looking
-at one server are told the same thing.
+*Workload and performance insight*, and it has two front ends: the MCP server's four
+performance tools (`cli/mcp.rs`, rendered by `cli/perf.rs`) and the app's *Performance* view
+(`ui/perf_view.rs`, fetched by the app's `perf_fetch`). **Both rank with these functions rather
+than a second time**, so an agent and a person looking at one server are told the same thing.
 **Statements.** `StatementStat` is one normalised statement — `query`, `database` where the
 source records one, `calls`, `total_ms`, `mean_ms`, and `rows` where the source counts them — and
 `StatementOrder` (`Total`, the default; `Mean`; `Calls`) is the ranking, `name`/`parse` being the
@@ -100,6 +99,13 @@ as an `IndexDraft::new` and returns `ddl::diff`'s plan as `ChangeSet::editor_scr
 *INCOMPLETE* header of a plan the emitter could only partly express, and the batches a client
 needs, which is the `client_script` rule. It is text to propose; nothing in this module or
 its callers runs it (`a_suggestion_becomes_the_differs_create_index`, which asserts `CREATE INDEX
-[IX_Orders_CustomerID] ON [dbo].[Orders] ([CustomerID])` and its `INCLUDE ([Total])`). Verified
+[IX_Orders_CustomerID] ON [dbo].[Orders] ([CustomerID])` and its `INCLUDE ([Total])`). **The
+edit itself is `MissingIndex::add_to`**, which pushes `index_info()` onto a draft as an
+`IndexDraft::new`: `suggestion_ddl` calls it, and so does the app's *Create index*, which wants
+the draft edit for the preview rather than a script — one decision of how a suggestion becomes an
+index, two front ends (`ui/perf_view.md`). `index_sizes_per_table_only` is the other question a
+size list needs answered: an empty index ranking means "this engine sizes indexes per table"
+only when some table has index bytes and no index has a figure of its own, and otherwise that
+there are no indexes (`only_a_table_wide_index_figure_means_sizes_are_per_table`). Verified
 live by the change's author: duplicate and redundant detection on MariaDB 10.11, and that same
 statement from a real SQL Server's DMVs through `index_health`.

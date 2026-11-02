@@ -309,6 +309,16 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                 ui.overlay,
                 &ui.schema_actions,
             )),
+            // Performance: the server's statistics, raised from the same gear.
+            // It hands index DDL to the preview and steps aside while that is
+            // up, so it takes compare's `preview_open` clause below.
+            crate::perf_view::perf_overlay(crate::perf_view::PerfCtx::new(
+                ui.overlay,
+                ui.conn,
+                ui.schema,
+                ui.ddl,
+                &ui.schema_actions,
+            )),
             // The binary-cell panel joins this group on the merits: like the
             // properties modal beside it, it is a question asked *about the
             // result on screen* rather than about the schema tree, and it is
@@ -576,6 +586,7 @@ fn workspace_modals_up(
     let blob_open = blob.target;
     let compare_open = overlay.compare;
     let copy_open = overlay.copy_table;
+    let perf_open = overlay.perf;
     // **The browser counts only while it is the thing on screen.** It renders
     // nothing while one of the account forms or the DDL preview is up — those
     // are raised from it and painted in an earlier group — and a wrapper that
@@ -608,6 +619,9 @@ fn workspace_modals_up(
             // here it is load-bearing: the modal stays open behind the
             // preview it raised, to count the rows once the plan commits.
             || (copy_open.with(Option::is_some) && preview_open.with(Option::is_none))
+            // Performance too: it stays open behind the preview its *Create
+            // index* or *Drop* raised, so the list is there to refresh after.
+            || (perf_open.with(Option::is_some) && preview_open.with(Option::is_none))
     }
 }
 
@@ -752,6 +766,9 @@ mod modal_backdrop_gate {
         "monitor_view.rs",
         "object_editor.rs",
         "overlays.rs",
+        // In the layer's workspace group, after `server_vars_view.rs`, raised
+        // by `workspace_modals_up`'s `perf_open` arm.
+        "perf_view.rs",
         "plan_view.rs",
         "properties.rs",
         "routine_editor.rs",

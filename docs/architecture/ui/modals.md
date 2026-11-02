@@ -69,6 +69,11 @@ the rows once the plan commits (`DdlPreview::then`). Without the clause in
 `workspace_modals_up` the group's wrapper would fill the layer over the preview's Apply for the
 whole time the plan is on screen. The two must ask the same two signals, as the users browser
 and its predicate do.
+**The Performance view, mounted directly after the Server variables viewer, takes it too, and for
+*Copy to*'s reason** — its *Drop* and *Create index* raise the preview and it stays open behind
+it, hidden by its own `perf && preview.is_none()` style, so the list is there to refresh once the
+plan is applied. Its arm is `perf_open && preview_open.is_none()`: a plain term like `vars_open`
+beside it would fill the layer over the preview's Apply exactly as above.
 **`whole_ui_gate` 5 → 2, and the two left are the layer and the union.** The three group
 predicates take the bundles they read — `ddl_modals_up(OverlayUi, ImportUi, DumpUi, ScriptUi,
 DdlUi)`, `workspace_modals_up(OverlayUi, BlobUi, DdlUi)` and `settings_modals_up(LayoutUi)` —

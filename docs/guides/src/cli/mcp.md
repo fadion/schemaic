@@ -126,7 +126,9 @@ The level is read when the server starts. If you change it, restart the server f
 `top_statements`, `index_health`, `table_sizes` and `current_locks` let the agent look into a slow
 server. Like the rest, they only read: an index `index_health` suggests comes back as a
 `CREATE INDEX` for you to run if you choose, and to end a session the agent is told to point you
-at **Server activity**. On SQLite there are no statements or locks to report.
+at **Server activity**. On SQLite there are no statements or locks to report. The same
+statements, index findings and sizes are in the app's [Performance](../schema/performance.md)
+view.
 
 - `top_statements` ranks statements by total time, mean time or calls, counted since the
   server's statistics were last reset. It reads them from a source that has to be on:

@@ -114,8 +114,9 @@ inside a `dyn_container`, did.
 `pill_active_bg`/`pill_active_text` when `on`, `text_dim` with a `pill_hover_bg` hover when not.
 The designer's *Table | Columns | Indexes …* strip and Server Variables' *Variables | Status*
 switch both call it, so the two cannot drift apart again — the switch wore Server Activity's
-underlined labels until the user asked for it to match the designer's tabs. **`count_pill`** is
-the third caller — the filter pill with a count, shared by Compare results' *All · Changed ·
+underlined labels until the user asked for it to match the designer's tabs — and so do the
+Performance view's two rows (`perf_view::pills`). **`count_pill`** is
+the fourth caller — the filter pill with a count, shared by Compare results' *All · Changed ·
 Added · Removed* and the Live monitor's *All · Inserts · Updates · Deletes*: a coloured dot
 naming the kind (none for *All*), the name, the count in `text_faint` while inactive, wrapped in
 `in_ring_button` at radius 6 so the focus outline follows its corners, Enter or Space picking.

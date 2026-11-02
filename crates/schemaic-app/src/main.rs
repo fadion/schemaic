@@ -3396,6 +3396,14 @@ fn app_view(
     let server_vars_state: RwSignal<schemaic_ui::VarsState> =
         RwSignal::new(schemaic_ui::VarsState::Loading);
     let server_vars_generation: RwSignal<u64> = RwSignal::new(0);
+    // The Performance view — `server_vars`' shape, with the list and the
+    // statement order beside the target.
+    let perf: RwSignal<Option<schemaic_ui::PerfTarget>> = RwSignal::new(None);
+    let perf_view: RwSignal<schemaic_ui::PerfView> = RwSignal::new(Default::default());
+    let perf_order: RwSignal<schemaic_core::workload::StatementOrder> =
+        RwSignal::new(Default::default());
+    let perf_state: RwSignal<schemaic_ui::PerfState> = RwSignal::new(Default::default());
+    let perf_generation: RwSignal<u64> = RwSignal::new(0);
     // The schema tree's size column (persisted; see `UiState::show_table_sizes`).
     let table_sizes = RwSignal::new(ui_state.show_table_sizes);
     // The history panel's *Current*/*All* switch (`UiState::history_all_connections`).
@@ -11206,6 +11214,125 @@ fn app_view(
         )
     };
 
+    /// How many of each the Performance view lists — sizes and missing indexes
+    /// — where a person scrolls, against the MCP tools' 20 that ride along on
+    /// every turn.
+    const PERF_VIEW_ROWS: usize = 50;
+    // The Performance view's lists — `server_vars_fetch`'s shape: a generation
+    // claimed before the round trip and compared, with the target, the list
+    // and the order, when it lands. Every read is `core::workload`'s over the
+    // `Db` methods the MCP performance tools call, so the two front ends see
+    // one answer.
+    let perf_fetch: Rc<
+        dyn Fn(
+            schemaic_ui::PerfTarget,
+            schemaic_ui::PerfView,
+            schemaic_core::workload::StatementOrder,
+        ),
+    > = {
+        let handle = handle.clone();
+        let db_for = db_for.clone();
+        Rc::new(
+            move |target: schemaic_ui::PerfTarget,
+                  view: schemaic_ui::PerfView,
+                  order: schemaic_core::workload::StatementOrder| {
+                use schemaic_core::workload as wl;
+                use schemaic_ui::{PerfData, PerfState, PerfView};
+                let db = match db_for(target.conn_id) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        perf_state.set(PerfState::Failed(e));
+                        return;
+                    }
+                };
+                let want = target.clone();
+                let generation = perf_generation.get_untracked() + 1;
+                perf_generation.set(generation);
+                let report = create_ext_action(cx, move |res: Result<PerfData, String>| {
+                    if perf.with_untracked(|t| t.as_ref() != Some(&want))
+                        || perf_view.get_untracked() != view
+                        || (view == PerfView::Statements && perf_order.get_untracked() != order)
+                        || perf_generation.get_untracked() != generation
+                    {
+                        return;
+                    }
+                    perf_state.set(match res {
+                        Ok(data) => PerfState::Loaded(Rc::new(data)),
+                        Err(e) => PerfState::Failed(e),
+                    });
+                });
+                let database = target.database.clone();
+                handle.spawn(async move {
+                    let shown = |e: DbError| db_error_shown(&e);
+                    let res = match (view, database) {
+                        (PerfView::Statements, database) => db
+                            .fetch_top_statements(
+                                database.as_deref(),
+                                order,
+                                wl::DEFAULT_STATEMENT_LIMIT,
+                            )
+                            .await
+                            .map(PerfData::Statements)
+                            .map_err(shown),
+                        // The view refuses these without a database before
+                        // asking, so this arm is only a stale request's.
+                        (_, None) => Err(String::new()),
+                        (PerfView::Sizes, Some(database)) => db
+                            .fetch_table_stats(&database)
+                            .await
+                            .map_err(shown)
+                            .map(|stats| {
+                                let (tables, indexes) = wl::largest(&stats, PERF_VIEW_ROWS);
+                                PerfData::Sizes {
+                                    tables,
+                                    indexes,
+                                    per_table: wl::index_sizes_per_table_only(&stats),
+                                }
+                            }),
+                        (PerfView::Indexes, Some(database)) => {
+                            let token = tokio_util::sync::CancellationToken::new();
+                            match db.fetch_schema(&database, token).await {
+                                Err(e) => Err(shown(e)),
+                                Ok(schema) => match db.fetch_table_stats(&database).await {
+                                    Err(e) => Err(shown(e)),
+                                    Ok(stats) => {
+                                        // A refused missing-index read costs only
+                                        // that section, as a refused usage view
+                                        // costs only the usage in the stats.
+                                        let (missing, missing_error) =
+                                            if wl::supports_missing_index_hints(
+                                                db.engine().dialect(),
+                                            ) {
+                                                match db
+                                                    .fetch_missing_indexes(
+                                                        Some(&database),
+                                                        PERF_VIEW_ROWS,
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(m) => (m, None),
+                                                    Err(e) => (Vec::new(), Some(shown(e))),
+                                                }
+                                            } else {
+                                                (Vec::new(), None)
+                                            };
+                                        Ok(PerfData::Indexes {
+                                            findings: wl::index_health(&schema.tables, &stats),
+                                            counted: wl::usage_counted(&stats),
+                                            missing,
+                                            missing_error,
+                                        })
+                                    }
+                                },
+                            }
+                        }
+                    };
+                    report(res);
+                });
+            },
+        )
+    };
+
     let toggle_table_sizes: Rc<dyn Fn()> = Rc::new(move || table_sizes.update(|on| *on = !*on));
 
     // Fetch one database's table statistics into its node's slot, once.
@@ -15577,6 +15704,11 @@ fn app_view(
             server_vars_state,
             server_vars_filter: RwSignal::new(String::new()),
             server_vars_generation,
+            perf,
+            perf_view,
+            perf_order,
+            perf_state,
+            perf_generation,
             run_guard,
             snippet_edit: snippet_edit_open,
             alias_rename: alias_rename_open,
@@ -15639,6 +15771,7 @@ fn app_view(
             principals,
             grants,
             server_vars: server_vars_fetch,
+            perf: perf_fetch,
             toggle_table_sizes,
             db_stats,
         }),

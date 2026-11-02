@@ -1325,6 +1325,7 @@ pub(crate) enum GearKind {
     CollapseAll,
     Users,
     ServerVariables,
+    Performance,
     CreateDatabase,
     ShowTableSizes,
 }
@@ -1359,6 +1360,9 @@ impl GearKind {
             // The same question as the browser above it: a read, of a server
             // that has to be reachable to answer.
             GearKind::ServerVariables => down,
+            // A read of the server's statistics; its index *Create* and *Drop*
+            // go through the DDL preview, which carries the read-only refusal.
+            GearKind::Performance => down,
             GearKind::CreateDatabase => read_only || down,
         }
     }
@@ -1371,6 +1375,7 @@ impl GearKind {
             GearKind::CollapseAll => tr!("tree-collapse-all"),
             GearKind::Users => tr!("tree-users"),
             GearKind::ServerVariables => tr!("tree-server-variables"),
+            GearKind::Performance => tr!("tree-performance"),
             GearKind::CreateDatabase => tr!("tree-new-database"),
             GearKind::ShowTableSizes => tr!("tree-show-table-sizes"),
         }
@@ -1439,6 +1444,15 @@ pub(crate) fn gear_entries(
         out.push(GearEntry {
             kind: GearKind::ServerVariables,
             disabled: GearKind::ServerVariables.disabled_when(read_only, down),
+        });
+    }
+    // Beside the settings, and gated the same way. Every engine has something
+    // to show — SQLite its index health and `dbstat` sizes, with no statement
+    // statistics, which the view says — so the row asks for a connection only.
+    if connection_exists {
+        out.push(GearEntry {
+            kind: GearKind::Performance,
+            disabled: GearKind::Performance.disabled_when(read_only, down),
         });
     }
     // Dimmed on read-only *and* on down, for the reason
@@ -1594,6 +1608,11 @@ pub(crate) fn schema_settings_overlay(
                             GearKind::ServerVariables => {
                                 crate::server_vars_view::open_for_active(conn, overlay);
                             }
+                            GearKind::Performance => crate::perf_view::open_for_active(
+                                conn,
+                                overlay,
+                                tabs_ui.active_db.get_untracked(),
+                            ),
                             // The read-only refusal is inside `open_for_new`,
                             // so every home of this action is guarded by
                             // construction — see it for why the guard moved
@@ -4866,6 +4885,23 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                 &close,
             ),
         },
+        // The gear's Performance, on the active tab's database.
+        Command {
+            id: "performance",
+            label: tr!("palette-performance"),
+            hint: tr!("palette-performance-hint"),
+            arg: instant(
+                Rc::new({
+                    let conn = ui.conn;
+                    let overlay = ui.overlay;
+                    let active_db = ui.tabs_ui.active_db;
+                    move || {
+                        crate::perf_view::open_for_active(conn, overlay, active_db.get_untracked())
+                    }
+                }),
+                &close,
+            ),
+        },
     ];
     // **No "Server Variables" without a connection to read them from**, for
     // the gear's reason: the door would do nothing, and a palette row that
@@ -4875,7 +4911,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
         connections.with_untracked(|cs| schemaic_core::connection::by_id(cs, id).is_some())
     };
     if !has_conn {
-        cmds.retain(|c| c.id != "server variables");
+        cmds.retain(|c| c.id != "server variables" && c.id != "performance");
     }
     // **No "Ask AI" while the assistant is off** — omitted, as the Activity
     // panel is on an engine without sessions. The registry is built per open,
@@ -8114,6 +8150,7 @@ mod tests {
                     "Collapse all",
                     "Users and privileges",
                     "Server variables",
+                    "Performance",
                     "Create database",
                     "Show table sizes",
                 ],
@@ -8126,6 +8163,7 @@ mod tests {
                     GearKind::CollapseAll,
                     GearKind::Users,
                     GearKind::ServerVariables,
+                    GearKind::Performance,
                     GearKind::CreateDatabase,
                     GearKind::ShowTableSizes,
                 ],
@@ -8147,6 +8185,7 @@ mod tests {
                 GearKind::Refresh,
                 GearKind::CollapseAll,
                 GearKind::ServerVariables,
+                GearKind::Performance,
                 GearKind::ShowTableSizes
             ]
         );

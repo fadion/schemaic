@@ -75,7 +75,8 @@ away: you see the SQL first. An entry that's missing means the engine can't do i
 greyed out means the connection is marked read-only.
 
 The panel's gear menu (and a right-click on empty space) holds what isn't about one object:
-**Refresh**, **Collapse all**, **Users and privileges**, **Server variables**, **Create database**,
+**Refresh**, **Collapse all**, **Users and privileges**, **Server variables**,
+[**Performance**](performance.md), **Create database**,
 and **Show table sizes**, which adds each table's size on disk to its row.
 
 ## Keeping a big server tidy
@@ -95,3 +96,5 @@ and **Show table sizes**, which adds each table's size on disk to its row.
 - [ER diagram](er-diagram.md) — see how tables relate, and export the picture.
 - [Live monitor](live-monitor.md) — watch rows change in a table as it happens.
 - [Comparing schemas](compare.md) — find what differs between two databases, and bring one in line.
+- [Performance](performance.md) — find the slow statements, the indexes worth a look, and the
+  largest tables.

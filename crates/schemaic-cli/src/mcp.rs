@@ -1880,7 +1880,13 @@ async fn table_sizes(db: &Db, database: Option<&str>, args: &Value) -> (String, 
     let mut out = format!("Largest tables in {database}:\n");
     out.push_str(&format_table(&crate::perf::table_sizes_result(&tables)));
     if indexes.is_empty() {
-        out.push_str("\n\nThis engine reports index sizes per table, not per index.");
+        out.push_str(
+            if schemaic_core::workload::index_sizes_per_table_only(&stats) {
+                "\n\nThis engine reports index sizes per table, not per index."
+            } else {
+                "\n\nThis database has no indexes to size."
+            },
+        );
     } else {
         out.push_str("\n\nLargest indexes:\n");
         out.push_str(&format_table(&crate::perf::index_sizes_result(&indexes)));

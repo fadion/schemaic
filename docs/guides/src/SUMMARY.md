@@ -25,6 +25,7 @@
   - [ER diagram](schema/er-diagram.md)
   - [Live monitor](schema/live-monitor.md)
   - [Comparing schemas](schema/compare.md)
+  - [Performance](schema/performance.md)
 - [Users and access](users/README.md)
   - [Granting and revoking](users/privileges.md)
 - [Import and dump](import-export/README.md)

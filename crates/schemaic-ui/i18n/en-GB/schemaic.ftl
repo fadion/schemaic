@@ -375,6 +375,8 @@ palette-switch-connection = Switch connection
 palette-switch-connection-hint = <connection>
 palette-server-variables = Server variables
 palette-server-variables-hint = the active connection's settings
+palette-performance = Performance
+palette-performance-hint = the slowest statements, index health and the largest tables
 palette-enter-number = Enter a number
 palette-nothing-found = Nothing found
 
@@ -467,6 +469,7 @@ tree-drop-foreign-key = Drop foreign key
 tree-ai-explain = AI explain
 tree-users = Users and privileges
 tree-server-variables = Server variables
+tree-performance = Performance
 # The gear's and the tree's blank-space entry; under Create ▸ it is just "Database".
 tree-new-database = Create database
 tree-show-table-sizes = Show table sizes
@@ -3309,6 +3312,65 @@ server-vars-count = { $count ->
 # While the search narrows the list; $count is the total.
 server-vars-count-filtered = { $shown } of { $count } settings
 server-vars-refresh = Refresh
+
+## Performance view (perf_view.rs)
+
+perf-title = Performance — { $connection }
+perf-title-database = Performance — { $connection } · { $database }
+perf-view-statements = Statements
+perf-view-indexes = Indexes
+perf-view-sizes = Sizes
+perf-order-total = Total time
+perf-order-mean = Mean time
+perf-order-calls = Calls
+perf-loading = Reading the server's statistics…
+perf-no-database = Choose a database in the query toolbar first — indexes and sizes are one database's.
+perf-refresh = Refresh
+perf-copy = Copy
+perf-copy-statement = Copy statement
+# The statement sources, when off. Each must read as core's
+# `workload::Unavailable::reason` does in English.
+perf-src-not-supported = This engine keeps no statement statistics.
+perf-src-pgss-not-installed = pg_stat_statements is not installed in this database.
+perf-src-pgss-not-loaded = pg_stat_statements is installed but not loaded: it must be listed in shared_preload_libraries, which takes a server restart.
+perf-src-ps-off = performance_schema is off on this server. It is a startup option, so turning it on takes a restart.
+perf-src-digest-off = performance_schema is on, but its statements_digest consumer is disabled.
+perf-src-qs-off = Query Store is off for this database.
+perf-src-qs-error = Query Store is in an error state for this database.
+perf-src-no-permission = This login may not read the statement statistics: { $error }
+perf-src-enable = To turn it on, run this in a query tab:
+perf-statements-none = The statistics source is on but has recorded no statements yet.
+perf-since = Counted since { $since }.
+# A statement's figures, joined by middle dots under its text.
+perf-total = { $time } total
+perf-mean = { $time } mean
+perf-sub-ms = { $ms }ms
+perf-calls = { $n ->
+    [one] { $shown } call
+   *[other] { $shown } calls
+}
+perf-rows = { $n ->
+    [one] { $shown } row
+   *[other] { $shown } rows
+}
+perf-indexes-none = No duplicate, redundant or unused indexes found.
+perf-problem-unused = Not read since the counters were last reset
+perf-problem-duplicate = Duplicates { $of }
+perf-problem-redundant = Covered by { $by }, whose key begins with this one's
+perf-usage-note = Usage counts start again when the server restarts or its statistics are reset, so an index used only by a monthly job can look unused. Check before dropping one.
+perf-usage-uncounted = This server reports no index usage counts, so no index can be called unused — only duplicates and prefixes are shown.
+perf-drop-index = Drop
+perf-create-index = Create index
+perf-missing-title = Missing indexes the optimiser recorded since the last restart
+perf-missing-none = None recorded.
+perf-missing-detail = { $uses } uses · { $impact }% estimated improvement
+perf-missing-note = Each is one optimiser's estimate. Check it against the indexes above before creating it.
+perf-sizes-none = This database reported no table sizes.
+perf-sizes-tables = Largest tables
+perf-sizes-indexes = Largest indexes
+perf-sizes-no-index-sizes = This engine reports index sizes per table, not per index.
+perf-sizes-no-indexes = This database has no indexes to size.
+perf-rows-estimate = ~{ $shown } rows
 
 ## Edit snippet modal (snippet_edit.rs)
 
