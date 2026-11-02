@@ -127,12 +127,6 @@ with a sync script.
 
 ## MCP server
 
-### Performance tools
-
-Top statements, index-usage health, missing and unused indexes, table sizes and current locks. They
-share their backend with the app's *Workload and performance insight* entry, so they land after it.
-They read only, and any index they suggest comes back as DDL to propose, never to run.
-
 ### Non-goals
 
 - **HTTP or SSE transport.** Stdio keeps access control at the process boundary. A listening socket

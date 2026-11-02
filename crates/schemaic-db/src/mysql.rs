@@ -882,6 +882,127 @@ pub(crate) async fn fetch_table_stats(db: &Db, database: &str) -> Result<SchemaS
     out
 }
 
+/// `performance_schema`'s statement digests, ranked — server-wide, with the
+/// schema each ran in. Timer columns are picoseconds; `/ 1e9` is
+/// milliseconds. Every figure comes back as text (`CAST … AS CHAR`) and is
+/// parsed here, because MariaDB has no `CAST … AS DOUBLE` before 10.4 and the
+/// driver hands a `DECIMAL` back as bytes.
+///
+/// The text is capped at 8 KiB **in bytes** (`CONVERT … USING binary`), as
+/// `MY_PROCESSLIST_SQL` caps its own, so a multi-byte character can't make
+/// the cut land mid-sequence. The row with a NULL digest is the server's
+/// overflow bucket — statements that arrived after the digest table filled —
+/// and is no statement at all.
+fn my_statements_sql(order: schemaic_core::workload::StatementOrder, limit: usize) -> String {
+    use schemaic_core::workload::StatementOrder;
+    let by = match order {
+        StatementOrder::Total => "SUM_TIMER_WAIT",
+        StatementOrder::Mean => "AVG_TIMER_WAIT",
+        StatementOrder::Calls => "COUNT_STAR",
+    };
+    format!(
+        "SELECT CONVERT(LEFT(CONVERT(DIGEST_TEXT USING binary), 8192) USING utf8mb4), \
+         SCHEMA_NAME, CAST(COUNT_STAR AS CHAR), CAST(SUM_TIMER_WAIT / 1e9 AS CHAR), \
+         CAST(AVG_TIMER_WAIT / 1e9 AS CHAR), CAST(SUM_ROWS_SENT + SUM_ROWS_AFFECTED AS CHAR) \
+         FROM performance_schema.events_statements_summary_by_digest \
+         WHERE DIGEST_TEXT IS NOT NULL \
+         ORDER BY {by} DESC LIMIT {limit}"
+    )
+}
+
+/// The MySQL/MariaDB half of [`Db::fetch_top_statements`]. Server-wide, so
+/// it opens no database.
+pub(crate) async fn fetch_top_statements(
+    db: &Db,
+    order: schemaic_core::workload::StatementOrder,
+    limit: usize,
+) -> Result<schemaic_core::workload::StatementReport, DbError> {
+    let mut conn = db.open(None, false).await?;
+    let out = collect_top_statements(&mut conn, order, limit).await;
+    let _ = conn.disconnect().await;
+    out
+}
+
+async fn collect_top_statements(
+    conn: &mut Conn,
+    order: schemaic_core::workload::StatementOrder,
+    limit: usize,
+) -> Result<schemaic_core::workload::StatementReport, DbError> {
+    use schemaic_core::workload::{self as wl, StatementReport, StatementStat, Unavailable};
+    let qerr = |e: mysql_async::Error| DbError::Query(e.to_string());
+    // A permission refusal on `performance_schema` (1142 table access, 1044
+    // database access) is the source being out of reach, not a failure.
+    let denied = |e: mysql_async::Error| match e {
+        mysql_async::Error::Server(ref s) if s.code == 1142 || s.code == 1044 => Ok(
+            StatementReport::Unavailable(Unavailable::NoPermission(s.message.clone())),
+        ),
+        e => Err(qerr(e)),
+    };
+    let on = conn
+        .query_first::<u64, _>("SELECT CAST(@@performance_schema AS UNSIGNED)")
+        .await
+        .map_err(qerr)?
+        .unwrap_or(0)
+        == 1;
+    let consumer = if on {
+        match conn
+            .query_first::<String, _>(
+                "SELECT CAST(ENABLED AS CHAR) FROM performance_schema.setup_consumers \
+                 WHERE NAME = 'statements_digest'",
+            )
+            .await
+        {
+            Ok(v) => v.map(|s| s.eq_ignore_ascii_case("YES")),
+            Err(e) => return denied(e),
+        }
+    } else {
+        None
+    };
+    if let Some(u) = wl::mysql_digest_availability(on, consumer) {
+        return Ok(StatementReport::Unavailable(u));
+    }
+    type Row = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<Row> = match conn
+        .query_map(my_statements_sql(order, limit), |r: Row| r)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => return denied(e),
+    };
+    let float = |s: &Option<String>| s.as_deref().and_then(|s| s.trim().parse::<f64>().ok());
+    let int = |s: &Option<String>| s.as_deref().and_then(|s| s.trim().parse::<u64>().ok());
+    let statements = rows
+        .iter()
+        .map(|r| StatementStat {
+            query: r.0.clone().unwrap_or_default(),
+            database: r.1.clone().filter(|s| !s.is_empty()),
+            calls: int(&r.2).unwrap_or(0),
+            total_ms: float(&r.3).unwrap_or(0.0),
+            mean_ms: float(&r.4).unwrap_or(0.0),
+            rows: int(&r.5),
+        })
+        .collect();
+    // The oldest digest's first sighting: the counters cover no earlier
+    // than that. Best effort — `FIRST_SEEN` arrived in MySQL 5.7.
+    let since = conn
+        .query_first::<Option<String>, _>(
+            "SELECT CAST(MIN(FIRST_SEEN) AS CHAR) \
+             FROM performance_schema.events_statements_summary_by_digest",
+        )
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+    Ok(StatementReport::Ready { statements, since })
+}
+
 /// `information_schema.PROCESSLIST`, minus this connection and minus the
 /// server's own internal threads.
 ///
@@ -1296,6 +1417,23 @@ fn map_mysql_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_digest_query_ranks_by_the_asked_timer_and_skips_the_overflow_row() {
+        use schemaic_core::workload::StatementOrder;
+        for (order, col) in [
+            (StatementOrder::Total, "SUM_TIMER_WAIT"),
+            (StatementOrder::Mean, "AVG_TIMER_WAIT"),
+            (StatementOrder::Calls, "COUNT_STAR"),
+        ] {
+            let sql = my_statements_sql(order, 7);
+            assert!(
+                sql.contains(&format!("ORDER BY {col} DESC LIMIT 7")),
+                "{sql}"
+            );
+            assert!(sql.contains("WHERE DIGEST_TEXT IS NOT NULL"), "{sql}");
+        }
+    }
 
     /// **The session list reads a bounded prefix of the statement.**
     ///

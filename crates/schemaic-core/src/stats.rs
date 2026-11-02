@@ -673,6 +673,13 @@ impl SchemaStats {
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty()
     }
+
+    /// Every table's figures, in the order the engine listed them — for the
+    /// database-wide readers ([`crate::workload`]) that rank or sweep them all
+    /// rather than look one up.
+    pub fn tables(&self) -> &[TableStats] {
+        &self.tables
+    }
 }
 
 /// Human byte size, 1024-based with IEC units: `0 B`, `912 B`, `1.5 KiB`,

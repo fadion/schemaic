@@ -3555,6 +3555,156 @@ fn index_stats_sql(usage: bool) -> String {
     )
 }
 
+/// Query Store's statements, ranked — one database's, since Query Store is
+/// kept per database.
+///
+/// One row per query **text**, summed across its plans and intervals.
+/// `avg_duration` is microseconds per execution within an interval, so the
+/// total is `avg_duration × count_executions` summed, and the mean that total
+/// over the executions; both `/ 1000` to milliseconds. Floats throughout —
+/// `bigint` arithmetic over a busy server's lifetime overflows.
+fn query_store_sql(order: schemaic_core::workload::StatementOrder, limit: usize) -> String {
+    use schemaic_core::workload::StatementOrder;
+    let by = match order {
+        StatementOrder::Total => "total_us",
+        StatementOrder::Mean => "mean_us",
+        StatementOrder::Calls => "calls",
+    };
+    format!(
+        "SELECT TOP ({limit}) LEFT(query_text, 8192), DB_NAME(), calls, total_us / 1000.0, \
+         mean_us / 1000.0, row_total FROM ( \
+           SELECT qt.query_sql_text AS query_text, \
+             CAST(SUM(rs.count_executions) AS float) AS calls, \
+             SUM(CAST(rs.avg_duration AS float) * rs.count_executions) AS total_us, \
+             SUM(CAST(rs.avg_duration AS float) * rs.count_executions) \
+               / NULLIF(SUM(CAST(rs.count_executions AS float)), 0) AS mean_us, \
+             SUM(CAST(rs.avg_rowcount AS float) * rs.count_executions) AS row_total \
+           FROM sys.query_store_query_text qt \
+           JOIN sys.query_store_query q ON q.query_text_id = qt.query_text_id \
+           JOIN sys.query_store_plan p ON p.query_id = q.query_id \
+           JOIN sys.query_store_runtime_stats rs ON rs.plan_id = p.plan_id \
+           GROUP BY qt.query_text_id, qt.query_sql_text \
+         ) s ORDER BY {by} DESC"
+    )
+}
+
+/// Is this SQL Server refusal a missing grant — `VIEW DATABASE STATE`,
+/// `VIEW SERVER STATE` — rather than a failure?
+fn is_permission_refusal(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("permission") || m.contains("view database state") || m.contains("view server state")
+}
+
+/// The SQL Server half of [`Db::fetch_top_statements`]: Query Store's state
+/// first, so a database where it is off says so, then the list.
+pub(crate) async fn fetch_top_statements(
+    db: &Db,
+    database: Option<&str>,
+    order: schemaic_core::workload::StatementOrder,
+    limit: usize,
+) -> Result<schemaic_core::workload::StatementReport, DbError> {
+    use schemaic_core::workload::{self as wl, StatementReport, StatementStat, Unavailable};
+    let mut client = connect(db, database).await?;
+    let refused = |e: DbError| match e {
+        DbError::Query(msg) if is_permission_refusal(&msg) => {
+            Ok(StatementReport::Unavailable(Unavailable::NoPermission(msg)))
+        }
+        e => Err(e),
+    };
+    let state = match query_rows(
+        &mut client,
+        "SELECT actual_state_desc FROM sys.database_query_store_options",
+    )
+    .await
+    {
+        Ok(rows) => rows.first().and_then(|r| r.first().cloned().flatten()),
+        Err(e) => return refused(e),
+    };
+    if let Some(u) = wl::query_store_availability(state.as_deref()) {
+        return Ok(StatementReport::Unavailable(u));
+    }
+    let rows = match query_rows(&mut client, &query_store_sql(order, limit)).await {
+        Ok(rows) => rows,
+        Err(e) => return refused(e),
+    };
+    let float = |r: &[Option<String>], i: usize| -> Option<f64> {
+        r.get(i)?.as_deref()?.trim().parse().ok()
+    };
+    let statements = rows
+        .iter()
+        .map(|r| StatementStat {
+            query: cell(r, 0),
+            database: r.get(1).cloned().flatten(),
+            calls: float(r, 2).map_or(0, |f| f.round() as u64),
+            total_ms: float(r, 3).unwrap_or(0.0),
+            mean_ms: float(r, 4).unwrap_or(0.0),
+            rows: float(r, 5).map(|f| f.round() as u64),
+        })
+        .collect();
+    let since = query_rows(
+        &mut client,
+        "SELECT CONVERT(nvarchar(40), MIN(first_execution_time), 120) \
+         FROM sys.query_store_runtime_stats",
+    )
+    .await
+    .ok()
+    .and_then(|rows| rows.first().and_then(|r| r.first().cloned().flatten()));
+    Ok(StatementReport::Ready { statements, since })
+}
+
+/// The missing-index DMVs for the current database, ranked by the
+/// documentation's uses × cost × impact, the table named by schema and name
+/// rather than `statement`'s three-part text.
+fn missing_index_sql(limit: usize) -> String {
+    format!(
+        "SELECT TOP ({limit}) OBJECT_SCHEMA_NAME(d.object_id), OBJECT_NAME(d.object_id), \
+         d.equality_columns, d.inequality_columns, d.included_columns, \
+         CAST(s.user_seeks + s.user_scans AS float), CAST(s.avg_total_user_cost AS float), \
+         CAST(s.avg_user_impact AS float) \
+         FROM sys.dm_db_missing_index_details d \
+         JOIN sys.dm_db_missing_index_groups g ON g.index_handle = d.index_handle \
+         JOIN sys.dm_db_missing_index_group_stats s ON s.group_handle = g.index_group_handle \
+         WHERE d.database_id = DB_ID() \
+         ORDER BY (s.user_seeks + s.user_scans) * s.avg_total_user_cost * s.avg_user_impact DESC"
+    )
+}
+
+/// The SQL Server half of [`Db::fetch_missing_indexes`]. A refusal is an
+/// error here, not an empty list: "no suggestions" would read as "nothing
+/// is missing".
+pub(crate) async fn fetch_missing_indexes(
+    db: &Db,
+    database: Option<&str>,
+    limit: usize,
+) -> Result<Vec<schemaic_core::workload::MissingIndex>, DbError> {
+    use schemaic_core::workload::{MissingIndex, parse_bracketed_list, rank_missing};
+    let mut client = connect(db, database).await?;
+    let rows = query_rows(&mut client, &missing_index_sql(limit)).await?;
+    let float = |r: &[Option<String>], i: usize| -> f64 {
+        r.get(i)
+            .and_then(|c| c.as_deref())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0.0)
+    };
+    let found = rows
+        .iter()
+        .filter_map(|r| {
+            let table = r.get(1).cloned().flatten()?;
+            Some(MissingIndex {
+                schema: r.first().cloned().flatten(),
+                table,
+                equality: parse_bracketed_list(r.get(2).and_then(|c| c.as_deref())),
+                inequality: parse_bracketed_list(r.get(3).and_then(|c| c.as_deref())),
+                include: parse_bracketed_list(r.get(4).and_then(|c| c.as_deref())),
+                uses: float(r, 5).round() as u64,
+                avg_cost: float(r, 6),
+                avg_impact: float(r, 7),
+            })
+        })
+        .collect();
+    Ok(rank_missing(found, limit))
+}
+
 pub(crate) async fn fetch_table_stats(
     db: &Db,
     database: &str,
@@ -6155,6 +6305,41 @@ mod write_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_store_ranks_by_the_asked_figure_in_floats() {
+        use schemaic_core::workload::StatementOrder;
+        for (order, col) in [
+            (StatementOrder::Total, "total_us"),
+            (StatementOrder::Mean, "mean_us"),
+            (StatementOrder::Calls, "calls"),
+        ] {
+            let sql = query_store_sql(order, 9);
+            assert!(sql.starts_with("SELECT TOP (9) "), "{sql}");
+            assert!(sql.ends_with(&format!("ORDER BY {col} DESC")), "{sql}");
+            assert!(sql.contains("CAST(rs.avg_duration AS float)"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_missing_grant_is_told_apart_from_a_failure() {
+        assert!(is_permission_refusal(
+            "The user does not have permission to perform this action."
+        ));
+        assert!(is_permission_refusal(
+            "VIEW DATABASE STATE permission denied in database 'x'."
+        ));
+        assert!(!is_permission_refusal(
+            "Invalid object name 'sys.query_store_query'."
+        ));
+    }
+
+    #[test]
+    fn missing_indexes_are_read_for_the_current_database_only() {
+        let sql = missing_index_sql(25);
+        assert!(sql.starts_with("SELECT TOP (25) "), "{sql}");
+        assert!(sql.contains("WHERE d.database_id = DB_ID()"), "{sql}");
+    }
 
     /// **A SQL Server future does not carry the driver's login inline.**
     /// Inline, `connect` was ~22 KiB in a debug build and every `Db` call

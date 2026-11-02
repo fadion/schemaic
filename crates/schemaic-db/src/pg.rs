@@ -2059,6 +2059,109 @@ pub(crate) async fn fetch_table_stats(db: &Db, database: &str) -> Result<SchemaS
     Ok(SchemaStats::new(tables))
 }
 
+/// `pg_stat_statements`, ranked — the PostgreSQL half of
+/// [`Db::fetch_top_statements`].
+///
+/// `ns` is the schema the extension was created in, quoted here: the view
+/// lives wherever `CREATE EXTENSION` put it, and the catalogue connection's
+/// `search_path` leads with `pg_catalog`, not with it. `exec_columns` is
+/// PostgreSQL 13's renaming (`total_time` → `total_exec_time`); before it the
+/// figures had the shorter names and the same meaning.
+///
+/// Server-wide: the view holds every database's statements, and `dbid`
+/// names which. The text is cut to 8 KiB — a statement is shown, not run, and
+/// an ORM's thousand-column `INSERT` is no more readable at full length.
+fn pg_statements_sql(
+    ns: &str,
+    exec_columns: bool,
+    order: schemaic_core::workload::StatementOrder,
+    limit: usize,
+) -> String {
+    use schemaic_core::workload::StatementOrder;
+    let (total, mean) = if exec_columns {
+        ("total_exec_time", "mean_exec_time")
+    } else {
+        ("total_time", "mean_time")
+    };
+    let by = match order {
+        StatementOrder::Total => format!("s.{total}"),
+        StatementOrder::Mean => format!("s.{mean}"),
+        StatementOrder::Calls => "s.calls".to_string(),
+    };
+    let ns = schemaic_core::export::ident_sql(ns, schemaic_core::intel::SqlDialect::Postgres);
+    format!(
+        "SELECT left(s.query, 8192), d.datname, s.calls::text, s.{total}::float8::text, \
+         s.{mean}::float8::text, s.rows::text \
+         FROM {ns}.pg_stat_statements s \
+         LEFT JOIN pg_catalog.pg_database d ON d.oid = s.dbid \
+         ORDER BY {by} DESC NULLS LAST LIMIT {limit}"
+    )
+}
+
+/// The PostgreSQL half of [`Db::fetch_top_statements`]: the extension's
+/// presence in `database` first, so its absence is said rather than read as a
+/// quiet server, then the version for the column names, then the list.
+pub(crate) async fn fetch_top_statements(
+    db: &Db,
+    database: Option<&str>,
+    order: schemaic_core::workload::StatementOrder,
+    limit: usize,
+) -> Result<schemaic_core::workload::StatementReport, DbError> {
+    use schemaic_core::workload::{self as wl, StatementReport, StatementStat, Unavailable};
+    let client = connect_catalogue(db, database).await?;
+    let ext = query_all(
+        &client,
+        "SELECT n.nspname FROM pg_catalog.pg_extension e \
+         JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace \
+         WHERE e.extname = 'pg_stat_statements'",
+    )
+    .await?;
+    let Some(ns) = ext.first().and_then(|r| opt(r, 0)) else {
+        return Ok(StatementReport::Unavailable(
+            Unavailable::ExtensionNotInstalled,
+        ));
+    };
+    let version = query_all(&client, "SELECT current_setting('server_version_num')")
+        .await?
+        .first()
+        .and_then(|r| num(r, 0))
+        .unwrap_or(0);
+    let sql = pg_statements_sql(&ns, version >= 130_000, order, limit);
+    let rows = match query_all(&client, &sql).await {
+        Ok(rows) => rows,
+        Err(DbError::Query(msg)) => {
+            return match wl::classify_pg_statements_error(&msg) {
+                Some(u) => Ok(StatementReport::Unavailable(u)),
+                None => Err(DbError::Query(msg)),
+            };
+        }
+        Err(e) => return Err(e),
+    };
+    let float = |r: &[Option<String>], i| opt(r, i).and_then(|s| s.parse::<f64>().ok());
+    let statements = rows
+        .iter()
+        .map(|r| StatementStat {
+            query: cell(r, 0),
+            database: opt(r, 1),
+            calls: num(r, 2).unwrap_or(0),
+            total_ms: float(r, 3).unwrap_or(0.0),
+            mean_ms: float(r, 4).unwrap_or(0.0),
+            rows: num(r, 5),
+        })
+        .collect();
+    // PostgreSQL 14's `pg_stat_statements_info`; older servers have no
+    // record of when the counters began, and say nothing rather than guess.
+    let since_sql = format!(
+        "SELECT stats_reset::text FROM {}.pg_stat_statements_info",
+        schemaic_core::export::ident_sql(&ns, schemaic_core::intel::SqlDialect::Postgres)
+    );
+    let since = query_all_optional(&client, &since_sql)
+        .await
+        .ok()
+        .and_then(|rows| rows.first().and_then(|r| opt(r, 0)));
+    Ok(StatementReport::Ready { statements, since })
+}
+
 /// `pg_stat_activity`, narrowed to the sessions a person opened.
 ///
 /// `backend_type = 'client backend'` drops the checkpointer, the WAL writer, the
@@ -5095,6 +5198,31 @@ pub(crate) async fn refetch_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_statements_query_names_the_columns_of_the_servers_version() {
+        use schemaic_core::workload::StatementOrder;
+        let new = pg_statements_sql("public", true, StatementOrder::Mean, 20);
+        assert!(new.contains("s.total_exec_time::float8"), "{new}");
+        assert!(new.contains("ORDER BY s.mean_exec_time DESC"), "{new}");
+        assert!(new.ends_with("LIMIT 20"), "{new}");
+        let old = pg_statements_sql("public", false, StatementOrder::Total, 5);
+        assert!(old.contains("s.total_time::float8"), "{old}");
+        assert!(!old.contains("exec_time"), "{old}");
+        assert!(old.contains("ORDER BY s.total_time DESC"), "{old}");
+        let calls = pg_statements_sql("public", true, StatementOrder::Calls, 5);
+        assert!(calls.contains("ORDER BY s.calls DESC"), "{calls}");
+    }
+
+    #[test]
+    fn the_statements_view_is_read_from_the_extensions_schema_quoted() {
+        use schemaic_core::workload::StatementOrder;
+        let sql = pg_statements_sql("my\"ext", true, StatementOrder::Total, 1);
+        assert!(
+            sql.contains("FROM \"my\"\"ext\".pg_stat_statements s"),
+            "{sql}"
+        );
+    }
 
     /// **The read-only setup's one call is qualified and its path a literal.**
     /// A bare `set_config` resolved through the hostile path it was correcting.

@@ -1553,6 +1553,62 @@ tracks the list too* — is what this site broke, at a longer range than the rul
 Only a **vacant** slot is warmed — `Idle` or `Unavailable`, never `Loading` (a fetch of its own
 will land) and never `Loaded` (substituting one reading for another with nothing to say which is
 newer). `warming_a_disposed_slot_does_nothing` panics rather than fails against the old body.
+**`Db::fetch_top_statements` and `Db::fetch_missing_indexes` are the workload reads**
+(`core::workload`) — the MCP server's `top_statements` and `index_health` today, and the roadmap's
+app view when it is built; the size ranking and index health beside them read nothing new, sweeping
+`fetch_table_stats` and `fetch_schema`. Both ask a capability before anything is dialled —
+`supports_statement_stats`, false on SQLite, answering `Unavailable::NotSupported`; and
+`supports_missing_index_hints`, SQL Server only, answering an empty list elsewhere, which is why
+the caller asks the capability itself and says so rather than showing that list — resolve a
+`None` database to the connection's own, clamp the limit through `workload::statement_limit`, and
+run **fixed catalogue SQL on an ordinary session**, as `fetch_table_stats` does: no user text
+reaches them, so there is no `Enforce` and no text gate, and the statement text they return is
+data to show. **Each is bounded by `WORKLOAD_TIMEOUT` (30 s) around the whole dispatch**, for
+`fetch_sessions`' reason — a black-holed host otherwise holds the caller for the OS connect
+timeout — and longer than `PING_TIMEOUT` because these are real reads over views that grow with
+the workload. The bound is `tokio::time::timeout`, so it abandons the read rather than cancelling
+it: neither method takes a token, and a statement past the deadline runs on to completion on the
+server. Neither is on `every_reachability_path_is_bounded_by_a_timeout`'s list, there being no
+timer calling them. **An absent source is `Ok(StatementReport::Unavailable(…))`, not an error**;
+failing to reach the server stays one.
+PostgreSQL's (`pg::fetch_top_statements`) asks `pg_extension` joined to `pg_namespace` where
+`pg_stat_statements` was created — no row is `ExtensionNotInstalled` — and reads the view **from
+that schema, quoted through `export::ident_sql`**, because the catalogue connection's
+`search_path` leads with `pg_catalog`, not with wherever `CREATE EXTENSION` put it
+(`the_statements_view_is_read_from_the_extensions_schema_quoted`). `server_version_num` ≥ 130000
+picks the `*_exec_time` columns PostgreSQL 13 renamed from `total_time`/`mean_time`
+(`the_statements_query_names_the_columns_of_the_servers_version`). The view holds every
+database's statements, so each row's database is `dbid` joined to `pg_database`; the text is
+`left(query, 8192)`, a statement being shown and not run. A failed read goes through
+`classify_pg_statements_error`, so not-preloaded and permission-denied become `Unavailable` and
+anything else stays an error. `since` is `pg_stat_statements_info.stats_reset`, which PostgreSQL 14
+added; on an older server that read fails and `since` is `None` rather than a guess. MySQL's and
+MariaDB's (`mysql::fetch_top_statements`, `my_statements_sql`) open no database, the source being
+server-wide: `@@performance_schema` and the `statements_digest` consumer's `ENABLED` decide
+availability through `mysql_digest_availability`, and `events_statements_summary_by_digest` is
+then ranked by `SUM_TIMER_WAIT`, `AVG_TIMER_WAIT` or `COUNT_STAR`, its picosecond timers `/ 1e9`
+to milliseconds. **Every figure comes back `CAST … AS CHAR` and is parsed here**, because MariaDB
+has no `CAST … AS DOUBLE` before 10.4 and the driver hands a `DECIMAL` back as bytes. The text is
+capped at 8 KiB **in bytes** (`CONVERT … USING binary`), as `MY_PROCESSLIST_SQL` caps its own, so
+a multi-byte character cannot make the cut land mid-sequence; the row with a NULL `DIGEST_TEXT` —
+the overflow bucket for statements that arrived after the digest table filled — is no statement
+and is filtered out (`the_digest_query_ranks_by_the_asked_timer_and_skips_the_overflow_row`).
+Error 1142 or 1044 on the consumer or the digest read is `NoPermission`, and `since` is
+`MIN(FIRST_SEEN)`, best effort. SQL Server's (`mssql::fetch_top_statements`, `query_store_sql`)
+reads `sys.database_query_store_options.actual_state_desc` first, through
+`query_store_availability`, then sums Query Store **per query text** across its plans and
+intervals: `avg_duration × count_executions` summed is the total and that over the executions
+the mean, microseconds to milliseconds, **in floats throughout**, because `bigint` arithmetic over
+a busy server's lifetime overflows. A refusal `is_permission_refusal` recognises (a missing `VIEW
+DATABASE STATE` or `VIEW SERVER STATE`) is `NoPermission`, and `since` is
+`MIN(first_execution_time)`. `mssql::fetch_missing_indexes` (`missing_index_sql`) reads the three
+missing-index DMVs for `DB_ID()` only, names the table by `OBJECT_SCHEMA_NAME`/`OBJECT_NAME`
+rather than the DMV's three-part `statement` text, and ranks by uses × cost × impact, then again
+through `workload::rank_missing`. **A refusal there is an error, not an empty list**: "no
+suggestions" would read as "nothing is missing". Verified live by the change's author: MariaDB
+10.11 with `performance_schema` off, MySQL 8.4 with a ready list and its `since`, PostgreSQL 16
+both without the extension and with it installed but not preloaded, and SQL Server's Query Store
+list and missing-index suggestions.
 **`count_rows` takes a `CancellationToken` like every other unbounded operation.** It was the one
 that didn't, and the scan it starts is a full one: closing the modal abandoned the *answer* while
 the query ran on for minutes holding a connection, and reopening offered the button again, so N

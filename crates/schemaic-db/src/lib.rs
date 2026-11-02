@@ -1948,6 +1948,13 @@ pub const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// which is the app's existing answer to "the server is not responding".
 pub const CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The bound on a workload read — [`Db::fetch_top_statements`],
+/// [`Db::fetch_missing_indexes`]. Longer than [`PING_TIMEOUT`] because these
+/// are real reads over views that grow with the workload (Query Store's
+/// runtime stats can run to millions of rows), and shorter than forever
+/// because nobody is waiting on a timer for them to give up.
+pub const WORKLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl Db {
     /// Copy a SQLite database whole to the file `target` (`sqlite::backup_to`).
     /// The server engines back up through their own tools, which the app runs
@@ -2274,6 +2281,84 @@ impl Db {
             .map_err(|_| DbError::ConnectFailed(ConnectFailure::TimedOut))??;
         list.truncated |= activity::prepare_locks(&mut list.locks);
         Ok(list)
+    }
+
+    /// The statements this server has spent most on — the *Performance*
+    /// view's and the MCP `top_statements` tool's input
+    /// ([`schemaic_core::workload`]).
+    ///
+    /// `database` is where the source lives: PostgreSQL's extension is
+    /// created per database (its view still holds every database's
+    /// statements), SQL Server's Query Store is kept per database, and
+    /// MySQL's `performance_schema` is server-wide and ignores it. `None` is
+    /// the connection's own database, or the engine's maintenance one.
+    ///
+    /// **An absent source is an answer, not an error** — `StatementReport::
+    /// Unavailable` names which source and why, so a view can say so rather
+    /// than draw an empty list that reads as "nothing is slow". A failure to
+    /// reach the server stays an error.
+    ///
+    /// Fixed catalogue SQL, so it runs on an ordinary session as
+    /// [`Db::fetch_table_stats`] does: no user text reaches it, and the
+    /// statement text it returns is data to show. Bounded by
+    /// [`WORKLOAD_TIMEOUT`] around the whole dispatch, for
+    /// [`Db::fetch_sessions`]' reason — a black-holed host otherwise holds the
+    /// view for the OS connect timeout.
+    pub async fn fetch_top_statements(
+        &self,
+        database: Option<&str>,
+        order: schemaic_core::workload::StatementOrder,
+        limit: usize,
+    ) -> Result<schemaic_core::workload::StatementReport, DbError> {
+        use schemaic_core::workload::{self as wl, StatementReport, Unavailable};
+        if !wl::supports_statement_stats(self.engine.dialect()) {
+            return Ok(StatementReport::Unavailable(Unavailable::NotSupported));
+        }
+        let limit = wl::statement_limit(Some(limit));
+        let database = database.or(self.database());
+        let read = async {
+            match self.engine {
+                Engine::Postgres => pg::fetch_top_statements(self, database, order, limit).await,
+                Engine::MySql => mysql::fetch_top_statements(self, order, limit).await,
+                Engine::MsSql => mssql::fetch_top_statements(self, database, order, limit).await,
+                // Unreachable — `supports_statement_stats` above is the gate.
+                Engine::Sqlite => Ok(StatementReport::Unavailable(Unavailable::NotSupported)),
+            }
+        };
+        tokio::time::timeout(WORKLOAD_TIMEOUT, read)
+            .await
+            .map_err(|_| DbError::ConnectFailed(ConnectFailure::TimedOut))?
+    }
+
+    /// The indexes SQL Server's optimiser looked for in `database` and did
+    /// not find, ranked ([`schemaic_core::workload::MissingIndex`]). Empty on
+    /// an engine that records none
+    /// ([`schemaic_core::workload::supports_missing_index_hints`]) — the
+    /// caller asks the capability first and says so rather than showing it.
+    ///
+    /// Suggestions only: turning one into DDL goes through `ddl::diff` and the
+    /// preview, never through here.
+    pub async fn fetch_missing_indexes(
+        &self,
+        database: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<schemaic_core::workload::MissingIndex>, DbError> {
+        use schemaic_core::workload as wl;
+        if !wl::supports_missing_index_hints(self.engine.dialect()) {
+            return Ok(Vec::new());
+        }
+        let limit = wl::statement_limit(Some(limit));
+        let database = database.or(self.database());
+        let read = async {
+            match self.engine {
+                Engine::MsSql => mssql::fetch_missing_indexes(self, database, limit).await,
+                // Unreachable — `supports_missing_index_hints` above is the gate.
+                Engine::Postgres | Engine::MySql | Engine::Sqlite => Ok(Vec::new()),
+            }
+        };
+        tokio::time::timeout(WORKLOAD_TIMEOUT, read)
+            .await
+            .map_err(|_| DbError::ConnectFailed(ConnectFailure::TimedOut))?
     }
 
     /// The server's settings — the Server variables viewer's list — or, where

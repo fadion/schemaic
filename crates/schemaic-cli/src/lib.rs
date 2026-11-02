@@ -32,6 +32,7 @@ pub mod exec;
 pub mod format;
 pub mod import;
 pub mod mcp;
+pub mod perf;
 pub mod query;
 pub mod run;
 pub mod select;

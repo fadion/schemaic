@@ -37,7 +37,7 @@ servers you've registered with them yourself, which Schemaic can't switch off.
 - **All databases** sends the outline of every database on the connection. On a big server this
   can make each message large.
 - **None** sends no outline, and also takes away the schema tools — listing, searching,
-  describing, sampling, comparing and checking a table change — so the assistant has to ask you for table and column names.
+  describing, sampling, comparing, checking a table change and the performance tools — so the assistant has to ask you for table and column names.
 
 Databases you've hidden in the schema tree are left out of the outline.
 
@@ -69,6 +69,10 @@ On its own, the assistant can look things up with Schemaic's tools:
   same comparison as the schema tree's **Compare with** ([Comparing schemas](../schema/compare.md)). It reads
   structure only, so it works at every data access level, and it runs nothing: the script comes
   back in its reply for you to run if you choose.
+- *Look into performance* — the server's slowest statements, unused and duplicate indexes, the
+  largest tables, and current locks. The statements and locks can carry values, so they need the
+  same data access as a query. What each engine reports, and how to turn on the statement
+  statistics, is under [Performance tools](../cli/mcp.md#performance-tools).
 - *Check a table change* — it can work out the SQL for a change it wants to suggest, without
   running anything.
 - *Check a statement* — before it offers SQL that writes data, it checks it against the same

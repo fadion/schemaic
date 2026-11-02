@@ -88,9 +88,13 @@ Nothing the server offers writes to the database. What it can read depends on th
 | `describe_table` | One table's definition and foreign keys                 | Always                      |
 | `search_objects` | Tables, views and columns by part of their name         | Always                      |
 | `compare_schemas` | The SQL that would make one database's structure match another's | Always            |
+| `index_health`   | One database's unused, duplicate and redundant indexes  | Always                      |
+| `table_sizes`    | One database's largest tables and indexes               | Always                      |
 | `run_query`      | Runs one read-only statement, 200 rows at most          | **Let it read data** only   |
 | `explain`        | A read's plan, and what in it looks slow                | **Let it read data** only   |
 | `sample_rows`    | The first rows of a table                               | **Let it read data** only   |
+| `top_statements` | The statements the server has spent most time on        | **Let it read data** only   |
+| `current_locks`  | Locks held and waited for, and who is blocking whom     | **Let it read data** only   |
 | `list_connections` | The connections the server serves                     | With several connections    |
 
 Two tools the app's own assistant has are left out: `propose_table_change` and `propose_sql`.
@@ -108,10 +112,39 @@ name the call gives, so it compares only across two [served connections](#servin
 any. `run_query` and `explain` pass the same read-only check as
 [`schemaic query`](reading.md#only-reads), and a query is cancelled after 30 seconds.
 
+`top_statements` and `current_locks` need **Let it read data** because what they show can carry
+values: SQL Server's Query Store keeps statements as they were sent, literals and all, and a lock
+on MySQL names the key values of the rows it holds.
+
 With several connections, a tool is listed when any of them allows it, and a call is refused on
 a connection whose level withholds it.
 
 The level is read when the server starts. If you change it, restart the server from your client.
+
+## Performance tools
+
+`top_statements`, `index_health`, `table_sizes` and `current_locks` let the agent look into a slow
+server. Like the rest, they only read: an index `index_health` suggests comes back as a
+`CREATE INDEX` for you to run if you choose, and to end a session the agent is told to point you
+at **Server activity**. On SQLite there are no statements or locks to report.
+
+- `top_statements` ranks statements by total time, mean time or calls, counted since the
+  server's statistics were last reset. It reads them from a source that has to be on:
+
+  | Engine | Source | When it's off |
+  |---|---|---|
+  | PostgreSQL | the `pg_stat_statements` extension | Run `CREATE EXTENSION pg_stat_statements;` in the database. The library also has to be in `shared_preload_libraries`, which takes a restart. |
+  | MySQL/MariaDB | `performance_schema`'s statement digests | `performance_schema` is a startup option, so turning it on takes a restart. If it's on but the digest consumer isn't, run `UPDATE performance_schema.setup_consumers SET ENABLED = 'YES' WHERE NAME = 'statements_digest';` |
+  | SQL Server | the database's Query Store, one per database | Run `ALTER DATABASE CURRENT SET QUERY_STORE = ON;` in that database. |
+
+  When the source is off, the agent is told which and, where one statement does it, the statement
+  to pass on. It never runs it.
+- `index_health` lists one database's indexes nothing has read since the counters were last
+  reset, exact duplicates, and indexes whose key is the start of another's. On SQL Server it adds
+  the indexes the optimiser recorded as missing. Usage counts start again when the server
+  restarts, so an index it calls unused may only be unused lately.
+- `table_sizes` lists one database's largest tables and indexes. MySQL and MariaDB report index
+  size per table, so there it lists tables only.
 
 ## The agent log
 
@@ -130,8 +163,8 @@ than 32,768 characters, or a reason longer than 500, is cut, and the line says h
 were left out.
 
 A successful call's answer — the rows or definitions the agent was shown — is never copied into
-the log. Where it showed rows (`run_query`, `sample_rows`, and the sample rows of
-`describe_table`), the line records how many.
+the log. Where it showed rows (`run_query`, `sample_rows`, `top_statements`, `current_locks`, and
+the sample rows of `describe_table`), the line records how many.
 
 The file is capped at 8 MiB. Past that it's renamed `agent_log.jsonl.1`, replacing the previous
 one, and a new file starts, so the log keeps the most recent calls and drops the oldest.

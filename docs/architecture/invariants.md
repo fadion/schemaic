@@ -1315,7 +1315,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   is on the written side as `cli::dump` is**: it prints the same plan's `export_script()` to stdout
   and runs none of it, so its servers see catalogue reads alone (`cli/run.rs`'s `run_compare`, which
   prints `cli::compare::report`) — and so is the MCP server's `compare_schemas`, which hands a model
-  that same report as text and runs nothing either (`cli/mcp.rs`).
+  that same report as text and runs nothing either (`cli/mcp.rs`). **A missing-index suggestion
+  is on the differ side as well**: `core::workload::suggestion_ddl` pushes the suggested index
+  onto `TableDraft::from_table` and returns the plan's `ChangeSet::editor_script` — the reader's
+  form, withheld header and client batches included, never `emit()` joined by the caller — so the
+  `CREATE INDEX` the MCP server's `index_health` hands a model on SQL Server is the differ's, not a
+  second one, and it is text to propose that nothing on that path runs (`core/workload.rs`).
   **Nor is a plan applied in part**: what the dialect can't express is `ChangeSet::unsupported()`,
   the preview names each one and Apply refuses while it does — on the action, not only on the
   disabled button. The "INCOMPLETE" preamble that carries the same omission *out* through Copy and

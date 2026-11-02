@@ -27,7 +27,8 @@ In more detail:
   send them: **Attach 3 rows to chat** in the grid, or **AI summary** of a selection. The gesture
   is the consent, and it covers what you selected and nothing more.
 - **Let it read data** — the assistant can run read-only queries, read sample rows, and see a few
-  example rows when it describes a table. **AI fill value**, **AI insert row** and **AI seed
+  example rows when it describes a table. It can also read the server's statement statistics and
+  current locks, which can quote values. **AI fill value**, **AI insert row** and **AI seed
   table** also send up to 20 of the table's rows, newest by primary key, as examples to match.
 
 There's no masking level. A model can't tell a masked value from a real one, so it would reason

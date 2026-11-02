@@ -868,6 +868,9 @@ tested (they share `history.rs`'s shape; a new one belongs here, not in the UI):
     index empty, which would answer *"no statistics for this table"* for every row, silently. The
     index keys on the **name** alone so a lookup borrows its `&str` instead of allocating a key,
     and the handful of same-named tables in other namespaces are separated inside the bucket.
+    `SchemaStats::tables()` hands the `Vec` out as a slice, in the engine's order, for the
+    database-wide readers in `core::workload` that rank or sweep every table rather than look one
+    up — a borrow, so the field stays private and the index cannot be left behind.
   - The panel and the copied Markdown are two renderings of one claim, so each rule they share
     is one function: `RowCount::qualifier` (the word a figure is qualified with — the two had
     drifted to "(estimated)" against "(estimate)", with only the Markdown half tested),

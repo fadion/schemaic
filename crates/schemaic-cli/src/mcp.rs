@@ -729,11 +729,15 @@ pub enum McpTool {
     CompareSchemas,
     ProposeTableChange,
     ProposeSql,
+    TopStatements,
+    IndexHealth,
+    TableSizes,
+    CurrentLocks,
 }
 
 impl McpTool {
     /// Every tool, in the order `tools/list` advertises them.
-    pub const ALL: [McpTool; 10] = [
+    pub const ALL: [McpTool; 14] = [
         McpTool::RunQuery,
         McpTool::Explain,
         McpTool::SampleRows,
@@ -744,6 +748,10 @@ impl McpTool {
         McpTool::CompareSchemas,
         McpTool::ProposeTableChange,
         McpTool::ProposeSql,
+        McpTool::TopStatements,
+        McpTool::IndexHealth,
+        McpTool::TableSizes,
+        McpTool::CurrentLocks,
     ];
 
     /// The name on the wire.
@@ -759,6 +767,10 @@ impl McpTool {
             McpTool::ProposeTableChange => "propose_table_change",
             McpTool::ProposeSql => "propose_sql",
             McpTool::CompareSchemas => "compare_schemas",
+            McpTool::TopStatements => "top_statements",
+            McpTool::IndexHealth => "index_health",
+            McpTool::TableSizes => "table_sizes",
+            McpTool::CurrentLocks => "current_locks",
         }
     }
 
@@ -777,6 +789,10 @@ impl McpTool {
             McpTool::ProposeTableChange => "mcp__schemaic__propose_table_change",
             McpTool::ProposeSql => "mcp__schemaic__propose_sql",
             McpTool::CompareSchemas => "mcp__schemaic__compare_schemas",
+            McpTool::TopStatements => "mcp__schemaic__top_statements",
+            McpTool::IndexHealth => "mcp__schemaic__index_health",
+            McpTool::TableSizes => "mcp__schemaic__table_sizes",
+            McpTool::CurrentLocks => "mcp__schemaic__current_locks",
         }
     }
 
@@ -799,13 +815,24 @@ impl McpTool {
             // an existence oracle over values, one key per call. So `explain`
             // stands wherever `run_query` does and nowhere else.
             McpTool::RunQuery | McpTool::Explain | McpTool::SampleRows => true,
+            // **Other people's statements are their data.** PostgreSQL and
+            // MySQL replace literals with placeholders, but SQL Server's Query
+            // Store keeps the text as sent — `WHERE email = 'x@y'` and all.
+            McpTool::TopStatements => true,
+            // A lock row names what is locked, and on MySQL that is the
+            // record's key values (`data_locks.LOCK_DATA`) — one row's worth
+            // of data per lock.
+            McpTool::CurrentLocks => true,
             McpTool::ListDatabases
             | McpTool::ListSchema
             | McpTool::DescribeTable
             | McpTool::SearchObjects
             | McpTool::ProposeTableChange
             | McpTool::ProposeSql
-            | McpTool::CompareSchemas => false,
+            | McpTool::CompareSchemas
+            // Names and sizes — the catalogue, not the rows.
+            | McpTool::IndexHealth
+            | McpTool::TableSizes => false,
         }
     }
 
@@ -844,7 +871,14 @@ impl McpTool {
             | McpTool::SearchObjects
             | McpTool::ProposeTableChange
             // Two whole catalogues, and a script naming every object in them.
-            | McpTool::CompareSchemas => true,
+            | McpTool::CompareSchemas
+            // Every table and index name in a database, ranked — the
+            // overview `list_schema` gives, with sizes. The statements and
+            // the locks name tables too.
+            | McpTool::IndexHealth
+            | McpTool::TableSizes
+            | McpTool::TopStatements
+            | McpTool::CurrentLocks => true,
         }
     }
 
@@ -870,7 +904,13 @@ impl McpTool {
             | McpTool::ProposeTableChange
             | McpTool::ProposeSql
             // The script it hands back is text; nothing runs it here.
-            | McpTool::CompareSchemas => true,
+            | McpTool::CompareSchemas
+            // Catalogue and statistics views only, and an index suggestion
+            // comes back as DDL to propose, never run.
+            | McpTool::TopStatements
+            | McpTool::IndexHealth
+            | McpTool::TableSizes
+            | McpTool::CurrentLocks => true,
         }
     }
 
@@ -896,7 +936,11 @@ impl McpTool {
             | McpTool::ListSchema
             | McpTool::DescribeTable
             | McpTool::SearchObjects
-            | McpTool::CompareSchemas => false,
+            | McpTool::CompareSchemas
+            | McpTool::TopStatements
+            | McpTool::IndexHealth
+            | McpTool::TableSizes
+            | McpTool::CurrentLocks => false,
         }
     }
 
@@ -916,14 +960,17 @@ impl McpTool {
 /// for the table and column names (or to raise the setting) rather than retry.
 const NO_SCHEMA_ACCESS: &str = "Refused: the user's Schema context setting is None, so the \
      assistant is given no database structure and list_databases, list_schema, describe_table, \
-     search_objects, sample_rows, compare_schemas and propose_table_change are unavailable. Ask the user for the table and column names you need \
+     search_objects, sample_rows, compare_schemas, propose_table_change and the performance tools \
+     (top_statements, index_health, table_sizes, current_locks) are unavailable. Ask the user for \
+     the table and column names you need \
      — or tell them to set Schema context to a database in AI settings.";
 
 /// What the server says when a withheld tool is called anyway. It names the
 /// setting, because the model's next move should be to ask the user for the
 /// values (or to change the level) rather than to retry the same call.
 const NO_DATA_ACCESS: &str = "Refused: this connection's AI data access is set so the assistant \
-     reads no rows on its own, so run_query, explain and sample_rows are unavailable. Ask the user for the values you need \
+     reads no rows on its own, so run_query, explain, sample_rows, top_statements and \
+     current_locks are unavailable. Ask the user for the values you need \
      — they can attach rows from a result grid, or raise the connection's AI data access \
      setting.";
 
@@ -932,8 +979,8 @@ const NO_DATA_ACCESS: &str = "Refused: this connection's AI data access is set s
 /// model passing it on would send the user looking for a grid that is not
 /// there.
 const NO_DATA_ACCESS_STANDALONE: &str = "Refused: this connection's AI data access, set in \
-     Schemaic, lets no assistant read rows on its own, so run_query, explain and sample_rows are \
-     unavailable. Ask the \
+     Schemaic, lets no assistant read rows on its own, so run_query, explain, sample_rows, \
+     top_statements and current_locks are unavailable. Ask the \
      user \
      for the values you need — or ask them to set the connection's AI data access to \"Let it \
      read data\" in Schemaic's connection settings and restart this server.";
@@ -943,7 +990,8 @@ const NO_DATA_ACCESS_STANDALONE: &str = "Refused: this connection's AI data acce
 /// command line's.
 const NO_DATA_ACCESS_URL: &str = "Refused: this connection was given to `schemaic mcp` as a \
      --url, whose AI data access lets no assistant read rows on its own unless the command \
-     says otherwise, so run_query, explain and sample_rows are unavailable. Ask the user for the \
+     says otherwise, so run_query, explain, sample_rows, top_statements and current_locks are \
+     unavailable. Ask the user for the \
      values you need — or ask them to add --ai-data full to the server's command line and \
      restart it.";
 
@@ -1283,6 +1331,89 @@ pub fn tools_list(
                 },
                 "required": ["sql"]
             }
+        },
+        {
+            "name": "top_statements",
+            "description": format!(
+                "The statements this {} server has spent the most time on since its counters \
+                 were last reset — total and mean milliseconds, calls and rows, from {}. Ranked \
+                 by total time unless `order` says otherwise. When the source is off, the answer \
+                 says which and what would turn it on; pass that on to the user rather than \
+                 trying to enable it. Read-only.",
+                dialect.engine_label(),
+                statement_source(dialect),
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "order": {
+                        "type": "string",
+                        "enum": ["total", "mean", "calls"],
+                        "description": "Rank by total time (default), mean time per call, or call count."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": format!(
+                            "How many statements, 1 to {}. Defaults to 20.",
+                            schemaic_core::workload::MAX_STATEMENT_LIMIT
+                        )
+                    },
+                    "database": {
+                        "type": "string",
+                        "description": "Where the statistics source lives. Defaults to the connection's active database."
+                    }
+                }
+            }
+        },
+        {
+            "name": "index_health",
+            "description": format!(
+                "One database's index problems: indexes nothing has read since the counters were \
+                 last reset, exact duplicates, and indexes whose key is a leading prefix of \
+                 another's{}. Read-only: any index it suggests comes back as DDL to propose to \
+                 the user, never run. Usage counts reset with the server, so say \"unused \
+                 since …\", never \"never used\".",
+                if schemaic_core::workload::supports_missing_index_hints(dialect) {
+                    " — plus the indexes the optimiser recorded as missing, each with its \
+                     CREATE INDEX"
+                } else {
+                    ""
+                },
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "database": {
+                        "type": "string",
+                        "description": "Defaults to the connection's active database."
+                    }
+                }
+            }
+        },
+        {
+            "name": "table_sizes",
+            "description": "One database's largest tables (data plus indexes) and largest \
+                            indexes, ranked by bytes, with row estimates. Read-only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "database": {
+                        "type": "string",
+                        "description": "Defaults to the connection's active database."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many of each, 1 to 100. Defaults to 20."
+                    }
+                }
+            }
+        },
+        {
+            "name": "current_locks",
+            "description": "The locks this server's sessions hold and wait for right now, and \
+                            which sessions block which. Read-only: to end a session, tell the \
+                            user which one — Schemaic's Server Activity panel can kill it.",
+            "inputSchema": { "type": "object", "properties": {} }
         }
     ]);
     if let Some(list) = tools.as_array_mut() {
@@ -1501,8 +1632,260 @@ async fn answer(endpoint: &Endpoint, name: &str, args: &Value) -> Answer {
         McpTool::ProposeSql => {
             propose_sql(arg("sql").unwrap_or(""), propose_policy(endpoint, args))
         }
+        // Statements and locks are row data and answer with their count.
+        McpTool::TopStatements => {
+            return Box::pin(top_statements(db, tool_database(args, database), args)).await;
+        }
+        McpTool::CurrentLocks => return Box::pin(current_locks(db)).await,
+        McpTool::IndexHealth => Box::pin(index_health(db, tool_database(args, database))).await,
+        McpTool::TableSizes => Box::pin(table_sizes(db, tool_database(args, database), args)).await,
     };
     answered.into()
+}
+
+/// How many rows a performance tool returns when the call doesn't say.
+const PERF_ROWS: usize = 20;
+
+/// The most `table_sizes` returns of each kind.
+const MAX_SIZE_ROWS: usize = 100;
+
+/// A performance tool's `limit`: absent is [`PERF_ROWS`], anything else must
+/// be a whole number in `1..=max`. Refused rather than clamped, so a model
+/// that asked for 10,000 learns the ceiling instead of silently getting less.
+fn perf_limit(args: &Value, max: usize) -> Result<usize, String> {
+    match args.get("limit") {
+        None | Some(Value::Null) => Ok(PERF_ROWS.min(max)),
+        Some(v) => match v.as_u64() {
+            Some(n) if n >= 1 && n as usize <= max => Ok(n as usize),
+            _ => Err(format!("`limit` must be a whole number from 1 to {max}.")),
+        },
+    }
+}
+
+/// Where `top_statements` reads from, for its description — naming the
+/// source a model can tell the user to turn on.
+fn statement_source(dialect: SqlDialect) -> &'static str {
+    match dialect {
+        SqlDialect::Postgres => "the pg_stat_statements extension",
+        SqlDialect::MySql => "performance_schema's statement digests",
+        SqlDialect::MsSql => "the database's Query Store",
+        SqlDialect::Sqlite => "nowhere: SQLite keeps no statement statistics",
+    }
+}
+
+/// `top_statements`: [`Db::fetch_top_statements`], as a table, or what is
+/// missing. An absent source is an **answer**, not an error — the model's next
+/// move is to tell the user, not to retry.
+async fn top_statements(db: &Db, database: Option<&str>, args: &Value) -> Answer {
+    use schemaic_core::workload::{MAX_STATEMENT_LIMIT, StatementOrder, StatementReport};
+    let order = match args.get("order").and_then(Value::as_str) {
+        None => StatementOrder::Total,
+        Some(s) => match StatementOrder::parse(s) {
+            Some(o) => o,
+            None => {
+                return ("`order` must be total, mean or calls.".to_string(), true).into();
+            }
+        },
+    };
+    let limit = match perf_limit(args, MAX_STATEMENT_LIMIT) {
+        Ok(n) => n,
+        Err(e) => return (e, true).into(),
+    };
+    // Bounded twice: `fetch_top_statements` carries `WORKLOAD_TIMEOUT`, and
+    // the server's own deadline stands over it as over every read here. It
+    // takes no token, so the deadline abandons rather than cancels.
+    let Some(read) =
+        with_deadline_abandoning(db.fetch_top_statements(database, order, limit)).await
+    else {
+        return (
+            format!(
+                "Reading the statement statistics timed out ({}s).",
+                QUERY_TIMEOUT.as_secs()
+            ),
+            true,
+        )
+            .into();
+    };
+    match read {
+        Ok(StatementReport::Ready { statements, since }) => {
+            if statements.is_empty() {
+                return (
+                    "The statistics source is on but has recorded no statements yet.".to_string(),
+                    false,
+                )
+                    .into();
+            }
+            let n = statements.len();
+            let mut out = format_table_cells(
+                &crate::perf::statements_result(&statements),
+                STATEMENT_CHARS,
+            );
+            if let Some(since) = since {
+                out.push_str(&format!("\nCounted since {since}."));
+            }
+            Answer::with_rows(out, n)
+        }
+        Ok(StatementReport::Unavailable(u)) => (crate::perf::unavailable_text(&u), false).into(),
+        Err(e) => (format!("Error reading statement statistics: {e}"), true).into(),
+    }
+}
+
+/// `current_locks`: [`Db::fetch_locks`], bounded there by `PING_TIMEOUT`.
+async fn current_locks(db: &Db) -> Answer {
+    if !schemaic_core::activity::supports_activity(dialect_of(db)) {
+        return (
+            "This engine has no server sessions, so there are no locks to show.".to_string(),
+            false,
+        )
+            .into();
+    }
+    let Some(read) = with_deadline_abandoning(db.fetch_locks()).await else {
+        return ("Reading the locks timed out.".to_string(), true).into();
+    };
+    match read {
+        Ok(list) if list.locks.is_empty() => {
+            let said = if list.contended_only {
+                "No session is waiting on a lock. (This server lists contended locks only.)"
+            } else {
+                "No locks are held or waited for."
+            };
+            (said.to_string(), false).into()
+        }
+        Ok(list) => {
+            let n = list.locks.len();
+            let mut out = format_table(&crate::perf::locks_result(&list));
+            if list.truncated {
+                out.push_str("\n(The list was capped; more locks exist.)");
+            }
+            if list.contended_only {
+                out.push_str("\n(This server lists contended locks only.)");
+            }
+            Answer::with_rows(out, n)
+        }
+        Err(e) => (format!("Error reading locks: {e}"), true).into(),
+    }
+}
+
+/// The database a per-database performance tool reads, or the refusal that
+/// says one is needed.
+fn perf_database(database: Option<&str>) -> Result<&str, (String, bool)> {
+    database.ok_or_else(|| {
+        (
+            "No database given and the connection has no default — pass a `database`.".to_string(),
+            true,
+        )
+    })
+}
+
+/// The table statistics `index_health` and `table_sizes` sweep. The read
+/// takes no token on any engine, so the deadline abandons rather than
+/// cancels it (`with_deadline_abandoning`'s reason).
+async fn perf_stats(
+    db: &Db,
+    database: &str,
+) -> Result<schemaic_core::stats::SchemaStats, (String, bool)> {
+    match with_deadline_abandoning(db.fetch_table_stats(database)).await {
+        Some(Ok(s)) => Ok(s),
+        Some(Err(e)) => Err((
+            format!("Error reading statistics for {database}: {e}"),
+            true,
+        )),
+        None => Err((
+            format!(
+                "Reading the statistics for {database} timed out ({}s).",
+                QUERY_TIMEOUT.as_secs()
+            ),
+            true,
+        )),
+    }
+}
+
+/// `index_health`: the unused, duplicate and redundant indexes of one
+/// database, then — where the engine records them — the missing ones, each
+/// with the DDL `ddl::diff` would emit for it. Nothing is run.
+async fn index_health(db: &Db, database: Option<&str>) -> (String, bool) {
+    use schemaic_core::workload as wl;
+    let database = match perf_database(database) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let token = CancellationToken::new();
+    let schema = match with_deadline(db.fetch_schema(database, token.clone()), token).await {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => return (format!("Error reading schema for {database}: {e}"), true),
+        None => {
+            return (
+                format!("Reading the schema for {database} timed out and was cancelled."),
+                true,
+            );
+        }
+    };
+    let stats = match perf_stats(db, database).await {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let findings = wl::index_health(&schema.tables, &stats);
+    let mut out = if findings.is_empty() {
+        format!("No duplicate, redundant or unused indexes found in {database}.")
+    } else {
+        format_table(&crate::perf::index_health_result(&findings))
+    };
+    out.push_str("\n\n");
+    out.push_str(crate::perf::usage_note(&stats));
+    let dialect = dialect_of(db);
+    if wl::supports_missing_index_hints(dialect) {
+        out.push_str("\n\nMissing indexes the optimiser recorded since the last restart:\n");
+        let read =
+            with_deadline_abandoning(db.fetch_missing_indexes(Some(database), PERF_ROWS)).await;
+        match read.unwrap_or_else(|| {
+            Err(schemaic_db::DbError::Query(
+                "the read timed out".to_string(),
+            ))
+        }) {
+            Ok(missing) if missing.is_empty() => out.push_str("(none recorded)"),
+            Ok(missing) => {
+                let s = crate::perf::suggestions(&schema, dialect, missing);
+                out.push_str(&format_table(&crate::perf::missing_result(&s)));
+                out.push_str("\n\nThe DDL for each, to propose — never to run:\n");
+                out.push_str(&crate::perf::suggestion_ddl_text(&s));
+                out.push_str(
+                    "\nEach is a suggestion from one optimiser's estimates: check it against the \
+                     existing indexes above before proposing it.",
+                );
+            }
+            Err(e) => out.push_str(&format!("(unavailable: {e})")),
+        }
+    }
+    (out, false)
+}
+
+/// `table_sizes`: the largest tables and indexes of one database.
+async fn table_sizes(db: &Db, database: Option<&str>, args: &Value) -> (String, bool) {
+    let database = match perf_database(database) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    let n = match perf_limit(args, MAX_SIZE_ROWS) {
+        Ok(n) => n,
+        Err(e) => return (e, true),
+    };
+    let stats = match perf_stats(db, database).await {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let (tables, indexes) = schemaic_core::workload::largest(&stats, n);
+    if tables.is_empty() {
+        return (format!("{database} reported no table sizes."), false);
+    }
+    let mut out = format!("Largest tables in {database}:\n");
+    out.push_str(&format_table(&crate::perf::table_sizes_result(&tables)));
+    if indexes.is_empty() {
+        out.push_str("\n\nThis engine reports index sizes per table, not per index.");
+    } else {
+        out.push_str("\n\nLargest indexes:\n");
+        out.push_str(&format_table(&crate::perf::index_sizes_result(&indexes)));
+    }
+    (out, false)
 }
 
 /// The guard policy `propose_sql` judges a statement under: the endpoint's
@@ -1891,6 +2274,17 @@ fn no_rows_reply(e: crate::query::NoRows) -> (String, bool) {
 
 /// Render a result set as a pipe table (capped), for the assistant to read.
 fn format_table(rs: &ResultSet) -> String {
+    format_table_cells(rs, MCP_CELL_CHARS)
+}
+
+/// How wide `top_statements` lets a statement run. The text *is* that
+/// tool's answer — a statement cut at [`MCP_CELL_CHARS`] is usually cut
+/// before its `WHERE` — while the list is short ([`PERF_ROWS`] by default),
+/// so the wider cell costs little.
+const STATEMENT_CHARS: usize = 400;
+
+/// [`format_table`] at a cell width of the caller's.
+fn format_table_cells(rs: &ResultSet, cell_chars: usize) -> String {
     if rs.columns.is_empty() {
         return "(no columns)".to_string();
     }
@@ -1911,7 +2305,7 @@ fn format_table(rs: &ResultSet) -> String {
     // cell carrying `|`, a newline or a novel is handled the same here as in a
     // chat attachment. The width is this call site's: a tool result rides along
     // on every turn, so it stays narrow.
-    let mut out = schemaic_core::prompt::pipe_table(&header, &rows, MCP_CELL_CHARS);
+    let mut out = schemaic_core::prompt::pipe_table(&header, &rows, cell_chars);
     let more = if rs.truncated {
         format!("\n({}+ rows, capped)", rs.row_count())
     } else {
@@ -2887,19 +3281,66 @@ mod tests {
     /// One predicate decides both halves, so a tool can never be listed by one
     /// rule and refused by another.
     #[test]
-    fn only_the_query_plan_and_sample_tools_count_as_reading_rows() {
+    fn only_queries_plans_samples_statements_and_locks_count_as_reading_rows() {
         assert!(McpTool::RunQuery.reads_row_data());
         assert!(McpTool::Explain.reads_row_data());
         // A sample is rows, whoever wrote the `SELECT`.
         assert!(McpTool::SampleRows.reads_row_data());
+        // Query Store keeps statements with their literals, and a MySQL lock
+        // names the locked record's key values.
+        assert!(McpTool::TopStatements.reads_row_data());
+        assert!(McpTool::CurrentLocks.reads_row_data());
         for schema_tool in [
             McpTool::ListDatabases,
             McpTool::ListSchema,
             McpTool::DescribeTable,
             McpTool::ProposeTableChange,
+            McpTool::IndexHealth,
+            McpTool::TableSizes,
         ] {
             assert!(!schema_tool.reads_row_data());
         }
+    }
+
+    /// Every performance tool names tables, so *Schema context: None*
+    /// withholds them all, and all of them only read.
+    #[test]
+    fn the_performance_tools_read_the_catalogue_and_write_nothing() {
+        use super::{NO_DATA_ACCESS_URL, NO_SCHEMA_ACCESS};
+        for tool in [
+            McpTool::TopStatements,
+            McpTool::IndexHealth,
+            McpTool::TableSizes,
+            McpTool::CurrentLocks,
+        ] {
+            assert!(tool.reads_schema(), "{tool:?}");
+            assert!(tool.read_only(), "{tool:?}");
+            assert!(!tool.needs_panel(), "{tool:?}");
+            assert_eq!(
+                refusal_for(tool, true, false, Host::Standalone),
+                Some(NO_SCHEMA_ACCESS)
+            );
+            assert!(NO_SCHEMA_ACCESS.contains(tool.name()), "{tool:?}");
+        }
+        for tool in [McpTool::TopStatements, McpTool::CurrentLocks] {
+            assert!(NO_DATA_ACCESS.contains(tool.name()), "{tool:?}");
+            assert!(NO_DATA_ACCESS_STANDALONE.contains(tool.name()), "{tool:?}");
+            assert!(NO_DATA_ACCESS_URL.contains(tool.name()), "{tool:?}");
+        }
+    }
+
+    #[test]
+    fn a_performance_limit_defaults_and_refuses_what_it_cannot_honour() {
+        use super::{PERF_ROWS, perf_limit};
+        use serde_json::json;
+        assert_eq!(perf_limit(&json!({}), 100), Ok(PERF_ROWS));
+        assert_eq!(perf_limit(&json!({"limit": null}), 100), Ok(PERF_ROWS));
+        assert_eq!(perf_limit(&json!({"limit": 5}), 100), Ok(5));
+        assert_eq!(perf_limit(&json!({"limit": 100}), 100), Ok(100));
+        assert!(perf_limit(&json!({"limit": 0}), 100).is_err());
+        assert!(perf_limit(&json!({"limit": 101}), 100).is_err());
+        assert!(perf_limit(&json!({"limit": "ten"}), 100).is_err());
+        assert!(perf_limit(&json!({"limit": 2.5}), 100).is_err());
     }
 
     /// **The set is one set.** Every advertised name maps back to a variant and
@@ -3059,7 +3500,11 @@ mod tests {
                     "list_schema",
                     "describe_table",
                     "search_objects",
-                    "compare_schemas"
+                    "compare_schemas",
+                    "top_statements",
+                    "index_health",
+                    "table_sizes",
+                    "current_locks"
                 ],
                 "{engine:?}"
             );
@@ -3100,9 +3545,18 @@ mod tests {
                 "list_schema",
                 "describe_table",
                 "search_objects",
-                "compare_schemas"
+                "compare_schemas",
+                "index_health",
+                "table_sizes"
             ]
         );
+        // Other people's statements and locked key values are rows.
+        for withheld in [McpTool::TopStatements, McpTool::CurrentLocks] {
+            assert_eq!(
+                refusal_for(withheld, false, true, Host::Standalone),
+                Some(NO_DATA_ACCESS_STANDALONE)
+            );
+        }
         let refusal = refusal_for(McpTool::RunQuery, false, true, Host::Standalone);
         assert_eq!(refusal, Some(NO_DATA_ACCESS_STANDALONE));
         assert!(!NO_DATA_ACCESS_STANDALONE.contains("grid"));

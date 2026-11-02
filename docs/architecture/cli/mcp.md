@@ -1,11 +1,12 @@
 # `cli/mcp.rs`
 
-`cli/mcp.rs` — the **MCP (stdio) server**: newline-delimited JSON-RPC on stdin/stdout, and ten
+`cli/mcp.rs` — the **MCP (stdio) server**: newline-delimited JSON-RPC on stdin/stdout, and fourteen
 tools, none of which writes anything. It was `app/mcp.rs` until `schemaic mcp` needed it, and it
 lives here so that the second way in is the same server rather than a copy of its gates —
-`schemaic-cli` cannot reach into `schemaic-app`, which depends on it. The ten (`run_query`,
+`schemaic-cli` cannot reach into `schemaic-app`, which depends on it. The fourteen (`run_query`,
 `explain`, `sample_rows`, `list_databases`, `list_schema`, `describe_table`, `search_objects`,
-`compare_schemas`, `propose_table_change`, `propose_sql`, in `McpTool::ALL`'s order, which is
+`compare_schemas`, `propose_table_change`, `propose_sql`, and the four performance tools
+`top_statements`, `index_health`, `table_sizes` and `current_locks`, in `McpTool::ALL`'s order, which is
 `tools/list`'s) are described
 for **this** connection's engine and listed for **this** connection's access levels and **this** host:
 `tools_list(engine, reads_data, schema, host)` builds
@@ -85,8 +86,9 @@ argument too, which the SCHEMA eye's rule already allows for: `run_query` answer
 hidden database included.
 **Every call is recorded in the agent log (`core::agent_log`), refused ones included.**
 `call_tool` is now `answer` — the dispatch, refusals and the unknown-name reply included,
-returning an `Answer { text, is_error, rows }` and awaited `Box::pin`ned, `rows` set by the three
-arms that show rows (`run_query`, `sample_rows`, `describe_table`'s samples) — then `record` when the endpoint is
+returning an `Answer { text, is_error, rows }` and awaited `Box::pin`ned, `rows` set by the five
+arms that show rows (`run_query`, `sample_rows`, `describe_table`'s samples, and the statements
+and locks `top_statements` and `current_locks` list) — then `record` when the endpoint is
 audited, then the JSON wrap; a call the agent was refused is as much a part of what it tried as
 one it was given, so a gate's refusal and an unknown tool get a line too. `audit_as` is what
 decides it: the connection's saved name, set by the two front ends from the saved connection
@@ -119,7 +121,7 @@ comparison, and a `connection` that is not a string.
 Smoke-tested through `schemaic mcp` over stdio under a throwaway `APPDATA`: a `describe_table`,
 a refused `run_query` with its value masked and the refusal as its error, and an unknown tool
 each got their line.
-**The ten are a type — `McpTool` — and that is what makes the advertised array and the gates one
+**The fourteen are a type — `McpTool` — and that is what makes the advertised array and the gates one
 set.** They used to be written out independently in five places the compiler related to nothing:
 the `json!` array in `tools_list`, a `==` in `reads_row_data`, a `matches!` in `reads_schema`,
 `call_tool`'s dispatch with its `other =>` catch-all, and `ai.rs`'s two `mcp__schemaic__*` `const`
@@ -244,8 +246,8 @@ about rows not shown (`a_long_plan_stops_at_the_cap_and_says_so`,
 MySQL's `EXPLAIN` reads a `const` table to plan it and answers "Impossible WHERE noticed after
 reading const tables" exactly when no row has that key — an existence oracle over values, one
 key per call. So below `AiData::Full` it is withheld and refused with `NO_DATA_ACCESS`, whose
-two wordings name both tools, and `sample_rows` beside them
-(`only_the_query_plan_and_sample_tools_count_as_reading_rows`).
+wordings name both tools, and `sample_rows`, `top_statements` and `current_locks` beside them
+(`only_queries_plans_samples_statements_and_locks_count_as_reading_rows`).
 `reads_schema` answers `false`, as `run_query`'s does: the plan names the tables and indexes of
 a statement the model wrote, which is what `run_query` on the same text would tell it. Its
 refusals and failures are `run_query`'s sentences, through the shared `no_rows_reply`, since it
@@ -440,11 +442,12 @@ spec tells it to walk away from, and `2025-03-26` is answered `2024-11-05`
 (`the_answer_is_the_newest_version_the_client_can_know`). The loop keeps what was agreed, and
 `tools/list` goes through `annotated`: from `2025-03-26` on — the revision that introduced
 them — every tool carries `annotations: {readOnlyHint}` from `McpTool::read_only`, an
-exhaustive match that answers `true` for all ten (`run_query` and `sample_rows` read on a
+exhaustive match that answers `true` for all fourteen (`run_query` and `sample_rows` read on a
 read-only session, `explain` plans without the analysing form that would run the statement,
 `search_objects` and `list_databases` read only the catalogue, `compare_schemas` reads two
 catalogues and hands back a script nothing runs, `propose_table_change` and `propose_sql` run
-nothing). A `2024-11-05` session, or a `tools/list` sent before the
+nothing, and the performance tools read catalogue and statistics views and hand back an index
+suggestion as DDL nothing runs). A `2024-11-05` session, or a `tools/list` sent before the
 handshake, gets the list as it always was
 (`a_2025_session_is_told_every_tool_is_read_only`).
 **`search_objects` is Find-Anywhere's question asked over this server's two reads, not a third
@@ -564,6 +567,61 @@ hosts list it (`compare_schemas_is_a_catalogue_tool`). Like the two arms above, 
 -c second` under a throwaway `APPDATA`: with `source_connection` `second` it returned `CREATE
 TABLE k` and `DROP TABLE people`, with "destructive: people — Drops the table and every row in
 it."
+**The four performance tools — `top_statements`, `index_health`, `table_sizes` and
+`current_locks` — are the MCP half of the roadmap's *Workload and performance insight*, on the
+backend its app view is meant to share** (`core::workload`, rendered by `cli/perf.rs`). They are
+advertised on every engine and answer for an absent source rather than being withheld: on SQLite
+`top_statements` says the engine keeps no statement statistics and `current_locks` that it has no
+server sessions (`activity::supports_activity`, asked before the read), while `index_health` and
+`table_sizes` do answer there, from `dbstat`'s sizes and with no usage counts, which the usage note
+says. `top_statements {order?, limit?, database?}` is `Db::fetch_top_statements`; an `order` other
+than `total`, `mean` or `calls` is refused, and **an absent source is an answer, not an error** —
+`is_error` false, `perf::unavailable_text`'s reason and one-statement fix — because the model's
+next move is to tell the user, not to retry; a source that is on and has recorded nothing says so,
+and a ready list ends "Counted since …" where the source dates its counters. Its table is rendered
+through `format_table_cells` at `STATEMENT_CHARS` (400) rather than `MCP_CELL_CHARS`: the text
+*is* that tool's answer, a statement cut at the ordinary width is usually cut before its `WHERE`,
+and the list is short by default. `current_locks` takes no arguments and is `Db::fetch_locks`,
+Server Activity's *Locks* read, saying when the list was capped and when the server lists
+contended locks only; its description sends the model to the user, and the panel's *Kill
+session*, for a session that should end. `table_sizes {database?, limit?}` is `workload::largest`
+over `fetch_table_stats`, and says the engine reports index sizes per table rather than printing
+an empty second table. `index_health {database?}` reads the database's schema (`with_deadline`)
+and its stats and prints `workload::index_health`'s findings and `perf::usage_note`, and its
+description tells the model to say "unused since …", never "never used". **On SQL Server
+(`supports_missing_index_hints`) it then appends `Db::fetch_missing_indexes`' top `PERF_ROWS` as a
+numbered table, and below it each suggestion's DDL whole, headed "to propose — never to run"** —
+`ddl::diff`'s own `CREATE INDEX`, through `workload::suggestion_ddl`, and a closing line to check
+each against the existing indexes above before proposing it; a refusal of the DMVs is an
+"(unavailable: …)" line under the rest. Verified live by the change's author on SQL Server:
+`CREATE INDEX [IX_Orders_CustomerID] ON [dbo].[Orders] ([CustomerID]) INCLUDE ([Total]);`.
+`index_health` and `table_sizes` need a database — the call's, else the endpoint's, else a
+refusal asking for one (`perf_database`) — and read the stats through `perf_stats`, under
+`with_deadline_abandoning`, `fetch_table_stats` taking no token on any engine. **`limit` is
+refused, never clamped** (`perf_limit`), `sample_rows`' rule: absent or `null` is `PERF_ROWS` (20),
+and anything but a whole number from 1 to the tool's ceiling — `MAX_STATEMENT_LIMIT` (500) for
+statements, `MAX_SIZE_ROWS` (100) for sizes — is an error naming the range, so a model that asked
+for 10,000 learns the ceiling rather than silently getting less
+(`a_performance_limit_defaults_and_refuses_what_it_cannot_honour`).
+**The gates: all four read the catalogue, and two of them read rows.** `reads_schema` is `true`
+for every one — index health and sizes rank every table and index name in a database, the overview
+`list_schema` gives with sizes, and the statements and the locks name tables too — so *Schema
+context: None* withholds them and `NO_SCHEMA_ACCESS` names them. `reads_row_data` is `true` for
+`top_statements`, because **other people's statements are their data**: PostgreSQL and MySQL
+replace literals with placeholders, but Query Store keeps the text as sent, `WHERE email = 'x@y'`
+and all; and for `current_locks`, because a MySQL 8 lock row names the locked record's key values
+(`data_locks.LOCK_DATA`), one row's worth of data per lock. So below `AiData::Full` those two are
+withheld and refused, and all three `NO_DATA_ACCESS` wordings name them; `index_health` and
+`table_sizes`, names and sizes only, are offered at every data level. None is `needs_panel`, and
+`read_only` is `true` for all four (`the_performance_tools_read_the_catalogue_and_write_nothing`,
+`only_queries_plans_samples_statements_and_locks_count_as_reading_rows`).
+**Their reads are bounded here as every read is**, inside `with_deadline_abandoning` — none of
+`fetch_top_statements`, `fetch_missing_indexes`, `fetch_locks` or `fetch_table_stats` takes a
+token, so the deadline abandons rather than cancels — and `mcp_deadline_gate` holds them to it as
+it holds the rest. `schemaic-db` bounds three of them a second time underneath
+(`WORKLOAD_TIMEOUT`, 30 s, around the whole dispatch of the first two, `PING_TIMEOUT` for the
+locks), which the gate cannot see and does not need to. Their arms in `answer` are `Box::pin`ned
+like the others'.
 `propose_table_change` is the odd one out and stays read-only like the rest: it takes a
 `core::propose::Proposal`, introspects the table, runs `propose::apply` → `ddl::diff` → `emit`,
 and hands the model back the change list in the *preview's own words* plus the SQL and anything
