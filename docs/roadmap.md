@@ -38,3 +38,222 @@ actually offers. Don't assume it behaves like the engine it is compatible with.
 
 A service that differs from its engine is answered by a capability, never by a check of which
 service it is (`AGENTS.md`).
+
+---
+
+The entries below are grouped by surface and ordered roughly cheapest first within each group.
+The headless release's decisions are taken; the other entries' are not. What an entry lists under
+*Open* is for the user to settle before work starts, and the traps are the ones known today.
+
+They ship in this order, one release each. Releases 2 and 3 merge if 3 turns out small.
+
+1. **Headless:** every CLI entry, plus the MCP server's audit log, several connections in one
+   server, `compare_schemas` and `propose_sql`. All of it is in `schemaic-cli` and shares the
+   CLI's guards.
+2. **Performance:** *Workload and performance insight* with the MCP performance tools, which share
+   its backend, plus the Server Activity keyboard path.
+3. **Data and editor:** *Compare and sync table data*, the custom keymap and the two chart kinds.
+4. **DuckDB**, alone. A new engine answers every capability predicate and needs its own read-only
+   allowlist, so it gets a release with nothing else in it.
+
+## Desktop app
+
+### Small gaps
+
+Each of these is a one-session change.
+
+- **Server Activity:** Kill session and Cancel query can only be reached with a right-click, apart
+  from the lock-wait banner's Kill. Give them a keyboard path.
+- **Charts:** add scatter and stacked bar.
+
+### Custom keymap
+
+The shortcuts can't be rebound. Add a keymap file, plus a settings page for it, that rebinds
+palette commands. Conflicts are reported, not resolved silently.
+
+- **Trap:** Floem's focus and Tab handling (`floem-gotchas.md`). Some bindings are consumed before
+  a keymap would ever see them.
+
+### DuckDB as a fifth engine
+
+DuckDB is embedded like SQLite, sqlparser has a DuckDB dialect, and it queries CSV and Parquet
+files directly. That brings "open a Parquet file", plus Parquet import and export, almost for free.
+It is far cheaper than Oracle. ClickHouse would come after DuckDB.
+
+- **Trap:** a new engine has to answer every capability predicate listed in `AGENTS.md`. Answer
+  each from what DuckDB actually does, never by putting it on SQLite's side of an `== Sqlite`
+  check.
+- **Trap:** the read-only gate is an allowlist per dialect. DuckDB's file-reading functions
+  (`read_csv`, `read_parquet`, `COPY … TO`) read and write the *client's* filesystem, so they need
+  their own entries. `COPY … TO` is a write.
+- **Open:** a file-backed database only, or also in-memory sessions over loose files?
+
+### Workload and performance insight
+
+Server Activity shows *who* is running and what they are waiting on, but not *why it's slow*. Table
+statistics (`core::stats`) already cover one table at a time: its sizes, row counts, dead rows and
+free space, and per-index usage with `IndexStats::is_unused`. What is missing is the server-wide
+view. This is shared with the MCP performance tools below, so build the backend once in
+`schemaic-db` and `schemaic-core`, reusing `core::stats` rather than reading the same figures twice.
+
+- **Sources:**
+  - `pg_stat_statements`.
+  - MySQL and MariaDB `performance_schema` statement digests.
+  - SQL Server Query Store, plus the missing-index DMVs.
+- **Views:**
+  - Top statements by total and mean time.
+  - Unused and duplicate indexes across the whole database, not one table at a time.
+  - The largest tables and indexes, ranked.
+- **Trap:** each source may be absent:
+  - `pg_stat_statements` is an extension that might not be installed.
+  - `performance_schema` can be off.
+  - Query Store has to be turned on per database.
+
+  Ask a capability of the live server and explain what is missing; don't show an empty view.
+- **Trap:** suggesting an index produces DDL. That goes through the normal preview modal and is
+  never run silently.
+
+### Compare and sync table data
+
+There is schema compare and there is compare of two results, but no row-level compare of two tables
+with a sync script.
+
+- **Shape:**
+  1. Pair rows by primary key or a unique key the user picks.
+  2. Show them as added, removed or changed.
+  3. Produce `INSERT`, `UPDATE` and `DELETE` for the ticked ones.
+- **Trap:** a table with no usable key cannot be paired. Refuse it; don't guess.
+- **Trap:** the sync script is a write of user data. It goes through the write guard, and like any
+  other write it is transactional, with the report claiming only what the engine delivered.
+- **Trap:** large tables can't be held in memory on both sides. Stream both sides ordered by the key
+  and merge them.
+- **Open:** cross-engine sync, or same engine only, as schema compare is today?
+
+## CLI
+
+### Shell completions
+
+Generate bash, zsh, fish, elvish and PowerShell completions with `clap_complete`, from a
+`completions <shell>` subcommand. Add it to the `wants_cli` allowlist.
+
+- **Decided:** static only. Saved connection names are not completed: that would run a
+  subprocess on every Tab press.
+
+### `--param name=value`
+
+The app has `:name` parameters (`core::params`), but the CLI cannot bind them.
+
+- **Decided:** `-p/--param`, repeatable, on `query`, `exec` and `export`. The value's kind is
+  spelled before the `=`, matching the app's four kinds:
+  - `-p name=value` is text, quoted as a literal.
+  - `-p name:number=42` is a number, refused if it isn't one.
+  - `-p name:null` is NULL.
+  - `-p name:sql=created_at` is raw SQL, which is what makes `ORDER BY :col` work.
+- **Decided:** substitution goes through the same function the app's run does
+  (`params::prepare_run`'s substitution), before any guard, so every gate reads the statement as
+  it will be sent. That is also what makes the raw kind safe.
+- **Trap:** a statement with placeholders and no `-p` for one of them is refused as a usage error,
+  never sent with the placeholder in it.
+
+### Run a `.sql` script
+
+`schemaic compare` prints a migration, but nothing in the CLI can apply it: `exec` refuses more
+than one statement. This also covers restoring a `schemaic dump` on every engine, which is why
+there is no separate `restore` command.
+
+- **Decided:** an explicit `exec --script`, not `-f` quietly accepting several statements. A
+  script is always a write and always needs `--yes`, and a file that gains a second statement
+  must not switch mode on its own.
+- **Decided:** it stops at the first failing statement, names it, and exits 4.
+- **Decided:** with `-d`, `script::restore_refusal` runs first, so a script whose `USE` or
+  `\connect` would move its writes to another database is refused before anything runs.
+- **Trap:** the guard already exists. `sql::script_verdict` treats a whole file as a write, and
+  `ScriptRequest::approved` mints the request. Use those; don't add a laxer gate.
+- **Trap:** `--yes` answers the script's confirm and nothing stronger. A read-only connection
+  refuses it outright, as `exec` does today.
+- **Trap:** it runs on one connection (`Db::run_script`), because a dump's statements are not
+  independent.
+- **Non-goal:** `pg_restore` archives. The app's restore launches the engine's own client; anyone
+  holding a custom-format archive can run `pg_restore` themselves.
+
+### `schemaic import`
+
+Import CSV, TSV, JSON and Excel into an existing table. The logic already exists in core: column
+mapping (`import::auto_map`) and the pre-flight problem report (`import::validate`).
+
+- **Decided:** the mapping is the app's default — by header name, or by position with
+  `--no-header` — plus `--map file_col=table_col` and `--skip file_col` for the exceptions.
+- **Decided:** a file with any pre-flight problem is refused and nothing is written, as in the
+  app. The problems go to stderr, and the run exits 7, a new code meaning "file rejected, nothing
+  written" (3 stays the guard's refusal).
+- **Decided:** refused on a read-only connection; no `--yes` (it is an `INSERT`); recorded in the
+  write log as `Source::Import`.
+
+### A one-off connection
+
+For containers and CI, where there is no GUI to save a connection in. Saving one from the CLI is
+ruled out twice over: the app owns `connections.json` while it runs and would overwrite the CLI's
+addition on its next save, and a container usually has no OS keyring to hold the password.
+
+- **Decided:** a connection given on the command line and never saved: `--url` (or
+  `SCHEMAIC_URL`) in place of `-c`, parsed by `conn_import`'s URL parser.
+- **Decided:** the URL may not carry a password; one that does is refused, since argv is visible
+  to every process. The password comes from `--password-stdin` or `SCHEMAIC_PASSWORD`.
+- **Decided:** it is read-write unless `--read-only` is given, and its AI data level is
+  `--ai-data`, defaulting to schema only. CLI access is implied: the user typed the connection.
+- **Non-goal:** `connection add` and `connection import`. The app already imports.
+
+## MCP server
+
+### Audit log of agent calls
+
+`exec` writes to the write log, but MCP reads are logged nowhere. On a production connection, what
+the agent looked at matters too.
+
+- **Decided:** a separate `agent_log.jsonl` beside the write log, in its format and with its
+  masking. Each line holds the tool, the connection, the database, the SQL, the row count, the
+  outcome, and whether the call came from the panel or a standalone server.
+- **Decided:** on by default. Agent reads are frequent, so unlike the write log it is capped:
+  past a size limit it rolls over to one `.1` file.
+
+### Several connections in one server
+
+One process serves one connection today, so working across databases needs one client entry per
+connection.
+
+- **Decided:** repeat `-c`. The first is the default for a tool called without a `connection`
+  argument; `list_connections` names the rest. There is no `--all`: each client config names
+  exactly what it exposes.
+- **Trap:**
+  - Each connection still needs CLI access.
+  - The `AiData` level is read per connection, not once for the server.
+  - SSH tunnels open lazily, per connection.
+
+### `compare_schemas`
+
+A tool that wraps `cli/compare.rs` and returns the migration as text. It executes nothing.
+
+- **Decided:** both sides are connections this server was given, so it lands after *Several
+  connections*. It reads only the catalogue, so like `list_schema` it needs no data level. Both
+  sides are the same engine, as in the CLI.
+
+### `propose_sql`
+
+Today the only proposal tool is `propose_table_change`. Add a `propose_sql` that validates through
+`run_verdict` and, in the panel, opens the usual preview. It executes nothing.
+
+- **Decided:** panel only, like `propose_table_change`. A standalone server has nobody reading
+  the proposal.
+
+### Performance tools
+
+Top statements, index-usage health, missing and unused indexes, table sizes and current locks. They
+share their backend with the app's *Workload and performance insight* entry, so they land after it.
+They read only, and any index they suggest comes back as DDL to propose, never to run.
+
+### Non-goals
+
+- **HTTP or SSE transport.** Stdio keeps access control at the process boundary. A listening socket
+  would need auth, and adds attack surface for little gain.
+- **MCP resources and prompts.** Few clients use them well, and the tools already cover what they
+  would carry.
