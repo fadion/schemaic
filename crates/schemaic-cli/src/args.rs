@@ -795,7 +795,42 @@ pub fn comment_led_sql_last(argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsSt
 /// clap. `run::main`'s whole front, apart so a test can drive it — a fix that
 /// lives in the composition is only pinned by a test of the composition.
 pub fn parse_argv(argv: Vec<std::ffi::OsString>) -> Result<Cli, clap::Error> {
-    Cli::try_parse_from(comment_led_sql_last(argv))
+    use clap::CommandFactory as _;
+    parse_with(Cli::command(), argv)
+}
+
+/// [`parse_argv`] over a given `cmd` — the tests' way to point an argument's
+/// environment variable at a name no other test reads.
+fn parse_with(mut cmd: clap::Command, argv: Vec<std::ffi::OsString>) -> Result<Cli, clap::Error> {
+    use clap::FromArgMatches as _;
+    let mut matches = cmd.try_get_matches_from_mut(comment_led_sql_last(argv))?;
+    refuse_an_exported_connection_beside_a_url(&mut cmd, &matches)?;
+    Cli::from_arg_matches_mut(&mut matches).map_err(|e| e.format(&mut cmd))
+}
+
+/// **`mcp --url` with `SCHEMAIC_CONNECTION` exported is refused.** `mcp`
+/// serves its `-c`s *and* a `--url`, so the variable did not give way to the
+/// URL as it does nowhere else ([`ConnArgs::source`] refuses the mix): it
+/// became the server's **first, default** connection, `-d` landing on it, and
+/// every tool call naming none read the developer's own connection while the
+/// person believed the agent was on the URL's. A typed `-c` beside `--url`
+/// is still both, as asked.
+fn refuse_an_exported_connection_beside_a_url(
+    cmd: &mut clap::Command,
+    matches: &clap::ArgMatches,
+) -> Result<(), clap::Error> {
+    let Some(("mcp", m)) = matches.subcommand() else {
+        return Ok(());
+    };
+    let exported = m.value_source("connection") == Some(clap::parser::ValueSource::EnvVariable);
+    if exported && m.contains_id("url") && m.get_one::<String>("url").is_some() {
+        return Err(cmd.error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--url is served beside the connection SCHEMAIC_CONNECTION names, as the \
+             default; unset SCHEMAIC_CONNECTION, or name it with -c to serve both",
+        ));
+    }
+    Ok(())
 }
 
 /// Does this argv mean the CLI rather than the app?
@@ -1943,6 +1978,29 @@ mod tests {
             .find(|a| a.get_id() == id)
             .expect("an argument");
         arg.get_env().map(|e| e.to_string_lossy().into_owned())
+    }
+
+    /// **An exported connection does not join `mcp --url`'s server** as its
+    /// default; a typed `-c` beside the URL still does. The variable is
+    /// renamed to one no other test reads, since the environment is the
+    /// process's.
+    #[test]
+    fn mcp_refuses_an_exported_connection_beside_a_url() {
+        use clap::CommandFactory as _;
+        const VAR: &str = "SCHEMAIC_TEST_MCP_EXPORTED_CONNECTION";
+        // SAFETY: no other test reads or writes this variable.
+        unsafe { std::env::set_var(VAR, "prod") };
+        let cmd =
+            || Cli::command().mut_subcommand("mcp", |s| s.mut_arg("connection", |a| a.env(VAR)));
+        let argv = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        let err =
+            parse_with(cmd(), argv(&["schemaic", "mcp", "--url", "mysql://u@h/d"])).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert!(err.to_string().contains("SCHEMAIC_CONNECTION"), "{err}");
+        // Typed, it is both; and the variable alone still serves.
+        let typed = argv(&["schemaic", "mcp", "-c", "prod", "--url", "mysql://u@h/d"]);
+        assert!(parse_with(cmd(), typed).is_ok());
+        assert!(parse_with(cmd(), argv(&["schemaic", "mcp"])).is_ok());
     }
 
     /// **`-d` comes from `SCHEMAIC_DATABASE` the way `-c` comes from
