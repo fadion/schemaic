@@ -257,6 +257,36 @@ shortcuts-recall-prompt = Предишна / следваща подкана
 shortcuts-copy-paste = Копиране / поставяне
 shortcuts-find-in-diagram = Търсене в диаграмата
 
+## Клавишни комбинации › смяна на клавиша на команда
+
+keymap-hint = Щракнете с десен бутон или щракнете двукратно върху команда, за да смените клавиша ѝ. Клавишите без меню са фиксирани.
+keymap-search = Търсене на клавишни комбинации
+keymap-no-match = Няма съвпадаща клавишна комбинация.
+keymap-assign = Задаване
+keymap-clear = Премахване
+keymap-reset = Връщане по подразбиране
+keymap-unset = Не е зададена
+keymap-press = Натиснете новата клавишна комбинация. Esc отказва.
+keymap-taken = { $keys } вече се използва от { $holder }.
+keymap-replace = Замяна
+keymap-cancel = Отказ
+keymap-fixed = { $keys } се използва от { $holder }, което не може да се променя.
+keymap-refused = { $keys } не може да се използва. { $reason }
+keymap-refusal-needs-primary = Буква, цифра или Tab изисква { $primary }, иначе би въвело текст.
+keymap-refusal-needs-modifier = Този клавиш изисква { $primary } или { $alt }.
+keymap-refusal-escape = Esc затваря и отказва навсякъде, затова никога не е клавиш на команда.
+keymap-refusal-editing = Всяко текстово поле го използва за редактиране.
+keymap-refusal-system = Използва се от работния плот.
+
+## Известие при стартиране за keymap.json
+
+keymap-problems = Някои промени на клавишни комбинации в keymap.json не можаха да бъдат приложени:
+keymap-problem-unknown = • „{ $id }“ не е команда, позната на тази версия.
+keymap-problem-unreadable = • { $command }: „{ $keys }“ не е клавишна комбинация, затова остава клавишът по подразбиране.
+keymap-problem-refused = • { $command }: { $keys } не може да се използва, затова остава клавишът по подразбиране. { $reason }
+keymap-problem-fixed = • { $command }: { $keys } се използва от { $holder }, което не може да се променя, затова остава клавишът по подразбиране.
+keymap-problem-taken = • { $command }: { $keys } вече се използва от { $holder }, затова { $command } няма клавиш.
+
 ## Key names in shortcut labels — a keyboard's own legends, so a language
 ## whose keyboards print another word uses it (German: Strg, Umschalt, Entf).
 ## Keys written the same everywhere (letters, arrows, Tab, Esc, F6) and macOS's

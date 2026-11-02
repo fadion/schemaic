@@ -257,6 +257,36 @@ shortcuts-recall-prompt = Recuperar la instrucción anterior / siguiente
 shortcuts-copy-paste = Copiar / pegar
 shortcuts-find-in-diagram = Buscar en el diagrama
 
+## Atajos › cambiar la tecla de un comando
+
+keymap-hint = Haz clic derecho o doble clic en un comando para cambiar su tecla. Las teclas sin menú son fijas.
+keymap-search = Buscar atajos
+keymap-no-match = Ningún atajo coincide.
+keymap-assign = Asignar
+keymap-clear = Quitar
+keymap-reset = Restablecer el predeterminado
+keymap-unset = Sin asignar
+keymap-press = Pulsa la nueva combinación de teclas. Esc cancela.
+keymap-taken = { $keys } ya lo usa { $holder }.
+keymap-replace = Sustituir
+keymap-cancel = Cancelar
+keymap-fixed = { $keys } lo usa { $holder }, que no se puede cambiar.
+keymap-refused = No se puede usar { $keys }. { $reason }
+keymap-refusal-needs-primary = Una letra, un dígito o Tab necesita { $primary }, o escribiría.
+keymap-refusal-needs-modifier = Esta tecla necesita { $primary } o { $alt }.
+keymap-refusal-escape = Esc cierra y cancela en todas partes, así que nunca es la tecla de un comando.
+keymap-refusal-editing = Todos los campos de texto la usan para editar.
+keymap-refusal-system = La usa el escritorio.
+
+## Aviso al iniciar sobre keymap.json
+
+keymap-problems = Algunos cambios de atajos en keymap.json no se pudieron aplicar:
+keymap-problem-unknown = • «{ $id }» no es un comando que conozca esta versión.
+keymap-problem-unreadable = • { $command }: «{ $keys }» no es una combinación de teclas, así que conserva la predeterminada.
+keymap-problem-refused = • { $command }: no se puede usar { $keys }, así que conserva la predeterminada. { $reason }
+keymap-problem-fixed = • { $command }: { $keys } lo usa { $holder }, que no se puede cambiar, así que conserva la predeterminada.
+keymap-problem-taken = • { $command }: { $keys } ya lo usa { $holder }, así que { $command } no tiene tecla.
+
 ## Key names in shortcut labels — a keyboard's own legends, so a language
 ## whose keyboards print another word uses it (German: Strg, Umschalt, Entf).
 ## Keys written the same everywhere (letters, arrows, Tab, Esc, F6) and macOS's

@@ -257,6 +257,36 @@ shortcuts-recall-prompt = Rikujto mesazhin e mëparshëm / pasues
 shortcuts-copy-paste = Kopjo / ngjit
 shortcuts-find-in-diagram = Gjej në diagram
 
+## Shkurtoret › ndryshimi i tastit të një komande
+
+keymap-hint = Klikoni me të djathtën ose dyklikoni një komandë për t'i ndryshuar tastin. Tastet pa menu janë të fiksuara.
+keymap-search = Kërkoni shkurtore
+keymap-no-match = Asnjë shkurtore nuk përputhet.
+keymap-assign = Cakto
+keymap-clear = Hiq
+keymap-reset = Rikthe parazgjedhjen
+keymap-unset = I pacaktuar
+keymap-press = Shtypni kombinimin e ri të tasteve. Esc anulon.
+keymap-taken = { $keys } përdoret tashmë nga { $holder }.
+keymap-replace = Zëvendëso
+keymap-cancel = Anulo
+keymap-fixed = { $keys } përdoret nga { $holder }, i cili nuk mund të ndryshohet.
+keymap-refused = { $keys } nuk mund të përdoret. { $reason }
+keymap-refusal-needs-primary = Një shkronjë, një shifër ose Tab ka nevojë për { $primary }, përndryshe do të shkruante.
+keymap-refusal-needs-modifier = Ky tast ka nevojë për { $primary } ose { $alt }.
+keymap-refusal-escape = Esc mbyll dhe anulon kudo, prandaj nuk është kurrë tasti i një komande.
+keymap-refusal-editing = Çdo fushë teksti e përdor për redaktim.
+keymap-refusal-system = E përdor desktopi.
+
+## Njoftim në nisje për keymap.json
+
+keymap-problems = Disa ndryshime shkurtoresh në keymap.json nuk mund të zbatoheshin:
+keymap-problem-unknown = • “{ $id }” nuk është një komandë që e njeh ky version.
+keymap-problem-unreadable = • { $command }: “{ $keys }” nuk është kombinim tastesh, prandaj mbetet tasti parazgjedhur.
+keymap-problem-refused = • { $command }: { $keys } nuk mund të përdoret, prandaj mbetet tasti parazgjedhur. { $reason }
+keymap-problem-fixed = • { $command }: { $keys } përdoret nga { $holder }, i cili nuk mund të ndryshohet, prandaj mbetet tasti parazgjedhur.
+keymap-problem-taken = • { $command }: { $keys } përdoret tashmë nga { $holder }, prandaj { $command } nuk ka tast.
+
 ## Key names in shortcut labels — a keyboard's own legends, so a language
 ## whose keyboards print another word uses it (German: Strg, Umschalt, Entf).
 ## Keys written the same everywhere (letters, arrows, Tab, Esc, F6) and macOS's

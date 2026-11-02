@@ -257,6 +257,36 @@ shortcuts-recall-prompt = Vorherige / nächste Eingabe zurückholen
 shortcuts-copy-paste = Kopieren / Einfügen
 shortcuts-find-in-diagram = Im Diagramm suchen
 
+## Tastenkürzel › die Taste eines Befehls ändern
+
+keymap-hint = Klicke mit rechts auf einen Befehl oder doppelklicke ihn, um seine Taste zu ändern. Tasten ohne Menü sind fest.
+keymap-search = Tastenkürzel durchsuchen
+keymap-no-match = Kein Tastenkürzel passt.
+keymap-assign = Zuweisen
+keymap-clear = Entfernen
+keymap-reset = Auf Standard zurücksetzen
+keymap-unset = Nicht festgelegt
+keymap-press = Drücke die neue Tastenkombination. Esc bricht ab.
+keymap-taken = { $keys } ist bereits { $holder } zugewiesen.
+keymap-replace = Ersetzen
+keymap-cancel = Abbrechen
+keymap-fixed = { $keys } gehört zu { $holder } und kann nicht geändert werden.
+keymap-refused = { $keys } kann nicht verwendet werden. { $reason }
+keymap-refusal-needs-primary = Ein Buchstabe, eine Ziffer oder Tab braucht { $primary }, sonst würde getippt.
+keymap-refusal-needs-modifier = Diese Taste braucht { $primary } oder { $alt }.
+keymap-refusal-escape = Esc schließt und bricht überall ab und ist deshalb nie die Taste eines Befehls.
+keymap-refusal-editing = Jedes Textfeld nutzt sie zum Bearbeiten.
+keymap-refusal-system = Der Desktop nutzt sie.
+
+## Hinweis beim Start zu keymap.json
+
+keymap-problems = Einige Tastenkürzel-Änderungen in keymap.json konnten nicht übernommen werden:
+keymap-problem-unknown = • „{ $id }“ ist kein Befehl, den diese Version kennt.
+keymap-problem-unreadable = • { $command }: „{ $keys }“ ist keine Tastenkombination, daher bleibt die Standardtaste.
+keymap-problem-refused = • { $command }: { $keys } kann nicht verwendet werden, daher bleibt die Standardtaste. { $reason }
+keymap-problem-fixed = • { $command }: { $keys } gehört zu { $holder } und kann nicht geändert werden, daher bleibt die Standardtaste.
+keymap-problem-taken = • { $command }: { $keys } ist bereits { $holder } zugewiesen, daher hat { $command } keine Taste.
+
 ## Key names in shortcut labels — the German keyboard's legends
 
 key-ctrl = Strg

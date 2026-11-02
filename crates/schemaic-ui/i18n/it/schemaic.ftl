@@ -257,6 +257,36 @@ shortcuts-recall-prompt = Richiama il prompt precedente / successivo
 shortcuts-copy-paste = Copia / incolla
 shortcuts-find-in-diagram = Trova nel diagramma
 
+## Scorciatoie › cambiare il tasto di un comando
+
+keymap-hint = Fai clic destro o doppio clic su un comando per cambiarne il tasto. I tasti senza menu sono fissi.
+keymap-search = Cerca scorciatoie
+keymap-no-match = Nessuna scorciatoia corrisponde.
+keymap-assign = Assegna
+keymap-clear = Rimuovi
+keymap-reset = Ripristina predefinito
+keymap-unset = Non impostato
+keymap-press = Premi la nuova combinazione di tasti. Esc annulla.
+keymap-taken = { $keys } è già usato da { $holder }.
+keymap-replace = Sostituisci
+keymap-cancel = Annulla
+keymap-fixed = { $keys } è usato da { $holder }, che non si può cambiare.
+keymap-refused = { $keys } non si può usare. { $reason }
+keymap-refusal-needs-primary = Una lettera, una cifra o Tab richiede { $primary }, altrimenti scriverebbe.
+keymap-refusal-needs-modifier = Questo tasto richiede { $primary } o { $alt }.
+keymap-refusal-escape = Esc chiude e annulla ovunque, quindi non è mai il tasto di un comando.
+keymap-refusal-editing = Ogni campo di testo lo usa per modificare.
+keymap-refusal-system = Lo usa il desktop.
+
+## Avviso all'avvio su keymap.json
+
+keymap-problems = Alcune modifiche alle scorciatoie in keymap.json non sono state applicate:
+keymap-problem-unknown = • “{ $id }” non è un comando che questa versione conosce.
+keymap-problem-unreadable = • { $command }: “{ $keys }” non è una combinazione di tasti, quindi resta quello predefinito.
+keymap-problem-refused = • { $command }: { $keys } non si può usare, quindi resta quello predefinito. { $reason }
+keymap-problem-fixed = • { $command }: { $keys } è usato da { $holder }, che non si può cambiare, quindi resta quello predefinito.
+keymap-problem-taken = • { $command }: { $keys } è già usato da { $holder }, quindi { $command } non ha tasto.
+
 ## Key names in shortcut labels — a keyboard's own legends, so a language
 ## whose keyboards print another word uses it (German: Strg, Umschalt, Entf).
 ## Keys written the same everywhere (letters, arrows, Tab, Esc, F6) and macOS's

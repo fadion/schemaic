@@ -257,6 +257,36 @@ shortcuts-recall-prompt = Rappeler l'invite précédente / suivante
 shortcuts-copy-paste = Copier / coller
 shortcuts-find-in-diagram = Rechercher dans le diagramme
 
+## Raccourcis › changer la touche d'une commande
+
+keymap-hint = Faites un clic droit ou un double-clic sur une commande pour changer sa touche. Les touches sans menu sont fixes.
+keymap-search = Rechercher un raccourci
+keymap-no-match = Aucun raccourci ne correspond.
+keymap-assign = Attribuer
+keymap-clear = Effacer
+keymap-reset = Rétablir la valeur par défaut
+keymap-unset = Non définie
+keymap-press = Appuyez sur la nouvelle combinaison de touches. Échap annule.
+keymap-taken = { $keys } est déjà utilisé par { $holder }.
+keymap-replace = Remplacer
+keymap-cancel = Annuler
+keymap-fixed = { $keys } est utilisé par { $holder }, qui ne peut pas être modifié.
+keymap-refused = { $keys } ne peut pas être utilisé. { $reason }
+keymap-refusal-needs-primary = Une lettre, un chiffre ou Tab demande { $primary }, sinon la touche écrirait.
+keymap-refusal-needs-modifier = Cette touche demande { $primary } ou { $alt }.
+keymap-refusal-escape = Échap ferme et annule partout : ce n'est jamais la touche d'une commande.
+keymap-refusal-editing = Tous les champs de texte s'en servent pour l'édition.
+keymap-refusal-system = Le bureau s'en sert.
+
+## Avis au démarrage sur keymap.json
+
+keymap-problems = Certaines modifications de raccourcis dans keymap.json n'ont pas pu être appliquées :
+keymap-problem-unknown = • « { $id } » n'est pas une commande connue de cette version.
+keymap-problem-unreadable = • { $command } : « { $keys } » n'est pas une combinaison de touches, la touche par défaut est donc conservée.
+keymap-problem-refused = • { $command } : { $keys } ne peut pas être utilisé, la touche par défaut est donc conservée. { $reason }
+keymap-problem-fixed = • { $command } : { $keys } est utilisé par { $holder }, qui ne peut pas être modifié, la touche par défaut est donc conservée.
+keymap-problem-taken = • { $command } : { $keys } est déjà utilisé par { $holder }, { $command } n'a donc aucune touche.
+
 ## Key names in shortcut labels — a keyboard's own legends, so a language
 ## whose keyboards print another word uses it (German: Strg, Umschalt, Entf).
 ## Keys written the same everywhere (letters, arrows, Tab, Esc, F6) and macOS's

@@ -261,6 +261,36 @@ shortcuts-recall-prompt = Promptul anterior / următor
 shortcuts-copy-paste = Copiază / lipește
 shortcuts-find-in-diagram = Caută în diagramă
 
+## Scurtături › schimbarea tastei unei comenzi
+
+keymap-hint = Fă clic dreapta sau dublu clic pe o comandă pentru a-i schimba tasta. Tastele fără meniu sunt fixe.
+keymap-search = Caută scurtături
+keymap-no-match = Nicio scurtătură nu se potrivește.
+keymap-assign = Atribuie
+keymap-clear = Șterge
+keymap-reset = Revino la implicit
+keymap-unset = Nesetată
+keymap-press = Apasă noua combinație de taste. Esc anulează.
+keymap-taken = { $keys } este deja folosită de { $holder }.
+keymap-replace = Înlocuiește
+keymap-cancel = Anulează
+keymap-fixed = { $keys } este folosită de { $holder }, care nu poate fi schimbată.
+keymap-refused = { $keys } nu poate fi folosită. { $reason }
+keymap-refusal-needs-primary = O literă, o cifră sau Tab are nevoie de { $primary }, altfel ar scrie.
+keymap-refusal-needs-modifier = Tasta aceasta are nevoie de { $primary } sau { $alt }.
+keymap-refusal-escape = Esc închide și anulează peste tot, deci nu este niciodată tasta unei comenzi.
+keymap-refusal-editing = Fiecare câmp de text o folosește pentru editare.
+keymap-refusal-system = O folosește desktopul.
+
+## Notificare la pornire despre keymap.json
+
+keymap-problems = Unele modificări de scurtături din keymap.json nu au putut fi aplicate:
+keymap-problem-unknown = • „{ $id }” nu este o comandă cunoscută de această versiune.
+keymap-problem-unreadable = • { $command }: „{ $keys }” nu este o combinație de taste, așa că rămâne tasta implicită.
+keymap-problem-refused = • { $command }: { $keys } nu poate fi folosită, așa că rămâne tasta implicită. { $reason }
+keymap-problem-fixed = • { $command }: { $keys } este folosită de { $holder }, care nu poate fi schimbată, așa că rămâne tasta implicită.
+keymap-problem-taken = • { $command }: { $keys } este deja folosită de { $holder }, așa că { $command } nu are tastă.
+
 ## Key names in shortcut labels — a keyboard's own legends, so a language
 ## whose keyboards print another word uses it (German: Strg, Umschalt, Entf).
 ## Keys written the same everywhere (letters, arrows, Tab, Esc, F6) and macOS's

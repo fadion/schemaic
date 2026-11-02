@@ -257,6 +257,36 @@ shortcuts-recall-prompt = Vorige / volgende prompt terughalen
 shortcuts-copy-paste = Kopiëren / plakken
 shortcuts-find-in-diagram = Zoeken in het diagram
 
+## Sneltoetsen › de toets van een opdracht wijzigen
+
+keymap-hint = Klik met rechts of dubbelklik op een opdracht om de toets te wijzigen. Toetsen zonder menu liggen vast.
+keymap-search = Sneltoetsen zoeken
+keymap-no-match = Geen sneltoets komt overeen.
+keymap-assign = Toewijzen
+keymap-clear = Wissen
+keymap-reset = Standaard herstellen
+keymap-unset = Niet ingesteld
+keymap-press = Druk op de nieuwe toetscombinatie. Esc annuleert.
+keymap-taken = { $keys } wordt al gebruikt door { $holder }.
+keymap-replace = Vervangen
+keymap-cancel = Annuleren
+keymap-fixed = { $keys } wordt gebruikt door { $holder }, dat niet kan worden gewijzigd.
+keymap-refused = { $keys } kan niet worden gebruikt. { $reason }
+keymap-refusal-needs-primary = Een letter, een cijfer of Tab heeft { $primary } nodig, anders zou hij typen.
+keymap-refusal-needs-modifier = Deze toets heeft { $primary } of { $alt } nodig.
+keymap-refusal-escape = Esc sluit en annuleert overal, dus is nooit de toets van een opdracht.
+keymap-refusal-editing = Elk tekstveld gebruikt hem om te bewerken.
+keymap-refusal-system = Het bureaublad gebruikt hem.
+
+## Melding bij het starten over keymap.json
+
+keymap-problems = Sommige sneltoetswijzigingen in keymap.json konden niet worden toegepast:
+keymap-problem-unknown = • ‘{ $id }’ is geen opdracht die deze versie kent.
+keymap-problem-unreadable = • { $command }: ‘{ $keys }’ is geen toetscombinatie, dus de standaardtoets blijft.
+keymap-problem-refused = • { $command }: { $keys } kan niet worden gebruikt, dus de standaardtoets blijft. { $reason }
+keymap-problem-fixed = • { $command }: { $keys } wordt gebruikt door { $holder }, dat niet kan worden gewijzigd, dus de standaardtoets blijft.
+keymap-problem-taken = • { $command }: { $keys } wordt al gebruikt door { $holder }, dus { $command } heeft geen toets.
+
 ## Key names in shortcut labels — a keyboard's own legends, so a language
 ## whose keyboards print another word uses it (German: Strg, Umschalt, Entf).
 ## Keys written the same everywhere (letters, arrows, Tab, Esc, F6) and macOS's
