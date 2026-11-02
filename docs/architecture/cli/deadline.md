@@ -22,6 +22,14 @@ still holds for every statement that reached the server
 (`a_future_that_ignores_the_cancel_is_abandoned_after_the_grace`). The worst case is
 therefore `timeout` plus the grace, not `timeout`. The SSH tunnel is opened before this wrapper
 is ever entered, so it has a bound of its own in `run.rs`.
+**`with_deadline` is a wrapper over `with_deadline_unwound`, which keeps what the future said
+after the cancel.** It returns `Deadlined::{InTime(r), Late(Option<r>)}` — `Late(Some)` the answer
+the future gave while unwinding inside the grace, `Late(None)` that it was abandoned — and
+`with_deadline` folds both `Late`s to `None`, as it always answered. The unwound answer is thrown
+away for a read, which changed nothing, but not for `exec --script`: `Db::run_script` returns how
+many statements it got through before the token stopped it, and that count is the one thing a
+timed-out script's caller needs (`an_unwound_answer_is_kept_and_an_abandoned_one_is_none`). The
+gate below counts it as wrapped, `with_deadline` being a prefix of its name.
 **It is deliberately not a merge with `mcp.rs`'s `with_deadline`**, and the server moving into
 this crate did not merge them: that one wraps a read none of the subcommands makes
 (`fetch_schema`), at the server's fixed `QUERY_TIMEOUT` rather than a `--timeout`, and the

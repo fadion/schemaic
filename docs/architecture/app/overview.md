@@ -619,7 +619,8 @@ they ask `still_pinned` for the fold, and log an `abandoned` line saying so
 cannot find it. A transaction `save_conn` asks about ends through `end_tx`, which logs its own.
 `script_run` logs a `.sql` file whole — `Source::Script`, its detail
 `file <path>, N statements ran`, and as `sql` the failing statement when `RunOutcome::Failed`'s
-`at` names one; the statements that succeeded are not lines of their own. Its error is
+`at` names one; the statements that succeeded are not lines of their own. The mapping is core's
+`Entry::ended_script`, which `schemaic exec --script` shares. Its error is
 `ScriptFailure::message`, English: the failure is a value (`Said`, `Changed`, `ReaderStopped`,
 `NoTerminator`) that `script_view` words for the modal, since the reader's own two sentences
 once reached this persisted record in the interface's language

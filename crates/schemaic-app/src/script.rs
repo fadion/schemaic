@@ -6,7 +6,8 @@
 //! tool could replay.
 //!
 //! The shape is two halves running at once, as a dump's is. A **blocking reader**
-//! walks the file a block at a time, feeds [`Splitter`] and pushes the statements
+//! ([`schemaic_db::feed_script`], shared with `schemaic exec --script`) walks
+//! the file a block at a time, feeds [`Splitter`](schemaic_core::script::Splitter) and pushes the statements
 //! it completes into a bounded channel; the **executor** (`Db::run_script`) pulls
 //! from the other end and applies them in order on one pinned connection. Each
 //! reports how it ended, and [`run_outcome`] decides which ending the user is
@@ -20,13 +21,7 @@
 //! and why a 2 GB file read at disk speed cannot pile up in memory ahead of a
 //! server applying it one statement at a time.
 
-use std::io::Read;
-
-// The read size is core's (`next_read`), shared with the restore's scan.
-// Independent of `SCRIPT_QUEUE`: that is how much *file* is read at once, this
-// how many *statements* may be in flight. A dump's extended `INSERT`s put tens
-// of statements in one block, which the queue then meters out.
-use schemaic_core::script::{ReadEnd, RunOutcome, Splitter, next_read, run_outcome};
+use schemaic_core::script::{ReadEnd, RunOutcome, run_outcome};
 use schemaic_db::{Db, SCRIPT_QUEUE};
 use schemaic_ui::{ScriptProgress, ScriptRequest};
 use tokio_util::sync::CancellationToken;
@@ -94,62 +89,15 @@ fn read(
     // Best-effort: a file whose length cannot be read still loads, it just has
     // no denominator to report against.
     let total = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let mut file = std::io::BufReader::with_capacity(schemaic_core::script::READ_BLOCK, file);
-    let mut splitter = Splitter::new(dialect);
-    let mut block = vec![0u8; schemaic_core::script::READ_BLOCK];
-
-    loop {
-        if token.is_cancelled() {
-            return ReadEnd::Cancelled;
-        }
-        // **The read grows with what is still unfinished**, and that is what
-        // keeps the splitter's cost linear. `Splitter::split` re-scans its
-        // buffer from the start on every block, so a statement spanning *m*
-        // blocks costs O(m²·block) — nothing for a dump, whose statements are
-        // far smaller than one block, but a file with *no* terminator in it (a
-        // CSV renamed `.sql`, a dump truncated inside a string) grows the buffer
-        // to `MAX_PENDING_BYTES` and would re-scan a quarter of a gigabyte a
-        // thousand times before being refused: minutes of a pinned thread before
-        // the message saying the file is not a script. Doubling the read makes
-        // the number of re-scans logarithmic instead.
-        let want = next_read(splitter.pending());
-        if block.len() < want {
-            block.resize(want, 0);
-        }
-        let n = match file.read(&mut block[..want]) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => return ReadEnd::Failed(e.to_string()),
-        };
-        for stmt in splitter.push(&block[..n]) {
-            // The executor has gone. It holds the reason; this half must not
-            // invent one (`ReadEnd::Stopped` carries no message on purpose).
-            if tx.blocking_send(stmt).is_err() {
-                return ReadEnd::Stopped;
-            }
-        }
-        // Checked after the push, so a statement that merely *reaches* the
-        // ceiling and then ends is not refused for it.
-        if splitter.pending() > schemaic_core::script::MAX_PENDING_BYTES {
-            return ReadEnd::NoTerminator;
-        }
+    let file = std::io::BufReader::with_capacity(schemaic_core::script::READ_BLOCK, file);
+    // The splitting, the growing read and every ending are the database
+    // layer's, shared with `schemaic exec --script`.
+    schemaic_db::feed_script(file, dialect, tx, token, |done| {
         let _ = progress.send(ScriptProgress {
-            bytes_done: splitter.consumed(),
+            bytes_done: done,
             bytes_total: total,
         });
-    }
-
-    // The last statement need not carry a terminator.
-    for stmt in splitter.finish() {
-        if tx.blocking_send(stmt).is_err() {
-            return ReadEnd::Stopped;
-        }
-    }
-    let _ = progress.send(ScriptProgress {
-        bytes_done: splitter.consumed(),
-        bytes_total: total,
-    });
-    ReadEnd::Eof
+    })
 }
 
 #[cfg(test)]

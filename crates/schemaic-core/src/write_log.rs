@@ -163,6 +163,40 @@ impl Entry {
         self
     }
 
+    /// The same entry ended as a script run ended: the file and how many
+    /// statements ran in `detail`, and on a failure the statement the server
+    /// refused, when there was one, as `sql`.
+    ///
+    /// **One record for both front ends** — the app's script modal and
+    /// `schemaic exec --script` — since a script is logged whole, never per
+    /// statement: it is a write unread (`sql::script_verdict`), and the count
+    /// is the answer to "how much of it happened?".
+    pub fn ended_script(self, file: &str, outcome: &crate::script::RunOutcome) -> Entry {
+        use crate::script::RunOutcome;
+        let ran = |n: usize| {
+            let s = crate::text::plural(n, "statement", "statements");
+            format!("file {file}, {n} {s} ran")
+        };
+        match outcome {
+            RunOutcome::Done { ran: n } => self.with_detail(ran(*n)).ended(Ok(None)),
+            RunOutcome::Cancelled { ran: n } => {
+                self.with_detail(ran(*n)).ended_as(Outcome::Cancelled, None)
+            }
+            RunOutcome::Failed {
+                failure,
+                ran: n,
+                at,
+            } => {
+                let mut e = self.with_detail(ran(*n));
+                if let Some((sql, _)) = at {
+                    e.sql = sql.clone();
+                }
+                // English: the write log is a persisted record.
+                e.ended(Err(failure.message()))
+            }
+        }
+    }
+
     /// The same entry ended as `ran` says, or `None` while it has no verdict.
     ///
     /// `aborted_before` is whether the statement ran inside a transaction a
@@ -494,6 +528,40 @@ mod tests {
     const MY: SqlDialect = SqlDialect::MySql;
     const PG: SqlDialect = SqlDialect::Postgres;
     const MS: SqlDialect = SqlDialect::MsSql;
+
+    fn script_entry(outcome: crate::script::RunOutcome) -> Entry {
+        Entry::now(Source::Script, "c", Some("shop"), "").ended_script("m.sql", &outcome)
+    }
+
+    #[test]
+    fn a_finished_script_is_logged_with_its_file_and_count() {
+        let e = script_entry(crate::script::RunOutcome::Done { ran: 3 });
+        assert_eq!(e.detail.as_deref(), Some("file m.sql, 3 statements ran"));
+        assert_eq!(e.outcome, Outcome::Ok);
+        assert!(e.sql.is_empty());
+        let one = script_entry(crate::script::RunOutcome::Done { ran: 1 });
+        assert_eq!(one.detail.as_deref(), Some("file m.sql, 1 statement ran"));
+    }
+
+    #[test]
+    fn a_failed_script_names_the_statement_the_server_refused() {
+        let e = script_entry(crate::script::RunOutcome::Failed {
+            failure: crate::script::ScriptFailure::Said("no such table".into()),
+            ran: 2,
+            at: Some(("DROP TABLE x".into(), 9)),
+        });
+        assert_eq!(e.outcome, Outcome::Failed);
+        assert_eq!(e.sql, "DROP TABLE x");
+        assert_eq!(e.error.as_deref(), Some("no such table"));
+        assert_eq!(e.detail.as_deref(), Some("file m.sql, 2 statements ran"));
+    }
+
+    #[test]
+    fn a_cancelled_script_is_logged_as_cancelled_with_its_count() {
+        let e = script_entry(crate::script::RunOutcome::Cancelled { ran: 0 });
+        assert_eq!(e.outcome, Outcome::Cancelled);
+        assert_eq!(e.detail.as_deref(), Some("file m.sql, 0 statements ran"));
+    }
 
     #[test]
     fn strings_and_numbers_become_placeholders_and_names_stay() {

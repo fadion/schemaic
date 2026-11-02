@@ -22,7 +22,8 @@ and never to turn into the write failing: the write it records has already happe
 in Unix milliseconds, `Source` one of `editor`/`script`/`grid`/`ddl`/`import`/`copy`/`cli`/
 `restore`, `connection` the name the user saved. `Outcome` is `ok`/`failed`/`cancelled` and
 **`unknown`, for a write the client lost track of** — `schemaic exec`'s deadline passing after the
-statement was sent, which may or may not have taken effect (exit 5, under `cli/exec.rs`), and
+statement was sent, which may or may not have taken effect (exit 5, under `cli/exec.rs`), an
+`exec --script` its deadline abandoned past the unwind grace with no count (`cli/run.rs`), and
 every *Restore from file*, which is logged as it launches and ends in the terminal's client,
 out of Schemaic's sight (`launch::restore_log_entry`). `sql`
 is empty where a path has no statement to name — an import, a restore, a file that ran to the
@@ -31,6 +32,15 @@ end — and
 it is never masked. `now` stamps an entry (an empty database is `None`,
 `an_empty_database_is_no_database`), `with_detail` adds the detail, and `ended` (`Ok(rows)` or
 `Err(message)`) and `ended_as` (an outcome with no row count) say how it went.
+**`ended_script(file, &RunOutcome)` ends a script run, for both front ends** — the app's script
+modal (`Source::Script`) and `schemaic exec --script` (`Source::Cli`). A script is logged whole,
+never per statement, being a write unread (`sql::script_verdict`): `detail` is `file <file>, N
+statements ran` on every arm, `Done` is `ok` with no row count, `Cancelled` is `cancelled`, and
+`Failed` is `failed` with `ScriptFailure::message` — English, this being a persisted record — and
+the refused statement as `sql` where `at` names one. The mapping was inline in the app until the
+CLI needed the same record (`a_finished_script_is_logged_with_its_file_and_count`,
+`a_failed_script_names_the_statement_the_server_refused`,
+`a_cancelled_script_is_logged_as_cancelled_with_its_count`).
 **How a run ended is decided here, not in the front ends.** Each maps its own state onto `Ran`
 (`Rows(Option<u64>)`, `Failed`, `Cancelled`, `Unknown`, `Pending`) in one thin match — the app's
 `ran_of(&QueryState)`, the CLI's `exec_ran` — and `Entry::landed(ran, aborted_before, dialect)`

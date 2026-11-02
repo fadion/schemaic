@@ -134,8 +134,10 @@ substitute for the statement, and none of these is a style preference.
   the app's `session_enforce`, since `run_verdict` is a text gate too. Never a second, laxer gate. **The requests its guard mints are a
   separate list from the refusals**: `ScriptRequest::approved` for the file,
   `RerunRequest::approved` for `apply_view`, `open_table_filtered` and the grid's post-commit
-  re-fetch, and `cli::exec::ExecRequest::approved` for `schemaic exec` — minted against
-  `run_verdict` itself, whose `--yes` answers a `Confirm` and cannot answer a `Block`.
+  re-fetch, `cli::exec::ExecRequest::approved` for `schemaic exec` — minted against
+  `run_verdict` itself, whose `--yes` answers a `Confirm` and cannot answer a `Block` — and
+  `cli::exec::ScriptRequest::approved` for `schemaic exec --script`, minted against
+  `script_verdict` as the app's file request is, `--yes` standing where its script panel stands.
   `read_only_reason` has no request: it is enforced inside `cli::query::read_only_query`, the one
   headless read path, which both front ends call — inside its streaming sibling `read_only_export`
   behind `schemaic export`, on `stream_query_enforced(…, Enforce::ReadOnly)` — and inside its plan sibling

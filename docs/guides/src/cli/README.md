@@ -72,14 +72,14 @@ password from a pipe instead: `cat pw.txt | schemaic ping -c prod --password-std
 | `export`     | Streams a read's whole result into a file                                    |
 | `dump`       | Writes a database's tables to a `.sql` file that recreates them              |
 | `compare`    | Prints the SQL that would make one database's structure match another's      |
-| `exec`       | Runs one statement that writes                                               |
+| `exec`       | Runs one statement that writes, or a whole `.sql` script with `--script`     |
 | `mcp`        | Serves a connection to an AI agent over MCP                                  |
 | `version`    | Prints the version                                                           |
 | `completions` | Prints a tab-completion script for your shell                                |
 
 `schemaic <command> --help` gives every flag. Each command that waits on a server takes
-`--timeout`, in seconds: 30 by default, two minutes for `compare`, an hour for `export` and
-`dump`.
+`--timeout`, in seconds: 30 by default, two minutes for `compare`, an hour for `export`, `dump`
+and `exec --script`.
 
 ## Output
 
@@ -110,5 +110,5 @@ to stderr, so stdout is always safe to pipe or parse. `--format` picks the shape
 ## In this section
 
 - [Reading and exporting](reading.md) — `query`, `explain`, `export`, `dump` and `compare`.
-- [Running writes](exec.md) — `exec`, and the questions it asks first.
+- [Running writes](exec.md) — `exec`, the questions it asks first, and running a whole script.
 - [MCP server](mcp.md) — hand a connection to an AI agent in your editor or desktop app.

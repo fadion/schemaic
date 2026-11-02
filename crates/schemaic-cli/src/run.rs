@@ -379,18 +379,24 @@ async fn dispatch(command: Command) -> Exit {
             target,
             output: _,
             yes,
+            script,
             timeout,
         } => {
-            run_exec(
-                &file.connections,
-                &target,
-                &sql,
-                &params.params,
-                out,
-                yes,
-                Duration::from_secs(timeout),
-            )
-            .await
+            let timeout = Duration::from_secs(crate::args::exec_timeout(script, timeout));
+            if script {
+                run_script(&file.connections, &target, &sql, yes, timeout).await
+            } else {
+                run_exec(
+                    &file.connections,
+                    &target,
+                    &sql,
+                    &params.params,
+                    out,
+                    yes,
+                    timeout,
+                )
+                .await
+            }
         }
         Command::Export {
             sql,
@@ -1833,6 +1839,257 @@ async fn run_exec(
     }
 }
 
+/// Where a script's bytes come from: a file, read twice — once for the
+/// database switches, once to run, and checked between the two
+/// (`script::probe_still_describes`) — or text already in memory, from stdin
+/// or the argument, which has nothing to change under it.
+enum ScriptInput {
+    File(std::path::PathBuf),
+    Bytes(Vec<u8>),
+}
+
+/// `schemaic exec --script`: a whole `.sql` file on one connection, through
+/// [`exec::ScriptRequest`] — `sql::script_verdict`, the app's gate for a file
+/// — and `Db::run_script`, the app's runner.
+///
+/// **Select, approve, scan, then connect.** The scan is
+/// `script::restore_refusal`: a `USE other` or `\connect other` takes every
+/// statement after it off the database the guard judged, so a script that
+/// would leave it is refused before anything is dialled, its lines named.
+async fn run_script(
+    conns: &[Connection],
+    target: &Target,
+    sql: &SqlArgs,
+    yes: bool,
+    timeout: Duration,
+) -> Exit {
+    use schemaic_core::script::{FileStamp, ReadEnd, database_switches, restore_refusal};
+    let conn = match select_conn(conns, &target.conn) {
+        Ok(c) => c,
+        Err(exit) => return exit,
+    };
+    let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
+    let (name, input) = match sql.source() {
+        SqlSource::File(path) => (path.display().to_string(), ScriptInput::File(path.into())),
+        SqlSource::Stdin if target.conn.password_stdin => {
+            warn(
+                "the script and --password-stdin cannot both come from stdin; \
+                 leave the password to the OS keyring, or pass the script with -f",
+            );
+            return Exit::Usage;
+        }
+        SqlSource::Stdin => match read_stdin(
+            "the script",
+            "schemaic exec --script -c … --yes - < migration.sql",
+        ) {
+            Ok(text) => (
+                "stdin".to_string(),
+                ScriptInput::Bytes(sql_text(text).into_bytes()),
+            ),
+            Err(exit) => return exit,
+        },
+        SqlSource::Text(text) => (
+            "the command line".to_string(),
+            ScriptInput::Bytes(text.as_bytes().to_vec()),
+        ),
+    };
+    let database = database_for(target, conn);
+    let request = match exec::ScriptRequest::approved(conn, database.as_deref(), &name, yes) {
+        Ok(r) => r,
+        Err(e) => {
+            warn(&e.message());
+            if refused_for_no_database(&e) {
+                hint(&no_database_hint(
+                    &target.conn.connection,
+                    NoDatabaseFailure::Refused,
+                ));
+            }
+            return Exit::Refused;
+        }
+    };
+    // The whole input, not a prefix: a `--databases` dump writes `USE b`
+    // half-way down.
+    let (switches, stamp) = match &input {
+        ScriptInput::File(path) => {
+            let file = match std::fs::File::open(path) {
+                Ok(f) => f,
+                Err(e) => {
+                    warn(&format!("could not read the script {name}: {e}"));
+                    return Exit::Usage;
+                }
+            };
+            let stamp = FileStamp::of(&file);
+            (
+                database_switches(std::io::BufReader::new(file), dialect),
+                stamp,
+            )
+        }
+        ScriptInput::Bytes(b) => (database_switches(&b[..], dialect), FileStamp::default()),
+    };
+    let switches = match switches {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            warn(&format!(
+                "{name} holds no statement terminator, so it is not a SQL script; \
+                 check that it is the file you meant"
+            ));
+            return Exit::Usage;
+        }
+        Err(e) => {
+            warn(&format!("could not read the script {name}: {e}"));
+            return Exit::Usage;
+        }
+    };
+    if let Some(refusal) = restore_refusal(&name, request.database(), &switches) {
+        warn(&refusal.to_string());
+        return Exit::Refused;
+    }
+    // The connect is bounded as a statement's is; the run by `--timeout`.
+    let (db, _tunnel) =
+        match connect(request.connection(), &target.conn, query::DEFAULT_TIMEOUT).await {
+            Ok(v) => v,
+            Err(exit) => return exit,
+        };
+    let entry = schemaic_core::write_log::Entry::now(
+        schemaic_core::write_log::Source::Cli,
+        &conn.name,
+        Some(request.database()),
+        "",
+    );
+
+    let token = tokio_util::sync::CancellationToken::new();
+    let (tx, rx) = tokio::sync::mpsc::channel(schemaic_db::SCRIPT_QUEUE);
+    let reader = {
+        let token = token.clone();
+        tokio::task::spawn_blocking(move || match input {
+            ScriptInput::File(path) => {
+                let file = match std::fs::File::open(&path) {
+                    Ok(f) => f,
+                    Err(e) => return ReadEnd::Failed(e.to_string()),
+                };
+                // The scan above read this path; what runs must be what it read.
+                if !schemaic_core::script::probe_still_describes(stamp, FileStamp::of(&file)) {
+                    return ReadEnd::Changed;
+                }
+                let file =
+                    std::io::BufReader::with_capacity(schemaic_core::script::READ_BLOCK, file);
+                schemaic_db::feed_script(file, dialect, tx, token, |_| {})
+            }
+            ScriptInput::Bytes(b) => {
+                schemaic_db::feed_script(std::io::Cursor::new(b), dialect, tx, token, |_| {})
+            }
+        })
+    };
+    // The deadline is the only thing that cancels the run, so a cancelled
+    // outcome below is a timeout. Its unwound answer is kept: the count of
+    // what ran before it is the one thing the caller needs.
+    use crate::deadline::{Deadlined, with_deadline_unwound};
+    let ran = with_deadline_unwound(
+        db.run_script(request.database(), rx, token.clone()),
+        token.clone(),
+        timeout,
+    )
+    .await;
+    let (exec_end, ran) = match ran {
+        Deadlined::InTime(r) | Deadlined::Late(Some(r)) => r,
+        Deadlined::Late(None) => {
+            // Abandoned mid-statement: nothing can say how far it got.
+            token.cancel();
+            let entry = entry
+                .with_detail(format!("file {name}, stopped after {}s", timeout.as_secs()))
+                .ended_as(schemaic_core::write_log::Outcome::Unknown, None);
+            append_to_write_log(&entry, dialect);
+            warn(&format!(
+                "stopped after {}s and the server did not answer the cancel; \
+                 some of the script may have been applied",
+                timeout.as_secs()
+            ));
+            return Exit::Unknown;
+        }
+    };
+    let read_end = reader
+        .await
+        .unwrap_or_else(|e| ReadEnd::ReaderStopped(e.to_string()));
+    let outcome = schemaic_core::script::run_outcome(read_end, exec_end, ran);
+    append_to_write_log(&entry.ended_script(&name, &outcome), dialect);
+    for line in script_report(&outcome, timeout) {
+        warn(&line);
+    }
+    script_exit(&outcome)
+}
+
+/// Append `entry` to the write log, with values kept or masked as the user
+/// set it in the app; a failure to write is said, never fatal.
+fn append_to_write_log(
+    entry: &schemaic_core::write_log::Entry,
+    dialect: schemaic_core::intel::SqlDialect,
+) {
+    let keep =
+        schemaic_core::persist::load_json::<schemaic_core::persist::UiState>("ui_state.json")
+            .write_log_values;
+    if let Err(e) = schemaic_core::write_log::append(entry, dialect, keep) {
+        warn(&format!("couldn't append to the write log: {e}"));
+    }
+}
+
+/// What `exec --script` says on stderr when it ends — stdout stays empty,
+/// since a script prints no rows.
+///
+/// **Every ending says how many statements ran**, the failures most of all: a
+/// script is not transactional unless the file said so, and that count is the
+/// answer to "how much of it happened?".
+fn script_report(outcome: &schemaic_core::script::RunOutcome, timeout: Duration) -> Vec<String> {
+    use schemaic_core::script::RunOutcome;
+    let ran = |n: usize| {
+        format!(
+            "{n} {} ran",
+            schemaic_core::text::plural(n, "statement", "statements")
+        )
+    };
+    match outcome {
+        RunOutcome::Done { ran: n } => vec![ran(*n)],
+        RunOutcome::Cancelled { ran: n } => vec![format!(
+            "stopped after {}s: {} before it, and the rest did not run; \
+             unless the script holds its own transaction, those are applied",
+            timeout.as_secs(),
+            ran(*n)
+        )],
+        RunOutcome::Failed {
+            failure,
+            ran: n,
+            at,
+        } => {
+            let mut lines = vec![failure.message()];
+            if let Some((sql, line)) = at {
+                let head: String = sql.chars().take(200).collect();
+                let cut = if head.len() < sql.len() { "…" } else { "" };
+                lines.push(format!("the statement on line {line} failed: {head}{cut}"));
+            }
+            // Nothing to say about "before it" when nothing ran and no
+            // statement failed — a connect that failed, a file not readable.
+            if *n > 0 || at.is_some() {
+                lines.push(format!(
+                    "{} before it; unless the script holds its own transaction, those are applied",
+                    ran(*n)
+                ));
+            }
+            lines
+        }
+    }
+}
+
+/// How `exec --script` exits: a failure is 4, as a failed statement is; a run
+/// the deadline stopped is 5, since the statements before it may have been
+/// applied and running it again would repeat them.
+fn script_exit(outcome: &schemaic_core::script::RunOutcome) -> Exit {
+    use schemaic_core::script::RunOutcome;
+    match outcome {
+        RunOutcome::Done { .. } => Exit::Ok,
+        RunOutcome::Failed { .. } => Exit::Failed,
+        RunOutcome::Cancelled { .. } => Exit::Unknown,
+    }
+}
+
 /// The write log's entry for an `exec` of `sql`, stamped before it runs — or
 /// `None` for a statement that does not write (`exec` runs reads too), which
 /// the log has no business holding. `write_log::is_logged` errs toward a write.
@@ -1866,12 +2123,7 @@ fn log_exec(
     let Some(entry) = entry.landed(exec_ran(ran), false, dialect) else {
         return;
     };
-    let keep =
-        schemaic_core::persist::load_json::<schemaic_core::persist::UiState>("ui_state.json")
-            .write_log_values;
-    if let Err(e) = schemaic_core::write_log::append(&entry, dialect, keep) {
-        warn(&format!("couldn't append to the write log: {e}"));
-    }
+    append_to_write_log(&entry, dialect);
 }
 
 /// How an `exec` ended, in the write log's terms: a timeout after the
@@ -2438,6 +2690,52 @@ mod tests {
         .unwrap();
         c.database = database.to_string();
         c
+    }
+
+    /// A failed script is a 4 like a failed statement; one the deadline
+    /// stopped is a 5, since what ran before it may be applied and a retry
+    /// would run it twice.
+    #[test]
+    fn a_scripts_exit_says_whether_retrying_is_safe() {
+        use schemaic_core::script::{RunOutcome, ScriptFailure};
+        assert_eq!(script_exit(&RunOutcome::Done { ran: 3 }), Exit::Ok);
+        assert_eq!(
+            script_exit(&RunOutcome::Failed {
+                failure: ScriptFailure::Said("x".into()),
+                ran: 1,
+                at: None,
+            }),
+            Exit::Failed
+        );
+        assert_eq!(
+            script_exit(&RunOutcome::Cancelled { ran: 2 }),
+            Exit::Unknown
+        );
+    }
+
+    /// **Every ending names how many statements ran**, and a failure names
+    /// the statement and its line.
+    #[test]
+    fn a_scripts_report_counts_what_ran_and_names_the_failure() {
+        use schemaic_core::script::{RunOutcome, ScriptFailure};
+        let t = Duration::from_secs(60);
+        assert_eq!(
+            script_report(&RunOutcome::Done { ran: 1 }, t),
+            vec!["1 statement ran"]
+        );
+        let failed = script_report(
+            &RunOutcome::Failed {
+                failure: ScriptFailure::Said("no such table: nope".into()),
+                ran: 2,
+                at: Some(("INSERT INTO nope VALUES (2)".into(), 3)),
+            },
+            t,
+        );
+        assert_eq!(failed[0], "no such table: nope");
+        assert!(failed[1].contains("line 3") && failed[1].contains("INSERT INTO nope"));
+        assert!(failed[2].starts_with("2 statements ran"), "{failed:?}");
+        let stopped = script_report(&RunOutcome::Cancelled { ran: 4 }, t);
+        assert!(stopped[0].contains("60s") && stopped[0].contains("4 statements"));
     }
 
     fn param(s: &str) -> Binding {

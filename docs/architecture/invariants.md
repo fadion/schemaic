@@ -360,7 +360,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   inside the three read functions is what keeps the early one from being
   the only check. The refusals are `rerunnable_for_export`, `script_verdict`,
   `read_only_reason` and `init_sql::check` (below); the requests are `RerunRequest`, minted against the first, `ScriptRequest`,
-  against the second, and `ExecRequest`, minted against `run_verdict` itself.
+  against the second, `ExecRequest`, minted against `run_verdict` itself, and
+  `cli::exec::ScriptRequest`, against the second again.
   **`schemaic exec` is the write half, and it is the third minted request.** `ExecRequest`'s
   fields are private — the statement, its `Enforce`, and the connection and database the verdict
   judged, so an approval cannot be spent on another target; `ExecRequest::approved` is its only
@@ -380,6 +381,22 @@ Re-introducing the anti-patterns these guard against is a regression:
   report "1 and 2 committed, 3 failed". The policy it assembles passes `confirm_writes: false`, and
   `cli/exec.rs` carries the reason that is where the consent lives rather than a setting being
   ignored.
+  **`schemaic exec --script` is the fourth minted request, and it is the app's file request on a
+  command line, not `exec`'s.** Where a whole file *is* wanted, the "1 and 2 committed, 3 failed"
+  above is the answer rather than a refusal — every ending names how many statements ran — so the
+  runner is `Db::run_script` and the gate is the one the app's script panel asks:
+  `cli::exec::ScriptRequest::approved` mints against `sql::script_verdict`, never `run_verdict`,
+  with the same `--yes` asymmetry. The verdict has no `Allow`, so every script needs `--yes`, which
+  stands where the panel stands; a read-only connection is a `Block` it cannot answer, the file
+  refused unread. The request carries the connection and database it judged, as `ExecRequest`
+  does, and `run.rs` adds one refusal behind it before anything is dialled:
+  `script::restore_refusal` over the whole input, since a `USE` or `\connect` in the file would
+  carry every statement after it out of the database the guard judged (the restore paragraph
+  below has the bug). The app's script modal does not scan, and the difference is deliberate: its
+  panel shows what the probe read before a Run button opened from the database node the user
+  right-clicked, while `--yes` is given against a database named on a command line with nothing
+  showing the file first — the scan is what makes `--yes` a statement about where the script
+  writes.
   **A connection's init SQL is the fourth refusal, and the one guarding SQL the user never ran.**
   `Connection::init_sql` runs at every connect, so on every operation — a run, a listing, a ping, a
   `KILL` — with nobody at the keyboard and no moment to confirm anything. `core::init_sql::check`

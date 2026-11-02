@@ -131,27 +131,6 @@ with a sync script.
 
 ## CLI
 
-### Run a `.sql` script
-
-`schemaic compare` prints a migration, but nothing in the CLI can apply it: `exec` refuses more
-than one statement. This also covers restoring a `schemaic dump` on every engine, which is why
-there is no separate `restore` command.
-
-- **Decided:** an explicit `exec --script`, not `-f` quietly accepting several statements. A
-  script is always a write and always needs `--yes`, and a file that gains a second statement
-  must not switch mode on its own.
-- **Decided:** it stops at the first failing statement, names it, and exits 4.
-- **Decided:** with `-d`, `script::restore_refusal` runs first, so a script whose `USE` or
-  `\connect` would move its writes to another database is refused before anything runs.
-- **Trap:** the guard already exists. `sql::script_verdict` treats a whole file as a write, and
-  `ScriptRequest::approved` mints the request. Use those; don't add a laxer gate.
-- **Trap:** `--yes` answers the script's confirm and nothing stronger. A read-only connection
-  refuses it outright, as `exec` does today.
-- **Trap:** it runs on one connection (`Db::run_script`), because a dump's statements are not
-  independent.
-- **Non-goal:** `pg_restore` archives. The app's restore launches the engine's own client; anyone
-  holding a custom-format archive can run `pg_restore` themselves.
-
 ### `schemaic import`
 
 Import CSV, TSV, JSON and Excel into an existing table. The logic already exists in core: column

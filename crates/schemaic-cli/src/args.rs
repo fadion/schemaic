@@ -260,12 +260,20 @@ pub enum Command {
         output: OutputArgs,
         /// Answer the guard's question: a DELETE or UPDATE with no WHERE, a
         /// TRUNCATE, or a statement that drops a table, database or schema.
-        /// It cannot unlock a read-only connection.
+        /// With --script, the question every script is asked. It cannot unlock
+        /// a read-only connection.
         #[arg(long)]
         yes: bool,
-        /// Seconds before the statement is stopped.
-        #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
-        timeout: u64,
+        /// Run a whole .sql script — a migration, or a `schemaic dump` to
+        /// restore — on one connection, in order, stopping at the first
+        /// statement the server refuses. Always needs --yes; refused if the
+        /// script would switch to another database (`USE`, `\connect`).
+        #[arg(long, conflicts_with = "params")]
+        script: bool,
+        /// Seconds before the statement is stopped — 30 by default, an hour
+        /// with --script.
+        #[arg(long, value_parser = at_least_one_second())]
+        timeout: Option<u64>,
     },
     /// Serve a connection to an AI agent over MCP, on stdin/stdout.
     ///
@@ -338,6 +346,17 @@ const EXPORT_TIMEOUT_SECS: u64 = 3600;
 /// large schema takes longer than one statement's thirty seconds.
 const COMPARE_TIMEOUT_SECS: u64 = 120;
 
+/// `exec`'s `--timeout`, or its default: a statement's thirty seconds, or for
+/// a script [`EXPORT_TIMEOUT_SECS`] — a dump being restored is a whole
+/// database's worth of rows, and thirty seconds would stop it a few tables in.
+pub fn exec_timeout(script: bool, timeout: Option<u64>) -> u64 {
+    timeout.unwrap_or(if script {
+        EXPORT_TIMEOUT_SECS
+    } else {
+        DEFAULT_TIMEOUT_SECS
+    })
+}
+
 /// `ping`'s default: the app's own answer to "the server is not responding",
 /// the five seconds after which its health check says Disconnected — so the
 /// two agree on a dead host.
@@ -402,7 +421,7 @@ pub struct SqlArgs {
     /// process list and the shell's history.
     pub sql: Option<String>,
     /// Read the statement from a file instead (`-` is stdin). Still one
-    /// statement: a whole script is not what this runs.
+    /// statement, unless `exec --script` was asked for.
     #[arg(short = 'f', long, value_name = "PATH")]
     pub file: Option<std::path::PathBuf>,
 }
@@ -1374,10 +1393,50 @@ mod tests {
     #[test]
     fn exec_defaults_to_the_shared_timeout() {
         let cli = parse(&["schemaic", "exec", "DELETE FROM t", "-c", "1"]).unwrap();
-        let Command::Exec { timeout, .. } = cli.command else {
+        let Command::Exec {
+            timeout, script, ..
+        } = cli.command
+        else {
             panic!("expected an exec");
         };
-        assert_eq!(timeout, crate::query::DEFAULT_TIMEOUT.as_secs());
+        assert!(!script);
+        assert_eq!(
+            exec_timeout(script, timeout),
+            crate::query::DEFAULT_TIMEOUT.as_secs()
+        );
+    }
+
+    #[test]
+    fn a_script_defaults_to_an_hour_and_a_given_timeout_wins() {
+        let cli = parse(&[
+            "schemaic", "exec", "--script", "-f", "m.sql", "-c", "1", "--yes",
+        ])
+        .unwrap();
+        let Command::Exec {
+            timeout,
+            script,
+            yes,
+            ..
+        } = cli.command
+        else {
+            panic!("expected an exec");
+        };
+        assert!(script && yes);
+        assert_eq!(exec_timeout(script, timeout), EXPORT_TIMEOUT_SECS);
+        assert_eq!(exec_timeout(true, Some(5)), 5);
+        assert_eq!(exec_timeout(false, Some(5)), 5);
+    }
+
+    /// A script is run as written; substituting into a whole file is not
+    /// something the app does either.
+    #[test]
+    fn a_script_takes_no_params() {
+        assert!(
+            parse(&[
+                "schemaic", "exec", "--script", "-f", "m.sql", "-c", "1", "-p", "a=1",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

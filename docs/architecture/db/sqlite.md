@@ -42,7 +42,22 @@ each outcome sent over an unbounded mpsc channel so the UI still fills result ta
 and the `InterruptHandle` handed out **before** any work so Stop reaches a mid-flight statement —
 the same shape `fetch_query` and `run_script` use. `spawn_blocking` rather than `run_script`'s
 `block_in_place`, because the results have to reach an async `FnMut` as they arrive and the suite
-runs on a current-thread runtime, where `block_in_place` panics. "Stop on error" is kept as the
+runs on a current-thread runtime, where `block_in_place` panics. **`run_script` met that panic
+too, once `schemaic exec --script` ran it** — the CLI builds a current-thread runtime — so it now
+asks `Handle::runtime_flavor()`: the app's multi-thread runtime keeps `block_in_place`, and any
+other flavour moves the loop, with a clone of the `Db`, onto `spawn_blocking`, where
+`blocking_recv` is as legal; a runner that panics there is an `ExecEnd::Failed` saying so with no
+statement and no count. The pin is `a_script_runs_on_a_current_thread_runtime_and_stops_at_its_first_failure`
+(`#[tokio::test]`, current-thread, driven through `feed_script` so the composition is what is
+tested), seen red against the plain `block_in_place`. **`import_rows` had the same unguarded
+`block_in_place`** and goes through the private `off_executor(f)` now — `block_in_place` on a
+multi-thread runtime, the call made **inline** on any other. Not `spawn_blocking`, as
+`run_script`'s fallback is, because `RowSource` is a borrowed `&mut dyn Iterator` that cannot be
+moved into a `'static` task. Inline is not free: it holds the one runtime thread for the whole
+load, so a deadline's timer cannot fire until the import returns — the cost of the only shape
+that runs at all there (`an_import_runs_on_a_current_thread_runtime`, seen red against the
+unconditional `block_in_place`). `lib.rs`'s `next_batch_off_executor` makes the same choice
+for its batch pull. "Stop on error" is kept as the
 other two arms keep it: every statement after a failure reports `Cancelled`, those statements
 having been written against a state that never happened. The arm this replaced looped
 `fetch_query` — a connection per statement — which made both pragmas the twelve-step rebuild

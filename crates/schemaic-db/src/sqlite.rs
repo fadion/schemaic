@@ -1554,7 +1554,8 @@ pub(crate) async fn refetch_rows(
 /// quoting and literal escaping are the ones the SQL *export* is tested for
 /// rather than a second set written here.
 ///
-/// **It uses `block_in_place`, not `spawn_blocking`**, because `RowSource` is a
+/// **It uses [`off_executor`], not `spawn_blocking`** — `block_in_place` where
+/// the runtime allows it, inline where it does not — because `RowSource` is a
 /// borrowed `&mut dyn Iterator` that cannot be moved into a `'static` task. The
 /// alternative — pulling rows on the async side and shipping batches over a
 /// channel — would need the connection to outlive each batch, which is exactly
@@ -1573,9 +1574,9 @@ pub(crate) async fn import_rows(
     use schemaic_core::import::INSERT_BATCH_ROWS;
     use schemaic_core::intel::SqlDialect;
 
-    let conn = tokio::task::block_in_place(|| open(db))?;
+    let conn = off_executor(|| open(db))?;
 
-    tokio::task::block_in_place(|| {
+    off_executor(|| {
         let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
         conn.execute_batch("BEGIN").map_err(query_err)?;
 
@@ -1664,6 +1665,22 @@ fn import_failure(e: DbError, undo: Result<(), String>, no_transaction: bool) ->
     DbError::QueryFailed(crate::QueryFailure::RollbackFailedToo { error, rollback })
 }
 
+/// Run blocking `f` where the runtime allows it: under `block_in_place` on a
+/// multi-thread runtime, which is the app's, and inline on a current-thread
+/// one — `schemaic`'s headless front ends — where `block_in_place` panics.
+///
+/// **Inline is not free there**: the one runtime thread is held for the call,
+/// so a deadline's timer cannot fire until it returns. For a borrowed iterator
+/// that cannot be moved to `spawn_blocking` it is the only shape that runs at
+/// all, and a local file's import is the one caller.
+fn off_executor<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 /// SQLite's arm of [`crate::Db::run_script`]. See there for why nothing is
 /// wrapped in a transaction and why the connection is pinned.
 ///
@@ -1707,8 +1724,11 @@ pub(crate) async fn run_script(
             h.interrupt();
         })
     };
-    let out = tokio::task::block_in_place(|| {
-        let conn = match open(db) {
+    let db = db.clone();
+    let loop_cancel = cancel.clone();
+    let work = move || {
+        let cancel = loop_cancel;
+        let conn = match open(&db) {
             Ok(c) => c,
             Err(e) => return (ExecEnd::Connect(e.to_string()), 0),
         };
@@ -1741,7 +1761,25 @@ pub(crate) async fn run_script(
             }
         };
         (end, ran)
-    });
+    };
+    // **`block_in_place` panics on a current-thread runtime**, and
+    // `schemaic exec --script` runs on one: there the loop goes to a blocking
+    // thread instead, where `blocking_recv` is as legal. The app's
+    // multi-thread runtime keeps the original shape.
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    let out = match Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => tokio::task::spawn_blocking(work).await.unwrap_or_else(|e| {
+            (
+                ExecEnd::Failed {
+                    message: format!("the script runner stopped unexpectedly: {e}"),
+                    sql: String::new(),
+                    line: 0,
+                },
+                0,
+            )
+        }),
+    };
     // A run that finished normally leaves the watcher parked on a token that
     // will never trip.
     watcher.abort();
@@ -4765,6 +4803,48 @@ mod tests {
         }
     }
 
+    /// **A script runs on a current-thread runtime**, which is what
+    /// `schemaic exec --script` builds and what `#[tokio::test]` gives — the
+    /// loop's `block_in_place` panicked there. Driven through
+    /// `crate::feed_script`, the reader both front ends share, so the
+    /// composition is what is pinned: a failing statement stops the run, the
+    /// ones before it stay applied, and the ones after it never run.
+    #[tokio::test]
+    async fn a_script_runs_on_a_current_thread_runtime_and_stops_at_its_first_failure() {
+        use schemaic_core::script::{ExecEnd, ReadEnd};
+        let (keeper, db) = shared_memory("script_current_thread");
+        let script = "CREATE TABLE t (a INTEGER);\n\
+                      INSERT INTO t VALUES (1);\n\
+                      INSERT INTO nope VALUES (2);\n\
+                      INSERT INTO t VALUES (3);\n";
+        let (tx, rx) = tokio::sync::mpsc::channel(crate::SCRIPT_QUEUE);
+        let reader = tokio::task::spawn_blocking(move || {
+            crate::feed_script(
+                std::io::Cursor::new(script.as_bytes().to_vec()),
+                schemaic_core::intel::SqlDialect::Sqlite,
+                tx,
+                CancellationToken::new(),
+                |_| {},
+            )
+        });
+        let (end, ran) = db.run_script(MAIN, rx, CancellationToken::new()).await;
+        let read = reader.await.expect("the reader finishes");
+        assert_eq!(ran, 2, "{end:?}");
+        match end {
+            ExecEnd::Failed { sql, line, .. } => {
+                assert!(sql.contains("nope"), "{sql}");
+                assert_eq!(line, 3);
+            }
+            other => panic!("expected the third statement to fail: {other:?}"),
+        }
+        // The reader stopped because the executor did, or finished first.
+        assert!(matches!(read, ReadEnd::Stopped | ReadEnd::Eof), "{read:?}");
+        let n: i64 = keeper
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "only the statements before the failure ran");
+    }
+
     /// **A cancel during the schema read is honoured**, through the public
     /// [`Db::fetch_schema`] rather than this module's own function — the seam
     /// where it went wrong. The Export modal paints a full backdrop over this
@@ -7525,6 +7605,29 @@ mod tests {
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, n as i64);
+    }
+
+    /// **And on a current-thread runtime**, the headless front ends' — where
+    /// `block_in_place` panicked before the first row.
+    #[tokio::test]
+    async fn an_import_runs_on_a_current_thread_runtime() {
+        let (keeper, db) = shared_memory("import_current_thread");
+        keeper
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
+            .unwrap();
+        let mut rows = (1..=3).map(|i| Ok(vec![Value::Int(i), Value::Str(format!("v{i}"))]));
+        let cols = vec!["id".to_string(), "v".to_string()];
+        let target = crate::ImportTarget {
+            database: MAIN,
+            schema: None,
+            table: "t",
+            columns: &cols,
+            ..Default::default()
+        };
+        let loaded = import_rows(&db, target, &mut rows, CancellationToken::new())
+            .await
+            .expect("import");
+        assert_eq!(loaded, 3);
     }
 
     /// **A copy is the source's rows, all of them, in the target** — read by

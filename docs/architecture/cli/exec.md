@@ -49,3 +49,21 @@ server count the same (`a_read_only_connection_mints_a_read_only_session`,
 `1` `run.rs` used to pass printed one row of a thousand-row `UPDATE … RETURNING` with no warning,
 and a parameter would let a call site choose it again. The cap is on what is printed, never on
 the statement — each engine's row loop stops reading and leaves the statement to finish.
+**`ScriptRequest` is the second request this module mints, for `exec --script`, on
+`ExecRequest`'s rule**: `ScriptRequest::approved(conn, database, file, assume_yes)` is the only
+constructor, its fields private, and it carries the connection and database its verdict judged
+for `run.rs`'s `run_script` to connect through and run in. What it asks is
+**`sql::script_verdict`, the app's gate for a `.sql` file — never `run_verdict`**, because the
+statements are not read when it answers, so `file` (a path, `stdin` or `the command line`) is
+what the refusal names. The verdict's shape carries over unchanged: the file is a write unread,
+so a read-only connection is `NotRun::Blocked` even for a file of `SELECT`s, and `--yes` cannot
+help, a `Block` having no override; there is no `Allow` arm, so **every script needs `--yes`**,
+which here stands where the app's script panel stands, a `Confirm` without it being
+`NotRun::NeedsConsent`. The match is exhaustive, `Allow` grouped with an answered `Confirm` rather
+than caught by a wildcard, so the day `script_verdict` does allow something that is a change made
+on this page. No database is `Blocked(GuardReason::NoDatabase)` — the verdict's own block, and
+then a second `let … else` after it, so the request's `database` is a `String` rather than an
+`Option` the runner would have to unwrap. It mints no `Enforce`: `Db::run_script` takes none,
+and on a read-only connection nothing reaches it (`a_script_needs_yes_and_yes_gives_it`,
+`a_read_only_connection_refuses_a_script_and_yes_does_not_help`,
+`a_script_with_no_database_is_refused_outright`).

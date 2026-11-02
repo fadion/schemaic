@@ -163,4 +163,7 @@ the English saying nothing was run (`a_databases_dump_names_the_database_it_swit
 `a_refusal_names_three_switches_and_counts_the_rest`); a switch to the target itself is no
 move, compared case-sensitively, case being part of a MySQL database's name on Linux
 (`a_dump_of_one_database_or_of_the_target_itself_is_not_refused`). Why it exists is the
-write-guard invariant's restore paragraph.
+write-guard invariant's restore paragraph. `schemaic exec --script` asks the pair too, over the
+whole input and before it connects, its `Display` being what the CLI prints (`cli/run.rs`); the
+CLI's second read of a file is held to the first by `probe_still_describes`, as the app's run is
+held to its probe.

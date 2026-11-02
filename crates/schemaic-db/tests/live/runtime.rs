@@ -1253,8 +1253,9 @@ const SESSION_CANCEL_MARKER: &str = "schemaicItCancelSession";
 /// receiver nothing was polling yet — `run_script` is called on the line below.
 /// A 17-statement script test would have hung until the CI job's
 /// `timeout-minutes` cut it off, reported as "still running" rather than as
-/// itself. This is the shape the app itself uses (`script::feed` alongside
-/// `Db::run_script`), so the test now drives the same arrangement it is testing.
+/// itself. This is the shape both front ends use (`feed_script` on a blocking
+/// thread alongside `Db::run_script`), so the test now drives the same
+/// arrangement it is testing.
 async fn run_script(scratch: &Scratch, stmts: &[String]) -> (ExecEnd, usize) {
     run_script_with(scratch, stmts, CancellationToken::new()).await
 }

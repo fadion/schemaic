@@ -519,7 +519,7 @@ to make. Feeding a
 script is **a task of its own**, not tidiness: the test channel holds 16, so filling it inline
 meant the seventeenth `send` awaited a receiver nothing was polling yet — `run_script` is called
 on the next line — and a 17-statement script test would have hung forever rather than failed. It
-is also the arrangement the app itself uses (`script::feed` alongside `Db::run_script`), so the
+is also the arrangement both front ends use (`feed_script` alongside `Db::run_script`), so the
 test now drives the shape it is testing.
 The
 cancellation test asserts `DbError::Cancelled` **specifically** and that the call returned well

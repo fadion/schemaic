@@ -4,6 +4,10 @@
 reads a database and writes a file, this reads a file and writes a database. Two halves at once — a
 **blocking reader** walks the file in reads sized by `script::next_read`, feeds `script::Splitter` and pushes
 completed statements into a bounded channel, while `Db::run_script` pulls from the other end.
+**The reading itself is `schemaic_db::feed_script`**, moved there so `schemaic exec --script`
+drives the same reader (`schemaic-db`'s entry has its contract); what stays here is the open, the
+stamp check below, the file's length as the progress denominator and the `BufReader`, and the
+progress callback that turns `feed_script`'s byte count into a `ScriptProgress`.
 Each reports how it ended and `script::run_outcome` decides which ending the user hears, which is
 **not** the same precedence `dump_verdict` uses (see `core::script`).
 `tx` is moved into the reader and dropped when it returns, so *every* exit — end of file, cancel,

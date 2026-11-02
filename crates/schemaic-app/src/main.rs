@@ -6084,31 +6084,7 @@ fn app_view(
                 let report = {
                     let script_token = script_token.clone();
                     create_ext_action(cx, move |o: RunOutcome| {
-                        use schemaic_core::write_log::Outcome;
-                        let ran = |n: &usize| {
-                            let s = schemaic_core::text::plural(*n, "statement", "statements");
-                            format!("file {file}, {n} {s} ran")
-                        };
-                        let logged = match &o {
-                            RunOutcome::Done { ran: n } => {
-                                entry.with_detail(ran(n)).ended(Ok(None))
-                            }
-                            RunOutcome::Cancelled { ran: n } => {
-                                entry.with_detail(ran(n)).ended_as(Outcome::Cancelled, None)
-                            }
-                            RunOutcome::Failed {
-                                failure,
-                                ran: n,
-                                at,
-                            } => {
-                                let mut e = entry.with_detail(ran(n));
-                                if let Some((sql, _)) = at {
-                                    e.sql = sql.clone();
-                                }
-                                // English: the write log is a persisted record.
-                                e.ended(Err(failure.message()))
-                            }
-                        };
+                        let logged = entry.ended_script(&file, &o);
                         (log_write)(conn_id, dialect, logged);
                         *script_token.borrow_mut() = None;
                         if !matches!(o, RunOutcome::Cancelled { .. }) {

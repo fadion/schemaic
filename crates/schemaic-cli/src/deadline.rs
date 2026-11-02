@@ -45,13 +45,41 @@ pub async fn with_deadline<F>(
 where
     F: std::future::Future,
 {
+    match with_deadline_unwound(fut, token, timeout).await {
+        Deadlined::InTime(r) => Some(r),
+        Deadlined::Late(_) => None,
+    }
+}
+
+/// How a [`with_deadline_unwound`] ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Deadlined<T> {
+    /// The future finished inside the deadline.
+    InTime(T),
+    /// The deadline passed and the token was cancelled. `Some` is what the
+    /// future returned while unwinding, inside [`UNWIND_GRACE`]; `None`, that
+    /// it was abandoned.
+    Late(Option<T>),
+}
+
+/// [`with_deadline`], keeping what the future said **after** the cancel —
+/// for a run whose unwound answer is worth having. A script's runner reports
+/// how many statements it got through before the token stopped it, and that
+/// count is the one thing a timed-out script's caller needs.
+pub async fn with_deadline_unwound<F>(
+    fut: F,
+    token: CancellationToken,
+    timeout: Duration,
+) -> Deadlined<F::Output>
+where
+    F: std::future::Future,
+{
     tokio::pin!(fut);
     tokio::select! {
-        r = &mut fut => Some(r),
+        r = &mut fut => Deadlined::InTime(r),
         _ = tokio::time::sleep(timeout) => {
             token.cancel();
-            let _ = tokio::time::timeout(UNWIND_GRACE, fut).await;
-            None
+            Deadlined::Late(tokio::time::timeout(UNWIND_GRACE, fut).await.ok())
         }
     }
 }
@@ -86,6 +114,41 @@ mod tests {
         let got = with_deadline(fut, token.clone(), Duration::from_secs(30)).await;
         assert_eq!(got, None, "the deadline is what the caller hears about");
         assert!(token.is_cancelled(), "the driver must have been told");
+    }
+
+    /// What the future says after the cancel is kept — a script runner's count
+    /// of the statements it got through — and one that never answers is
+    /// `Late(None)`.
+    #[tokio::test(start_paused = true)]
+    async fn an_unwound_answer_is_kept_and_an_abandoned_one_is_none() {
+        let token = CancellationToken::new();
+        let observer = token.clone();
+        let fut = async move {
+            observer.cancelled().await;
+            4
+        };
+        assert_eq!(
+            with_deadline_unwound(fut, token.clone(), Duration::from_secs(30)).await,
+            Deadlined::Late(Some(4))
+        );
+        assert_eq!(
+            with_deadline_unwound(
+                std::future::pending::<u8>(),
+                CancellationToken::new(),
+                Duration::from_secs(2)
+            )
+            .await,
+            Deadlined::Late(None)
+        );
+        assert_eq!(
+            with_deadline_unwound(
+                async { 1 },
+                CancellationToken::new(),
+                Duration::from_secs(2)
+            )
+            .await,
+            Deadlined::InTime(1)
+        );
     }
 
     /// **A future that never hears the cancel is abandoned, not awaited

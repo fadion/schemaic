@@ -119,9 +119,10 @@ for, so an argv statement `sql::carries_credential` recognises is run but warned
 stderr, and one from stdin or a file is not, being in neither — unless a `-p` was given, since
 its value is in argv whatever the statement's source. Stdin has one reader, so stdin
 (either spelling) together with `--password-stdin` is a usage error rather than a guess at which
-came first. **A file is still one statement**, not a script: several hit the guards they would
-as an argument — `exec`'s `NotRun::Several`, `query`'s gate — and nothing here goes near
-`Db::run_script`. `run.rs`'s `statement(&SqlArgs, …)` takes it; `read_sql_file` answers an
+came first. **A file is still one statement**, not a script, unless `exec --script` asks for one
+(below): several hit the guards they would as an argument — `exec`'s `NotRun::Several`,
+`query`'s gate — and only `--script` goes near `Db::run_script`. `run.rs`'s
+`statement(&SqlArgs, …)` takes it; `read_sql_file` answers an
 unreadable or non-UTF-8 file with a warning and `Exit::Usage` before anything is sent, and
 **`sql_text` takes one leading U+FEFF off text read from stdin or a file**, for the reason
 `piped_password` does: Notepad and Windows PowerShell 5.1 put a byte-order mark ahead of the
@@ -129,9 +130,21 @@ text, and `read_only_reason` refused `\u{FEFF}SELECT 1` as not a read — a file
 else came back refused. Only a *leading* mark goes; anywhere else it is data
 (`a_statement_from_a_file_or_pipe_loses_its_bom`, which asserts the gate refuses the raw text
 first). Both readers go through `read_source`, which takes them as parameters so the
-composition is tested too (`a_file_or_pipe_source_reads_without_its_bom`). `--timeout`'s six `default_value_t`s read
-`query::DEFAULT_TIMEOUT` through `DEFAULT_TIMEOUT_SECS`, not a second literal beside it
+composition is tested too (`a_file_or_pipe_source_reads_without_its_bom`). `--timeout`'s five `default_value_t`s read
+`query::DEFAULT_TIMEOUT` through `DEFAULT_TIMEOUT_SECS`, not a second literal beside it, and so
+does `exec`'s, which is an `Option<u64>` with no clap default (below)
 (`exec_defaults_to_the_shared_timeout`).
+**`exec --script` runs the input as a whole `.sql` script** — a migration, or a `schemaic dump`
+being restored — through `run.rs`'s `run_script` rather than `statement`. It
+`conflicts_with = "params"`, so `-p` beside it is a parse error: a script is run as written, and
+substituting into a whole file is not something the app does either
+(`a_script_takes_no_params`). Its help says it always needs `--yes` and is refused if the script
+would switch database, and `--yes`'s own help says that with `--script` it answers the question
+every script is asked. **Its `--timeout` default is an hour**, which is why `exec`'s `--timeout`
+is `Option<u64>`: `exec_timeout(script, timeout)` resolves it — the given value whichever mode,
+else `DEFAULT_TIMEOUT_SECS` for a statement and `EXPORT_TIMEOUT_SECS` for a script, since a dump
+being restored is a whole database's worth of rows and thirty seconds would stop it a few tables
+in (`a_script_defaults_to_an_hour_and_a_given_timeout_wins`). It still refuses `0`.
 **`-p`/`--param` is `ParamArgs`, flattened beside `SqlArgs` into the same four commands, and kept
 out of it on purpose**: `SqlArgs`'s group admits exactly one member, so a `-p` inside it would
 make "a statement and a parameter" a parse error. It is the app's parameters bar on the command

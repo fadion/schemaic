@@ -14,8 +14,9 @@ schemaic query -f report.sql -c prod
 schemaic query - -c prod < report.sql
 ```
 
-It must be a single statement; a whole script is refused. Pass a statement that carries a password
-with `-` on stdin, so it doesn't land in your shell history. A statement can't come from stdin
+It must be a single statement; a whole script is refused, except by
+[`exec --script`](exec.md#running-a-script). Pass a statement that carries a password with `-` on
+stdin, so it doesn't land in your shell history. A statement can't come from stdin
 together with `--password-stdin`, since stdin has only one reader.
 
 ## Filling in parameters
@@ -108,4 +109,4 @@ on the same connection unless you say otherwise. `-t` narrows it to the tables y
 their triggers.
 
 Nothing is run. The script goes to stdout for you to read or save, and what it drops or leaves out
-is listed on stderr. Both sides must be the same engine; MySQL and MariaDB count as one.
+is listed on stderr. To apply it, save it and run it with [`exec --script`](exec.md#running-a-script). Both sides must be the same engine; MySQL and MariaDB count as one.

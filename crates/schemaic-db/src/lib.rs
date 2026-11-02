@@ -3031,6 +3031,71 @@ impl Db {
     }
 }
 
+/// The reading half of a script run: `r` → statements → `tx`, on a blocking
+/// thread, with `progress` told how many bytes the splitter has consumed after
+/// each block. [`Db::run_script`] is the other half, and the two front ends —
+/// the app's script modal and `schemaic exec --script` — both drive this one.
+///
+/// `tx` is moved in and dropped when this returns, which is how the executor
+/// learns the input is finished — so every exit from this function, including
+/// the failures, closes the channel.
+///
+/// **The read grows with what is still unfinished** ([`schemaic_core::script::next_read`]),
+/// and that is what keeps the splitter's cost linear. `Splitter::split` re-scans
+/// its buffer from the start on every block, so a statement spanning *m* blocks
+/// costs O(m²·block) — nothing for a dump, whose statements are far smaller than
+/// one block, but a file with *no* terminator in it (a CSV renamed `.sql`, a dump
+/// truncated inside a string) grows the buffer to `MAX_PENDING_BYTES` and would
+/// re-scan a quarter of a gigabyte a thousand times before being refused.
+/// Doubling the read makes the number of re-scans logarithmic instead.
+pub fn feed_script<R: std::io::Read>(
+    mut r: R,
+    dialect: schemaic_core::intel::SqlDialect,
+    tx: tokio::sync::mpsc::Sender<schemaic_core::script::Statement>,
+    token: CancellationToken,
+    mut progress: impl FnMut(u64),
+) -> schemaic_core::script::ReadEnd {
+    use schemaic_core::script::{MAX_PENDING_BYTES, READ_BLOCK, ReadEnd, Splitter, next_read};
+    let mut splitter = Splitter::new(dialect);
+    let mut block = vec![0u8; READ_BLOCK];
+    loop {
+        if token.is_cancelled() {
+            return ReadEnd::Cancelled;
+        }
+        let want = next_read(splitter.pending());
+        if block.len() < want {
+            block.resize(want, 0);
+        }
+        let n = match r.read(&mut block[..want]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return ReadEnd::Failed(e.to_string()),
+        };
+        for stmt in splitter.push(&block[..n]) {
+            // The executor has gone. It holds the reason; this half must not
+            // invent one (`ReadEnd::Stopped` carries no message on purpose).
+            if tx.blocking_send(stmt).is_err() {
+                return ReadEnd::Stopped;
+            }
+        }
+        // Checked after the push, so a statement that merely *reaches* the
+        // ceiling and then ends is not refused for it.
+        if splitter.pending() > MAX_PENDING_BYTES {
+            return ReadEnd::NoTerminator;
+        }
+        progress(splitter.consumed());
+    }
+    // The last statement need not carry a terminator.
+    for stmt in splitter.finish() {
+        if tx.blocking_send(stmt).is_err() {
+            return ReadEnd::Stopped;
+        }
+    }
+    progress(splitter.consumed());
+    ReadEnd::Eof
+}
+
 /// Apply a batch of staged grid mutations — `UPDATE`s then `INSERT`s — in a
 /// single transaction. Every statement must affect **exactly one row**; if any
 /// affects zero or more than one (a stale/ambiguous UPDATE identity, or an

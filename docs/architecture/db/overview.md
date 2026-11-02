@@ -985,6 +985,18 @@ neither `Session` nor `run_ddl`, and `core::script` for the module it serves. Ca
 selected on **while waiting for the next statement** as well as while one runs — a load stalled
 on a slow disk spends most of its life waiting, and a Stop that only landed between statements
 would look ignored.
+**`feed_script(r, dialect, tx, token, progress)` is the other half**, and it lives here so that
+both front ends drive one reader: the app's script modal (`app/script.rs`, which keeps only the
+open, the `FileStamp` check and the `BufReader`) and `schemaic exec --script` (`cli/run.rs`, over
+a file or over bytes from stdin). It takes any `Read`, feeds `script::Splitter` in reads sized by
+`script::next_read` — doubling with the unfinished statement, which makes the splitter's re-scans
+of a terminator-less file logarithmic in number rather than a quarter of a gigabyte re-scanned a
+thousand times before `MAX_PENDING_BYTES` refuses it —
+sends each completed statement with `blocking_send`, and tells `progress` the splitter's
+`consumed()` after each block; the CLI passes a no-op. `tx` is moved in and dropped on return, so
+every exit closes the channel, and a failed send is `ReadEnd::Stopped` with no message, the
+executor that went away being the one holding the reason. A read interrupted by a signal
+(`ErrorKind::Interrupted`) is retried rather than reported as a failed file.
 **`Db::stream_query` is the whole-table export, and the row cap is the thing it exists to
 escape**: it runs `sql` uncapped and hands the rows to a *bounded*
 `tokio::sync::mpsc::Sender<ExportChunk>` in blocks of `chunk_rows` as they arrive, returning how

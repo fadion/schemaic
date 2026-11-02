@@ -11,7 +11,8 @@ schemaic exec - -c prod -d shop < change.sql
 It takes one statement, given [the same three ways](reading.md#giving-the-statement) as `query`,
 with its `:name` placeholders [filled in by `-p`](reading.md#filling-in-parameters).
 Several statements are refused rather than half-run — run them one at a time, so a failure
-part-way isn't something you have to piece back together.
+part-way isn't something you have to piece back together, or run the file as
+[a script](#running-a-script).
 
 A write prints how many rows it changed — `(3 rows affected)`, or `{"affected": 3}` with
 `--format json`. A statement that returns rows prints them instead.
@@ -40,6 +41,56 @@ write there.
 An ordinary write, such as an `UPDATE` with a `WHERE`, runs without asking: typing `exec` is your
 say-so. That holds even with **Confirm before running writes** turned on for the editor.
 
+## Running a script
+
+`--script` runs a whole `.sql` file — a migration, the output of
+[`compare`](reading.md#compare), or a [`dump`](reading.md#dump) to restore — on one connection,
+statement by statement, in order:
+
+```sh
+schemaic compare -c staging -d shop --source-connection prod --source-database shop > m.sql
+schemaic exec --script -f m.sql -c staging -d shop --yes
+schemaic exec --script -c staging -d shop --yes - < m.sql
+```
+
+The script comes from `-f`, from stdin with `-`, or as the argument. It is run as written, so
+`-p` can't be used with it, and a script on stdin can't share it with `--password-stdin`.
+
+Before anything is sent:
+
+- *Every script needs `--yes`*, whatever it holds — it isn't read for what it does, so there is no
+  script that runs without the question. Without it, exit code 3.
+- *A read-only connection refuses it*, even with `--yes`, even a file of `SELECT`s. So does having
+  no database to run in.
+- *A script that moves to another database is refused*, and the lines that do it are named: a
+  `USE`, psql's `\connect`, or a `CREATE DATABASE` or `DROP DATABASE` naming any database other
+  than the one you passed. Run it against the database it names, or remove those lines from a
+  copy. A MySQL or MariaDB dump names the database it came from in its `USE` line, so restore it
+  into a database of that name.
+
+It stops at the first statement the server refuses. Nothing goes to stdout; stderr says how it
+ended:
+
+```text
+schemaic: 3 statements ran
+```
+
+```text
+schemaic: no such table: nope
+schemaic: the statement on line 2 failed: INSERT INTO nope VALUES (1);
+schemaic: 1 statement ran before it; unless the script holds its own transaction, those are applied
+```
+
+The statements before the failure stay applied, unless the script wraps itself in its own
+transaction — fix the cause and work out where to pick up, rather than running the whole file
+again. A failure exits with code 4.
+
+`--timeout` defaults to an hour with `--script`. A script stopped by it exits with code 5, and the
+statements that ran before it may be applied.
+
+It runs plain SQL text. A PostgreSQL archive in `pg_dump`'s custom format isn't one — restore that
+with `pg_restore`.
+
 ## When it times out
 
 `exec` gives up after `--timeout` seconds (30 by default) and exits with code 5. The statement was
@@ -49,5 +100,6 @@ without transactions, part of it may have been applied. Check before running it 
 ## The write log
 
 Every write `exec` runs is added to the same write log as the app's own, `write_log.jsonl` in the
-settings folder. Values in its SQL are masked unless **Keep values in the write log** is on in
+settings folder. A script is one line there: the file, how many statements ran, and the one that
+failed. Values in its SQL are masked unless **Keep values in the write log** is on in
 **Settings** › **Query**.

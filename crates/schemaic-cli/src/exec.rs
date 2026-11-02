@@ -160,6 +160,58 @@ impl ExecRequest {
     }
 }
 
+/// A script approved to run — `exec --script`.
+///
+/// **The second request this module mints, on [`ExecRequest`]'s rule**: only
+/// [`ScriptRequest::approved`] builds one, and it asks `sql::script_verdict`,
+/// the app's gate for a `.sql` file, never `run_verdict`. That gate treats the
+/// whole file as a write without reading it, so a read-only connection is
+/// refused even for a file of `SELECT`s, and there is no `Allow` arm: every
+/// script needs `--yes`, which here stands where the app's script panel stands.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScriptRequest {
+    conn: Connection,
+    /// Always present: `script_verdict` blocks outright without one.
+    database: String,
+}
+
+impl ScriptRequest {
+    /// The guard and the request in one step. `file` names the script in the
+    /// refusal, since its statements are not read before this answers.
+    pub fn approved(
+        conn: &Connection,
+        database: Option<&str>,
+        file: &str,
+        assume_yes: bool,
+    ) -> Result<ScriptRequest, NotRun> {
+        let policy = GuardPolicy::of(Some(conn), database.is_none(), false);
+        match schemaic_core::sql::script_verdict(policy, file) {
+            RunVerdict::Block(why) => Err(NotRun::Blocked(why)),
+            RunVerdict::Confirm(why) if !assume_yes => Err(NotRun::NeedsConsent(why)),
+            // `script_verdict` never allows; matched rather than caught by a
+            // wildcard so that if it ever does, that is a change made here.
+            RunVerdict::Confirm(_) | RunVerdict::Allow => Ok(()),
+        }?;
+        let Some(database) = database else {
+            return Err(NotRun::Blocked(GuardReason::NoDatabase));
+        };
+        Ok(ScriptRequest {
+            conn: conn.clone(),
+            database: database.to_string(),
+        })
+    }
+
+    /// The saved connection the verdict judged — what the caller connects to.
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// The database the script runs in.
+    pub fn database(&self) -> &str {
+        &self.database
+    }
+}
+
 /// How many of the rows a write **returns** `exec` keeps — `UPDATE …
 /// RETURNING`, a `CALL` that selects. The cap is on what is printed, never on
 /// the statement: each engine's row loop stops reading at the cap and leaves the
@@ -344,6 +396,41 @@ mod tests {
         let w = approved("DELETE FROM t WHERE id = 1", false).unwrap();
         assert_eq!(w.database(), Some("app"));
         assert!(!w.connection().read_only);
+    }
+
+    /// **Every script needs `--yes`** — the file is a write unread, so there is
+    /// no script the guard waves through on its own.
+    #[test]
+    fn a_script_needs_yes_and_yes_gives_it() {
+        let got = ScriptRequest::approved(&conn(false), Some("app"), "m.sql", false);
+        assert!(matches!(got, Err(NotRun::NeedsConsent(_))), "{got:?}");
+        let r = ScriptRequest::approved(&conn(false), Some("app"), "m.sql", true).unwrap();
+        assert_eq!(r.database(), "app");
+        assert!(!r.connection().read_only);
+    }
+
+    /// A read-only connection refuses a script **unread**, and `--yes` does
+    /// not reach it — strictly stronger than the statement guard.
+    #[test]
+    fn a_read_only_connection_refuses_a_script_and_yes_does_not_help() {
+        for yes in [false, true] {
+            assert_eq!(
+                ScriptRequest::approved(&conn(true), Some("app"), "m.sql", yes),
+                Err(NotRun::Blocked(GuardReason::ReadOnly)),
+                "yes = {yes}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_script_with_no_database_is_refused_outright() {
+        for yes in [false, true] {
+            assert_eq!(
+                ScriptRequest::approved(&conn(false), None, "m.sql", yes),
+                Err(NotRun::Blocked(GuardReason::NoDatabase)),
+                "yes = {yes}"
+            );
+        }
     }
 
     /// A read through `exec` is not an error — it is pointless but harmless,

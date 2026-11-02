@@ -328,7 +328,50 @@ statement that may have been applied in whole or in part — and for `TimedOut` 
 transaction across runs, so nothing it runs is inside an aborted one. It reads `ui_state.json`'s `write_log_values` on every
 run, so the one file follows the setting the user chose in the GUI, and an append that fails is
 a warning on stderr that **leaves the exit status alone**: the status is the statement's, and
-the write has happened either way.
+the write has happened either way. That append is `append_to_write_log`, which `log_exec` and
+the script path below both call.
+**`exec --script` is `run_script`, the app's *Run SQL script* without the window: select,
+approve, scan, then connect.** `select_conn` first; then the input, `ScriptInput::File` for `-f
+<path>` or `ScriptInput::Bytes` for stdin (`-f -` or `-`, its leading U+FEFF taken off by
+`sql_text`) or the argument — stdin together with `--password-stdin` being `Exit::Usage`, as for
+a statement. Then `exec::ScriptRequest::approved` (`cli/exec.rs`), whose refusal is a `warn`, the
+no-database hint where it applies, and exit 3. **Then the scan**: `script::database_switches`
+over the **whole** input and `script::restore_refusal` against the request's database, so a
+`USE other` or `\connect other` anywhere in the file — a `mysqldump --databases` dump writes one
+half-way down — is refused with its lines named, exit 3, before anything is dialled. That is
+*Restore from file*'s check (the write-guard invariant's restore paragraph), not the app's script
+modal's, which does not scan — **deliberately, because the two consents differ**. The app's run
+is confirmed by its panel, which shows what the probe read before a button marked Run, opened
+from the database node the user right-clicked; `exec --script`'s only consent is `--yes`, given
+against a database named on the command line with nothing showing the file first, so a `USE
+other` or `\connect other` would carry the writes off the one database that consent named. The
+scan is what makes `--yes` a statement about where the script writes. A file that cannot be opened or holds no terminator is
+`Exit::Usage`. Only then `connect`, under `query::DEFAULT_TIMEOUT` rather than `--timeout`, whose
+script default of an hour is the run's, not the login's.
+**A file is read twice, and the second read checks it is the first.** The scan's open takes a
+`FileStamp`, and the reader's open asks `script::probe_still_describes` of it before handing over
+a statement, answering `ReadEnd::Changed` if the file moved between the two — the same check the
+app's reader makes between its probe and its run, here guarding what the scan approved. Bytes
+from stdin or the argument have nothing to change under them and carry `FileStamp::default()`.
+The run is the app's own pair: `schemaic_db::feed_script` on `spawn_blocking`, with no progress
+callback, feeding a `SCRIPT_QUEUE` channel, and `Db::run_script` in the request's database on
+the other end — which on SQLite is what found `block_in_place` panicking on this crate's
+current-thread runtime (`sqlite.rs`'s entry). **The runner is under
+`deadline::with_deadline_unwound`, not `with_deadline`**, because a script stopped by its
+deadline still owes the caller how many statements ran: `Late(Some((end, ran)))` is folded like
+an in-time answer, and only `Late(None)` — abandoned past the unwind grace — has no count, which
+is logged `Outcome::Unknown` with `stopped after Ns` and exits 5 saying some of the script may
+have been applied. Otherwise `script::run_outcome` folds the two endings, the entry is
+`Entry::ended_script(&name, &outcome)` under `Source::Cli`, stamped after `connect` as
+`run_exec`'s is, and `script_report` says it on stderr — stdout stays empty. **Every ending names
+the count**, a failure the line and the first 200 characters of the statement the server
+refused too, since a script is not transactional unless the file said so and the count is the
+answer to how much of it happened. `script_exit` maps `Done` to 0, `Failed` to 4, and
+`Cancelled` to **5**: the deadline is the only thing that cancels this run, so a cancel is a
+timeout, and the statements before it may have been applied — exit 4's "retrying may work"
+would repeat them (`a_scripts_exit_says_whether_retrying_is_safe`,
+`a_scripts_report_counts_what_ran_and_names_the_failure`). No test drives `run_script` itself, so
+its order — the scan before the connect, the stamp check between the reads — is the code's.
 **`mcp` is `serve_mcp`, and it keeps the order that makes exit 3 true.** `select_conn` first, so
 `cli_access` gates it like every subcommand: a connection the user never exposed is exit 3 and
 an unknown one exit 2, before the keyring is read, and the MCP client shows a server that failed
