@@ -622,7 +622,7 @@ cannot find it. A transaction `save_conn` asks about ends through `end_tx`, whic
 `at` names one; the statements that succeeded are not lines of their own. The mapping is core's
 `Entry::ended_script`, which `schemaic exec --script` shares. Its error is
 `ScriptFailure::message`, English: the failure is a value (`Said`, `Changed`, `ReaderStopped`,
-`NoTerminator`) that `script_view` words for the modal, since the reader's own two sentences
+`NoTerminator`, `Refused`) that `script_view` words for the modal, since the reader's own two sentences
 once reached this persisted record in the interface's language
 (`english_says_every_script_failure_as_core_does`). `commit_edits` logs
 `grid_sql` of the staged batch with `commit_writes`' count, through a `log_commit` ext action

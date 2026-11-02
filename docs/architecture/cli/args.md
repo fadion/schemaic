@@ -130,8 +130,9 @@ used to, took as well (`a_piped_password_loses_a_bom_and_one_line_ending`).
 carrying a password belongs: argv sits in the process list while the command runs and in the
 shell's history afterwards, the exposure the app keeps such statements out of its own history
 for, so an argv statement `sql::carries_credential` recognises is run but warned about on
-stderr, and one from stdin or a file is not, being in neither — unless a `-p` was given, since
-its value is in argv whatever the statement's source. Stdin has one reader, so stdin
+stderr, and one from stdin or a file is not, being in neither — unless a `-p` value is what
+put the credential there, whatever the statement's source (`run.rs`'s `credential_on_argv`
+decides which part of argv it came from). Stdin has one reader, so stdin
 (either spelling) together with `--password-stdin` is a usage error rather than a guess at which
 came first. **A file is still one statement**, not a script, unless `exec --script` asks for one
 (below): several hit the guards they would as an argument — `exec`'s `NotRun::Several`,

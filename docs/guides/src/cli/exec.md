@@ -53,8 +53,14 @@ schemaic exec --script -f m.sql -c staging -d shop --yes
 schemaic exec --script -c staging -d shop --yes - < m.sql
 ```
 
-The script comes from `-f`, from stdin with `-`, or as the argument. It is run as written, so
-`-p` can't be used with it, and a script on stdin can't share it with `--password-stdin`.
+The script comes from `-f`, from stdin with `-`, or as the argument. `-f` takes a pipe as well as
+a file, such as `-f /dev/stdin` or `-f <(…)`. It is run as written, so `-p` can't be used with
+it, and a script on stdin can't share it with `--password-stdin`. A script given as the argument
+that carries a password is warned about on stderr, as a statement is — pass it with `-f` or `-`.
+
+A file or stdin in UTF-16 with its byte-order mark — what Windows PowerShell 5.1's `>` writes — is
+read as such, and a byte that isn't valid UTF-8 becomes a replacement character rather than
+stopping the run.
 
 Before anything is sent:
 
@@ -83,7 +89,14 @@ schemaic: 1 statement ran before it; unless the script holds its own transaction
 
 The statements before the failure stay applied, unless the script wraps itself in its own
 transaction — fix the cause and work out where to pick up, rather than running the whole file
-again. A failure exits with code 4.
+again. A failure exits with code 4 — but a connection Schemaic refuses to open, such as one whose
+[init SQL](../connections/safeguards.md#init-sql) it won't run, exits with code 3, as on every
+command.
+
+On SQL Server the script is sent batch by batch, split at its `GO` lines (one batch if it has
+none), so stderr counts batches: `2 batches ran`. When a batch of several statements fails, stderr
+names `the batch starting on line 12`, and statements of that batch, before and after the error,
+may have been applied — SQL Server carries on past an error inside a batch.
 
 `--timeout` defaults to an hour with `--script`. A script stopped by it exits with code 5, and the
 statements that ran before it may be applied.

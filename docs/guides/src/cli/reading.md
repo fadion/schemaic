@@ -44,7 +44,8 @@ A placeholder with no `-p`, or a name given twice, stops the command with exit c
 anything is sent. A `-p` the statement doesn't use is only warned about on stderr. The checks
 below read the statement with the values in, so a `:sql` value that writes is refused by `query`
 just as if you'd typed it into the statement. A password in a `-p` value lands in your shell
-history as one in the statement would, and gets the same warning on stderr.
+history as one in the statement would, and gets a warning on stderr: write it into the statement
+instead, and pipe that with `-`.
 
 ## Only reads
 

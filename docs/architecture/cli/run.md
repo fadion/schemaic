@@ -117,9 +117,20 @@ something to leave to argument order; both, and a `number` that is not one, are 
 `Exit::Usage` before anything is gated or dialled (`a_statement_missing_a_param_is_a_usage_error`,
 `bind_refuses_a_placeholder_with_no_value`, `bind_refuses_a_name_given_twice`,
 `bind_refuses_a_number_that_is_not_one`). A `-p` the statement never asks for is only a warning on
-stderr, and the statement runs (`bind_reports_a_param_the_statement_never_asks_for`). The
-credential warning reads the bound text, and fires for a statement from stdin or a file too once a
-`-p` was given, its value being in argv.
+stderr, and the statement runs (`bind_reports_a_param_the_statement_never_asks_for`).
+**The credential warning asks where the credential came from, not whether any `-p` was given** —
+`credential_on_argv`, the one predicate for every path that takes SQL from argv, `exec
+--script`'s argument among them, which never asked. Any `-p` used to make the whole statement "on
+the command line", so a password in a file or on stdin was blamed on argv beside an unrelated
+`-p`, and the advice — pipe it on stdin — left one given through `-p` exactly where it was. It
+reads the bound text for whether a credential is there at all, then the template statement by
+statement: `carries_credential` reads a **shape** (`IDENTIFIED BY`, `WITH PASSWORD`), so
+`IDENTIFIED BY :pw` has one in the template too, and what tells a `-p` secret from a written one
+is whether the statement of that shape holds a placeholder. That, or a raw `-p` that brought the
+shape into a template with none, is `CredentialOnArgv::Param`, warned about from any source with
+advice to write the password into the statement and pipe that; a written one is `Statement`,
+warned about only when the statement was the argument
+(`a_credential_is_blamed_on_the_part_of_argv_it_came_from`).
 **Every byte of data goes through `emit`, never `print!`**, which panics when the write fails:
 `schemaic list | head -3` exited 101 — no code the contract names — with a panic message on the
 stderr an agent reads as the diagnosis. A `BrokenPipe` is a quiet `Exit::Ok`, the reader having
@@ -380,10 +391,21 @@ a warning on stderr that **leaves the exit status alone**: the status is the sta
 the write has happened either way. That append is `append_to_write_log`, which `log_exec` and
 the script path below both call.
 **`exec --script` is `run_script`, the app's *Run SQL script* without the window: select,
-approve, scan, then connect.** `select_conn` first; then the input, `ScriptInput::File` for `-f
-<path>` or `ScriptInput::Bytes` for stdin (`-f -` or `-`, its leading U+FEFF taken off by
-`sql_text`) or the argument — stdin together with `--password-stdin` being `Exit::Usage`, as for
-a statement. Then `exec::ScriptRequest::approved` (`cli/exec.rs`), whose refusal is a `warn`, the
+approve, scan, then connect.** `select_conn` first; then the input, built by `script_input`:
+`ScriptInput::File` for a `-f <path>` that is a regular file, `ScriptInput::Bytes` for
+everything else — stdin (`-f -` or `-`), the argument, and **a `-f` path that is not a regular
+file** (a pipe, `/dev/stdin`, a `<(…)`, a named FIFO), read whole, once, there. A regular file is
+read twice, below, and a pipe read twice is empty the second time: the run reported "0 statements
+ran" and exit 0 over a migration it never applied, or "changed on disk" while the producer was
+still writing, and a FIFO's second open blocked outright. **Stdin is read as bytes**
+(`read_stdin_bytes`), not through `read_stdin`'s UTF-8 `String`, so the script reader's own
+decoding reaches it as it reaches a file — UTF-16 by its BOM, an invalid byte replaced, a leading
+U+FEFF taken off by the `Splitter` — where `- < dump.sql` used to be refused as not valid UTF-8
+while `-f dump.sql` ran. Stdin together with `--password-stdin` is `Exit::Usage`, as for a
+statement, and **a script given as the argument is warned about when it carries a credential**,
+through `credential_on_argv` as any statement is. The readers are parameters, so the composition
+is tested without a file or a pipe (`a_scripts_input_is_read_once_unless_it_is_a_regular_file`).
+Then `exec::ScriptRequest::approved` (`cli/exec.rs`), whose refusal is a `warn`, the
 no-database hint where it applies, and exit 3. **Then the scan**: `script::database_switches`
 over the **whole** input and `script::restore_refusal` against the request's database, so a
 `USE other` or `\connect other` anywhere in the file — a `mysqldump --databases` dump writes one
@@ -401,7 +423,8 @@ script default of an hour is the run's, not the login's.
 `FileStamp`, and the reader's open asks `script::probe_still_describes` of it before handing over
 a statement, answering `ReadEnd::Changed` if the file moved between the two — the same check the
 app's reader makes between its probe and its run, here guarding what the scan approved. Bytes
-from stdin or the argument have nothing to change under them and carry `FileStamp::default()`.
+— from stdin, the argument or a `-f` that is no regular file — have nothing to change under them
+and carry `FileStamp::default()`.
 The run is the app's own pair: `schemaic_db::feed_script` on `spawn_blocking`, with no progress
 callback, feeding a `SCRIPT_QUEUE` channel, and `Db::run_script` in the request's database on
 the other end — which on SQLite is what found `block_in_place` panicking on this crate's
@@ -415,12 +438,27 @@ have been applied. Otherwise `script::run_outcome` folds the two endings, the en
 `run_exec`'s is, and `script_report` says it on stderr — stdout stays empty. **Every ending names
 the count**, a failure the line and the first 200 characters of the statement the server
 refused too, since a script is not transactional unless the file said so and the count is the
-answer to how much of it happened. `script_exit` maps `Done` to 0, `Failed` to 4, and
-`Cancelled` to **5**: the deadline is the only thing that cancels this run, so a cancel is a
+answer to how much of it happened. **On SQL Server the count is of batches**
+(`script::pieces_are_batches`), which is what the runner sends one at a time — a script with no
+`GO` is one — and a failed batch of several statements (`script::piece_is_batch`) is said as "the
+batch starting on line L failed", followed by a line saying SQL Server carries on past an error
+inside a batch, so statements of it before and after the error may have been applied. "0
+statements ran before it" over a table the batch had created sent the reader back to re-run what
+had landed (`a_failed_tsql_batch_is_said_as_a_batch`). The write log and the app's modal were not
+changed with it. **A `ScriptFailure::Changed` gets the CLI's own sentence** — the file changed on
+disk between the database check and the run, so none of it was run; run it again — because
+core's is the modal's, which tells the user to choose again from a summary a command line does
+not have (`a_changed_script_names_no_summary`). `script_exit` maps `Done` to 0, `Failed` to 4,
+**a `Failed` whose failure is `ScriptFailure::Refused` to 3** — a connect refused by a rule that
+stands, as every other command exits for it (`a_standing_refusal_exits_refused_on_a_script`) —
+and `Cancelled` to **5**: the deadline is the only thing that cancels this run, so a cancel is a
 timeout, and the statements before it may have been applied — exit 4's "retrying may work"
 would repeat them (`a_scripts_exit_says_whether_retrying_is_safe`,
-`a_scripts_report_counts_what_ran_and_names_the_failure`). No test drives `run_script` itself, so
-its order — the scan before the connect, the stamp check between the reads — is the code's.
+`a_scripts_report_counts_what_ran_and_names_the_failure`). **Its guard order is pinned**:
+`the_write_paths_refuse_before_they_connect_or_read` drives `run_script` against a `--url` whose
+host does not resolve, and a script that leaves its database, a read-only connection and a
+missing `--yes` must each come back exit 3 — a guard moved after the connect would answer with
+the connect's failure instead. The stamp check between the reads is still the code's alone.
 **`import` is `run_import`, the app's *Import* without the window: select, refuse, read the
 file's columns, connect, check, load.** `select_conn` first, with exits 2 and 3 as everywhere.
 **A `read_only` connection is refused next, before the file is opened** — a `warn` in
@@ -467,7 +505,9 @@ cancel and to check the table before importing again. **It writes the app's reco
 <db.schema.table>` — `import_run`'s own shape — stamped after the check and ended `ok` with the
 row count, `failed` with the message, `cancelled` for either late error, and `unknown` for
 `Late(None)`, appended through `append_to_write_log` with its exit-status-preserving warning.
-No unit test drives `run_import`, so its order is the code's; what it decides between reading the
+The same test pins its first two refusals: a read-only connection and one with no database are
+each exit 3 though the host does not resolve and the file does not exist, so neither the connect
+nor the read came first. The rest of its order is the code's; what it decides between reading the
 file and checking it is `file_columns` and `plan_mapping`, which `cli/import.rs`'s tests compose.
 **`mcp` is `serve_mcp`, and it keeps the order that makes exit 3 true.** `select_conn` first, so
 `cli_access` gates it like every subcommand: a connection the user never exposed is exit 3 and

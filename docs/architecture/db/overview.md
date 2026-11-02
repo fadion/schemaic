@@ -979,12 +979,17 @@ PostgreSQL (`tests/live/writeback.rs`) and against SQL Server 2022 and 2025
 `Receiver<script::Statement>` where that one takes a Sender — and it is the load half of the
 round trip `dump.rs` opens. It executes each statement in order on one pinned connection, stops
 at the first the server refuses, and returns `(script::ExecEnd, ran)` for the driver to fold
-against how the *reading* half ended. Three arms, all of them minimal by design: no transaction
+against how the *reading* half ended. Four arms, all of them minimal by design: no transaction
 of ours on any engine, and no pragma on SQLite. See the connection invariant for why it can be
 neither `Session` nor `run_ddl`, and `core::script` for the module it serves. Cancellation is
 selected on **while waiting for the next statement** as well as while one runs — a load stalled
 on a slow disk spends most of its life waiting, and a Stop that only landed between statements
-would look ignored.
+would look ignored. **A connect that fails ends the run as `DbError::script_connect_end` says**,
+with a count of nought, on every engine's arm: a `DbRefusal` that `stands()` — init SQL the
+allowlist will not run, a session that cannot be made safe — is `ExecEnd::Refused`, anything else
+`ExecEnd::Connect`. Both used to be `Connect`, so `schemaic exec --script` exited 4, "retrying may
+work", over a refusal every other command exits 3 for and that a retry meets again
+(`a_standing_refusal_ends_a_script_as_refused`).
 **`feed_script(r, dialect, tx, token, progress)` is the other half**, and it lives here so that
 both front ends drive one reader: the app's script modal (`app/script.rs`, which keeps only the
 open, the `FileStamp` check and the `BufReader`) and `schemaic exec --script` (`cli/run.rs`, over

@@ -32,6 +32,18 @@ timed-out script's caller needs (`an_unwound_answer_is_kept_and_an_abandoned_one
 `schemaic import` keeps it for the same kind of reason: `Db::import_rows` that committed inside
 the grace did import, and reporting it stopped would claim less than the engine delivered. The
 gate below counts it as wrapped, `with_deadline` being a prefix of its name.
+**The deadline is armed twice: on the runtime's timer and on a thread of its own, `Watchdog`.**
+The `sleep` arm of the `select!` cannot fire while the future holds the executor, and on this
+crate's current-thread runtime SQLite's import does, inline, for the whole load (`sqlite.rs`'s
+entry has why it cannot be moved off), so `schemaic import --timeout` never stopped a SQLite
+load. `Watchdog::arm` spawns a thread that waits `timeout` on a channel and cancels the token if
+nothing ended the wait; dropping it when the call returns drops the sender and ends the thread at
+once. The load watches the token, so it stops itself — the thread cancels, it does not wait out
+the grace, which stays the timer arm's for every future that yields. **A future that finishes
+after the watchdog cancelled it is `Late(Some(r))`, not `InTime`**: when the future wins the
+`select!`, `token.is_cancelled()` decides which, so a blocked import's `Cancelled` still reaches
+`run_import` as the late error it is (`a_future_blocking_the_executor_still_sees_the_cancel`, on a
+current-thread runtime). The cost is an OS thread per deadlined call, held until it returns.
 **It is deliberately not a merge with `mcp.rs`'s `with_deadline`**, and the server moving into
 this crate did not merge them: that one wraps a read none of the subcommands makes
 (`fetch_schema`), at the server's fixed `QUERY_TIMEOUT` rather than a `--timeout`, and the

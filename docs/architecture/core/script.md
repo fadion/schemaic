@@ -119,7 +119,16 @@ server answers "syntax error near…", and reporting that would name the file's 
 problem when the disk is. Cancel is either half's to witness and neither's to call a finish.
 **Every arm carries `ran`**: a script is not transactional unless the file said so, so "it
 stopped" always leaves "how much of it happened?", and that count is the only answer — which is
-why an exhaustive test asserts no arm drops it.
+why an exhaustive test asserts no arm drops it. **`ExecEnd::Refused` is a connect refused by a
+rule that stands**, folded to `ScriptFailure::Refused`: nothing ran, and running it again
+unchanged refuses again. It is apart from `Connect` only so that `schemaic exec --script` can
+exit 3 for it as every other command does (`db::DbError::script_connect_end` makes the split);
+`message` and the modal's `script_failure_text` say its text as they say `Said`'s.
+**`pieces_are_batches` and `piece_is_batch` say what `ran` counts.** On T-SQL a piece is a `GO`
+batch, so the count is of batches, and a failed piece of several statements
+(`sql::tsql_statements`) may have applied some on either side of its error, SQL Server carrying
+on past a statement-terminating error inside a batch. Only the CLI's report asks them; the write
+log and the app's modal were left saying *statements*.
 **The panel *is* the confirmation, so the file it described has to be the file that runs** —
 which is what `FileStamp` and `probe_still_describes` hold together. The probe reads a bounded
 prefix and keeps only counts; the run re-opens the path and sends whatever is there at that

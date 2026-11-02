@@ -56,7 +56,10 @@ multi-thread runtime, the call made **inline** on any other. Not `spawn_blocking
 moved into a `'static` task. Inline is not free: it holds the one runtime thread for the whole
 load, so a deadline's timer cannot fire until the import returns — the cost of the only shape
 that runs at all there (`an_import_runs_on_a_current_thread_runtime`, seen red against the
-unconditional `block_in_place`). `lib.rs`'s `next_batch_off_executor` makes the same choice
+unconditional `block_in_place`). It cost `schemaic import --timeout` its meaning on SQLite until
+`cli/deadline.rs` armed a watchdog thread beside the timer: the token is cancelled from there on
+time, and the load sees it at the next row, where its loop asks `is_cancelled`.
+`lib.rs`'s `next_batch_off_executor` makes the same choice
 for its batch pull. "Stop on error" is kept as the
 other two arms keep it: every statement after a failure reports `Cancelled`, those statements
 having been written against a state that never happened. The arm this replaced looped
