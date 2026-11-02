@@ -33,12 +33,23 @@ decision, not the host's. **The host changes what a refusal advises, never wheth
 refuses**: the panel's `NO_DATA_ACCESS` says the user can attach rows from a result grid, a
 gesture an outside client does not have, so `NO_DATA_ACCESS_STANDALONE` names the *Let it read
 data* level in Schemaic's connection settings instead
-(`rows_are_withheld_standalone_with_advice_that_fits_the_client`). That advice is still wrong
-for a `schemaic mcp --url` connection, which has no settings in Schemaic and whose level is
-`--ai-data`'s — a known leftover; only the start-up notice says so (`run.rs`'s `serve_mcp`).
+(`rows_are_withheld_standalone_with_advice_that_fits_the_client`). That advice is wrong in turn
+for a `schemaic mcp --url` connection, which was never saved and so has no settings in Schemaic:
+its level is `--ai-data`'s, so `NO_DATA_ACCESS_URL` tells the model to ask for `--ai-data full`
+on the server's command line and a restart. Which of the two is the endpoint's
+`level_from_flag`, and **`refusal_on(endpoint, tool)` is the one place that reads it** — it
+wraps `refusal_for(tool, e.samples, e.schema, e.host)` and swaps the standalone advice for the
+URL's when the flag is set, so both call sites (`answer`, and `compare_schemas`' per-side check
+below) go through it and which field is passed as which argument is decided once. Only the
+advice changes: a level that allows rows refuses nothing, and a refusal for another reason
+(`NO_PANEL`) keeps its own words (`a_url_connections_withheld_rows_name_the_flag`, through the
+serve loop). Before it, only the start-up notice said `--ai-data`, and every per-call refusal
+sent the user looking for a connection setting that does not exist.
 **`Endpoint` is the server's, and the app's `McpEndpoint` is an alias of it** — `db`,
 `database`, `samples`, `hidden`, `schema`, `host`, `audit_as`, `read_only` (the connection's
-read-only flag, which only `propose_sql` reads). It was a struct in `app/ai.rs`, which this
+read-only flag, which only `propose_sql` reads), `level_from_flag` (the level is `--ai-data`'s
+— set by `Endpoint::with_level_from_flag`, left `false` by `standalone` and by the app's panel
+blob). It was a struct in `app/ai.rs`, which this
 crate cannot name. `Endpoint::standalone(db, database, ai_data)` is the other constructor, and
 each field it sets is a decision rather than a default. `samples` is
 `ai_data.unwrap_or_default().may_query()` — rows only at `AiData::Full`: `OnRequest` is the level
@@ -325,7 +336,7 @@ pure `pick(endpoints, args)` — the `connection` argument's non-empty value by 
 first; a name not served is an error naming the ones that are — where *name* is the
 connection name `serve_mcp` gave it (saved, or a `--url`'s suggested one), never the id or `#<id>` that `-c` also accepts — and handed to that endpoint's own
 `call_tool`, so **the listing is the union but every call is judged by its own connection**:
-`refusal_for` against that connection's levels, refused in that connection's words, and recorded
+`refusal_on` against that connection's levels, refused in that connection's words, and recorded
 in the agent log under that connection's `audit_as`. A tool listed because another connection
 offers it is the stale-listing case the server-side refusal was already the backstop for
 (`a_call_is_judged_by_the_connection_it_names`, through `serve_on`: `run_query` named at the
@@ -352,7 +363,7 @@ because it is the one that needs two endpoints and `call_tool` is handed one.
 ahead of `pick`, and `compare_across` resolves both sides by saved name: the target from
 `connection`, else the first, the source from `source_connection`, either one not served refused
 with the served names as `pick` refuses. Then it **holds each side to its own levels**, asking
-`refusal_for` of the target and then the source, so a connection whose *Schema context* is None
+`refusal_on` of the target and then the source, so a connection whose *Schema context* is None
 cannot have its catalogue read by naming it as the other side of a comparison started at one
 that allows it — the same rule as "every call is judged by its own connection", applied to a call
 with two (`compare_schemas_across_connections_holds_each_side_to_its_levels`: an unserved source
@@ -384,8 +395,8 @@ not only the listing**, and that composition has tests of its own through the se
 `a_standalone_call_to_a_withheld_tool_is_refused_by_the_server` and
 `a_call_is_gated_by_its_own_level_not_the_others`, on an endpoint whose SQLite file does not
 exist so a call wrongly let through fails at once — because `refusal_for` alone was tested, and
-forcing `Host::Panel` or swapping the two levels at `refusal_for`'s call site (in `answer`) kept the suite
-green. **The handshake speaks
+forcing `Host::Panel` or swapping the two levels at `refusal_for`'s call site (then in `answer`,
+now in `refusal_on`) kept the suite green. **The handshake speaks
 `2025-06-18` and `2024-11-05`** (`SUPPORTED_PROTOCOLS`, newest first). The newer one costs a
 stdio, tools-only server nothing: its breaking changes are HTTP's and the removal of batching,
 and all it adds is optional. `2025-03-26` is left out on purpose — it *requires* accepting

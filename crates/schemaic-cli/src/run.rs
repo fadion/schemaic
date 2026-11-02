@@ -996,23 +996,7 @@ async fn serve_mcp(conns: &[Connection], target: &McpTarget) -> Exit {
         warn("--ai-data is for a --url connection; a saved one's is set in Schemaic");
         return Exit::Usage;
     }
-    let mut args: Vec<ConnArgs> = target
-        .connections
-        .iter()
-        .map(|c| ConnArgs {
-            connection: Some(c.clone()),
-            ..Default::default()
-        })
-        .collect();
-    // A `--url` comes after the `-c`s, so with any it is not the default.
-    // No `--password-stdin`: stdin is the protocol's, so its password is
-    // `SCHEMAIC_PASSWORD`'s (`connect`).
-    if let Some(url) = &target.url {
-        args.push(ConnArgs {
-            url: Some(url.clone()),
-            ..Default::default()
-        });
-    }
+    let args = mcp_conn_args(target);
     // Every one selected — and its CLI access asked — before any is dialled.
     let mut selected = Vec::with_capacity(args.len());
     for a in &args {
@@ -1067,9 +1051,7 @@ async fn serve_mcp(conns: &[Connection], target: &McpTarget) -> Exit {
         } else {
             None
         };
-        let endpoint =
-            crate::mcp::Endpoint::standalone(db, default_database(flag, conn), conn.ai_data)
-                .audited_as(&conn.name);
+        let endpoint = mcp_endpoint(db, flag, conn);
         eprintln!(
             "{}",
             mcp_notice(
@@ -1085,6 +1067,37 @@ async fn serve_mcp(conns: &[Connection], target: &McpTarget) -> Exit {
     crate::mcp::serve_many(endpoints).await;
     drop(tunnels);
     Exit::Ok
+}
+
+/// The connections `schemaic mcp` is asked to serve, one [`ConnArgs`] each:
+/// the `-c`s in order, then any `--url`, which with a `-c` is not the default.
+///
+/// **No `--password-stdin`**, and every one says so: stdin is the protocol's,
+/// so a password is `SCHEMAIC_PASSWORD`'s (`connect`), and a refusal that
+/// offered the flag would send the user to one `mcp` does not have.
+fn mcp_conn_args(target: &McpTarget) -> Vec<ConnArgs> {
+    let saved = target.connections.iter().map(|c| ConnArgs {
+        connection: Some(c.clone()),
+        stdin_is_protocol: true,
+        ..Default::default()
+    });
+    let url = target.url.iter().map(|u| ConnArgs {
+        url: Some(u.clone()),
+        stdin_is_protocol: true,
+        ..Default::default()
+    });
+    saved.chain(url).collect()
+}
+
+/// The endpoint `schemaic mcp` serves `conn` as, over `db`, `-d` being `flag`.
+///
+/// **A `--url` connection's level is its flag's** — the id 0 `parse_url`
+/// leaves is the mark of one, as in [`mcp_notice`] — so its refusals name
+/// `--ai-data` rather than a connection setting it does not have.
+fn mcp_endpoint(db: Db, flag: Option<&str>, conn: &Connection) -> crate::mcp::Endpoint {
+    crate::mcp::Endpoint::standalone(db, default_database(flag, conn), conn.ai_data)
+        .audited_as(&conn.name)
+        .with_level_from_flag(conn.id == 0)
 }
 
 /// What `schemaic mcp` says on stderr as it starts: which connection, and —
@@ -1428,12 +1441,14 @@ fn select_conn<'a>(
                 warn(&e.message());
                 exit_for_no_connection(&e)
             }),
-        Ok(crate::args::ConnSource::Url(url)) => one_off_connection(url, args.read_only)
-            .map(std::borrow::Cow::Owned)
-            .map_err(|why| {
-                warn(&why);
-                Exit::Usage
-            }),
+        Ok(crate::args::ConnSource::Url(url)) => {
+            one_off_connection(url, args.read_only, args.stdin_is_protocol)
+                .map(std::borrow::Cow::Owned)
+                .map_err(|why| {
+                    warn(&why);
+                    Exit::Usage
+                })
+        }
     }
 }
 
@@ -1442,22 +1457,31 @@ fn select_conn<'a>(
 /// **A URL that carries a password is refused**, never used and never
 /// repeated: argv is readable by every process on the machine and lands in the
 /// shell's history, which is the exposure the rest of this CLI keeps a
-/// password out of. `--password-stdin` or `SCHEMAIC_PASSWORD` carries it.
+/// password out of. `--password-stdin` or `SCHEMAIC_PASSWORD` carries it —
+/// only the variable when `stdin_is_protocol` (`mcp`), which has no
+/// `--password-stdin` to offer.
 ///
 /// **CLI access is implied** — the person typed the connection; the flag
 /// exists to keep a *saved* connection out of reach until they say so. Its
 /// read-only flag is `--read-only`'s, and its AI data level stays the
 /// default, which no CLI command but `mcp` reads.
-fn one_off_connection(url: &str, read_only: bool) -> Result<Connection, String> {
+fn one_off_connection(
+    url: &str,
+    read_only: bool,
+    stdin_is_protocol: bool,
+) -> Result<Connection, String> {
     let mut conn = schemaic_core::conn_import::parse_url(url)
         .map_err(|e| format!("--url: {}", e.message()))?;
     if !conn.password.is_empty() {
-        return Err(
+        let carrier = if stdin_is_protocol {
+            "SCHEMAIC_PASSWORD"
+        } else {
+            "--password-stdin or SCHEMAIC_PASSWORD"
+        };
+        return Err(format!(
             "--url carries a password, which the command line puts in the process \
-                    list and your shell's history; take it out of the URL and give it with \
-                    --password-stdin or SCHEMAIC_PASSWORD"
-                .to_string(),
-        );
+             list and your shell's history; take it out of the URL and give it with {carrier}"
+        ));
     }
     conn.cli_access = true;
     conn.read_only = read_only;
@@ -3314,12 +3338,63 @@ mod tests {
     /// the message names the flags, not the URL.
     #[test]
     fn a_url_with_a_password_is_refused() {
-        let why = one_off_connection("postgresql://app:s3cret@pg.example/shop", false).unwrap_err();
+        let url = "postgresql://app:s3cret@pg.example/shop";
+        let why = one_off_connection(url, false, false).unwrap_err();
         assert!(!why.contains("s3cret"), "{why}");
-        assert!(why.contains("SCHEMAIC_PASSWORD"), "{why}");
+        assert!(
+            why.contains("SCHEMAIC_PASSWORD") && why.contains("--password-stdin"),
+            "{why}"
+        );
         // A JDBC query string is a password too.
         assert!(
-            one_off_connection("jdbc:mysql://pg.example/shop?user=app&password=x", false).is_err()
+            one_off_connection(
+                "jdbc:mysql://pg.example/shop?user=app&password=x",
+                false,
+                false
+            )
+            .is_err()
+        );
+        // Where stdin is the protocol's, the flag it has no use for is not
+        // offered.
+        let why = one_off_connection(url, false, true).unwrap_err();
+        assert!(
+            why.contains("SCHEMAIC_PASSWORD") && !why.contains("--password-stdin"),
+            "{why}"
+        );
+    }
+
+    /// **Every connection `mcp` serves knows stdin is the protocol's** — the
+    /// composition that brings the wording above to `mcp --url`'s refusal.
+    #[test]
+    fn mcp_marks_every_connection_as_having_no_stdin() {
+        let target = McpTarget {
+            connections: vec!["a".to_string(), "b".to_string()],
+            url: Some("mysql://u@h/d".to_string()),
+            ..Default::default()
+        };
+        let args = mcp_conn_args(&target);
+        let named: Vec<_> = args
+            .iter()
+            .map(|a| (a.connection.as_deref(), a.url.as_deref()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                (Some("a"), None),
+                (Some("b"), None),
+                (None, Some("mysql://u@h/d"))
+            ]
+        );
+        assert!(args.iter().all(|a| a.stdin_is_protocol));
+        // And `select_conn` hands it on: a password-carrying `--url` is
+        // still refused there.
+        let pw = McpTarget {
+            url: Some("mysql://u:pw@h/d".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            select_conn(&[], &mcp_conn_args(&pw)[0]).unwrap_err(),
+            Exit::Usage
         );
     }
 
@@ -3327,7 +3402,7 @@ mod tests {
     /// `--read-only`'s, and nothing else is invented.
     #[test]
     fn a_url_connection_has_cli_access_and_the_read_only_asked_for() {
-        let c = one_off_connection("postgresql://app@pg.example:5433/shop", true).unwrap();
+        let c = one_off_connection("postgresql://app@pg.example:5433/shop", true, false).unwrap();
         assert!(c.cli_access && c.read_only);
         assert_eq!(
             (c.host.as_str(), c.port, c.user.as_str()),
@@ -3335,11 +3410,11 @@ mod tests {
         );
         assert_eq!(c.default_database(), Some("shop"));
         assert!(
-            !one_off_connection("mysql://app@h/db", false)
+            !one_off_connection("mysql://app@h/db", false, false)
                 .unwrap()
                 .read_only
         );
-        assert!(one_off_connection("not a url", false).is_err());
+        assert!(one_off_connection("not a url", false, false).is_err());
     }
 
     /// **The composition**: `select_conn` builds a `--url` connection and
@@ -3540,7 +3615,7 @@ mod tests {
 
         let url = "mysql://app@unreachable.invalid/shop";
         let mut saved = conn("shop");
-        saved.name = one_off_connection(url, false).unwrap().name;
+        saved.name = one_off_connection(url, false, true).unwrap().name;
         saved.cli_access = true;
         let target = McpTarget {
             connections: vec![saved.name.clone()],
@@ -3548,6 +3623,34 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(serve_mcp(&[saved], &target).await, Exit::Usage);
+    }
+
+    /// **A `--url` endpoint's level is its flag's, a saved one's the app's** —
+    /// so a withheld tool's refusal names `--ai-data` on the one and the
+    /// connection settings on the other.
+    #[test]
+    fn an_mcp_endpoint_knows_where_its_level_is_set() {
+        use crate::mcp::McpTool;
+        let db = || {
+            Db::from_parts(
+                schemaic_db::Engine::MySql,
+                "h".to_string(),
+                3306,
+                "u".to_string(),
+                String::new(),
+                String::new(),
+            )
+        };
+        let url = one_off_connection("mysql://u@h/d", false, true).unwrap();
+        let e = mcp_endpoint(db(), None, &url);
+        let why = crate::mcp::refusal_on(&e, McpTool::RunQuery).expect("withheld");
+        assert!(
+            why.contains("--ai-data full") && !why.contains("connection settings"),
+            "{why}"
+        );
+        let e = mcp_endpoint(db(), None, &conn("shop"));
+        let why = crate::mcp::refusal_on(&e, McpTool::RunQuery).expect("withheld");
+        assert!(why.contains("connection settings"), "{why}");
     }
 
     /// On a server engine `-d` wins, else the connection's own, else none —
@@ -3589,7 +3692,7 @@ mod tests {
         // Beside other connections the tool is still listed, and refused here.
         let n = mcp_notice(&c, false, Some("shop"), true, true);
         // A `--url` connection's level is its flag's, not a setting in the app.
-        let url = one_off_connection("mysql://u@h/d", false).unwrap();
+        let url = one_off_connection("mysql://u@h/d", false, true).unwrap();
         let u = mcp_notice(&url, false, Some("d"), true, false);
         assert!(
             u.contains("--ai-data full") && !u.contains("connection settings"),

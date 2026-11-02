@@ -58,12 +58,15 @@ than either, and whichever bound is shorter answers first.
 **A `--url` connection takes the same two steps, and is built rather than looked up.**
 `select_conn` returns a `Cow<'a, Connection>`: `Borrowed` for a saved one, through
 `select::select` and its CLI-access gate exactly as before, and `Owned` for a URL, through
-`one_off_connection(url, read_only)` — `core::conn_import::parse_url`, then three decisions.
+`one_off_connection(url, read_only, stdin_is_protocol)` — `core::conn_import::parse_url`, then
+three decisions.
 **A URL that carries a password is refused**, exit 2, and the password is never repeated
 (a JDBC `?password=` counts, `parse_url` having read it into the same field): argv is readable
 by every process on the machine and lands in the shell's history, the exposure the rest of this
 CLI keeps a password out of, so the message points at `--password-stdin` and `SCHEMAIC_PASSWORD`
-instead (`a_url_with_a_password_is_refused`). **`cli_access` is `true`** — the person typed the
+instead — or at `SCHEMAIC_PASSWORD` alone when `ConnArgs::stdin_is_protocol` is set (`mcp`'s,
+below), since offering a flag the command does not have sends the user to a parse error
+(`a_url_with_a_password_is_refused`, both wordings). **`cli_access` is `true`** — the person typed the
 connection, and the flag exists to keep a *saved* one out of reach until they say so — `read_only`
 is `--read-only`'s, and the AI data level is left as `parse_url` left it, unset — only `mcp` reads
 it, and `serve_mcp` sets it from `--ai-data` (below)
@@ -472,7 +475,7 @@ refused, exit 2 — compared by the selected connections' ids, not by spelling, 
 naming one connection by its name and its id is caught — and so are two connections that share a
 **name**, since a tool call picks one by name and the second would be unreachable. Ids are
 compared only when non-zero, a `--url` connection's being the parser's placeholder `0`. Only then is each `connect`ed in turn, its tunnel opened and pushed onto a `Vec`
-held for the server's life, its `Endpoint::standalone(…).audited_as(&conn.name)` built and its
+held for the server's life, its endpoint built by `mcp_endpoint` (below) and its
 own `mcp_notice` line written, and the lot handed to `mcp::serve_many` under the saved names — a
 single `-c` takes the same path, as a list of one. `-d` is the first connection's; the others take
 `default_database(None, conn)`. **The notice is told which of the two it is speaking for**
@@ -492,7 +495,7 @@ one's did, and the tunnels already opened drop with it. `mcp_refuses_a_connectio
 exposed-then-unexposed pair refused with the exposed one's host never dialled, and a duplicate
 `-c` a usage error.
 **A `--url` is one more connection in that list, after the `-c`s**, so with any of them it is not
-the default. It becomes a `ConnArgs { url }` and goes through the same `select_conn`, so
+the default. It becomes a `ConnArgs { url, stdin_is_protocol }` and goes through the same `select_conn`, so
 `one_off_connection`'s two rules hold here as everywhere — a password in the URL refused, exit 2,
 and `cli_access` implied. Its password is `SCHEMAIC_PASSWORD`'s alone (`connect`'s URL branch),
 stdin being the protocol's. **Its AI data level is `--ai-data`'s, else `AiData::SchemaOnly`** — a
@@ -503,9 +506,17 @@ refused first, exit 2, because a saved connection's level is the app's to set. T
 name beside it would make one of the two unreachable. `mcp_notice` knows one by its id `0` and,
 when its rows are withheld, says to pass `--ai-data full` rather than to change a setting in
 Schemaic it does not have (`mcp_refuses_a_stray_level_and_a_url_that_shares_a_name`,
-`the_mcp_notice_explains_a_withheld_query_tool`). **Not yet followed through**: the per-call
-refusal, `mcp.rs`'s `NO_DATA_ACCESS_STANDALONE`, still tells the model to have the level changed
-in Schemaic, which for a `--url` connection should be `--ai-data` — and `one_off_connection`'s
-refusal of a password-carrying URL still offers `--password-stdin`, which `mcp` does not have.
+`the_mcp_notice_explains_a_withheld_query_tool`). **The per-call refusal says the same**:
+`mcp_endpoint(db, flag, conn)` builds the endpoint served — `Endpoint::standalone`,
+`audited_as`, and `with_level_from_flag(conn.id == 0)`, the id `0` being `parse_url`'s mark of a
+`--url` connection as it is `mcp_notice`'s — so a withheld tool is refused with `mcp.rs`'s
+`NO_DATA_ACCESS_URL`, which names `--ai-data full`, rather than `NO_DATA_ACCESS_STANDALONE`'s
+connection settings (`an_mcp_endpoint_knows_where_its_level_is_set`). **And its password
+refusal does not offer `--password-stdin`**: `mcp_conn_args(target)` builds the `ConnArgs` list
+— the `-c`s in order, then the `--url` — with `stdin_is_protocol` set on every one, which
+`select_conn` hands to `one_off_connection` (`mcp_marks_every_connection_as_having_no_stdin`; its
+`select_conn` step asserts only the exit, the wording being `a_url_with_a_password_is_refused`'s).
+Both were known leftovers until the change that added these two functions: the notice alone said
+`--ai-data`, and the refusal offered a flag `mcp` refuses to parse.
 Smoke-tested by the change's author against an empty profile: `mcp --url sqlite:<file> --ai-data
 full` answered `run_query`, and without `--ai-data` refused it at *Schema only*.

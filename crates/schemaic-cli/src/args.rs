@@ -658,6 +658,12 @@ pub struct ConnArgs {
     /// there.
     #[arg(long)]
     pub password_stdin: bool,
+    /// Is stdin the protocol's — `mcp`'s, the MCP client's JSON-RPC stream —
+    /// so that a password cannot come from it, and no message may offer
+    /// `--password-stdin`. Never a flag: set by the command that builds these
+    /// arguments by hand.
+    #[arg(skip)]
+    pub stdin_is_protocol: bool,
 }
 
 /// Which connection [`ConnArgs`] names: a saved one, or a one-off URL.

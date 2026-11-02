@@ -187,6 +187,9 @@ server answers at all, so neither has a `-d` and passing one is a parse error
 above share them — and `compare` and `mcp`, which have no `ConnArgs` of their own, build one with
 only `connection` set (`..Default::default()`, which `ConnArgs` derives for them) to use them
 too, and `mcp` one more with only `url` set for its `--url` (below); `compare` takes no `--url`.
+`mcp`'s also set **`stdin_is_protocol`**, the one field that is never a flag (`#[arg(skip)]`):
+stdin there is the client's JSON-RPC stream, so `run.rs`'s refusal of a password-carrying URL
+must not offer `--password-stdin` (`run.rs`'s `mcp_conn_args`).
 **`--url` (`SCHEMAIC_URL`) is a connection given rather than saved**, for a container or a CI job
 with no Schemaic setup — `postgresql://user@host/db`, `mysql://…`, `sqlserver://…`, `sqlite:path`,
 whatever `core::conn_import::parse_url` reads. `-c` is `required_unless_present = "url"` and

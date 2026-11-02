@@ -609,6 +609,8 @@ fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
         audit_as: None,
         // Likewise the saved connection's, set in `endpoint_from_blob`.
         read_only: false,
+        // The panel's connection is always a saved one.
+        level_from_flag: false,
     }
 }
 

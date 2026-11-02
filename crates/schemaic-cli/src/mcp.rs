@@ -272,10 +272,9 @@ async fn compare_across(
     let (text, is_error) = match sides {
         Err(why) => (why, true),
         Ok((t, s)) => {
-            let refused = [t, s].into_iter().find_map(|n| {
-                let e = n.endpoint;
-                refusal_for(McpTool::CompareSchemas, e.samples, e.schema, e.host)
-            });
+            let refused = [t, s]
+                .into_iter()
+                .find_map(|n| refusal_on(n.endpoint, McpTool::CompareSchemas));
             match refused {
                 Some(why) => (why.to_string(), true),
                 None => {
@@ -384,6 +383,11 @@ pub struct Endpoint {
     /// statement against, as the panel's Run will. From the saved connection,
     /// never the blob; `false` where nothing has said.
     pub read_only: bool,
+    /// Is the AI data level `--ai-data`'s rather than a saved setting's — a
+    /// `schemaic mcp --url` connection, which was never saved and so has no
+    /// connection settings to change. What a refusal advises turns on it
+    /// ([`refusal_on`]); whether it refuses does not.
+    pub level_from_flag: bool,
 }
 
 impl Endpoint {
@@ -422,7 +426,14 @@ impl Endpoint {
             audit_as: None,
             // `propose_sql` is the one reader, and it is panel-only.
             read_only: false,
+            level_from_flag: false,
         }
+    }
+
+    /// The same endpoint, its level marked as `--ai-data`'s when `yes`.
+    pub fn with_level_from_flag(mut self, yes: bool) -> Endpoint {
+        self.level_from_flag = yes;
+        self
     }
 
     /// The same endpoint, its calls recorded in the agent log under the
@@ -849,6 +860,15 @@ const NO_DATA_ACCESS_STANDALONE: &str = "Refused: this connection's AI data acce
      for the values you need — or ask them to set the connection's AI data access to \"Let it \
      read data\" in Schemaic's connection settings and restart this server.";
 
+/// [`NO_DATA_ACCESS_STANDALONE`] for a `--url` connection. It was never saved,
+/// so there are no connection settings to send the user to: its level is the
+/// command line's.
+const NO_DATA_ACCESS_URL: &str = "Refused: this connection was given to `schemaic mcp` as a \
+     --url, whose AI data access lets no assistant read rows on its own unless the command \
+     says otherwise, so run_query, explain and sample_rows are unavailable. Ask the user for the \
+     values you need — or ask them to add --ai-data full to the server's command line and \
+     restart it.";
+
 /// What the server says when a panel-only tool is called from outside the
 /// panel. Says what to do instead, for the reason the other two do.
 const NO_PANEL: &str = "Refused: propose_table_change and propose_sql hand their result to \
@@ -869,6 +889,17 @@ fn refusal_for(tool: McpTool, reads_data: bool, schema: bool, host: Host) -> Opt
         return Some(NO_PANEL);
     }
     (!schema && tool.reads_schema()).then_some(NO_SCHEMA_ACCESS)
+}
+
+/// [`refusal_for`] on endpoint `e` — what every call site asks, so which
+/// field is passed as which argument is decided once. A level set by
+/// `--ai-data` ([`Endpoint::level_from_flag`]) changes the data refusal's
+/// advice to [`NO_DATA_ACCESS_URL`], and nothing else.
+pub(crate) fn refusal_on(e: &Endpoint, tool: McpTool) -> Option<&'static str> {
+    match refusal_for(tool, e.samples, e.schema, e.host) {
+        Some(NO_DATA_ACCESS_STANDALONE) if e.level_from_flag => Some(NO_DATA_ACCESS_URL),
+        why => why,
+    }
 }
 
 /// The tools this server offers, described for **this** connection's engine.
@@ -1283,12 +1314,14 @@ async fn answer(endpoint: &Endpoint, name: &str, args: &Value) -> (String, bool)
         database,
         samples: reads_data,
         hidden,
-        schema,
-        host,
+        // The three gates are `refusal_on`'s, which reads them off `endpoint`.
+        schema: _,
+        host: _,
         audit_as: _,
         read_only,
+        level_from_flag: _,
     } = endpoint;
-    let (reads_data, schema, host) = (*reads_data, *schema, *host);
+    let reads_data = *reads_data;
     let database = database.as_deref();
     // The level gates the call as well as the listing: a client working from a
     // stale `tools/list` must not reach the DB through a tool this connection
@@ -1296,7 +1329,7 @@ async fn answer(endpoint: &Endpoint, name: &str, args: &Value) -> (String, bool)
     let Some(tool) = McpTool::from_name(name) else {
         return (format!("Unknown tool: {name}"), true);
     };
-    if let Some(why) = refusal_for(tool, reads_data, schema, host) {
+    if let Some(why) = refusal_on(endpoint, tool) {
         return (why.to_string(), true);
     }
     let arg = |key: &str| {
@@ -3017,6 +3050,7 @@ mod tests {
             host,
             audit_as: None,
             read_only: false,
+            level_from_flag: false,
         }
     }
 
@@ -3481,6 +3515,35 @@ mod tests {
             )
             .await,
             (super::NO_PANEL.to_string(), true)
+        );
+    }
+
+    /// **A `--url` connection's refusal names the flag**: it was never saved,
+    /// so "set it in Schemaic's connection settings" sends the user looking
+    /// for a setting that does not exist. Through the serve loop, for the
+    /// composition's sake.
+    #[tokio::test]
+    async fn a_url_connections_withheld_rows_name_the_flag() {
+        let ep = unreachable(false, true, super::Host::Standalone).with_level_from_flag(true);
+        for (tool, args) in [
+            ("run_query", r#"{"sql":"SELECT 1"}"#),
+            ("explain", r#"{"sql":"SELECT 1"}"#),
+        ] {
+            assert_eq!(
+                call(&ep, tool, args).await,
+                (super::NO_DATA_ACCESS_URL.to_string(), true),
+                "{tool}"
+            );
+        }
+        assert!(super::NO_DATA_ACCESS_URL.contains("--ai-data full"));
+        assert!(!super::NO_DATA_ACCESS_URL.contains("connection settings"));
+        // Only the advice changes: a level that allows rows refuses nothing,
+        // and a refusal for another reason keeps its own words.
+        let open = unreachable(true, true, super::Host::Standalone).with_level_from_flag(true);
+        assert_eq!(super::refusal_on(&open, McpTool::RunQuery), None);
+        assert_eq!(
+            super::refusal_on(&open, McpTool::ProposeSql),
+            Some(super::NO_PANEL)
         );
     }
 
