@@ -358,7 +358,21 @@ impl Handler for TunnelClient {
     // key; accept a known host only if the key still matches; refuse a changed
     // key (the MITM signal). Fingerprints are SHA256. The composition is
     // `host_key_decision`'s, and pure.
-    async fn check_server_key(&mut self, key: &ssh_key::PublicKey) -> Result<bool, Self::Error> {
+    async fn check_server_key(
+        &mut self,
+        offered: &russh::keys::PublicKeyOrCertificate,
+    ) -> Result<bool, Self::Error> {
+        // A host certificate only arrives when the client advertises
+        // `Preferred::host_key_certificates`, which `config_for` leaves empty.
+        // Should one arrive anyway, refuse it: there is no trusted authority to
+        // check it against, and the key inside is not the one anyone pinned.
+        let russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } = offered else {
+            tracing::error!(
+                "SSH host-key refusal for {}: unrequested certificate",
+                self.host_port
+            );
+            return Ok(false);
+        };
         let fingerprint = key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
         let openssh = openssh_verdict(&self.listed, key);
         if let Some(OpenSshVerdict::Changed { line }) = openssh {

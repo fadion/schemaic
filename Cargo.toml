@@ -179,7 +179,7 @@ tiberius = { version = "0.13", default-features = false, features = [
 encoding_rs = "0.8"
 # SSH tunnelling. Use the `ring` crypto backend instead of the default
 # `aws-lc-rs` to avoid the aws-lc-sys C/cmake build.
-russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh = { version = "0.65", default-features = false, features = ["ring", "flate2", "rsa"] }
 # Version pinned to match russh's transitive dependency (for `ssh_key::PublicKey`).
 ssh-key = "=0.7.0-rc.11"
 
