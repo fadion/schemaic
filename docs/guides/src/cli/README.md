@@ -92,7 +92,9 @@ SCHEMAIC_PASSWORD="$DB_PASSWORD" schemaic query "SELECT 1" --url "mysql://app@db
   `--read-only` can add read-only, never take it away.
 - *A database.* If the URL names none, pass `-d` or end the URL with `/<database>`.
 - `-c` and `--url` together are refused, even when one comes from the environment — unset the
-  variable you don't mean. `mcp` is the exception: it serves both.
+  variable you don't mean. `mcp` is the exception: it serves a `-c` you type beside a `--url`,
+  but still refuses `--url` with `SCHEMAIC_CONNECTION` set — unset it, or name it with `-c` to
+  serve both.
 
 ## The commands
 
@@ -143,7 +145,7 @@ to stderr, so stdout is always safe to pipe or parse. `--format` picks the shape
 | 4    | The server or the connection failed. Retrying may work                                 |
 | 5    | A write timed out after it was sent and may have been applied. Check before retrying   |
 | 6    | `query --fail-on-cap` only: `--limit` cut the rows short (they were still printed)     |
-| 7    | `import` only: the file has problems, listed on stderr. Nothing was written            |
+| 7    | `import` only: the file has problems, listed on stderr — or can't be read as its format, or is empty. Nothing was written |
 
 ## In this section
 

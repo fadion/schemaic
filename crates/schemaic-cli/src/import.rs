@@ -56,6 +56,11 @@ pub fn read_config(
     if format != ImportFormat::Xlsx && reading.sheet.is_some() {
         return Err("--sheet is for Excel files".to_string());
     }
+    // A JSON record's keys are its header; without one, `auto_map` pairs
+    // them with the table's columns by position, in their sorted order.
+    if format == ImportFormat::Json && reading.no_header {
+        return Err("--no-header is for CSV and Excel files".to_string());
+    }
     let mut dialect = match (format, head) {
         (ImportFormat::Csv, Some(head)) => {
             schemaic_core::import::sniff(&String::from_utf8_lossy(head))
@@ -109,6 +114,105 @@ fn position(names: &[String], name: &str) -> Option<usize> {
     })
 }
 
+/// Every place `name` is among `names`, matched as [`position`] matches it —
+/// the exact spelling where there is one, else the loose one.
+fn positions(names: &[String], name: &str) -> Vec<usize> {
+    let exact: Vec<usize> = (0..names.len()).filter(|&i| names[i] == name).collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    let want = name.trim().to_ascii_lowercase();
+    (0..names.len())
+        .filter(|&i| names[i].trim().to_ascii_lowercase() == want)
+        .collect()
+}
+
+/// Why a file could not be turned into columns. Nothing has been written.
+#[derive(Debug)]
+pub enum FileProblem {
+    /// It could not be parsed — the file's problem, [`crate::run::Exit::Rejected`].
+    Unreadable(schemaic_core::import::ImportError),
+    /// It holds no columns at all: a zero-byte CSV, a JSON `[]`.
+    Empty,
+}
+
+impl FileProblem {
+    /// The line for stderr, about the file called `name`.
+    pub fn message(&self, name: &str) -> String {
+        match self {
+            FileProblem::Unreadable(e) => format!("{name}: {e}"),
+            FileProblem::Empty => format!("{name} is empty; there is nothing to import"),
+        }
+    }
+}
+
+/// The file's columns, **as the load will read them** — for JSON, every key of
+/// every record ([`schemaic_core::import::json_columns`]), since a record's
+/// fields are its keys and a key the first record lacks is still a column;
+/// otherwise the header (or the first row's width), from a one-row sample.
+pub fn file_columns<R: std::io::Read>(
+    open: impl Fn() -> std::io::Result<R>,
+    format: ImportFormat,
+    cfg: &ReadConfig,
+) -> Result<Vec<String>, FileProblem> {
+    use schemaic_core::import::{ImportError, json_columns, probe_sample};
+    let columns = match format {
+        ImportFormat::Json => {
+            let r =
+                open().map_err(|e| FileProblem::Unreadable(ImportError::Read(e.to_string())))?;
+            json_columns(r)
+        }
+        _ => probe_sample(&open, format, cfg, 1).map(|s| s.columns),
+    }
+    .map_err(FileProblem::Unreadable)?;
+    if columns.is_empty() {
+        return Err(FileProblem::Empty);
+    }
+    Ok(columns)
+}
+
+/// What `schemaic import` will load, and what it says about the rest.
+#[derive(Debug)]
+pub struct ImportPlan {
+    pub mapping: Mapping,
+    /// A line of stderr per file column left out that nobody `--skip`ped.
+    pub notes: Vec<String>,
+}
+
+/// The mapping for `file_columns` into `table` — the app's automatic one,
+/// corrected by the flags — or why there is none to load.
+///
+/// **Every decision between reading the file and checking it**, in one place
+/// a test reaches: which `has_header` the automatic mapping is told (a JSON
+/// file always has its keys), the overrides, and the refusal of a mapping
+/// that inserts nothing.
+pub fn plan_mapping(
+    file_columns: &[String],
+    format: ImportFormat,
+    cfg: &ReadConfig,
+    table: &TableInfo,
+    maps: &[(String, String)],
+    skips: &[String],
+) -> Result<ImportPlan, String> {
+    use schemaic_core::import::{auto_map, insert_columns};
+    let has_header = cfg.dialect.has_header || format == ImportFormat::Json;
+    let auto = auto_map(file_columns, table, has_header);
+    let mapping = apply_overrides(auto.clone(), file_columns, table, maps, skips)?;
+    if insert_columns(&mapping, table).is_empty() {
+        return Err(format!(
+            "no column of the file matches a column of {}; --map one, e.g. --map 'file_column={}'",
+            table.name,
+            table
+                .columns
+                .first()
+                .map(|c| c.name.as_str())
+                .unwrap_or("column")
+        ));
+    }
+    let notes = skipped(&auto, &mapping, file_columns, table, skips);
+    Ok(ImportPlan { mapping, notes })
+}
+
 /// `mapping` with the `--map` and `--skip` flags applied, or why one of them
 /// cannot be.
 ///
@@ -127,13 +231,23 @@ pub fn apply_overrides(
     skips: &[String],
 ) -> Result<Mapping, String> {
     let table_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
-    let file_index = |name: &str| {
-        position(file_columns, name).ok_or_else(|| {
-            format!(
-                "the file has no column '{name}'; it has {}",
-                file_columns.join(", ")
-            )
-        })
+    // **A name the file has twice is refused**: no flag can say which one it
+    // means, and reaching the first — the matched one — left both out.
+    let file_index = |name: &str| match positions(file_columns, name).as_slice() {
+        [] => Err(format!(
+            "the file has no column '{name}'; it has {}",
+            file_columns.join(", ")
+        )),
+        [i] => Ok(*i),
+        several => Err(format!(
+            "the file has more than one column '{name}' (columns {}); a flag can't say \
+             which it means — rename one in the file",
+            several
+                .iter()
+                .map(|i| (i + 1).to_string())
+                .collect::<Vec<_>>()
+                .join(" and ")
+        )),
     };
     // Resolved first, so "mapped and skipped" is asked of the column the two
     // flags reach — `--map Name=name --skip name` name one column, spelled two
@@ -180,19 +294,59 @@ pub fn apply_overrides(
     Ok(mapping)
 }
 
-/// The file columns `mapping` leaves out, each with how to bring it in —
-/// said on stderr, since a column silently not imported is data lost without
-/// anyone deciding to lose it. `skips` are the ones the user left out on
-/// purpose, which need no sentence.
-pub fn skipped(mapping: &Mapping, file_columns: &[String], skips: &[String]) -> Vec<String> {
+/// The file columns `mapping` leaves out, each with why and how to bring it
+/// in — said on stderr, since a column silently not imported is data lost
+/// without anyone deciding to lose it. `auto` is the mapping before the
+/// flags, which tells a column a `--map` displaced from one nothing matched;
+/// `skips` are the ones the user left out on purpose, which need no sentence.
+///
+/// **Asked by position, not by name**: one `--skip name` used to silence
+/// every column of that name. A name the file has twice gets no advice to
+/// flag it, since [`apply_overrides`] refuses that flag.
+pub fn skipped(
+    auto: &Mapping,
+    mapping: &Mapping,
+    file_columns: &[String],
+    table: &TableInfo,
+    skips: &[String],
+) -> Vec<String> {
+    let skipped_on_purpose: Vec<usize> = skips
+        .iter()
+        .filter_map(|s| position(file_columns, s))
+        .collect();
     mapping
         .targets
         .iter()
         .zip(file_columns)
-        .filter(|(t, name)| **t == Target::Skip && position(skips, name).is_none())
-        .map(|(_, name)| {
+        .enumerate()
+        .filter(|(i, (t, _))| **t == Target::Skip && !skipped_on_purpose.contains(i))
+        .map(|(i, (_, name))| {
+            if positions(file_columns, name).len() > 1 {
+                return format!(
+                    "the file's column '{name}' (column {}) is not imported: another column \
+                     has the same name; rename one in the file to import both",
+                    i + 1
+                );
+            }
+            let taker = |t: usize| {
+                let at = mapping
+                    .targets
+                    .iter()
+                    .position(|m| *m == Target::Column(t))?;
+                file_columns.get(at)
+            };
+            let why = match auto.targets.get(i) {
+                Some(Target::Column(t)) => match taker(*t) {
+                    Some(by) => format!(
+                        "its match '{}' was given to '{by}' by --map",
+                        table.columns[*t].name
+                    ),
+                    None => "a flag took its match".to_string(),
+                },
+                _ => "no table column matches it".to_string(),
+            };
             format!(
-                "the file's column '{name}' is not imported: no table column matches it; \
+                "the file's column '{name}' is not imported: {why}; \
                  --map '{name}=<column>' to import it, or --skip '{name}' to say so"
             )
         })
@@ -356,9 +510,9 @@ mod tests {
         let t = table();
         let file = cols(&["name", "nick"]);
         let auto = schemaic_core::import::auto_map(&file, &t, true);
-        let m = apply_overrides(auto, &file, &t, &[map("nick=name")], &[]).unwrap();
+        let m = apply_overrides(auto.clone(), &file, &t, &[map("nick=name")], &[]).unwrap();
         assert_eq!(m.targets, vec![Target::Skip, Target::Column(1)]);
-        assert_eq!(skipped(&m, &file, &[]).len(), 1);
+        assert_eq!(skipped(&auto, &m, &file, &t, &[]).len(), 1);
     }
 
     #[test]
@@ -366,9 +520,9 @@ mod tests {
         let t = table();
         let file = cols(&["name", "email"]);
         let auto = schemaic_core::import::auto_map(&file, &t, true);
-        let m = apply_overrides(auto, &file, &t, &[], &cols(&["email"])).unwrap();
+        let m = apply_overrides(auto.clone(), &file, &t, &[], &cols(&["email"])).unwrap();
         assert_eq!(m.targets, vec![Target::Column(1), Target::Skip]);
-        assert!(skipped(&m, &file, &cols(&["email"])).is_empty());
+        assert!(skipped(&auto, &m, &file, &t, &cols(&["email"])).is_empty());
     }
 
     /// **A flag naming nothing is refused, never ignored** — a misspelt
@@ -404,11 +558,104 @@ mod tests {
         let t = table();
         let file = cols(&["name", "age"]);
         let m = schemaic_core::import::auto_map(&file, &t, true);
-        let notes = skipped(&m, &file, &[]);
+        let notes = skipped(&m, &m, &file, &t, &[]);
         assert_eq!(notes.len(), 1);
         assert!(
             notes[0].contains("'age'") && notes[0].contains("--map") && notes[0].contains("--skip")
         );
+    }
+
+    /// The plan as `run_import` composes it — the file's columns, then the
+    /// mapping — over in-memory bytes.
+    fn plan(
+        bytes: &'static str,
+        file: &str,
+        reading: &Reading,
+        maps: &[(String, String)],
+        skips: &[String],
+    ) -> Result<(Vec<String>, ImportPlan), String> {
+        let (format, cfg) = read_config(file, reading, Some(bytes.as_bytes()))?;
+        let open = || Ok::<_, std::io::Error>(bytes.as_bytes());
+        let columns = file_columns(open, format, &cfg).map_err(|e| e.message(file))?;
+        let p = plan_mapping(&columns, format, &cfg, &table(), maps, skips)?;
+        Ok((columns, p))
+    }
+
+    /// **Every key of a JSON file is a column**, not only the first record's —
+    /// a key the first record omits (a null an export left out) was dropped
+    /// from every row, silently.
+    #[test]
+    fn a_json_key_first_seen_after_record_one_is_imported() {
+        let json = r#"[{"id":"1","name":"a"},{"id":"2","name":"b","email":"b@x"}]"#;
+        let (columns, p) = plan(json, "p.json", &Reading::default(), &[], &[]).unwrap();
+        assert!(columns.contains(&"email".to_string()), "{columns:?}");
+        let at = columns.iter().position(|c| c == "email").unwrap();
+        assert_eq!(p.mapping.targets[at], Target::Column(2));
+    }
+
+    /// **A JSON file has no header to leave out**: `--no-header` there paired
+    /// its sorted keys with the table's columns by position.
+    #[test]
+    fn no_header_is_refused_on_a_json_file() {
+        let no_header = Reading {
+            no_header: true,
+            ..Default::default()
+        };
+        assert!(read_config("p.json", &no_header, None).is_err());
+        assert!(read_config("p.csv", &no_header, None).is_ok());
+        assert!(read_config("p.xlsx", &no_header, None).is_ok());
+    }
+
+    /// **A flag cannot say which of two same-named columns it means**, so it is
+    /// refused — `--skip name` reached the matched one and left both out.
+    #[test]
+    fn a_flag_naming_a_duplicated_column_is_refused() {
+        let csv = "name,email,name\nann,a@x,Ann\n";
+        let why = plan(csv, "p.csv", &Reading::default(), &[], &cols(&["name"])).unwrap_err();
+        assert!(why.contains("more than one"), "{why}");
+        let why = plan(csv, "p.csv", &Reading::default(), &[map("name=name")], &[]).unwrap_err();
+        assert!(why.contains("more than one"), "{why}");
+        // Unflagged, the second one is said, and not with advice that would
+        // be refused.
+        let (_, p) = plan(csv, "p.csv", &Reading::default(), &[], &[]).unwrap();
+        assert_eq!(p.notes.len(), 1, "{:?}", p.notes);
+        assert!(p.notes[0].contains("same name") && !p.notes[0].contains("--skip"));
+    }
+
+    /// **A column a `--map` displaced is said as displaced**, not as one no
+    /// table column matches.
+    #[test]
+    fn a_displaced_column_is_said_to_be_displaced() {
+        let csv = "name,nick\nann,a\n";
+        let (_, p) = plan(csv, "p.csv", &Reading::default(), &[map("nick=name")], &[]).unwrap();
+        assert_eq!(p.notes.len(), 1);
+        assert!(
+            p.notes[0].contains("'name'")
+                && p.notes[0].contains("'nick'")
+                && !p.notes[0].contains("no table column"),
+            "{}",
+            p.notes[0]
+        );
+    }
+
+    /// **An empty file is said to be empty**, not answered with a `--map` the
+    /// next run refuses.
+    #[test]
+    fn an_empty_file_is_said_to_be_empty() {
+        for (bytes, file) in [("", "p.csv"), ("[]", "p.json")] {
+            let why = plan(bytes, file, &Reading::default(), &[], &[]).unwrap_err();
+            assert!(why.contains("empty"), "{file}: {why}");
+        }
+    }
+
+    /// **A file that can't be parsed is the file's problem** (exit 7), not a
+    /// usage error.
+    #[test]
+    fn an_unparseable_file_is_a_file_problem() {
+        let (format, cfg) = read_config("p.json", &Reading::default(), None).unwrap();
+        let open = || Ok::<_, std::io::Error>(&b"[1, 2]"[..]);
+        let e = file_columns(open, format, &cfg).unwrap_err();
+        assert!(matches!(e, FileProblem::Unreadable(_)), "{e:?}");
     }
 
     #[test]

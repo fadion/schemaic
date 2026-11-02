@@ -17,7 +17,8 @@ transaction); and `missing_required` warns on `!nullable && !auto_increment && d
 for the load. **There are two drivers of that contract, and neither has a copy of it**: the
 import modal (`ui/import_view.rs`, through `SchemaActions::import_run`) and `schemaic import` (`cli/run.rs`'s
 `run_import`, with `cli/import.rs` standing in for the person at the preview — the header is
-the flag's there rather than `sniff`'s guess, and `--map`/`--skip` correct `auto_map`'s answer).
+the flag's there rather than `sniff`'s guess, a JSON file's columns are `json_columns`' rather
+than a sample's, and `--map`/`--skip` correct `auto_map`'s answer).
 **A row the stream cannot hand over is a `RowError`, not a sentence** —
 `RowIter`'s item is `Result<Vec<Value>, RowError>`, and so is `db::RowSource`'s, which a copy's
 read feeds too: `Issue` is `RowCtx::row`'s backstop for a file that changed underneath the
@@ -98,7 +99,16 @@ and returned by `WHERE NOT flag`. PostgreSQL, which rejects the integer for a re
 the exception rather than the default; SQL Server's `bit` takes `1`/`0`. With the second a
 `match` too, this file has no entry left in `engine_comparison_gate`'s budget. Note JSON columns are the union of every object's keys and the mapping is
 built from a *sample* — `trim_to_mapping` drops keys that first appear past it (CSV keeps the
-field-count check, where a mismatch means a stray delimiter). An array and JSON Lines read
+field-count check, where a mismatch means a stray delimiter). **That is safe only where somebody
+previews the sample**, which is why `json_columns` exists: every key of every record, in the
+order `json_records` emits a record's fields (first seen, each object's own keys sorted), so a
+mapping built on it covers every field the load will read. `schemaic import` built its mapping
+from a one-record `probe_sample`, and with `trim_to_mapping` behind it every key the *first*
+record lacked — a null an export left out — was dropped from every row with nothing said. It is
+a whole-file pass, one record deserialized at a time as a `serde_json::Value`, and a record
+that is not an object is `NotObjects` (`json_columns_read_every_record_in_the_readers_order`). **The app has the same
+shape, latent and not fixed**: its mapping is built on the 200-record preview, so a key first
+seen past record 200 is dropped there too. An array and JSON Lines read
 through one path: `ArrayUnwrap` blanks the wrapping brackets + top-level commas as bytes
 stream past, so a sample really stops at its limit instead of deserializing the file first
 (a whole-file walk still buffers, for the key union). CSV's NULL tokens match the *trimmed*

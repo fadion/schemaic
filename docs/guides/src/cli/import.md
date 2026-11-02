@@ -27,12 +27,16 @@ The format comes from the file's extension, or from `--format csv`, `json` or `x
 - `--null TEXT` says which field means `NULL`; repeat it for several (`--null NULL --null '\N'`).
   Without it, an empty field is `NULL`.
 - `--trim` strips the spaces around every field.
+- A JSON file's columns are every key that appears in any record. A record that leaves a key out
+  gives that column `NULL`.
 
 A flag for another format — `--sheet` on a CSV, `--delimiter` on a JSON file — is refused rather
 than ignored.
 
 The first row is always read as the header. Unlike in the app, there is no preview to catch a
 wrong guess, so it is never guessed: if the file has no header row, say so with `--no-header`.
+It's for CSV and Excel files; a JSON file's keys are its header, and `--no-header` on one is
+refused.
 
 ## Matching the columns
 
@@ -44,8 +48,10 @@ Each column in the file is matched to the table column of the same name, ignorin
 - `--skip notes` leaves the file's `notes` column out.
 
 Repeat either for each column. A flag naming a column the file or the table doesn't have is
-refused, so a misspelt `--skip` can't quietly import the column it meant to keep out. Columns the
-database fills in itself, such as generated columns, take no value from a file.
+refused, so a misspelt `--skip` can't quietly import the column it meant to keep out. So is one
+naming a column the file has more than once, since it can't say which it means — rename one in
+the file. Columns the database fills in itself, such as generated columns, take no value from a
+file.
 
 Before loading, stderr names every file column that isn't going in, with the flags that settle
 it:
@@ -53,6 +59,10 @@ it:
 ```text
 schemaic: the file's column 'extra' is not imported: no table column matches it; --map 'extra=<column>' to import it, or --skip 'extra' to say so
 ```
+
+A column a `--map` took the match from is said to be
+(`its match 'name' was given to 'nick' by --map`), and of two file columns with the same name, the
+second isn't imported until you rename one in the file.
 
 It also warns about a column that can't be `NULL`, has no default, and that nothing in the file
 fills — the load will most likely fail on it.
@@ -67,6 +77,10 @@ wrong, nothing is written. The first 20 problems go to stderr, and the command e
 schemaic: line 2, column age: not a whole number ("notanumber")
 schemaic: people.csv was not imported; nothing was written
 ```
+
+The same exit code, with nothing written, meets a file that can't be read as its format at all —
+JSON that isn't valid or isn't objects, a CSV that isn't UTF-8, a broken workbook — or one that is
+empty.
 
 Fix the file and run it again. Otherwise the rows go in inside one transaction:
 

@@ -433,14 +433,19 @@ write with nowhere to go is a guard-shaped refusal, as `exec`'s `Block(GuardReas
 is — where the read commands' (`dump`, `tables`, `describe`) want of one is exit 2. Then the file, all before anything is dialled: the first 64 KiB
 as the CSV sniffer's head, an unreadable file being exit 2; `import::read_config` (`cli/import.rs`),
 whose refusals are exit 2; `core::import::xlsx_size_refusal`, exit 2, and `memory_warning`, a
-warning only — both the modal's; and `probe_sample` for the file's column names alone, the check
-below reading every row anyway. Then `connect` under `query::DEFAULT_TIMEOUT` and a fresh
+warning only — both the modal's; and `import::file_columns` for the file's column names alone —
+for JSON every record's keys, the check below reading every row anyway. **A file that cannot be
+parsed, or holds no columns, is exit 7**, `Exit::Rejected`, through `file_rejected`: its
+`FileProblem` line, then "<file> was not imported; nothing was written", the sentence a caller
+branching on 7 reads. It was exit 2, a usage error, though the command line was right and the fix
+is in the file; the check's and the reader's own read errors below end the same way. Then `connect` under `query::DEFAULT_TIMEOUT` and a fresh
 `Db::fetch_schema` under `with_deadline` at the same bound (a failure or timeout exit 4); `-t`
 resolved by `resolve_tables`, `dump -t`'s resolver, over that schema and then looked up with
 `find_by_display` (`cli/import.rs` has why not the lenient lookup), a table that is not there, a
-bare name two schemas share, or a view being exit 2. Then the mapping: `auto_map` over the file's columns, corrected by
+bare name two schemas share, or a view being exit 2. Then the mapping, `import::plan_mapping`'s
+(`cli/import.rs` has its steps): `auto_map` over the file's columns, corrected by
 `import::apply_overrides` (a refusal exit 2), and **nothing mapped is exit 2 naming `--map`**,
-`insert_columns` being empty. A column left out is `import::skipped`'s sentence on stderr, and
+`insert_columns` being empty. A column left out is one of the plan's `notes` on stderr, and
 `Mapping::missing_required` a warning that the load will likely fail — both warnings, the
 modal's, not refusals. **Pass 1 is `validate` over the whole file on `spawn_blocking`**, collecting
 up to `IMPORT_MAX_ISSUES` (200, the app's figure) and printing the first `IMPORT_SHOWN_ISSUES`
@@ -462,7 +467,8 @@ cancel and to check the table before importing again. **It writes the app's reco
 <db.schema.table>` — `import_run`'s own shape — stamped after the check and ended `ok` with the
 row count, `failed` with the message, `cancelled` for either late error, and `unknown` for
 `Late(None)`, appended through `append_to_write_log` with its exit-status-preserving warning.
-No unit test drives `run_import`, so its order is the code's.
+No unit test drives `run_import`, so its order is the code's; what it decides between reading the
+file and checking it is `file_columns` and `plan_mapping`, which `cli/import.rs`'s tests compose.
 **`mcp` is `serve_mcp`, and it keeps the order that makes exit 3 true.** `select_conn` first, so
 `cli_access` gates it like every subcommand: a connection the user never exposed is exit 3 and
 an unknown one exit 2, before the keyring is read, and the MCP client shows a server that failed
@@ -514,7 +520,8 @@ one's did, and the tunnels already opened drop with it. `mcp_refuses_a_connectio
 exposed-then-unexposed pair refused with the exposed one's host never dialled, and a duplicate
 `-c` a usage error.
 **A `--url` is one more connection in that list, after the `-c`s**, so with any of them it is not
-the default. It becomes a `ConnArgs { url, stdin_is_protocol }` and goes through the same `select_conn`, so
+the default — which is why a `-c` that came from an exported `SCHEMAIC_CONNECTION` never gets
+here beside one, being refused at parse time (`cli/args.rs`). It becomes a `ConnArgs { url, stdin_is_protocol }` and goes through the same `select_conn`, so
 `one_off_connection`'s rules hold here as everywhere — a secret in the URL, or a sign-in as the
 user, refused, exit 2, and `cli_access` implied. Its password is `SCHEMAIC_PASSWORD`'s alone (`connect`'s URL branch),
 stdin being the protocol's. **Its AI data level is `--ai-data`'s, else `AiData::SchemaOnly`** — a

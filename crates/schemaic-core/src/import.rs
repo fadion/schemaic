@@ -2102,6 +2102,37 @@ pub fn read_json_columns<R: std::io::Read>(r: R) -> Result<Sample, ImportError> 
     })
 }
 
+/// Every key of every record of a JSON file, in the order [`json_records`]
+/// emits a record's fields — first seen, each object's own keys sorted — so
+/// a mapping built on it covers every field the load will read.
+///
+/// **For a mapping nobody previews.** A sample's columns are the keys of the
+/// records it read; [`trim_to_mapping`] then drops every key first seen after
+/// them, which in the app is a key past its 200-record preview and in the CLI
+/// was any key the *first* record omitted — a null an export left out, gone
+/// from every row with nothing said. Each record is read as a
+/// `serde_json::Value` and dropped before the next, so the pass holds one
+/// record at a time, not the file — a `Value` rather than
+/// [`read_json_columns`]' `IgnoredAny` map so that a record that is not an
+/// object is [`ReadRefusal::NotObjects`], as the reader says it.
+pub fn json_columns<R: std::io::Read>(r: R) -> Result<Vec<String>, ImportError> {
+    let mut columns: Vec<String> = Vec::new();
+    let stream =
+        serde_json::Deserializer::from_reader(ArrayUnwrap::new(r)).into_iter::<serde_json::Value>();
+    for v in stream {
+        let v = v.map_err(|e| ImportError::Read(e.to_string()))?;
+        let serde_json::Value::Object(map) = v else {
+            return Err(ImportError::Refused(ReadRefusal::NotObjects));
+        };
+        for k in map.keys() {
+            if !columns.iter().any(|c| c == k) {
+                columns.push(k.clone());
+            }
+        }
+    }
+    Ok(columns)
+}
+
 /// The mapping step's sample for a file, **falling back to its column list when
 /// the preview cannot be built from a prefix**.
 ///
@@ -5923,6 +5954,24 @@ mod tests {
             s.rows[1],
             vec![Some("3".to_string()), Some("2".to_string())]
         );
+    }
+
+    /// **`json_columns` is every key of the whole file, in the reader's
+    /// order** — the order `row_iter` emits a record's fields in, which a
+    /// mapping built on it has to match; a non-object is refused as the
+    /// reader refuses it, and `[]` has no columns.
+    #[test]
+    fn json_columns_read_every_record_in_the_readers_order() {
+        let json = r#"[{"b": 1}, {"a": 2, "b": 3}, {"c": null}]"#;
+        let all = read_sample(json.as_bytes(), ImportFormat::Json, &cfg(true), 100).unwrap();
+        assert_eq!(json_columns(json.as_bytes()).unwrap(), all.columns);
+        assert_eq!(all.columns, vec!["b", "a", "c"]);
+        assert!(matches!(
+            json_columns(&b"[1]"[..]),
+            Err(ImportError::Refused(ReadRefusal::NotObjects))
+        ));
+        assert!(json_columns(&b"[]"[..]).unwrap().is_empty());
+        assert!(json_columns(&b"{\"a\":1}\n{\"b\":2}\n"[..]).unwrap() == ["a", "b"]);
     }
 
     /// Within one object the keys arrive alphabetically, not in document order —

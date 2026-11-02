@@ -65,7 +65,8 @@ pub enum Exit {
     /// stderr. Not 4: nothing failed, and retrying returns the same cap.
     Capped = 6,
     /// `import`: the file was checked whole and has problems, each listed on
-    /// stderr; nothing was written. Not 3: no guard refused, and the fix is
+    /// stderr — or could not be read as a file of its format at all, or is
+    /// empty; nothing was written. Not 3: no guard refused, and the fix is
     /// in the file — not 2, since the command line was right.
     Rejected = 7,
 }
@@ -2396,6 +2397,15 @@ struct ImportLoad<'a> {
     skips: &'a [String],
 }
 
+/// The end of an import whose file could not be read as one — unparseable,
+/// not objects, empty: [`Exit::Rejected`], since the command line was right
+/// and the fix is in the file, with the sentence a caller branching on 7
+/// reads. Nothing was written.
+fn file_rejected(name: &str) -> Exit {
+    warn(&format!("{name} was not imported; nothing was written"));
+    Exit::Rejected
+}
+
 /// How many problems the check collects before it stops counting, as the
 /// app's import does, and how many of them are printed.
 const IMPORT_MAX_ISSUES: usize = 200;
@@ -2476,12 +2486,13 @@ async fn run_import(
     if let Some(w) = core_import::memory_warning(format, file_bytes) {
         warn(&w.message());
     }
-    // The file's columns, and nothing else: the check below reads every row.
-    let columns = match core_import::probe_sample(&open, format, &cfg, 1) {
-        Ok(sample) => sample.columns,
-        Err(e) => {
-            warn(&format!("{name}: {e}"));
-            return Exit::Usage;
+    // The file's columns as the load will read them — for JSON, every
+    // record's keys — and nothing else: the check below reads every row.
+    let columns = match crate::import::file_columns(&open, format, &cfg) {
+        Ok(columns) => columns,
+        Err(problem) => {
+            warn(&problem.message(&name));
+            return file_rejected(&name);
         }
     };
 
@@ -2534,30 +2545,18 @@ async fn run_import(
         ));
         return Exit::Usage;
     }
-    let mapping = core_import::auto_map(&columns, &table, cfg.dialect.has_header);
-    let mapping =
-        match crate::import::apply_overrides(mapping, &columns, &table, load.maps, load.skips) {
-            Ok(m) => m,
+    let plan =
+        match crate::import::plan_mapping(&columns, format, &cfg, &table, load.maps, load.skips) {
+            Ok(p) => p,
             Err(why) => {
                 warn(&why);
                 return Exit::Usage;
             }
         };
-    if core_import::insert_columns(&mapping, &table).is_empty() {
-        warn(&format!(
-            "no column of {name} matches a column of {}; --map one, e.g. --map 'file_column={}'",
-            table.name,
-            table
-                .columns
-                .first()
-                .map(|c| c.name.as_str())
-                .unwrap_or("column")
-        ));
-        return Exit::Usage;
+    for note in &plan.notes {
+        warn(note);
     }
-    for note in crate::import::skipped(&mapping, &columns, load.skips) {
-        warn(&note);
-    }
+    let mapping = plan.mapping;
     let missing = mapping.missing_required(&table);
     if !missing.is_empty() {
         warn(&format!(
@@ -2591,7 +2590,7 @@ async fn run_import(
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             warn(&format!("{name}: {e}"));
-            return Exit::Usage;
+            return file_rejected(&name);
         }
         Err(e) => {
             warn(&format!("the file check stopped unexpectedly: {e}"));
@@ -2627,7 +2626,7 @@ async fn run_import(
         Ok(Ok(it)) => it,
         Ok(Err(e)) => {
             warn(&format!("{name}: {e}"));
-            return Exit::Usage;
+            return file_rejected(&name);
         }
         Err(e) => {
             warn(&format!("the file reader stopped unexpectedly: {e}"));
