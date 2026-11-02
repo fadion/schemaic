@@ -59,6 +59,14 @@ one of sqlcmd's commands — `:setvar Region West`, `:r .\seed.sql`, `:on error 
 script talking to sqlcmd, and the bar asked for parameters `setvar`, `r` and `on`
 (`a_sqlcmd_command_line_is_not_a_parameter`). Not first on its line, or not a command, a `:name`
 is a placeholder as anywhere else.
+**Textual substitution can also *make* a comment, so a value starting with `-` is never spliced
+straight after a `-`.** `3-:n` with `-1` sent `3--1`, a line comment on PostgreSQL, SQLite and
+SQL Server, and the rest of the line — a later `WHERE` condition included — was dropped without
+a word; MySQL, whose `--` needs a space after it, computed it. `apart_from` puts one space
+between them, valid wherever the number is and added only there, and `template_position` asks
+the same question so the error positions it maps back still land
+(`a_negative_number_after_a_minus_is_not_a_comment`, which also runs `skip_noncode` over what
+was sent on all four dialects).
 `prepare_run` is the pair the run action calls — substitute, then `sql::run_verdict` on the
 result — so the ordering is structural rather than a rule a caller has to remember, and
 `strip_param_diagnostics` drops the reports `neutralize`'s own rewrite caused. Pure +

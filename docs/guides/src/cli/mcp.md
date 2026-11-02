@@ -69,6 +69,9 @@ Repeat `-c` to serve more than one connection from the same server:
 - A connection given twice is refused.
 - A [`--url`](#without-a-saved-connection) can join them. It's served after the `-c`s, so it's
   never the default, and it can't share a name with a saved connection being served.
+  The `-c` has to be typed: `--url` with `SCHEMAIC_CONNECTION` set is refused, so a connection
+  exported in your shell can't become the agent's default unnoticed. Unset it, or name it with
+  `-c` to serve both.
 
 The server takes no password for a saved connection. It reads it from the OS keyring, so nothing
 secret goes into the client's configuration file — however many connections it serves.

@@ -237,7 +237,16 @@ one. Unlike `ConnArgs`, `-c` has no `conflicts_with = "url"`: both are served, n
 above the other — **which is why `mcp`'s `--url` reads no `SCHEMAIC_URL`**: beside a typed `-c`,
 an exported one would quietly add a connection to the agent's server, where a one-connection
 command refuses the pair (`ConnArgs::source`). A URL served to an agent is typed into the client's
-config or not served at all. The level's absence and
+config or not served at all. **The same holds the other way round: an exported
+`SCHEMAIC_CONNECTION` beside `--url` is refused** (`ArgumentConflict`, naming the variable), since
+the variable did not give way to the URL as it does everywhere else — it became the server's
+first, *default* connection, `-d` landing on it, and every tool call naming none read the
+developer's own connection while the person believed the agent was on the URL's. clap has no way
+to say "conflicts only when it came from the environment", so `parse_argv` is now `parse_with`,
+which asks `refuse_an_exported_connection_beside_a_url` of the matches — `value_source` being
+`EnvVariable` — before they become a `Cli`; a typed `-c` beside `--url` still serves both, as
+asked, and the variable alone still serves (`mcp_refuses_an_exported_connection_beside_a_url`,
+which points the arg's `env` at a variable no other test reads). The level's absence and
 `--ai-data` without a `--url` are `run.rs`'s to settle (`mcp_takes_a_url_and_its_data_level`,
 which also holds `mcp` with neither `-c` nor `--url` to a parse error).
 **`wants_cli` is the routing predicate, and it is an allowlist of the *first* argument rather
