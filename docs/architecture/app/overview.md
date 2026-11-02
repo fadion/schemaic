@@ -1178,9 +1178,12 @@ copies the saved connection's `read_only` into the endpoint's, and `endpoint_fro
 `false`, so a rewritten blob cannot tell the tool a read-only connection takes writes (a blob
 with no `conn_id` therefore gets `false` whatever the connection is). `saved_db` hands back the
 saved `Connection` itself, where it used to return a `(Db, AiData, String)` of two of its fields.
-`the_subprocess_connects_where_the_saved_connection_points` asserts the name and
-the flag (its fixture is read-only, so the flag is the saved one's and not a default that
-agrees) — of `saved_db`'s answer, not of the endpoint `endpoint_from_blob` builds from it.
+Both halves are tested. `the_subprocess_connects_where_the_saved_connection_points` asserts the
+name and the flag of `saved_db`'s answer (its fixture is read-only, so the flag is the saved one's
+and not a default that agrees); `the_saved_data_level_bounds_the_blobs_samples` asserts them of
+the endpoint `endpoint_from_blob` builds — a forged blob carrying `"read_only": false` and
+`"connection_name": "elsewhere"` still gets the saved `audit_as` and `read_only`, and a blob with
+no `conn_id` gets `None` and `false`.
 What stays the blob's is the session's choice:
 the selected `database`, `schema` and `hidden`. **The residual**: the
 tunnel port is still the blob's, so a same-user process that rewrites it can point the subprocess
@@ -1314,7 +1317,11 @@ path states in a comment and this one had backwards, and clears them uncondition
 behind `harness == Harness::OpenCode`. **That list is `inherited_env_to_clear()` now, one function
 both spawns call**: OpenCode's `env_remove` chained with Copilot's, so the one-shot and the chat
 turn cannot come to clear different sets. It used to be OpenCode's list alone, which was complete
-only while OpenCode was the only harness isolated by its environment.
+only while OpenCode was the only harness isolated by its environment. **And the CLI's `--url`
+password variable after them** — `schemaic_core::PASSWORD_ENV` (`SCHEMAIC_PASSWORD`), moved from
+`cli/run.rs` into core so this crate could name it: exported in the terminal the app was started
+from, it reached every harness's shell, where a `printenv` hands an agent the database password
+(release review R1-L2-02, `the_clis_password_variable_is_cleared_from_every_agent`).
 `no_seal_variable_is_also_cleared` pins the disjointness the clear-then-set order leans on — no
 lever (`XDG_CONFIG_HOME`, `OPENCODE_DISABLE_PROJECT_CONFIG`, `COPILOT_HOME`) is ever in the list,
 since a lever there would strip its own harness's isolation while the panel reported it sealed —

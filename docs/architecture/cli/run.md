@@ -94,8 +94,9 @@ then shadows `let conn = &*conn;`, so nothing downstream knows which it got. In 
 `--url` connection never asks the keyring**: it was never saved, so the keyring holds nothing of
 it, and its id is the parser's placeholder `0`, which could name another connection's entries
 there. Its password is the pipe's, else the `SCHEMAIC_PASSWORD` environment variable
-(`PASSWORD_ENV` — an environment variable is not argv, and a CI secret store hands one over that
-way), else empty; a saved connection ignores that variable and is hydrated through
+(`schemaic_core::PASSWORD_ENV` — an environment variable is not argv, and a CI secret store hands one over that
+way; in core rather than here because the app clears it from every AI agent it spawns,
+`ai::inherited_env_to_clear`), else empty; a saved connection ignores that variable and is hydrated through
 `hydrate_for_cli` as before. Nothing about a URL connection is saved. The no-database hint goes
 through `no_database_hint_for(&ConnArgs, how)`, which for a URL says to pass `-d` or end the URL
 with `/<database>` — `schemaic databases -c <name>`, the saved form's advice, names nothing a URL
@@ -550,6 +551,15 @@ of a lone connection. With several, a connection below *Let it read data* has it
 have them listed. And the no-default-database hint offers `-d` only on the first line — `-d` is
 the first connection's — telling a later one to name `database` per call or pick a default for it
 in Schemaic (`the_mcp_notice_explains_a_withheld_query_tool`,
+`the_mcp_notice_says_when_there_is_no_default_database`). **A `--url` connection (id `0`) gets the
+URL's version of that hint** — `schemaic databases --url <the same URL>` where a saved one gets
+`databases -c <name>`, and "put one in its URL" where a saved one is told to pick a default in
+Schemaic — since it has neither a name `-c` knows nor settings in the app (release review
+R2-L8-03, the same test). **With several, each connection is announced before it is opened**:
+`mcp_connecting(conn, several)` is `schemaic mcp: connecting '<name>'` on stderr ahead of its
+`connect`, `None` with one. What opening it says — a keyring notice, a tunnel that failed, worded
+for a one-connection command — otherwise followed the *previous* connection's notice line and read
+as being about it (release review S6-L1-05, pinned in
 `the_mcp_notice_says_when_there_is_no_default_database`). The names a tool call's `connection`
 picks by are the saved `conn.name`s, while `-c` also takes an id or `#<id>`: a server started with
 `-c 3` is still addressed as its connection's name, which `list_connections` and the notice both

@@ -5388,6 +5388,13 @@ mod tests {
         }
     }
 
+    /// **The CLI's `--url` password variable never reaches an agent.** It is
+    /// the one database secret the app knows by name in its own environment.
+    #[test]
+    fn the_clis_password_variable_is_cleared_from_every_agent() {
+        assert!(inherited_env_to_clear().any(|k| k == schemaic_core::PASSWORD_ENV));
+    }
+
     /// **Clearing runs for every harness, so it must never clear any
     /// harness's own lever.** The removal list is unconditional and spans every
     /// harness whose isolation is an environment; each spawn clears first and
@@ -5400,13 +5407,6 @@ mod tests {
     ///
     /// Named literally, because both harnesses' `env()` need a directory to
     /// build and the suite touches no filesystem.
-    /// **The CLI's `--url` password variable never reaches an agent.** It is
-    /// the one database secret the app knows by name in its own environment.
-    #[test]
-    fn the_clis_password_variable_is_cleared_from_every_agent() {
-        assert!(inherited_env_to_clear().any(|k| k == schemaic_core::PASSWORD_ENV));
-    }
-
     #[test]
     fn no_seal_variable_is_also_cleared() {
         let cleared: Vec<&str> = inherited_env_to_clear().collect();

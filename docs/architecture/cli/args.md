@@ -77,7 +77,8 @@ to match, so two databases on one server is the short form. `-t`/`--table` repea
 `dump`'s does. **No `--password-stdin`**: with two connections it would be unclear whose
 password it was, so both sides come from the keyring. It takes no `--url` either. **No `OutputArgs`**, since what it prints
 is a script, not rows. Its `--timeout` is `COMPARE_TIMEOUT_SECS`, 120 s, because two whole
-catalogues are read and a large one takes longer than one statement's 30 s
+catalogues are read and a large one takes longer than one statement's 30 s — `pub(crate)`, since
+the MCP server's `compare_schemas` reads its catalogues under the same deadline (`cli/mcp.rs`)
 (`compare_takes_a_target_a_source_and_tables`, which holds `--password-stdin` and `--format`
 to parse errors and a blank `--source-database` to a validation error).
 **`import` takes a file, a table and the reading flags, and no statement**: the positional `FILE`,

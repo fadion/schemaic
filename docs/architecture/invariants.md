@@ -303,8 +303,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   one headless read path: the MCP server's `run_query` calls `read_only_query` too, rather than the CLI writing a
   second copy of the gate beside the one `mcp.rs` already had. Both live in `schemaic-cli` now, and
   `schemaic mcp` is a second way into that same server rather than a new path: its `run_query` is
-  the same call, the connection it serves has passed `cli/select.rs`'s `cli_access` gate like every
-  subcommand's, and the two tools that could lead toward a write, `propose_table_change` and
+  the same call, each connection it serves has passed `cli/select.rs`'s `cli_access` gate like every
+  subcommand's — or, for a `--url`, was typed by the person running it and is never saved
+  (`run.rs`'s `one_off_connection`, which implies `cli_access`) — and the two tools that could lead toward a write, `propose_table_change` and
   `propose_sql`, are not offered there at all. `propose_sql` asks `sql::run_verdict` itself, but
   as advice to the model and nothing more: it runs nothing and mints no request, and the statement
   the user runs from the panel's code block is judged again on the run action. The server's `explain` tool, and `schemaic explain` through the same
@@ -532,8 +533,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   action as well as at the menu: a menu built a moment before the connection was locked down is
   still on screen. The default (`OnRequest`) grants **no** automatic access — rows go only where
   the user attached them, so the gesture is the consent and there is no setting to forget.
-  **`schemaic mcp` asks `may_query` too**, of the saved connection it serves
-  (`mcp::Endpoint::standalone`): an outside client has no attach gesture, so `OnRequest` sends it
+  **`schemaic mcp` asks `may_query` too**, of each connection it serves
+  (`mcp::Endpoint::standalone`) — a saved one's level, a `--url` one's `--ai-data`'s, else
+  `SchemaOnly`: an outside client has no attach gesture, so `OnRequest` sends it
   no rows, and a level never chosen reads as that default rather than as the app's startup
   migration, whose legacy flag the CLI cannot see. And
   what is sent is kept honest at both ends: `result_shape` states out loud that no rows were sent,

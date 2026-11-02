@@ -79,7 +79,8 @@ rollback the server makes on the disconnect, in Schemaic's words for why it happ
 (`a_dropped_transaction_is_logged_as_the_rollback_the_server_made`).
 **Values are masked by default, because the SQL is the user's data.** An `UPDATE … SET email =
 'ann@example.com'` carries the very value a log kept for years should not hold in the clear.
-`line(entry, dialect, keep_values)` is the entry as the file holds it: unless `keep_values`
+`line(entry, dialect, keep_values)` is the entry as the file holds it — `masked(…)` serialised,
+the split letting the agent log cut the masked text before it serialises it: unless `keep_values`
 (`UiState::write_log_values`, off by default), `sql` goes through `mask_values` and `error`
 through `prompt::redact_engine_error`, which strips the values a uniqueness or not-null report
 quotes back. **A credential is masked whatever the setting says**: a statement

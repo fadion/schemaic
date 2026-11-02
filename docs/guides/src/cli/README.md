@@ -78,6 +78,8 @@ SCHEMAIC_PASSWORD="$DB_PASSWORD" schemaic query "SELECT 1" --url "mysql://app@db
   `user:pass@`, `password=`, but also `sslpassword=`, `passwd=` or `trustStorePassword=` — since a
   command line ends up in the process list and your shell history. Pipe the password with
   `--password-stdin` or set `SCHEMAIC_PASSWORD`, which is read only for a `--url` connection.
+  If it's set in the shell you start the app from, the app keeps it from the
+  [AI assistant's](../ai/README.md) agent.
 - *A password sign-in only.* A URL that signs in as you — Windows sign-in
   (`Integrated Security=true`) or Microsoft Entra (`Authentication=ActiveDirectoryDefault`) — is
   refused, as it would hand your identity to whatever host the URL names. So is an Entra method

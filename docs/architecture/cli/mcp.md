@@ -46,7 +46,8 @@ advice changes: a level that allows rows refuses nothing, and a refusal for anot
 serve loop). Before it, only the start-up notice said `--ai-data`, and every per-call refusal
 sent the user looking for a connection setting that does not exist.
 **`Endpoint` is the server's, and the app's `McpEndpoint` is an alias of it** — `db`,
-`database`, `samples`, `hidden`, `schema`, `host`, `audit_as`, `read_only` (the connection's
+`database`, `samples`, `hidden`, `schema`, `host`, `audit_as`, `audit_sink` (a test's in-memory
+agent log, below), `read_only` (the connection's
 read-only flag, which only `propose_sql` reads), `level_from_flag` (the level is `--ai-data`'s
 — set by `Endpoint::with_level_from_flag`, left `false` by `standalone` and by the app's panel
 blob). It was a struct in `app/ai.rs`, which this
@@ -84,7 +85,8 @@ argument too, which the SCHEMA eye's rule already allows for: `run_query` answer
 hidden database included.
 **Every call is recorded in the agent log (`core::agent_log`), refused ones included.**
 `call_tool` is now `answer` — the dispatch, refusals and the unknown-name reply included,
-returning `(text, is_error)` and awaited `Box::pin`ned — then `record` when the endpoint is
+returning an `Answer { text, is_error, rows }` and awaited `Box::pin`ned, `rows` set by the three
+arms that show rows (`run_query`, `sample_rows`, `describe_table`'s samples) — then `record` when the endpoint is
 audited, then the JSON wrap; a call the agent was refused is as much a part of what it tried as
 one it was given, so a gate's refusal and an unknown tool get a line too. `audit_as` is what
 decides it: the connection's saved name, set by the two front ends from the saved connection
@@ -94,11 +96,26 @@ itself (or, for `schemaic mcp --url`, the name `parse_url` suggested) — `serve
 `None` from `Endpoint::standalone` and every literal, so no test that drives the serve loop
 writes the user's log (`only_an_audited_endpoint_logs`). The line is the pure `audit_entry`: the
 tool, the database it ran in (`tool_database`, the call's own or the endpoint's), the `sql`
-argument, the `table` argument or else the `query` as its subject, the host as its `Caller`, and
-**an error's text only** — cut to `AUDIT_ERROR_CHARS` (500), and never a successful answer's,
-which is the rows the agent was shown (`the_agent_log_line_holds_the_ask_and_an_errors_reason_only`).
+argument, the `table` argument or else the `query` as its subject, the host as its `Caller`,
+**an error's text only** — never a successful answer's, which is the rows the agent was shown —
+and an answered call's row count (`the_agent_log_line_holds_the_ask_and_an_errors_reason_only`).
+The error is no longer cut here: `AUDIT_ERROR_CHARS` cut it before the masker saw it, which is
+how a long PostgreSQL value escaped redaction, so the cut is `agent_log::line_entry`'s, after the
+mask (`core/agent_log.rs`). **A `compare_schemas` line names the side it read from** as its
+subject — `from <source_connection, else this connection>.<source_database>` — since it read a
+second whole catalogue, and a call reading prod's was logged as a call on dev alone, `grep prod`
+finding nothing (release review R1-L2-01, `a_comparisons_line_names_its_source`). The
+`source_database` is the argument as given, not the database the comparison resolved.
 `record` reads `ui_state.json`'s `write_log_values` on every call, as `schemaic exec` does for
 the write log, and a failed append is a line on stderr, the server's log, never a failed call.
+**`Endpoint::audit_sink` is the seam that lets the record sites be tested**: an
+`AuditSink` (`Arc<Mutex<Vec<Entry>>>`) that `record` pushes the line into instead of the file,
+`None` everywhere outside tests. None of the four `record` sites had a test, since a test that
+drove one either wrote the user's log or, unaudited, recorded nothing
+(release review R2-L6-02). `every_call_is_recorded_under_the_connection_it_reached` drives the
+real serve loop over two audited endpoints and pins whether and under which name each call
+lands: a call naming `b`, `list_connections`, an unserved name, a refusal, a cross-connection
+comparison, and a `connection` that is not a string.
 Smoke-tested through `schemaic mcp` over stdio under a throwaway `APPDATA`: a `describe_table`,
 a refused `run_query` with its value masked and the refusal as its error, and an unknown tool
 each got their line.
@@ -310,7 +327,9 @@ and `every_database_read_carries_the_deadline` is the composition. That one took
 first shape measured a six-line window including comments, so the eight-line paragraph explaining
 the sample's deadline pushed the proof out of view and it reported a correct site. Comments are
 stripped before the window is measured now. It gained a floor of its own in the move
-(`tokens >= 4`), for the other gate's reason.
+(`tokens >= 4`), for the other gate's reason. Its window accepts `with_deadline_for(` beside
+`with_deadline(`, the same deadline under a duration of its own, which `compare_schemas`' two
+catalogue reads go through (below).
 **Both gates live in `ui/source_gate.rs`, as `mcp_deadline_gate`, not beside this file.** They
 need `source_gate::production_code`'s brace-aware cut, and this crate is Floem-free: a
 dev-dependency on `schemaic-ui` would compile Floem into its tests, and a second copy of the walk
@@ -318,13 +337,19 @@ is the thing `source_gate` exists to prevent. They read the file through
 `workspace_source("schemaic-cli/mcp.rs")`, which fails by name if the file moves again rather
 than scanning nothing.
 **One process can serve several connections, and one connection is still the server it always
-was.** `serve_on` takes a slice of `Named { name, endpoint }`; `serve(endpoint)` wraps one under
-the name `""` — the panel's `--mcp-serve` path, which has one and always will — and
+was.** `serve_on` takes a slice of `Named { name, endpoint }`; `serve(endpoint)` wraps one —
+the panel's `--mcp-serve` path, which has one and always will — under `sole_name`, the
+endpoint's `audit_as`, the saved connection's name. It was `""`, so a model naming the active
+connection, which the panel's prompt names, was refused with "it serves ." (release review
+S6-L1-03); `serves`, which words what a refusal says is served, now says the server has one
+connection and the argument should be left out when no name is non-empty. And
 `serve_many(Vec<(String, Endpoint)>)` is what `schemaic mcp` calls, with one or several, each
 under its saved name, or a `--url`'s suggested one (`run.rs`'s `serve_mcp`). What `tools/list` answers is the pure
-`listing(endpoints)`. **With one it is `tools_list` exactly as before** — no `connection`
-argument, no `list_connections` — so the panel and every client already configured against one
-`-c` see the listing they saw (`one_connection_lists_no_connection_argument`). With several,
+`listing(endpoints)`. **With one it is `tools_list` as before, less `compare_schemas`'
+`source_connection`** — no `connection` argument, no `list_connections`, and no other connection
+to name as a source — so the panel and every client already configured against one `-c` see the
+listing they saw (`one_connection_lists_no_connection_argument`,
+`a_one_connection_server_is_named_and_offers_no_other`). With several,
 every tool's `inputSchema` gains an optional `connection` ("Defaults to <first>"), a
 `list_connections` tool is appended, and the tools are the **union** of what each connection
 offers — each tool asked `McpTool::offered` against each connection's own pair of levels, never
@@ -333,7 +358,11 @@ no catalogue beside another with the reverse, though neither offers it
 (`several_connections_list_the_union_and_a_connection_argument`,
 `the_union_asks_each_connection_its_own_levels`). A call is then routed by the
 pure `pick(endpoints, args)` — the `connection` argument's non-empty value by name, else the
-first; a name not served is an error naming the ones that are — where *name* is the
+first; a name not served is an error naming the ones that are, and so is a value that is not a
+JSON string (`name_arg`, which `compare_across` asks of `source_connection` too). It used to read
+a non-string as absent, so a connection called `2024` passed as the number `2024` was answered on
+the default without a word, and an agent comparing the two got one connection's answer twice
+(release review S6-L1-02) — where *name* is the
 connection name `serve_mcp` gave it (saved, or a `--url`'s suggested one), never the id or `#<id>` that `-c` also accepts — and handed to that endpoint's own
 `call_tool`, so **the listing is the union but every call is judged by its own connection**:
 `refusal_on` against that connection's levels, refused in that connection's words, and recorded
@@ -342,9 +371,12 @@ offers it is the stale-listing case the server-side refusal was already the back
 (`a_call_is_judged_by_the_connection_it_names`, through `serve_on`: `run_query` named at the
 withheld connection refused, an unknown name refused with `a, b`, and `list_connections`
 answering). **The cost is in the descriptions**: they are `tools_list`'s, so they name the
-*first* connection's engine and its `run_query` heads, and `describe_table`'s promises samples
-when any connection sends them — the exact over-promise
-`describe_table_promises_samples_only_when_it_sends_them` closed for one connection. On a
+*first* connection's engine and its `run_query` heads. `describe_table`'s promised samples when
+any connection sent them — the exact over-promise
+`describe_table_promises_samples_only_when_it_sends_them` closed for one connection — and now
+promises them outright only when **every** connection sends them; on a mixed server its
+description says the samples come where the connection sends rows, which `list_connections` says
+(release review S6-L1-06, `a_mixed_listing_does_not_promise_rows_everywhere`). On a
 mixed-engine or mixed-level server the per-connection truth is `list_connections`', which names
 each one's engine, default database and whether its rows may be read ("you may read them" or
 "withheld"), the first marked `(the default)`. It is the server's own, not an `McpTool` — it reads
@@ -494,8 +526,12 @@ subpartition names, has its `SUBPARTITION BY` clause beside the key — `(partit
 subpartitioned by …)` (`database_schema_names_a_mysql_subpartition_clause`).
 **`compare_schemas {database?, source_database?, source_connection?, tables?}` is `schemaic
 compare` as a tool, and like the CLI it runs nothing.** `database` is the one the script would
-change — the call's own, else the endpoint's default (`tool_database`) — and `source_database`
-the one it should come to match, else the *source* endpoint's default. The source is the same
+change and `source_database` the one it should come to match, **each side resolved as `schemaic
+compare` resolves it**: the side's `Db::implied_database()` first (SQLite's `main`), then the
+argument, then that side's endpoint default. It took the argument raw, so on SQLite
+`source_database: "staging"` read `main` twice — `fetch_schema` reads `main` whatever it is
+called — and answered that `main` already matched a database that does not exist (release review
+S6-L1-01). The source is the same
 endpoint unless `source_connection` named another (`serve_on`, above), and the async
 `compare_schemas((target, name), (source, name), args)` tells the two cases apart by
 `std::ptr::eq` on the endpoints, so naming the target's own connection as the source is the
@@ -504,9 +540,15 @@ database on each side"), the same database on both sides of one connection ("Bot
 pointing at another `source_database` or a `source_connection` — on one SQLite connection, whose
 only database is `main`, that is every call without a `source_connection`), and two engines
 `core::compare::comparable` will not compare (`compare_schemas_refuses_before_reading`, which pins
-the first two sentences and only that the third is an error). Then both catalogues are read
-**concurrently**, each `db.fetch_schema` under `with_deadline` with its own token, and a failure
-or a timeout on either side is the error. **There is no differ and no report here**: it is
+the first two sentences — the second also for a SQLite `source_database` that names nothing —
+and only that the third is an error). Then both catalogues are read **concurrently**, each
+`db.fetch_schema` under `with_deadline_for(COMPARE_TIMEOUT, …)` with its own token, and a failure
+or a timeout on either side is the error. **`COMPARE_TIMEOUT` is `schemaic compare`'s deadline
+(`args::COMPARE_TIMEOUT_SECS`, 120 s), not a statement's**: it was `with_deadline`'s 30 s, and two
+whole catalogues of a large schema take longer while the model has no argument to raise it
+(release review S6-L1-04). `with_deadline_for(timeout, fut, token)` is `with_deadline`'s body
+with the deadline a parameter — `with_deadline` now calls it with `QUERY_TIMEOUT` — so it
+cancels rather than abandons, as above. **There is no differ and no report here**: it is
 `SchemaComparison::of(&target, &source, dialect)`, the target's dialect, and
 `cli::compare::report` — the CLI's own, so `tables` resolves as `-t` does, an unknown name is
 the error, and the notes are the CLI's stderr lines word for word (the three-armed first line,
@@ -564,8 +606,12 @@ saved connection and never from the blob (`ai.rs`'s entry). The verdicts are pin
 `propose_sql_passes_on_the_guards_verdict` — an `UPDATE … WHERE` valid with the block
 instruction, a bare `DELETE` passed on as asking first, the same `UPDATE` refused on a read-only
 connection with no block, an empty statement an error — and
-`propose_sql_lets_a_read_through_on_a_read_only_connection`. **Not pinned**: the `no_database`
-refusal, and the policy `answer` builds from the endpoint — both tests hand `propose_sql` a
-policy directly. The roadmap's "in the panel, opens the usual preview" was taken to mean the
+`propose_sql_lets_a_read_through_on_a_read_only_connection`. The policy `answer` builds is
+`propose_policy(endpoint, args)`, extracted so it could be pinned
+(`propose_sql_takes_its_policy_from_the_endpoint`: the endpoint's read-only mark, `confirm_writes`
+off, and `no_database` cleared by the call's own `database` or the endpoint's) — both tests above
+hand `propose_sql` a policy directly, so until then nothing held which endpoint field fed which
+(release review R2-L6-03). **Still not pinned**: the `no_database` refusal's wording through
+`propose_sql`. The roadmap's "in the panel, opens the usual preview" was taken to mean the
 fenced block's *Insert* and *Run*, the panel's usual surface for SQL: there is no SQL preview
 modal, so no new app surface was added.

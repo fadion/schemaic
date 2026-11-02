@@ -118,21 +118,33 @@ schemaic exec "UPDATE orders SET state = 'sent' WHERE id = 7" -c prod
   another's, on the same connection or across two of the same engine. It runs
   nothing.
 - `exec` writes. It refuses on a read-only connection, and a statement the guard
-  flags, such as a `DELETE` with no `WHERE`, needs `--yes`.
+  flags, such as a `DELETE` with no `WHERE`, needs `--yes`. `exec --script`
+  runs a whole `.sql` file, such as a migration or a `dump` to restore, and
+  always needs `--yes`.
+- `import` loads a CSV, TSV, JSON or Excel file into an existing table, as one
+  transaction. A file with any problem is refused and nothing is written.
+- `-p name=value` fills a `:name` placeholder in `query`, `explain`, `export`
+  and `exec`.
 - Output is a table, JSON, JSON Lines, CSV or vertical records. Rows go to
   stdout and everything else to stderr.
+- `completions` prints a completion script for bash, zsh, fish, elvish or
+  PowerShell.
 
-A connection is reachable only once you turn on **CLI access** in its settings;
-it is off by default. Where there is no keyring, such as over SSH or in a
-container, `--password-stdin` takes the password instead. `schemaic --help`
-covers the other commands, the formats and the exit codes.
+A saved connection is reachable only once you turn on **CLI access** in its
+settings; it is off by default. Every command that takes a connection, except
+`compare`, also takes one you type instead, with `--url`. It is never saved, and
+its password comes from `--password-stdin` or `SCHEMAIC_PASSWORD` (only the variable for
+`mcp`, whose stdin is the protocol's), never the URL. Where
+there is no keyring, such as over SSH or in a container, `--password-stdin`
+takes a saved connection's password instead. `schemaic --help` covers the other
+commands, the formats and the exit codes.
 
 To put `schemaic` on your `PATH`, use **Settings → General → Command line →
 Install**. The Linux `.deb` and `.rpm` do this for you.
 
 ## MCP server
 
-`schemaic mcp` serves one saved connection to any AI agent that speaks
+`schemaic mcp` serves your saved connections to any AI agent that speaks
 [MCP](https://modelcontextprotocol.io), such as an editor's assistant or a
 desktop app. It is the same server Schemaic's own AI panel uses, and it is meant
 for the agent to launch:
@@ -141,10 +153,19 @@ for the agent to launch:
 { "mcpServers": { "prod": { "command": "schemaic", "args": ["mcp", "--connection=prod"] } } }
 ```
 
-The agent gets `list_databases`, `list_schema`, `describe_table` and
-`search_objects`, plus `run_query` (read-only, 200 rows), `explain` and
-`sample_rows` when the connection's **AI data access** is *Let it read data*. Like
-the command line, it needs **CLI access** turned on for the connection.
+Repeat `--connection` to serve several: every tool then takes a `connection`
+argument, the first is the default, and `list_connections` names them. A
+connection given with `--url` is served too, at the level `--ai-data` sets
+(schema only by default).
+
+The agent gets `list_databases`, `list_schema`, `describe_table`,
+`search_objects` and `compare_schemas`, which returns the SQL that would make one
+database's structure match another's and runs nothing. It also gets `run_query`
+(read-only, 200 rows), `explain` and `sample_rows` when the connection's **AI
+data access** is *Let it read data*. Like the command line, a saved connection
+needs **CLI access** turned on. Every call the agent makes is recorded in
+`agent_log.jsonl` in Schemaic's configuration folder, with its values masked
+unless you choose to keep them.
 
 Read-only, here and in `schemaic query`, guards against mistakes and keeps an
 AI agent from writing. It is not a security boundary against a database whose

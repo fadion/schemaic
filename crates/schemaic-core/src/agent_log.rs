@@ -8,8 +8,8 @@
 //! at* on a production connection is the question this answers, and mixing
 //! its reads into the writes would bury the record that file exists for. The
 //! lines are [`write_log::Entry`] — [`Source::Agent`], the tool and the host
-//! in `detail` — and go through [`write_log::line`], so the values in a
-//! `run_query`'s SQL are masked as a write's are, and a credential's always.
+//! in `detail` — masked by [`write_log::masked`], as a write's values are and
+//! a credential's always, and only then cut to length ([`line_entry`]).
 //!
 //! **Capped, unlike the write log.** An agent calls a tool many times a
 //! minute, and nothing would ever clear it; past [`ROLL_OVER_BYTES`] the file
@@ -18,7 +18,7 @@
 //! is gone, which is the trade for a log that is on by default.
 //!
 //! [`write_log::Entry`]: crate::write_log::Entry
-//! [`write_log::line`]: crate::write_log::line
+//! [`write_log::masked`]: crate::write_log::masked
 //! [`Source::Agent`]: crate::write_log::Source::Agent
 
 use crate::intel::SqlDialect;

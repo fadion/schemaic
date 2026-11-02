@@ -178,24 +178,38 @@ step killed by its own timeout runs nothing after, so the cleanup would be skipp
 half-written `guide/` would ship. Whenever `guide/index.html` is absent — a failure, or a ref that
 predates the guide — the step also deletes the landing page's link to it, the paragraph
 `index.html.in` fences between `<!-- guide-link: … -->` and `<!-- /guide-link -->`. The script's `curl` carries `--connect-timeout 20 --max-time 120` as well as
-`--retry 3`, because `--retry` does not retry a transfer that hangs rather than fails. Since a
+`--retry 3`, because `--retry` does not retry a transfer that hangs rather than fails. **It refuses
+an output directory that is not empty and holds no `searchindex.js`** — no earlier build of this
+book — exit 2, because mdBook empties `--dest-dir` before writing, so `build.sh .` or a
+mistyped path would delete whatever was there (release review S7-L5-01). Since a
 broken guide no longer stops anything here, `ci.yml`'s `guide` job, running the same script on
 every push, is where breakage is meant to be seen. `book.toml`'s `site-url =
 "/schemaic/guide/"` — what the guide's absolute links and 404 page are built against — is a fourth
 copy of the Pages base path, and `Check the repository URL agrees everywhere` compares it with the
 expected URL alongside the other three. What the guide *says* is held by
 `core/tests/guide_labels.rs`, which reads the repository's own files. Every `**bold**` span in
-the guide's prose must be an interface label. Prose is read per paragraph block, so a label
-wrapped over two lines is read whole; fences of ```` ``` ```` or `~~~` of any length are dropped,
-and code spans close on a backtick run of the same length, as CommonMark has it. A label matches a
+the guide's prose must be an interface label — and every `__…__` one that opens at a word's start,
+as Markdown reads it (`snake__case` is no bold), which the guard read none of. Prose is read per
+paragraph block, so a label wrapped over two lines is read whole; fences of ```` ``` ```` or
+`~~~` of any length are dropped — but a backtick run with another backtick later on its line is a
+code span, not a fence, a fence's info string holding none (CommonMark), where a line opening
+```` ```x``` ```` used to hide the rest of the page from the check — and code spans close on a
+backtick run of the same length, as CommonMark has it
+(`every_bold_spelling_is_read_and_an_inline_run_is_no_fence`, release review S7-L6-02). A label matches a
 message in the en-GB catalogue — select variants (`[one]`, `*[other]`) included, since a plural
 label lives only there — with a placeable standing for any non-empty text; a message with fewer
 than two literal letters is ignored outright, and one with placeables matches only when its own
 literal letters are at least half the label's, because without that `{ $n } rows` vouched for
 *Delete all rows*. Failing the catalogue, the label may be a string literal in `schemaic-ui`'s or
-`schemaic-app`'s source, counted only before a file's first `#[cfg(test)]` and only for a label
+`schemaic-app`'s source, counted only before a file's `#[cfg(test)] mod` and only for a label
 starting in upper case, since a test fixture or a lower-case key is not something the interface
-shows. Every relative link must resolve to a file inside `docs/guides/src` — a link out to the
+shows. **Comments are dropped first** (`label_source`, which knows a `//` inside a string or a
+quote in a char literal is no comment): a renamed label's old spelling lives on in the comments
+that describe it — *AI Seed Table* did, in two doc comments — and a guide page still writing it
+passed. The cut is at the test *module* rather than the first `#[cfg(test)]`, which can be a
+helper with real code after it (`a_label_quoted_in_a_comment_is_not_in_the_source`, release review
+S7-L6-01). Every relative link must resolve to a file inside `docs/guides/src` — inline or a
+reference definition's `[name]: target`, which went unread (`a_reference_definition_is_a_link`) — a link out to the
 README resolves in the repository and 404s on the site — and every page must be in `SUMMARY.md`
 outside an HTML comment, which is all mdBook publishes. `no_kbd_holds_a_literal_backtick` refuses
 `` <kbd>` `` (write `&#96;`): the backtick opens a code span that swallows the rest of the

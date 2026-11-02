@@ -48,13 +48,22 @@
   introduces one that way — `constraint "x"`, `relation "x"`, `column "x"`, `at or near "x"` all
   quote mid-sentence, which `redaction_keeps_the_identifiers_postgres_quotes_the_same_way`
   holds — plus `is_statement_echo`, which exempts the user's own statement outright. Two prose
-  anchors remain because they name one message each with no family behind it:
+  anchors remain on those two engines because they name one message each with no family behind it:
   MySQL/MariaDB's `Duplicate entry 'V' for key` and PostgreSQL's `Failing row contains (V…)`.
   `Key (cols)=(V)` is anchored on **`Key (`** rather than on `)=(`, because `)=(` is also
   ordinary SQL — a row comparison, or any `f(x)=(…)` — and unanchored the rule deleted the very
   clause a syntax error was about (`redaction_leaves_a_row_comparison_in_the_users_own_sql_alone`).
   SQLite's constraint reports name no value and pass
-  through untouched. It takes **no dialect** — every engine's patterns are tried, and one
+  through untouched. **SQL Server had no rule at all**, so its values reached the prompt and the
+  agent log whole (release review S5-L5-02); it has two prose anchors of its own now. Msg 245's
+  `Conversion failed when converting the <type> value 'V' to data type …` has no colon, so
+  MySQL's shape misses it, and ` value '` alone is too common a phrase to default-deny, so the
+  rule bites only on a line carrying that prose; Msg 2627/2601's `The duplicate key value is (V).`
+  closes on `).`, else `)`, keeping the constraint and object names quoted earlier in the
+  sentence. Both are in `SPLIT_VALUE_ANCHORS` too, so a value holding a newline, or cut off, is
+  redacted to the end. Msg 8152's `Truncated value: 'V'` is MySQL's ` value: '` shape and needed
+  nothing (`redaction_covers_sql_server_value_messages` — a test of its own, not among the
+  live-captured strings below). It takes **no dialect** — every engine's patterns are tried, and one
   engine's anchor does not occur in another's message, so a wrong dialect cannot be passed to
   it. It is **not a SQL scan**, so it is not built on `sql::skip_noncode` and is not an
   exception to that invariant: the input is an engine's prose, and the quoting rules are the

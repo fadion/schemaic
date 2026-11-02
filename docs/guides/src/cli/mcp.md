@@ -100,7 +100,9 @@ there's no panel on the other end.
 `compare_schemas` is the same comparison as [`schemaic compare`](reading.md#compare): it reads
 both databases' structure and hands back the script, with what in it is destructive and what it
 leaves out. It runs nothing. Both databases must be the same engine, and a `tables` argument
-narrows it to the tables you name.
+narrows it to the tables you name. Reading two whole schemas can take a while, so it has two
+minutes, as `schemaic compare` does. On SQLite each side is its file's `main` database, whatever
+name the call gives, so it compares only across two [served connections](#serving-several-connections).
 
 **Only what I attach**, the default, gives an outside agent no rows at all: it has no way to attach
 any. `run_query` and `explain` pass the same read-only check as
@@ -120,12 +122,16 @@ for every connection, a `--url` one included, under its name.
 
 Each line is one call: when it was made, the connection and database, the tool and the table or
 search it named, whether it came from the panel (`panel`) or `schemaic mcp` (`mcp`), and whether
-it succeeded — with the reason, when it was refused or failed. For `run_query` and `explain` the
-line holds the SQL too, its values masked unless **Keep values in the write log** is on in
-**Settings** › **Query**. SQL that carries a password is masked either way.
+it succeeded — with the reason, when it was refused or failed. A `compare_schemas` line names the
+other side too (`from prod.app`). For `run_query`, `explain` and the panel's `propose_sql` the
+line holds the SQL, its values masked unless **Keep values in the write log** is on in
+**Settings** › **Query**. SQL that carries a password is masked either way. A statement longer
+than 32,768 characters, or a reason longer than 500, is cut, and the line says how many characters
+were left out.
 
 A successful call's answer — the rows or definitions the agent was shown — is never copied into
-the log.
+the log. Where it showed rows (`run_query`, `sample_rows`, and the sample rows of
+`describe_table`), the line records how many.
 
 The file is capped at 8 MiB. Past that it's renamed `agent_log.jsonl.1`, replacing the previous
 one, and a new file starts, so the log keeps the most recent calls and drops the oldest.
@@ -135,7 +141,8 @@ one, and a new file starts, so the log keeps the most recent calls and drops the
 The server writes a line to stderr for each connection as it starts — most clients show it in the
 server's log. It names the connection being served, and says why the row-reading tools are withheld or that there
 is no default database, with what to change. Look there first when the agent reports a tool
-missing.
+missing. With several connections, a `connecting` line names each one before it's opened, so an
+error that follows belongs to the connection just named.
 
 A connection without **CLI access** stops the server before it starts, and the client shows it as
 failed. So does an SSH tunnel that won't open: every connection's tunnel opens at the start. A

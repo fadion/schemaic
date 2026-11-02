@@ -331,7 +331,7 @@ pub fn line(entry: &Entry, dialect: SqlDialect, keep_values: bool) -> String {
     serde_json::to_string(&masked(entry, dialect, keep_values)).unwrap_or_default()
 }
 
-/// `entry` as [`line`] writes it, before it is serialised — for a log that
+/// `entry` as [`line()`] writes it, before it is serialised — for a log that
 /// does more to the masked text, as the agent log cuts it.
 pub fn masked(entry: &Entry, dialect: SqlDialect, keep_values: bool) -> Entry {
     let mut e = entry.clone();
