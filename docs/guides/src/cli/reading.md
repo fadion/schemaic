@@ -1,6 +1,7 @@
 # Reading and exporting
 
-`query`, `explain` and `export` only ever read. `dump` and `compare` read the database's
+`query`, `explain` and `export` only ever read, as do
+[the performance commands](#looking-into-a-slow-server). `dump` and `compare` read the database's
 structure and write nothing to the server. None of them asks a question first, because there is
 nothing to say yes to.
 
@@ -111,3 +112,39 @@ their triggers.
 
 Nothing is run. The script goes to stdout for you to read or save, and what it drops or leaves out
 is listed on stderr. To apply it, save it and run it with [`exec --script`](exec.md#running-a-script). Both sides must be the same engine; MySQL and MariaDB count as one.
+
+## Looking into a slow server
+
+```sh
+schemaic statements -c prod --order mean --limit 10
+schemaic indexes -c prod -d shop
+schemaic sizes -c prod -d shop --indexes
+schemaic locks -c prod
+```
+
+Four commands read what the app's [Performance](../schema/performance.md) view and
+**Server activity** show. They only read: a fix they point to is yours to run.
+
+| Command      | What it lists                                                                    | Columns |
+|--------------|----------------------------------------------------------------------------------|---------|
+| `statements` | The statements the server spent most time on. `--order` is `total` (the default), `mean` or `calls`; `--limit` is 20 by default, up to 500 | `total_ms`, `mean_ms`, `calls`, `rows`, `database`, `query` |
+| `indexes`    | Indexes unused since the counters were reset, exact duplicates, and indexes whose key starts another's | `table`, `index`, `problem`, `detail`, `bytes` |
+| `sizes`      | The largest tables, or with `--indexes` the largest indexes. `--limit` is 20 by default, up to 100 | `table`, `bytes`, `size`, `rows_estimate` (or `table`, `index`, `bytes`, `size`) |
+| `locks`      | The locks sessions hold and wait for, and who blocks whom                        | `session`, `state`, `kind`, `mode`, `object`, `blocked_by` |
+
+- *A database.* `indexes` and `sizes` look in one, so they need `-d` or a connection with its
+  own. `locks` is the whole server's and takes no `-d`.
+- *Statement statistics have to be on.* `statements` reads `pg_stat_statements` on PostgreSQL,
+  `performance_schema`'s digests on MySQL and MariaDB, and the database's Query Store on SQL
+  Server ([what turning each on takes](mcp.md#performance-tools)). When the source is off it says
+  why on stderr and exits 2, with `hint: to turn it on, run:` and the statement where one does it.
+  It never runs it. SQLite keeps no statistics, so it exits 2 there too.
+- *Usage counts start again* when the server restarts or its statistics are reset, so an index
+  `indexes` calls unused may only be unused lately. The note on stderr says so, or that the server
+  keeps no counts and only duplicates and prefixes are listed.
+- *Missing indexes.* On SQL Server, `indexes --missing` lists the indexes the optimiser recorded
+  as missing instead, with a `ddl` column holding the `CREATE INDEX` for each. Elsewhere it exits 2.
+- *Index sizes.* MySQL and MariaDB size indexes per table, not per index, so `sizes --indexes`
+  exits 2 there.
+- *Locks.* SQLite has no server sessions, so `locks` exits 2 there. MariaDB lists only locks
+  someone is waiting on, and says so on stderr.

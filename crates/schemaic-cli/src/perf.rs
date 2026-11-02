@@ -127,32 +127,65 @@ pub struct Suggestion {
 /// The suggestions, numbered to match [`suggestion_ddl_text`].
 pub fn missing_result(v: &[Suggestion]) -> ResultSet {
     ResultSet::from_rows(
-        vec![
-            col("n", "INT"),
-            col("table", "TEXT"),
-            col("key", "TEXT"),
-            col("include", "TEXT"),
-            col("uses", "BIGINT"),
-            col("impact_pct", "DOUBLE"),
-        ],
+        missing_columns(),
+        v.iter()
+            .enumerate()
+            .map(|(i, s)| missing_row(i, s))
+            .collect(),
+    )
+}
+
+fn missing_columns() -> Vec<Column> {
+    vec![
+        col("n", "INT"),
+        col("table", "TEXT"),
+        col("key", "TEXT"),
+        col("include", "TEXT"),
+        col("uses", "BIGINT"),
+        col("impact_pct", "DOUBLE"),
+    ]
+}
+
+/// Suggestion `i`'s row, numbered from one.
+fn missing_row(i: usize, s: &Suggestion) -> Vec<Value> {
+    let m = &s.index;
+    let key: Vec<&str> = m
+        .equality
+        .iter()
+        .chain(&m.inequality)
+        .map(String::as_str)
+        .collect();
+    vec![
+        Value::UInt(i as u64 + 1),
+        text(table_name(m.schema.as_deref(), &m.table)),
+        text(key.join(", ")),
+        text(m.include.join(", ")),
+        Value::UInt(m.uses),
+        Value::Float((m.avg_impact * 10.0).round() / 10.0),
+    ]
+}
+
+/// [`missing_result`] with each suggestion's DDL as a last column — what
+/// `schemaic indexes --missing` prints. A CLI row is not cut the way a tool
+/// reply's cell is, and a `--format json` reader wants the statement on its
+/// row rather than in numbered text beside it. Null where the table was not in
+/// the schema read.
+pub fn missing_with_ddl_result(v: &[Suggestion]) -> ResultSet {
+    let mut columns = missing_columns();
+    columns.push(col("ddl", "TEXT"));
+    ResultSet::from_rows(
+        columns,
         v.iter()
             .enumerate()
             .map(|(i, s)| {
-                let m = &s.index;
-                let key: Vec<&str> = m
-                    .equality
-                    .iter()
-                    .chain(&m.inequality)
-                    .map(String::as_str)
-                    .collect();
-                vec![
-                    Value::UInt(i as u64 + 1),
-                    text(table_name(m.schema.as_deref(), &m.table)),
-                    text(key.join(", ")),
-                    text(m.include.join(", ")),
-                    Value::UInt(m.uses),
-                    Value::Float((m.avg_impact * 10.0).round() / 10.0),
-                ]
+                let mut row = missing_row(i, s);
+                let ddl = s.ddl.trim_end();
+                row.push(if ddl.is_empty() {
+                    Value::Null
+                } else {
+                    text(ddl)
+                });
+                row
             })
             .collect(),
     )
@@ -365,6 +398,38 @@ mod tests {
         let text = suggestion_ddl_text(&s);
         assert!(text.starts_with("1. CREATE INDEX ["), "{text}");
         assert!(text.contains(&"x".repeat(200)), "{text}");
+    }
+
+    /// `schemaic indexes --missing` carries each suggestion's DDL in its own
+    /// column, whole and without its trailing newline — a `--format json`
+    /// reader takes the statement from the row, with no numbered text to
+    /// match it against. A table the schema read lacks is a null, not "".
+    #[test]
+    fn the_cli_suggestion_table_carries_each_ddl_whole() {
+        let long = format!("CREATE INDEX [{}] ON [t] ([a]);", "x".repeat(200));
+        let s = vec![
+            Suggestion {
+                index: MissingIndex {
+                    table: "t".into(),
+                    equality: vec!["a".into()],
+                    ..Default::default()
+                },
+                ddl: format!("{long}\n"),
+            },
+            Suggestion {
+                index: MissingIndex::default(),
+                ddl: String::new(),
+            },
+        ];
+        let rs = missing_with_ddl_result(&s);
+        let last = rs.columns.len() - 1;
+        assert_eq!(rs.columns[last].name, "ddl");
+        assert_eq!(cell(&rs, 0, 1), "t");
+        assert_eq!(cell(&rs, 0, last), long);
+        assert!(matches!(
+            rs.cell(1, last).map(|c| c.to_value()),
+            Some(Value::Null)
+        ));
     }
 
     #[test]

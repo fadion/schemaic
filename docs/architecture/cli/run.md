@@ -3,7 +3,7 @@
 `cli/run.rs` — dispatch, and the module that owns the output contract. **stdout is data; stderr
 is everything else** — no banners, no warnings, no progress — which is what makes `--format=json`
 safe to parse and `--format=csv` safe to redirect. The other half is `Exit`, and it has **seven**
-outcomes rather than two: 0 ok, 2 usage (including a connection, `-f` file or `describe` table that is not there), 3 a guard
+outcomes rather than two: 0 ok, 2 usage (including a connection, `-f` file or `describe` table that is not there, and a performance read the server cannot answer — below), 3 a guard
 refusal, 4 a server or connection failure, 5 a **write** whose deadline passed after it was
 sent, 6 a read `--limit` cut short, under `query --fail-on-cap` only, 7 an `import` whose file
 the check refused, nothing written (`Exit::Rejected`). A new outcome gets a new
@@ -197,7 +197,8 @@ flags are judged next, still before the file is read**: `command.output_args()` 
 `OutputArgs::output`, and a pair that does not go together — `--no-header` with a format that
 has no header — is a `warn` and `Exit::Usage` before anything is read, the way clap's own
 refusals are. The resolved
-`Output` is what `list`, `databases`, `ping`, `tables`, `describe`, `run_query`, `run_explain`,
+`Output` is what `list`, `databases`, `ping`, `tables`, `describe`, `statements`, `indexes`,
+`sizes`, `locks`, `run_query`, `run_explain`,
 `run_exec` and `emit_rows` take in place of
 a `Format`. No test pins that order; it is the code's.
 **`databases` lists the names `-d` takes, because a CLI user usually starts with none.** The
@@ -230,6 +231,48 @@ nothing dialled. `tables` prints its rows and the truncation warning as `query` 
 table meets (SQLite's compile-time column ceiling is 32 767), and **zero rows is "no table or
 view named 'x' in <db>", exit 2** — the command named something that is not there, as a
 connection that is not there is.
+**`statements`, `indexes`, `sizes` and `locks` are the MCP performance tools' reads as rows** —
+the same `Db` methods, ranked by the same `core::workload` functions and built into the same
+`cli/perf.rs` tables, so a script, an agent and the app's *Performance* view are told one thing of
+one server. Each is `select_conn` (the CLI-access gate, exits 2 and 3 as everywhere), then what can
+be refused without the server, then `connect`, then the reads. No text gate is asked and no
+`Enforce` session opened: the SQL sent is the database layer's fixed catalogue reads, with nothing
+of the user's in it (`db/overview.md`). Nor is the connection's AI data level, under which the
+tools withhold `top_statements` and `current_locks` below *Full* — that level is `mcp`'s alone to
+read (`cli/args.md`), and here, as for `query`, CLI access is the gate. **Rows go to stdout
+through `emit_rows`, in any `--format`; every note goes to stderr** — the usage note, "counted
+since …", what an empty list means, that a server lists contended locks only, that the lock list
+was capped — so stdout is the rows alone, and a source that is on but has counted nothing, an
+index list with no findings, or a server with no locks is **exit 0 and no rows**, with its note.
+**What the server cannot answer is exit 2, never an empty list**, because a script reading `$?`
+and stdout would take one as "nothing is slow": the answer is not there, as a `describe` table is
+not, and retrying will not bring it — `Exit::Usage`'s doc says so, and so does the help's second
+line under 2. That is `statements` on a source that is off or unreadable
+(`StatementReport::Unavailable`), its `reason()` on stderr and, where `enable_sql()` has one, a
+`hint: to turn it on, run: <statement>` — printed, never run; `indexes --missing` off SQL Server
+(`workload::supports_missing_index_hints`) and `locks` on an engine with no server sessions
+(`activity::supports_activity`), **both asked of the saved connection's dialect before
+connecting**; and `sizes --indexes` with an empty list where `workload::index_sizes_per_table_only`
+says the engine sizes indexes per table, which only the read can tell, told apart from a database
+with no indexes (exit 0). `indexes` and `sizes` need a database — `perf_database`, which is
+`database_for` or a `warn`, the no-database `hint:`'s `Refused` arm and exit 2, before anything
+is dialled — while `statements` passes `database_for`'s `Option` through, `fetch_top_statements`
+resolving `None` to the connection's own, and `locks` has no `-d` at all. **Every read goes through
+`with_deadline_read(what, read, token, timeout)`**, `deadline::with_deadline` with the reporting
+added — `reading <what> failed: …` or `reading <what> exceeded Ns`, both exit 4. **Its name is
+load-bearing**, and so is the shape of its call sites: `deadline.rs`'s gate is lexical, and finds a
+`db.` read wrapped only when `with_deadline` (a prefix of this name) precedes it with no `;`, `{`
+or `}` between, so each `format!` label is hoisted into a `what` variable above the call — written
+inline, its `{database}` would end the gate's search and fail it. `indexes` reads the schema
+(`fetch_schema`, the one read here that listens to its token) and then either the stats, printing
+`workload::index_health`'s findings, `perf::usage_note` and — on SQL Server — a hint naming
+`indexes --missing`; or `fetch_missing_indexes` at `MISSING_INDEX_ROWS` (50, the Performance
+view's figure, where the tool takes `PERF_ROWS`), paired with their DDL by `perf::suggestions` and
+printed through `missing_with_ddl_result`, **the DDL a column of the row** rather than the tool's
+numbered text below the table (`cli/perf.md`), then a note to check each against `schemaic
+indexes` before creating it. Nothing is run. `sizes` is `workload::largest` over
+`fetch_table_stats` at `--limit`. These four runners have no unit test of their own; their
+argument surface is `args.rs`'s, their tables `perf.rs`'s.
 **`export` is `run_export`, `run_query`'s order with the format judged first.** The format is
 the command line's to get right, so it is resolved before a connection is selected:
 `ExportFormat::from_name(--format)`, else `ExportFormat::for_path(--output)`, and neither is a

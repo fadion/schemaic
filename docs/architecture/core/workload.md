@@ -4,14 +4,17 @@
 one (`core/ui-state-models.md`): which statements a server has spent most on, which indexes
 nothing reads or another index already covers, which tables and indexes are largest, and — on
 SQL Server — which indexes the optimiser recorded as missing. It is the backend of the roadmap's
-*Workload and performance insight*, and it has two front ends: the MCP server's four
-performance tools (`cli/mcp.rs`, rendered by `cli/perf.rs`) and the app's *Performance* view
-(`ui/perf_view.rs`, fetched by the app's `perf_fetch`). **Both rank with these functions rather
-than a second time**, so an agent and a person looking at one server are told the same thing.
+*Workload and performance insight*, and it has three front ends: the MCP server's four
+performance tools (`cli/mcp.rs`, rendered by `cli/perf.rs`), the headless `schemaic statements`,
+`indexes`, `sizes` and `locks`, which print those same tables (`cli/run.md`), and the app's
+*Performance* view (`ui/perf_view.rs`, fetched by the app's `perf_fetch`). **All three rank with
+these functions rather than a second time**, so an agent, a script and a person looking at one
+server are told the same thing.
 **Statements.** `StatementStat` is one normalised statement — `query`, `database` where the
 source records one, `calls`, `total_ms`, `mean_ms`, and `rows` where the source counts them — and
 `StatementOrder` (`Total`, the default; `Mean`; `Calls`) is the ranking, `name`/`parse` being the
-stable spelling the MCP `order` argument takes (`an_order_round_trips_through_its_name`).
+stable spelling the MCP `order` argument and `schemaic statements --order` take
+(`an_order_round_trips_through_its_name`).
 `statement_limit` clamps a requested count into `1..=MAX_STATEMENT_LIMIT` (500), `None` being
 `DEFAULT_STATEMENT_LIMIT` (50), so an agent asking for "all" cannot make a fetch carry every digest
 a busy server has seen. The text is data to show and never to run — and it is *data* in the gating

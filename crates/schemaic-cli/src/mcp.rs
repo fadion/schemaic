@@ -1643,11 +1643,12 @@ async fn answer(endpoint: &Endpoint, name: &str, args: &Value) -> Answer {
     answered.into()
 }
 
-/// How many rows a performance tool returns when the call doesn't say.
-const PERF_ROWS: usize = 20;
+/// How many rows a performance tool returns when the call doesn't say — the
+/// CLI's default too, so `schemaic statements` and the tool list the same.
+const PERF_ROWS: usize = crate::args::PERF_LIMIT;
 
-/// The most `table_sizes` returns of each kind.
-const MAX_SIZE_ROWS: usize = 100;
+/// The most `table_sizes` returns of each kind; `schemaic sizes`'s ceiling.
+const MAX_SIZE_ROWS: usize = crate::args::MAX_SIZE_ROWS;
 
 /// A performance tool's `limit`: absent is [`PERF_ROWS`], anything else must
 /// be a whole number in `1..=max`. Refused rather than clamped, so a model

@@ -1,9 +1,10 @@
 # `cli/perf.rs`
 
 `cli/perf.rs` — the performance reads as tables: what the MCP server's four performance tools
-answer with (`cli/mcp.rs`), over `core::workload`'s model. Every reply is a `ResultSet` built here
-— `statements_result`, `index_health_result`, `missing_result`, `table_sizes_result`,
-`index_sizes_result`, `locks_result` — with **typed cells rather than pre-formatted strings**:
+answer with (`cli/mcp.rs`), and the rows `schemaic statements`, `indexes`, `sizes` and `locks`
+print (`cli/run.md`), over `core::workload`'s model. Every reply is a `ResultSet` built here
+— `statements_result`, `index_health_result`, `missing_result`, `missing_with_ddl_result`,
+`table_sizes_result`, `index_sizes_result`, `locks_result` — with **typed cells rather than pre-formatted strings**:
 milliseconds a `Float` rounded to three places (enough to tell a 0.2 ms lookup from a 0.02 ms one
 without printing float noise), counts and bytes `UInt`, a figure the source does not keep `Null`.
 So a tool's text goes through `mcp.rs`'s `format_table` and the one capped pipe-table renderer
@@ -16,7 +17,13 @@ table is named `schema.table` where it has a namespace. The sizes carry both the
 **A suggestion's DDL is printed whole, below the table, and never in a cell.** `missing_result`
 numbers the suggestions and `suggestion_ddl_text` prints each one's statements under the same
 number, because a cell is cut at `MCP_CELL_CHARS` and a cut `CREATE INDEX` is no DDL at all
-(`a_suggestions_ddl_is_given_whole_and_numbered`). `suggestions(schema, dialect, missing)` pairs
+(`a_suggestions_ddl_is_given_whole_and_numbered`). **The CLI's table is the exception, and
+carries the DDL as its last column**: `missing_with_ddl_result` is `missing_result`'s columns and
+rows — the two share `missing_columns` and `missing_row`, so the numbering and the figures cannot
+drift apart — plus `ddl`, each statement whole with its trailing newline trimmed, and `NULL` where
+the table was not in the schema read rather than `""`. A CLI row is not cut as a tool cell is, and
+a `--format json` reader wants the statement on its row, with no numbered text to match it
+against (`the_cli_suggestion_table_carries_each_ddl_whole`). `suggestions(schema, dialect, missing)` pairs
 each `MissingIndex` with `workload::suggestion_ddl` against the table as `schema` read it, under a
 `ddl::Target` of the dialect and the schema's flavour — the differ's statement, not one of this
 file's. The table is found by name, and by namespace too when the DMV gave one; a table the

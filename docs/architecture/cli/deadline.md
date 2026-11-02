@@ -50,7 +50,7 @@ this crate did not merge them: that one wraps a read none of the subcommands mak
 tokenless ones there (`fetch_databases`, `fetch_table_list`) go through
 `with_deadline_abandoning` beside it. It does share the bound: its wait after the cancel is
 `UNWIND_GRACE` too, for the same still-connecting driver.
-**`schemaic databases` is one of two callers here whose token is not the future's.**
+**`schemaic databases` is one of the callers here whose token is not the future's.**
 `fetch_databases` takes none, so `run.rs` hands `with_deadline` a fresh one and the cancel
 reaches nothing — the case the paragraph above warns about. It is wrapped anyway because this
 module's gate requires every `db.` read in the crate to be, and it is bounded regardless:
@@ -62,6 +62,15 @@ shorter one turns a late answer into a failure without returning any sooner.
 either, but it takes the timeout, so `run.rs` passes `--timeout` to both it and the wrapper: the
 check gives up by itself at the same moment the deadline would, and the wrap is there for the
 gate rather than for a cancel it cannot deliver.
+**The performance commands are the rest** — `statements`, `indexes`, `sizes` and `locks`, through
+`run.rs`'s `with_deadline_read`, which is `with_deadline` with the failure and timeout said on
+stderr. Of their reads only `fetch_schema` takes the token it is handed; `fetch_top_statements`,
+`fetch_missing_indexes`, `fetch_table_stats` and `fetch_locks` take none, so the deadline abandons
+them, `databases`' trade. Three are bounded underneath as well — `WORKLOAD_TIMEOUT`, 30 s, around
+the first two, `PING_TIMEOUT` around the locks (`cli/mcp.md`) — so a `--timeout` longer than that
+bound never fires for them. The helper counts as wrapped because `with_deadline` is a prefix of
+its name, `with_deadline_unwound`'s case; rename it to something else and the gate goes red at
+every call, which is the point.
 **The gate that produced this module is the part worth keeping.** `mcp.rs`'s
 `no_database_read_is_awaited_without_a_deadline` (in `ui/source_gate.rs` now, `mcp.rs`'s entry
 below has why) carries a floor on how many reads it finds, so

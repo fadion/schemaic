@@ -38,6 +38,14 @@ pub enum Exit {
     /// The command line was wrong, or named a connection, a `-f` file or a
     /// `describe` table that is not there. Nothing was sent to a server — or,
     /// for the table, nothing but the lookup that found it missing.
+    ///
+    /// **A performance read the server cannot answer comes here too**: a
+    /// statement-statistics source that is off or unreadable (`statements`,
+    /// which says the statement that turns it on), `indexes --missing` or
+    /// `locks` on an engine without them, `sizes --indexes` where indexes are
+    /// sized per table. The answer is not there, as the table is not, and
+    /// retrying will not bring it — what a script must not read as an empty
+    /// list.
     Usage = 2,
     /// A guard refused: not a read, a read-only connection, consent not given,
     /// or a connection the user has not exposed to the CLI. Nothing was sent to
@@ -340,6 +348,60 @@ async fn dispatch(command: Command) -> Exit {
             )
             .await
         }
+        Command::Statements {
+            target,
+            output: _,
+            order,
+            limit,
+            timeout,
+        } => {
+            statements(
+                &file.connections,
+                &target,
+                out,
+                order,
+                limit,
+                Duration::from_secs(timeout),
+            )
+            .await
+        }
+        Command::Indexes {
+            target,
+            output: _,
+            missing,
+            timeout,
+        } => {
+            indexes(
+                &file.connections,
+                &target,
+                out,
+                missing,
+                Duration::from_secs(timeout),
+            )
+            .await
+        }
+        Command::Sizes {
+            target,
+            output: _,
+            indexes,
+            limit,
+            timeout,
+        } => {
+            sizes(
+                &file.connections,
+                &target,
+                out,
+                indexes,
+                limit,
+                Duration::from_secs(timeout),
+            )
+            .await
+        }
+        Command::Locks {
+            conn,
+            output: _,
+            timeout,
+        } => locks(&file.connections, &conn, out, Duration::from_secs(timeout)).await,
         Command::Query {
             sql,
             params,
@@ -2149,6 +2211,305 @@ async fn describe(
         return Exit::Usage;
     }
     emit_rows(&rs, out).err().unwrap_or(Exit::Ok)
+}
+
+/// How many missing-index suggestions `indexes --missing` asks for: the
+/// Performance view's figure, and more than a server keeps worth reading.
+const MISSING_INDEX_ROWS: usize = 50;
+
+/// One of the performance reads, under `--timeout`: the value, or the exit
+/// already explained on stderr. `what` finishes "reading …".
+///
+/// **The reads take no token** — the statistics reads have nothing of the
+/// user's to `KILL` — so the cancel reaches nothing and the deadline abandons
+/// them, `databases`'s trade. `fetch_schema` is the one that listens.
+///
+/// Named for [`crate::deadline::with_deadline`], which it is with the
+/// reporting added: `deadline`'s gate looks for that name around every read.
+async fn with_deadline_read<T>(
+    what: &str,
+    read: impl std::future::Future<Output = Result<T, schemaic_db::DbError>>,
+    token: tokio_util::sync::CancellationToken,
+    timeout: Duration,
+) -> Result<T, Exit> {
+    match crate::deadline::with_deadline(read, token, timeout).await {
+        Some(Ok(v)) => Ok(v),
+        Some(Err(e)) => {
+            warn(&format!("reading {what} failed: {e}"));
+            Err(Exit::Failed)
+        }
+        None => {
+            warn(&format!(
+                "reading {what} exceeded {}s",
+                timeout.as_secs().max(1)
+            ));
+            Err(Exit::Failed)
+        }
+    }
+}
+
+/// The database a per-database performance command reads, or exit 2 with the
+/// hint a catalogue read gets — said before anything is dialled.
+fn perf_database(target: &Target, conn: &Connection, what: &str) -> Result<String, Exit> {
+    database_for(target, conn).ok_or_else(|| {
+        warn(&format!("`{what}` needs a database to look in"));
+        hint(&no_database_hint_for(
+            &target.conn,
+            NoDatabaseFailure::Refused,
+        ));
+        Exit::Usage
+    })
+}
+
+/// `schemaic statements` — [`Db::fetch_top_statements`], the read behind the
+/// MCP `top_statements` tool and the Performance view, as rows.
+///
+/// **A source that is off is exit 2**, on stderr with the one statement that
+/// turns it on (never run): the statistics are not there, as a `describe`
+/// table that is not there is, and a script must not read an empty list as
+/// "nothing is slow". A source that is on and has counted nothing yet is
+/// exit 0 and no rows, with a note.
+async fn statements(
+    conns: &[Connection],
+    target: &Target,
+    out: Output,
+    order: schemaic_core::workload::StatementOrder,
+    limit: usize,
+    timeout: Duration,
+) -> Exit {
+    use schemaic_core::workload::StatementReport;
+    let conn = match select_conn(conns, &target.conn) {
+        Ok(c) => c,
+        Err(exit) => return exit,
+    };
+    let conn = &*conn;
+    let database = database_for(target, conn);
+    let (db, _tunnel) = match connect(conn, &target.conn, timeout).await {
+        Ok(v) => v,
+        Err(exit) => return exit,
+    };
+    let token = tokio_util::sync::CancellationToken::new();
+    let report = match with_deadline_read(
+        "the statement statistics",
+        db.fetch_top_statements(database.as_deref(), order, limit),
+        token,
+        timeout,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(exit) => return exit,
+    };
+    match report {
+        StatementReport::Ready { statements, since } => {
+            if let Err(exit) = emit_rows(&crate::perf::statements_result(&statements), out) {
+                return exit;
+            }
+            if statements.is_empty() {
+                warn("the statistics source is on but has recorded no statements yet");
+            }
+            if let Some(since) = since {
+                warn(&format!("counted since {since}"));
+            }
+            Exit::Ok
+        }
+        StatementReport::Unavailable(u) => {
+            warn(&u.reason());
+            if let Some(sql) = u.enable_sql() {
+                hint(&format!("to turn it on, run: {sql}"));
+            }
+            Exit::Usage
+        }
+    }
+}
+
+/// `schemaic indexes` — the unused, duplicate and prefix-redundant indexes of
+/// one database ([`schemaic_core::workload::index_health`]), or with
+/// `--missing` the optimiser's missing-index suggestions, each with the DDL
+/// `ddl::diff` would emit for it. Both read what the MCP `index_health` tool
+/// reads; nothing is run.
+async fn indexes(
+    conns: &[Connection],
+    target: &Target,
+    out: Output,
+    missing: bool,
+    timeout: Duration,
+) -> Exit {
+    use schemaic_core::workload as wl;
+    let conn = match select_conn(conns, &target.conn) {
+        Ok(c) => c,
+        Err(exit) => return exit,
+    };
+    let conn = &*conn;
+    let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
+    let database = match perf_database(target, conn, "indexes") {
+        Ok(d) => d,
+        Err(exit) => return exit,
+    };
+    // Asked before dialling: the engine is known from the saved connection.
+    if missing && !wl::supports_missing_index_hints(dialect) {
+        warn("this engine records no missing-index suggestions; --missing reads SQL Server's");
+        return Exit::Usage;
+    }
+    let (db, _tunnel) = match connect(conn, &target.conn, timeout).await {
+        Ok(v) => v,
+        Err(exit) => return exit,
+    };
+    let token = tokio_util::sync::CancellationToken::new();
+    let what = format!("the schema of {database}");
+    let schema = match with_deadline_read(
+        &what,
+        db.fetch_schema(&database, token.clone()),
+        token,
+        timeout,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(exit) => return exit,
+    };
+    if missing {
+        let token = tokio_util::sync::CancellationToken::new();
+        let found = match with_deadline_read(
+            "the missing-index suggestions",
+            db.fetch_missing_indexes(Some(&database), MISSING_INDEX_ROWS),
+            token,
+            timeout,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(exit) => return exit,
+        };
+        let s = crate::perf::suggestions(&schema, dialect, found);
+        if let Err(exit) = emit_rows(&crate::perf::missing_with_ddl_result(&s), out) {
+            return exit;
+        }
+        warn(if s.is_empty() {
+            "the optimiser has recorded no missing indexes since the last restart"
+        } else {
+            "each is one optimiser's estimate; check it against `schemaic indexes` \
+             before creating it"
+        });
+        return Exit::Ok;
+    }
+    let token = tokio_util::sync::CancellationToken::new();
+    let what = format!("the statistics of {database}");
+    let stats =
+        match with_deadline_read(&what, db.fetch_table_stats(&database), token, timeout).await {
+            Ok(s) => s,
+            Err(exit) => return exit,
+        };
+    let findings = wl::index_health(&schema.tables, &stats);
+    if let Err(exit) = emit_rows(&crate::perf::index_health_result(&findings), out) {
+        return exit;
+    }
+    warn(crate::perf::usage_note(&stats));
+    if wl::supports_missing_index_hints(dialect) {
+        hint("`schemaic indexes --missing` lists the indexes the optimiser recorded as missing");
+    }
+    Exit::Ok
+}
+
+/// `schemaic sizes` — the largest tables of one database, or with `--indexes`
+/// its largest indexes ([`schemaic_core::workload::largest`]), as the MCP
+/// `table_sizes` tool reads them.
+///
+/// **An engine that sizes indexes per table only is exit 2 under
+/// `--indexes`**, which is a question it cannot answer — told apart from a
+/// database that simply has no indexes, which is exit 0 and no rows
+/// ([`schemaic_core::workload::index_sizes_per_table_only`]).
+async fn sizes(
+    conns: &[Connection],
+    target: &Target,
+    out: Output,
+    of_indexes: bool,
+    limit: usize,
+    timeout: Duration,
+) -> Exit {
+    use schemaic_core::workload as wl;
+    let conn = match select_conn(conns, &target.conn) {
+        Ok(c) => c,
+        Err(exit) => return exit,
+    };
+    let conn = &*conn;
+    let database = match perf_database(target, conn, "sizes") {
+        Ok(d) => d,
+        Err(exit) => return exit,
+    };
+    let (db, _tunnel) = match connect(conn, &target.conn, timeout).await {
+        Ok(v) => v,
+        Err(exit) => return exit,
+    };
+    let token = tokio_util::sync::CancellationToken::new();
+    let what = format!("the statistics of {database}");
+    let stats =
+        match with_deadline_read(&what, db.fetch_table_stats(&database), token, timeout).await {
+            Ok(s) => s,
+            Err(exit) => return exit,
+        };
+    let (tables, indexes) = wl::largest(&stats, limit);
+    if !of_indexes {
+        if let Err(exit) = emit_rows(&crate::perf::table_sizes_result(&tables), out) {
+            return exit;
+        }
+        if tables.is_empty() {
+            warn(&format!("{database} reported no table sizes"));
+        }
+        return Exit::Ok;
+    }
+    if indexes.is_empty() && wl::index_sizes_per_table_only(&stats) {
+        warn("this engine reports index sizes per table, not per index");
+        return Exit::Usage;
+    }
+    if let Err(exit) = emit_rows(&crate::perf::index_sizes_result(&indexes), out) {
+        return exit;
+    }
+    if indexes.is_empty() {
+        warn(&format!("{database} has no indexes to size"));
+    }
+    Exit::Ok
+}
+
+/// `schemaic locks` — the locks sessions hold and wait for
+/// ([`Db::fetch_locks`], the MCP `current_locks` tool's read). An engine with
+/// no server sessions (SQLite) is exit 2, before anything is opened.
+async fn locks(conns: &[Connection], args: &ConnArgs, out: Output, timeout: Duration) -> Exit {
+    let conn = match select_conn(conns, args) {
+        Ok(c) => c,
+        Err(exit) => return exit,
+    };
+    let conn = &*conn;
+    let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
+    if !schemaic_core::activity::supports_activity(dialect) {
+        warn("this engine has no server sessions, so there are no locks to show");
+        return Exit::Usage;
+    }
+    let (db, _tunnel) = match connect(conn, args, timeout).await {
+        Ok(v) => v,
+        Err(exit) => return exit,
+    };
+    let token = tokio_util::sync::CancellationToken::new();
+    let list = match with_deadline_read("the locks", db.fetch_locks(), token, timeout).await {
+        Ok(l) => l,
+        Err(exit) => return exit,
+    };
+    if let Err(exit) = emit_rows(&crate::perf::locks_result(&list), out) {
+        return exit;
+    }
+    // The MCP tool's wording, so the two say one thing of one server.
+    match (list.locks.is_empty(), list.contended_only) {
+        (true, true) => {
+            warn("no session is waiting on a lock (this server lists contended locks only)")
+        }
+        (true, false) => warn("no locks are held or waited for"),
+        (false, true) => warn("this server lists contended locks only"),
+        (false, false) => {}
+    }
+    if list.truncated {
+        warn("the list was capped; more locks exist");
+    }
+    Exit::Ok
 }
 
 /// Did this statement fail because it ran with no database — so the

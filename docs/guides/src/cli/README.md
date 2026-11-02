@@ -107,6 +107,10 @@ SCHEMAIC_PASSWORD="$DB_PASSWORD" schemaic query "SELECT 1" --url "mysql://app@db
 | `ping`       | Logs in and runs `SELECT 1`, to check a connection answers                   |
 | `tables`     | The tables and views in a database                                           |
 | `describe`   | One table's or view's columns: type, nullability, default and key            |
+| `statements` | The statements the server spent most time on                                 |
+| `indexes`    | A database's unused, duplicate and redundant indexes                         |
+| `sizes`      | A database's largest tables or indexes                                       |
+| `locks`      | The locks sessions hold and wait for                                         |
 | `query`      | Runs one read-only statement and prints its rows                             |
 | `explain`    | Shows how the server would run a read, and what in the plan looks slow       |
 | `export`     | Streams a read's whole result into a file                                    |
@@ -142,7 +146,7 @@ to stderr, so stdout is always safe to pipe or parse. `--format` picks the shape
 | Code | Meaning                                                                                |
 |------|----------------------------------------------------------------------------------------|
 | 0    | It ran                                                                                 |
-| 2    | A usage error, or a connection, file or table that isn't there. Nothing was sent       |
+| 2    | A usage error, or a connection, file or table that isn't there. Nothing was sent. Or a performance command's statistics are off, or the engine doesn't have what it asks for |
 | 3    | Refused: not a read, a read-only connection, no `--yes`, no CLI access, or a connection setting that makes it unsafe. Your statement never ran, and running it again unchanged refuses again |
 | 4    | The server or the connection failed. Retrying may work                                 |
 | 5    | A write timed out after it was sent and may have been applied. Check before retrying   |
@@ -151,7 +155,8 @@ to stderr, so stdout is always safe to pipe or parse. `--format` picks the shape
 
 ## In this section
 
-- [Reading and exporting](reading.md) — `query`, `explain`, `export`, `dump` and `compare`.
+- [Reading and exporting](reading.md) — `query`, `explain`, `export`, `dump` and `compare`, and
+  `statements`, `indexes`, `sizes` and `locks` for a slow server.
 - [Running writes](exec.md) — `exec`, the questions it asks first, and running a whole script.
 - [Importing a file](import.md) — `import`, loading a CSV, JSON or Excel file into a table.
 - [MCP server](mcp.md) — hand a connection to an AI agent in your editor or desktop app.

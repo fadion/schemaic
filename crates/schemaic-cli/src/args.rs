@@ -43,7 +43,8 @@ const AFTER_HELP: &str = concat!(
     "\n",
     "Exit codes:\n",
     "  0  It ran\n",
-    "  2  A usage error, or a connection, file or table that is not there; nothing was sent\n",
+    "  2  A usage error, or a connection, file or table that is not there; nothing was sent.\n",
+    "     Or a statistics source that is off, or a performance read this engine cannot make\n",
     "  3  A guard refused: not a read, a read-only connection, no --yes, or no CLI access; \
      nothing was sent. Or the connection's settings or session refused it (init SQL, \
      transport, MySQL sql_mode, a read-only PostgreSQL path); your statement never ran\n",
@@ -126,6 +127,73 @@ pub enum Command {
         #[command(flatten)]
         output: OutputArgs,
         /// Seconds before the lookup is cancelled.
+        #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
+        timeout: u64,
+    },
+    /// Rank the statements the server has spent its time on.
+    ///
+    /// Read from pg_stat_statements on PostgreSQL, performance_schema's
+    /// statement digests on MySQL and MariaDB, and the database's Query Store
+    /// on SQL Server. A source that is off is said on stderr, with the
+    /// statement that turns it on — never run — and exits 2.
+    Statements {
+        #[command(flatten)]
+        target: Target,
+        #[command(flatten)]
+        output: OutputArgs,
+        /// total (time across every call), mean (time per call) or calls.
+        #[arg(long, default_value = "total", value_parser = parse_statement_order)]
+        order: schemaic_core::workload::StatementOrder,
+        /// Maximum statements to return.
+        #[arg(long, default_value_t = PERF_LIMIT, value_parser = perf_limit(
+            schemaic_core::workload::MAX_STATEMENT_LIMIT
+        ))]
+        limit: usize,
+        /// Seconds before the read is given up on.
+        #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
+        timeout: u64,
+    },
+    /// List a database's unused, duplicate and prefix-redundant indexes.
+    ///
+    /// The note on how far the usage counts go back is on stderr. Nothing is
+    /// dropped: the output is for reading.
+    Indexes {
+        #[command(flatten)]
+        target: Target,
+        #[command(flatten)]
+        output: OutputArgs,
+        /// List the indexes the optimiser recorded as missing instead, each
+        /// with the DDL that would create it — never run. SQL Server only.
+        #[arg(long)]
+        missing: bool,
+        /// Seconds before the read is given up on.
+        #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
+        timeout: u64,
+    },
+    /// List a database's largest tables, or with --indexes its largest
+    /// indexes.
+    Sizes {
+        #[command(flatten)]
+        target: Target,
+        #[command(flatten)]
+        output: OutputArgs,
+        /// The largest indexes rather than the largest tables.
+        #[arg(long)]
+        indexes: bool,
+        /// Maximum rows to return.
+        #[arg(long, default_value_t = PERF_LIMIT, value_parser = perf_limit(MAX_SIZE_ROWS))]
+        limit: usize,
+        /// Seconds before the read is given up on.
+        #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
+        timeout: u64,
+    },
+    /// Show the locks sessions hold and wait for, and who blocks whom.
+    Locks {
+        #[command(flatten)]
+        conn: ConnArgs,
+        #[command(flatten)]
+        output: OutputArgs,
+        /// Seconds before the read is given up on.
         #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS, value_parser = at_least_one_second())]
         timeout: u64,
     },
@@ -481,6 +549,10 @@ impl Command {
             | Command::Ping { output, .. }
             | Command::Tables { output, .. }
             | Command::Describe { output, .. }
+            | Command::Statements { output, .. }
+            | Command::Indexes { output, .. }
+            | Command::Sizes { output, .. }
+            | Command::Locks { output, .. }
             | Command::Query { output, .. }
             | Command::Explain { output, .. }
             | Command::Exec { output, .. } => Some(output),
@@ -745,6 +817,28 @@ fn at_least_one_row() -> clap::builder::RangedU64ValueParser<usize> {
     clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
 }
 
+/// How many rows `statements` and `sizes` return unless asked for more — the
+/// MCP tools' default, so a person and an agent see the same list.
+pub const PERF_LIMIT: usize = 20;
+
+/// The most `sizes` returns: past this the list is the catalogue, which
+/// `tables` already is. The MCP `table_sizes` tool's ceiling.
+pub const MAX_SIZE_ROWS: usize = 100;
+
+/// A performance command's `--limit`: `1..=max`, **refused above it rather
+/// than clamped**, so asking for more than there can be says so.
+fn perf_limit(max: usize) -> clap::builder::RangedU64ValueParser<usize> {
+    clap::builder::RangedU64ValueParser::<usize>::new().range(1..=max as u64)
+}
+
+/// `statements --order`'s parser, over the names core's
+/// [`StatementOrder::parse`](schemaic_core::workload::StatementOrder::parse)
+/// takes — the MCP tool's `order` argument reads the same ones.
+fn parse_statement_order(s: &str) -> Result<schemaic_core::workload::StatementOrder, String> {
+    schemaic_core::workload::StatementOrder::parse(s)
+        .ok_or_else(|| format!("'{s}' is not an order; use total, mean or calls"))
+}
+
 /// `--timeout`'s parser: zero seconds cancels every statement before it runs.
 fn at_least_one_second() -> clap::builder::RangedU64ValueParser<u64> {
     clap::builder::RangedU64ValueParser::<u64>::new().range(1..)
@@ -855,6 +949,10 @@ pub fn wants_cli(argv: &[String]) -> bool {
                 | "ping"
                 | "tables"
                 | "describe"
+                | "statements"
+                | "indexes"
+                | "sizes"
+                | "locks"
                 | "query"
                 | "explain"
                 | "export"
@@ -1472,6 +1570,99 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
+    /// `statements` ranks by total time and returns the MCP tool's twenty
+    /// unless asked otherwise, and takes the tool's three order names.
+    #[test]
+    fn statements_defaults_to_total_time_and_twenty() {
+        use schemaic_core::workload::StatementOrder;
+        let cli = parse(&["schemaic", "statements", "-c", "prod", "-d", "shop"]).unwrap();
+        let Command::Statements {
+            target,
+            order,
+            limit,
+            timeout,
+            ..
+        } = cli.command
+        else {
+            panic!("expected statements");
+        };
+        assert_eq!(target.database.as_deref(), Some("shop"));
+        assert_eq!(order, StatementOrder::Total);
+        assert_eq!(limit, PERF_LIMIT);
+        assert_eq!(timeout, crate::query::DEFAULT_TIMEOUT.as_secs());
+        for (name, want) in [
+            ("mean", StatementOrder::Mean),
+            ("calls", StatementOrder::Calls),
+            ("Total", StatementOrder::Total),
+        ] {
+            let cli = parse(&["schemaic", "statements", "-c", "1", "--order", name]).unwrap();
+            let Command::Statements { order, .. } = cli.command else {
+                panic!("expected statements");
+            };
+            assert_eq!(order, want, "{name}");
+        }
+        let err = parse(&["schemaic", "statements", "-c", "1", "--order", "slowest"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    /// **A limit past the ceiling is refused, not clamped** — the MCP tools'
+    /// rule, so asking for more than there can be says so.
+    #[test]
+    fn a_performance_limit_past_its_ceiling_is_refused() {
+        let max = schemaic_core::workload::MAX_STATEMENT_LIMIT.to_string();
+        let over = (schemaic_core::workload::MAX_STATEMENT_LIMIT + 1).to_string();
+        assert!(parse(&["schemaic", "statements", "-c", "1", "--limit", &max]).is_ok());
+        for bad in [over.as_str(), "0"] {
+            let err = parse(&["schemaic", "statements", "-c", "1", "--limit", bad]).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
+        }
+        let over = (MAX_SIZE_ROWS + 1).to_string();
+        let err = parse(&["schemaic", "sizes", "-c", "1", "--limit", &over]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    /// `indexes` and `sizes` each have one switch, off by default; `indexes`
+    /// takes no `--limit`.
+    #[test]
+    fn indexes_and_sizes_each_take_their_switch() {
+        let cli = parse(&["schemaic", "indexes", "-c", "1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Indexes { missing: false, .. }
+        ));
+        let cli = parse(&["schemaic", "indexes", "-c", "1", "--missing"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Indexes { missing: true, .. }
+        ));
+        let err = parse(&["schemaic", "indexes", "-c", "1", "--limit", "5"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+
+        let cli = parse(&["schemaic", "sizes", "-c", "1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Sizes {
+                indexes: false,
+                limit: PERF_LIMIT,
+                ..
+            }
+        ));
+        let cli = parse(&["schemaic", "sizes", "-c", "1", "--indexes"]).unwrap();
+        assert!(matches!(cli.command, Command::Sizes { indexes: true, .. }));
+    }
+
+    /// `locks` is the server's, not one database's: no `-d`.
+    #[test]
+    fn locks_takes_a_connection_and_no_database() {
+        let cli = parse(&["schemaic", "locks", "-c", "prod"]).unwrap();
+        let Command::Locks { conn, .. } = cli.command else {
+            panic!("expected locks");
+        };
+        assert_eq!(conn.connection.as_deref(), Some("prod"));
+        let err = parse(&["schemaic", "locks", "-c", "1", "-d", "shop"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
     /// **`mcp` names a connection and, optionally, a database — nothing else.**
     /// Stdin is the protocol's, so `--password-stdin` would read the client's
     /// first JSON-RPC line as the password; it is not a flag here at all rather
@@ -1783,6 +1974,10 @@ mod tests {
             &["schemaic", "ping", "-c", "1", "--no-header"],
             &["schemaic", "tables", "-c", "1", "--no-header"],
             &["schemaic", "describe", "t", "-c", "1", "--no-header"],
+            &["schemaic", "statements", "-c", "1", "--no-header"],
+            &["schemaic", "indexes", "-c", "1", "--no-header"],
+            &["schemaic", "sizes", "-c", "1", "--no-header"],
+            &["schemaic", "locks", "-c", "1", "--no-header"],
             &["schemaic", "query", "SELECT 1", "-c", "1", "--no-header"],
             &["schemaic", "exec", "SELECT 1", "-c", "1", "--no-header"],
         ] {

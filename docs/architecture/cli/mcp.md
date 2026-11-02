@@ -570,7 +570,8 @@ it."
 **The four performance tools — `top_statements`, `index_health`, `table_sizes` and
 `current_locks` — are the MCP half of the roadmap's *Workload and performance insight*, on the
 backend its app view shares** (`core::workload`, rendered by `cli/perf.rs`; the view is
-`ui/perf_view.rs`). They are
+`ui/perf_view.rs`), and the CLI's `statements`, `indexes`, `sizes` and `locks` read the same
+methods into the same tables (`cli/run.md`). They are
 advertised on every engine and answer for an absent source rather than being withheld: on SQLite
 `top_statements` says the engine keeps no statement statistics and `current_locks` that it has no
 server sessions (`activity::supports_activity`, asked before the read), while `index_health` and
@@ -604,7 +605,11 @@ refused, never clamped** (`perf_limit`), `sample_rows`' rule: absent or `null` i
 and anything but a whole number from 1 to the tool's ceiling — `MAX_STATEMENT_LIMIT` (500) for
 statements, `MAX_SIZE_ROWS` (100) for sizes — is an error naming the range, so a model that asked
 for 10,000 learns the ceiling rather than silently getting less
-(`a_performance_limit_defaults_and_refuses_what_it_cannot_honour`).
+(`a_performance_limit_defaults_and_refuses_what_it_cannot_honour`). **`PERF_ROWS` and
+`MAX_SIZE_ROWS` are not this file's numbers**: they are defined from `args.rs`'s `PERF_LIMIT` and
+`MAX_SIZE_ROWS`, the `--limit` default and ceiling of `schemaic statements` and `sizes`, which
+refuse past the ceiling by the same rule — so the CLI and the tools cannot drift into two defaults
+for one list (`cli/args.md`).
 **The gates: all four read the catalogue, and two of them read rows.** `reads_schema` is `true`
 for every one — index health and sizes rank every table and index name in a database, the overview
 `list_schema` gives with sizes, and the statements and the locks name tables too — so *Schema

@@ -58,3 +58,8 @@ that list says so instead.
 
 The view reads the server when it opens and when you switch tabs or ranking. Press **Refresh** to
 read it again.
+
+## From the command line
+
+`schemaic statements`, `indexes` and `sizes` print the same lists in a terminal or a script — see
+[Looking into a slow server](../cli/reading.md#looking-into-a-slow-server).

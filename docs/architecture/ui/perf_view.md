@@ -4,11 +4,13 @@
 is slow, beside Server Activity's who-is-running — the statements it has spent most on, the
 indexes worth a look, and the largest tables and indexes, for the connection and database it was
 opened on. It is the app half of the roadmap's *Workload and performance insight*, the MCP
-server's four performance tools being the other (`cli/mcp.md`), and **it ranks with
+server's four performance tools being the other (`cli/mcp.md`) — with the CLI's `statements`,
+`indexes`, `sizes` and `locks` printing those tools' tables (`cli/run.md`) — and **it ranks with
 `core::workload`'s functions over the same `Db` reads those tools call**, so a person and an agent
 looking at one server are told the same thing — the same ranking, not the same length: the app
-asks for 50 statements, 50 tables and indexes and 50 missing indexes, where the tools default to
-`PERF_ROWS` (20). **Nothing here writes**: *Drop* on an index finding and *Create index* on a
+asks for 50 statements, 50 tables and indexes and 50 missing indexes, where the tools and the
+CLI default to `PERF_ROWS` (20; `PERF_LIMIT` on the CLI, the same constant) — though `schemaic
+indexes --missing` asks for this view's 50. **Nothing here writes**: *Drop* on an index finding and *Create index* on a
 SQL Server suggestion each go through the table's draft, `ddl::diff` and the DDL preview, and the
 statement that would turn a missing statistics source on is shown, never run. Modelled on the
 Server variables viewer (`ui/server_vars_view.md`), and mounted in the workspace group directly

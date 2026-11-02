@@ -1,7 +1,7 @@
 # `schemaic-cli`
 
 `schemaic-cli` — Schemaic without a window: `schemaic list` / `databases` / `ping` / `tables` /
-`describe` / `query` / `explain` / `export` / `dump` / `compare` / `exec` / `import` / `mcp` / `version` / `completions` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
+`describe` / `statements` / `indexes` / `sizes` / `locks` / `query` / `explain` / `export` / `dump` / `compare` / `exec` / `import` / `mcp` / `version` / `completions` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
 handed a credential — or, with `--url`, against one given on the command line and never saved,
 for a container or CI job with no Schemaic setup (`cli/args.md`, `cli/run.md`). It also holds the **MCP server** (`mcp.rs`), which has two ways in — the
 app's `--mcp-serve` for the AI panel, and `schemaic mcp -c <conn>` for any MCP client. Its whole

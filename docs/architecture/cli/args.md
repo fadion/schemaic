@@ -21,8 +21,8 @@ connected to the database named after the user, the unscoped landing the exec gu
 no-database arm exists to stop, reached without the guard seeing it
 (`a_blank_database_is_refused_at_parse_time`, `a_zero_timeout_or_limit_is_refused`).
 **`-c` falls back to `SCHEMAIC_CONNECTION` and `-d` to `SCHEMAIC_DATABASE`** (clap's `env`; a
-flag on the command line wins), on `query`, `explain`, `export`, `dump`, `exec`, `import`, `tables` and `describe` alike, `-c` on
-`databases` and `ping`
+flag on the command line wins), on `query`, `explain`, `export`, `dump`, `exec`, `import`, `tables`, `describe`, `statements`, `indexes` and `sizes` alike, `-c` on
+`databases`, `ping` and `locks`
 (through `ConnArgs`), both on `mcp` (through `McpTarget`) and both on `compare`, whose
 `--source-*` pair has no fallback (below), so an agent's shell is pointed at a connection and a database once. A `SCHEMAIC_DATABASE` that is set
 but blank goes through the same `non_blank` and is refused, not read as unset — it is `-d "$DB"`
@@ -38,7 +38,7 @@ footer and only a caller that asks should get a non-zero exit for rows read corr
 (`fail_on_cap_is_an_opt_in_query_flag`). `exec` has no `--limit` and its cap bounds only what
 is printed, so there is nothing for the flag to report (`exec_has_no_fail_on_cap_flag`).
 **`OutputArgs { format, no_header }` is flattened into every subcommand that prints rows** —
-`list`, `databases`, `ping`, `tables`, `describe`, `query`, `explain` and `exec` — in place of a `format`
+`list`, `databases`, `ping`, `tables`, `describe`, `statements`, `indexes`, `sizes`, `locks`, `query`, `explain` and `exec` — in place of a `format`
 field of each one's own, so `--no-header` is on all of them at once
 (`no_header_is_on_every_row_printing_subcommand`).
 `OutputArgs::output()` is `format::Output::new`, and whether the pair goes together is judged
@@ -102,7 +102,9 @@ help lists them where `--format` is. It is **a literal, checked against the code
 built from it**, because clap takes a `&'static str` there — `run.rs`'s tests hold it to `Exit`
 and `Format::NAMES`. Those tests read the text by its shape, which is the part to keep when
 editing it: an exit line is one whose first word is a number (the `\` continuation on 3 keeps
-its tail on the same line), and a format line is one indented by two spaces, so the
+its tail on the same line; 2's second line, the performance reads the server cannot answer, is a
+real line of its own and passes only because it opens with `Or` — a number there would read as an
+eighth code), and a format line is one indented by two spaces, so the
 `--no-header` and stdout/stderr lines under the formats sit at column 0 on purpose. **It is a
 `concat!` of `\n`-terminated literals, one per line**, not one literal with its breaks typed in:
 the columns are aligned with space runs, and a space run after a real line break is what
@@ -180,11 +182,13 @@ how the statement spells it, and the name must be one the statement could spell 
 statement: binding it, and every refusal that depends on the statement, is `run.rs`'s `bind`.
 **`ConnArgs` is `Target` without the database** — `-c` or `--url`, `--read-only` and
 `--password-stdin`, flattened into
-`Target { conn, database }` for `query`, `explain`, `export`, `dump`, `exec`, `import`, `tables` and `describe`, and taken alone by the
-two subcommands with
-no database to run in: `databases` lists the names `-d` takes, and `ping` asks whether the
-server answers at all, so neither has a `-d` and passing one is a parse error
-(`databases_has_no_database_flag`, `ping_takes_a_connection_and_the_reachability_timeout`).
+`Target { conn, database }` for `query`, `explain`, `export`, `dump`, `exec`, `import`, `tables`, `describe`, `statements`, `indexes` and `sizes`, and taken alone by the
+three subcommands with
+no database to run in: `databases` lists the names `-d` takes, `ping` asks whether the
+server answers at all, and `locks` reads the server's sessions rather than one database's, so
+none has a `-d` and passing one is a parse error
+(`databases_has_no_database_flag`, `ping_takes_a_connection_and_the_reachability_timeout`,
+`locks_takes_a_connection_and_no_database`).
 `run.rs`'s `select_conn` and `connect` take `&ConnArgs`, which is what lets every subcommand
 above share them — and `compare` and `mcp`, which have no `ConnArgs` of their own, build one with
 only `connection` set (`..Default::default()`, which `ConnArgs` derives for them) to use them
@@ -216,6 +220,22 @@ answer without one. `tables` has `--limit` at `DEFAULT_LIMIT`, like `query`; `de
 none, and passing one is a parse error — it names one table, so there is nothing to cap, and
 `run.rs` holds it to a memory bound instead (`tables_takes_a_target_and_a_limit`,
 `describe_takes_one_table_and_a_target`). Both default `--timeout` to `DEFAULT_TIMEOUT_SECS`.
+**`statements`, `indexes`, `sizes` and `locks` are the MCP server's four performance tools on
+the command line**, and take what those tools take as flags. `statements` has a `Target`,
+`--order total|mean|calls` (default `total`), read by `parse_statement_order` through
+`workload::StatementOrder::parse` — the names the tool's `order` argument reads, case ignored —
+and `--limit`. `indexes` has a `Target` and `--missing`, SQL Server's missing-index suggestions in
+place of the health findings, and **no `--limit`**, a parse error, the findings being a
+database's whole list. `sizes` has a `Target`, `--indexes` for the largest indexes rather than
+tables, and `--limit`. `locks` is `ConnArgs` alone (above). All four flatten `OutputArgs` and
+default `--timeout` to `DEFAULT_TIMEOUT_SECS`. **One default and one ceiling for both front
+ends**: `PERF_LIMIT` (20) and `MAX_SIZE_ROWS` (100) are defined here and `mcp.rs`'s `PERF_ROWS`
+and `MAX_SIZE_ROWS` are defined from them, so a person and an agent asking the same server get
+the same list; `statements`' ceiling is core's `MAX_STATEMENT_LIMIT`. **A `--limit` past its
+ceiling is refused, not clamped** (`perf_limit`, a `1..=max` range), the tools' rule — asking for
+more than there can be says so rather than silently getting less
+(`statements_defaults_to_total_time_and_twenty`, `a_performance_limit_past_its_ceiling_is_refused`,
+`indexes_and_sizes_each_take_their_switch`).
 **`mcp` takes `McpTarget` — `-c`, `--url`, `--ai-data` and `-d`, and deliberately no
 `--password-stdin`.** Stdin is
 the MCP client's JSON-RPC stream, so a password read from it would be the client's first
@@ -265,8 +285,8 @@ app's own binary a new subcommand does not reach the CLI until its name is added
 `databases` and `ping` were, and `tables` and `describe` after them — the test was seen red
 until both names went in (`every_subcommand_routes_to_the_cli`) — and `mcp`, which is not
 the app's `--mcp-serve` above though both start the one server, and `export` after it,
-`dump` after that, `explain` after that, `compare` after that, `completions` after that, and
-`import` after that.
+`dump` after that, `explain` after that, `compare` after that, `completions` after that,
+`import` after that, and `statements`, `indexes`, `sizes` and `locks` after that.
 `schemaic.com` calls
 `run::main` without asking, so a missing name shows everywhere except through it. **That test
 and `the_help_text_names_every_subcommand` read the names off clap's `Command`**

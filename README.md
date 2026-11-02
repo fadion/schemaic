@@ -108,6 +108,10 @@ schemaic exec "UPDATE orders SET state = 'sent' WHERE id = 7" -c prod
   rows unless you raise `--limit`.
 - `explain` shows a read's query plan and flags what looks slow. It plans the
   statement without running it.
+- `statements`, `indexes`, `sizes` and `locks` show what a slow server is
+  spending its time on: the costliest statements, the indexes worth a second
+  look, the largest tables and indexes, and who holds or waits on a lock. They
+  only read.
 - `export` streams a read's whole result into a JSON, CSV, SQL, Markdown, HTML
   or Excel file, with no row cap.
 - `dump` writes a database, or the tables you name, to a `.sql` file that
