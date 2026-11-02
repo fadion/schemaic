@@ -44,9 +44,7 @@ fn markdown_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Every `.rs` file under `dir`, recursively, as text — up to its first
-/// `#[cfg(test)]`, since a literal in a test module is a fixture, not
-/// something the interface shows.
+/// Every `.rs` file under `dir`, recursively, as [`label_source`] reads it.
 fn rust_sources(dir: &Path, out: &mut Vec<String>) {
     for entry in fs::read_dir(dir).expect("a source folder") {
         let path = entry.expect("a source entry").path();
@@ -54,10 +52,87 @@ fn rust_sources(dir: &Path, out: &mut Vec<String>) {
             rust_sources(&path, out);
         } else if path.extension().is_some_and(|e| e == "rs") {
             let text = fs::read_to_string(&path).expect("a source file");
-            let end = text.find("#[cfg(test)]").unwrap_or(text.len());
-            out.push(text[..end].to_string());
+            out.push(label_source(&text));
         }
     }
+}
+
+/// A source file's **code** — where a literal could be something the
+/// interface shows — up to its test module, with every comment dropped.
+///
+/// **A comment vouches for no label**: a renamed label's old spelling lives
+/// on in the comments that describe it (*AI Seed Table* did, in two doc
+/// comments), and the guard accepted a guide page still writing it. Cut at
+/// `#[cfg(test)] mod`, not the first `#[cfg(test)]`, which can be a helper
+/// halfway down a file with real code after it.
+fn label_source(text: &str) -> String {
+    let end = text
+        .match_indices("#[cfg(test)]")
+        .find(|(at, m)| text[at + m.len()..].trim_start().starts_with("mod "))
+        .map_or(text.len(), |(at, _)| at);
+    let text = &text[..end];
+    let mut out = String::with_capacity(text.len());
+    let (mut in_string, mut in_block) = (false, false);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_block {
+            if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                in_block = false;
+            }
+            continue;
+        }
+        if in_string {
+            out.push(c);
+            match c {
+                '\\' => out.extend(chars.next()),
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match (c, chars.peek()) {
+            ('/', Some('/')) => {
+                // To the end of the line, which is kept.
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                in_block = true;
+            }
+            ('"', _) => {
+                in_string = true;
+                out.push(c);
+            }
+            // A char literal — `'"'`, `'\''` — copied whole, so its quote
+            // opens no string; a lifetime (`'a`) is just copied.
+            ('\'', _) => {
+                out.push(c);
+                let mut ahead = chars.clone();
+                let literal = matches!(
+                    (ahead.next(), ahead.next()),
+                    (Some('\\'), _) | (Some(_), Some('\''))
+                );
+                if literal {
+                    while let Some(c) = chars.next() {
+                        out.push(c);
+                        if c == '\\' {
+                            out.extend(chars.next());
+                        } else if c == '\'' {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// The page's prose, one entry per block with the line it starts on: fenced
@@ -80,7 +155,9 @@ fn prose_blocks(text: &str) -> Vec<(usize, String)> {
             continue;
         }
         let run: String = trimmed.chars().take_while(|c| *c == '`').collect();
-        let run = if run.len() >= 3 {
+        // A backtick fence's info string holds no backtick (CommonMark):
+        // ```` ```x``` then **a** ```` is a code span and prose after it.
+        let run = if run.len() >= 3 && !trimmed[run.len()..].contains('`') {
             run
         } else {
             trimmed.chars().take_while(|c| *c == '~').collect()
@@ -144,15 +221,52 @@ fn strip_code_spans(text: &str) -> String {
     out
 }
 
-/// The text of each `**…**` span in a block.
+/// The text of each bold span in a block — `**…**`, and `__…__` where it
+/// opens at a word's start, as Markdown reads it (`snake__case` is no bold).
+/// Every spelling, since one the guard does not read is a label it never
+/// checks.
 fn bold_spans(line: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut rest = line;
-    while let Some(start) = rest.find("**") {
-        let after = &rest[start + 2..];
-        let Some(end) = after.find("**") else { break };
-        out.push(after[..end].to_string());
-        rest = &after[end + 2..];
+    for marker in ["**", "__"] {
+        let mut rest = line;
+        while let Some(start) = rest.find(marker) {
+            let opens_word = rest[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric());
+            let after = &rest[start + 2..];
+            let Some(end) = after.find(marker) else { break };
+            if marker == "**" || opens_word {
+                out.push(after[..end].to_string());
+            }
+            rest = &after[end + 2..];
+        }
+    }
+    out
+}
+
+/// Every link target in a page's prose: inline `[text](target)` and a
+/// reference definition's `[name]: target`, which the guard read none of.
+fn link_targets(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (_, prose) in prose_blocks(text) {
+        let mut rest = prose.as_str();
+        while let Some(at) = rest.find("](") {
+            let after = &rest[at + 2..];
+            let Some(end) = after.find(')') else { break };
+            out.push(after[..end].to_string());
+            rest = &after[end + 1..];
+        }
+    }
+    for line in text.lines() {
+        let t = line.trim_start();
+        if let Some(def) = t.strip_prefix('[')
+            && let Some((label, target)) = def.split_once("]:")
+            && !label.is_empty()
+            && let Some(target) = target.split_whitespace().next()
+        {
+            out.push(target.to_string());
+        }
     }
     out
 }
@@ -304,28 +418,21 @@ fn every_relative_link_in_the_guide_resolves() {
         let root = guide_src()
             .canonicalize()
             .expect("the guide's source folder");
-        for (line, prose) in prose_blocks(&text) {
-            let mut rest = prose.as_str();
-            while let Some(at) = rest.find("](") {
-                let after = &rest[at + 2..];
-                let Some(end) = after.find(')') else { break };
-                let target = &after[..end];
-                rest = &after[end + 1..];
-                let path = target.split('#').next().unwrap_or("");
-                // `[Title]()` is a draft chapter in SUMMARY.md; an absolute URL
-                // or a bare anchor is not a file.
-                if path.is_empty() || path.contains("://") || path.starts_with("mailto:") {
-                    continue;
-                }
-                // mdBook publishes only what is under `src/`: a link out to the
-                // repository's README resolves here and 404s on the site.
-                let published = dir
-                    .join(path)
-                    .canonicalize()
-                    .is_ok_and(|p| p.is_file() && p.starts_with(&root));
-                if path.starts_with('/') || !published {
-                    offenders.push(format!("{name}:{line}: {target}"));
-                }
+        for target in link_targets(&text) {
+            let path = target.split('#').next().unwrap_or("");
+            // `[Title]()` is a draft chapter in SUMMARY.md; an absolute URL
+            // or a bare anchor is not a file.
+            if path.is_empty() || path.contains("://") || path.starts_with("mailto:") {
+                continue;
+            }
+            // mdBook publishes only what is under `src/`: a link out to the
+            // repository's README resolves here and 404s on the site.
+            let published = dir
+                .join(path)
+                .canonicalize()
+                .is_ok_and(|p| p.is_file() && p.starts_with(&root));
+            if path.starts_with('/') || !published {
+                offenders.push(format!("{name}: {target}"));
             }
         }
     }
@@ -470,6 +577,52 @@ fn a_table_row_and_a_heading_are_blocks_of_their_own() {
     let blocks = prose_blocks("# T\n| **a** | b |\n| **c** | d |\ntext\nmore");
     let lines: Vec<_> = blocks.iter().map(|(line, _)| *line).collect();
     assert_eq!(lines, [1, 2, 3, 4]);
+}
+
+/// **A comment vouches for no label.** A renamed label's old spelling lives
+/// on in the comments that describe it — *AI Seed Table* did — and a guide
+/// page still writing it passed. And a test module is cut where it starts,
+/// not at the first `#[cfg(test)]`, which can be a helper's mid-file.
+#[test]
+fn a_label_quoted_in_a_comment_is_not_in_the_source() {
+    let src = "/// Open the \"AI Seed Table\" popover\n\
+               fn f() { show(\"Seed rows\"); } // the \"Old caption\" was here\n\
+               /* \"Block caption\" */\n\
+               #[cfg(test)]\nfn helper() { show(\"Later label\"); }\n\
+               #[cfg(test)]\nmod tests { fn t() { show(\"Fixture\"); } }";
+    let code = label_source(src);
+    assert!(!code.contains("\"AI Seed Table\""), "{code}");
+    assert!(!code.contains("\"Old caption\""), "{code}");
+    assert!(!code.contains("\"Block caption\""), "{code}");
+    assert!(
+        code.contains("\"Seed rows\"") && code.contains("\"Later label\""),
+        "{code}"
+    );
+    assert!(!code.contains("\"Fixture\""), "{code}");
+    // A `//` inside a string is the string's.
+    assert!(label_source("f(\"a//b\", \"Next\");").contains("\"Next\""));
+}
+
+/// **Every spelling of bold is read, and a backtick run with more after it
+/// on its line is a code span, not a fence** — `__a__` was not read at all,
+/// and a line opening ```` ```x``` ```` hid the rest of the page.
+#[test]
+fn every_bold_spelling_is_read_and_an_inline_run_is_no_fence() {
+    assert_eq!(spans_of("```x``` then **a**\n\nmore **b**"), ["a", "b"]);
+    let mut both = spans_of("__a__ and **b**");
+    both.sort();
+    assert_eq!(both, ["a", "b"]);
+    assert_eq!(spans_of("snake_case_name and **b**"), ["b"]);
+}
+
+/// **A reference-style link's target is a link too.**
+#[test]
+fn a_reference_definition_is_a_link() {
+    assert_eq!(
+        link_targets("See [the page][p].\n\n[p]: ../other.md#x\n"),
+        ["../other.md#x"]
+    );
+    assert_eq!(link_targets("[a](b.md) and [c](d.md)"), ["b.md", "d.md"]);
 }
 
 #[test]
