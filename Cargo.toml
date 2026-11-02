@@ -282,7 +282,7 @@ calamine = "0.36"
 # that needs a zip reader and writer. Already in the graph as calamine's own
 # dependency, so it is a `[dev-dependencies]` line and not a new crate for the
 # licence census to weigh; pinned to the same major the graph already resolves.
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # Profiling build: release-grade optimization (so we measure real perf, not a slow
 # debug build) but with full debug symbols so a sampling profiler (samply, etc.) can
