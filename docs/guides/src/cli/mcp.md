@@ -41,6 +41,10 @@ Nothing the server offers writes to the database. What it can read depends on th
 | `explain`        | A read's plan, and what in it looks slow                | **Let it read data** only   |
 | `sample_rows`    | The first rows of a table                               | **Let it read data** only   |
 
+Two tools the app's own assistant has are left out: `propose_table_change` and `propose_sql`.
+Each hands its result to the AI panel — a change to review, a statement to insert or run — and
+there's no panel on the other end.
+
 **Only what I attach**, the default, gives an outside agent no rows at all: it has no way to attach
 any. `run_query` and `explain` pass the same read-only check as
 [`schemaic query`](reading.md#only-reads), and a query is cancelled after 30 seconds.

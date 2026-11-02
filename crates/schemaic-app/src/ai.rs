@@ -307,10 +307,11 @@ fn endpoint_from_blob(
 ) -> Result<McpEndpoint, String> {
     let saved = saved_db(v, lookup)?;
     let mut endpoint = endpoint_from_value(v);
-    if let Some((db, ai_data, name)) = saved {
+    if let Some((db, conn)) = saved {
         endpoint.db = db;
-        endpoint.samples &= ai_data.may_query();
-        endpoint.audit_as = Some(name);
+        endpoint.samples &= conn.ai_data.unwrap_or_default().may_query();
+        endpoint.audit_as = Some(conn.name);
+        endpoint.read_only = conn.read_only;
     }
     Ok(endpoint)
 }
@@ -450,7 +451,7 @@ fn endpoint_blob(
 fn saved_db(
     v: &serde_json::Value,
     lookup: impl Fn(u64) -> Result<schemaic_core::connection::Connection, String>,
-) -> Result<Option<(Db, schemaic_core::connection::AiData, String)>, String> {
+) -> Result<Option<(Db, schemaic_core::connection::Connection)>, String> {
     let Some(id) = v.get("conn_id").and_then(|x| x.as_u64()) else {
         return Ok(None);
     };
@@ -465,13 +466,10 @@ fn saved_db(
     } else {
         None
     };
-    Ok(Some((
-        Db::connect(&saved, tunnel),
-        saved.ai_data.unwrap_or_default(),
-        // The agent log's name for it — the saved connection's, never the
-        // blob's, for the reason everything else here is.
-        saved.name.clone(),
-    )))
+    // The saved connection itself rides along: its data level, its name for
+    // the agent log and its read-only flag are the saved connection's, never
+    // the blob's, for the reason everything else here is.
+    Ok(Some((Db::connect(&saved, tunnel), saved)))
 }
 
 /// [`saved_db`]'s real lookup: the saved connection `id`, hydrated from
@@ -609,6 +607,8 @@ fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
         // Set from the saved connection in `endpoint_from_blob`, never the
         // blob: until then nothing is logged.
         audit_as: None,
+        // Likewise the saved connection's, set in `endpoint_from_blob`.
+        read_only: false,
     }
 }
 
@@ -3526,7 +3526,9 @@ fn render_ai_context(
          propose_table_change to check the change against the live table, then put the same \
          JSON in a ```{tag} fenced block in your reply — Schemaic renders that as a change \
          preview the user reviews and applies themselves. Send only what should change: it is \
-         a patch, and what you don't name, you don't touch.",
+         a patch, and what you don't name, you don't touch. Before offering a statement that \
+         writes data, call propose_sql: it says whether Schemaic would refuse it or ask the user \
+         first, and nothing runs.",
         tag = schemaic_core::propose::FENCE_TAG,
     );
     // **At `None`, say that the schema was withheld — don't just omit it.**
@@ -4684,13 +4686,20 @@ mod tests {
                 _ => Err("no such connection".to_string()),
             }
         };
+        // Read-only, so the flag below is the saved connection's and not a
+        // default that happens to agree.
+        saved.read_only = true;
         let forged = serde_json::json!({
             "conn_id": 42, "host": "evil.example", "port": 1, "user": "root",
             "engine": "mysql", "tls": null, "init_sql": "", "auth": "Password",
         });
-        let (db, _, name) = saved_db(&forged, lookup(saved.clone())).unwrap().unwrap();
-        // The agent log names the saved connection, not anything the blob says.
-        assert_eq!(name, saved.name);
+        let (db, conn) = saved_db(&forged, lookup(saved.clone())).unwrap().unwrap();
+        // The agent log's name and the read-only flag are the saved
+        // connection's, not anything the blob says.
+        assert_eq!(
+            (conn.name.as_str(), conn.read_only),
+            (saved.name.as_str(), saved.read_only)
+        );
         let (host, port, user, pass, _) = db.parts();
         assert_eq!(
             (host, port, user, pass),
@@ -4703,7 +4712,7 @@ mod tests {
         saved.ssh.enabled = true;
         saved.ssh.host = "bastion.example".into();
         let tunnelled = serde_json::json!({ "conn_id": 42, "host": "evil.example", "port": 40123 });
-        let (db, _, _) = saved_db(&tunnelled, lookup(saved.clone()))
+        let (db, _) = saved_db(&tunnelled, lookup(saved.clone()))
             .unwrap()
             .unwrap();
         assert_eq!(db.parts().0, "127.0.0.1");
@@ -4761,6 +4770,21 @@ mod tests {
                 .unwrap()
                 .schema
         );
+        // **The endpoint carries the saved connection's name and read-only
+        // flag** — the agent log's name and `propose_sql`'s judge — whatever
+        // the blob says, and a blob naming no saved connection carries neither.
+        let mut read_only = saved(None);
+        read_only.read_only = true;
+        let forged = serde_json::json!({
+            "conn_id": 42, "read_only": false, "connection_name": "elsewhere",
+        });
+        let e = endpoint_from_blob(&forged, |_| Ok(read_only.clone())).unwrap();
+        assert_eq!(e.audit_as.as_deref(), Some("app"));
+        assert!(e.read_only);
+        let unsaved =
+            endpoint_from_blob(&serde_json::json!({ "host": "h" }), |_| panic!("looked up"))
+                .unwrap();
+        assert_eq!((unsaved.audit_as, unsaved.read_only), (None, false));
     }
 
     /// **`--mcp-serve` serves a saved connection only on the app's grant for

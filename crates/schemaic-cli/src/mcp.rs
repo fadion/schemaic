@@ -14,6 +14,8 @@
 //!   - `search_objects` — tables, views and columns by part of their name.
 //!   - `propose_table_change` — check a schema change and show the DDL it would
 //!     produce, for the AI panel to turn into a preview. Runs nothing.
+//!   - `propose_sql` — what the write guard says of a statement the model means
+//!     to offer, for the AI panel's code block to Insert or Run. Runs nothing.
 //!
 //! The split between the schema tools is deliberate: enriching every table
 //! with keys makes each entry bigger, so the broad listings stay cheap and the
@@ -33,8 +35,8 @@
 //!   (an editor's agent, a desktop assistant). The connection is resolved
 //!   through `schemaic-conn` exactly as `schemaic query` resolves it, gated on
 //!   `cli_access`, and its tunnel is held for the server's lifetime. Nothing
-//!   reads the model's reply there, so `propose_table_change` has nowhere to
-//!   go and is withheld.
+//!   reads the model's reply there, so `propose_table_change` and
+//!   `propose_sql` have nowhere to go and are withheld.
 //!
 //! Either way the endpoint is a structured `schemaic_db::Db` handle — no
 //! credential URL is involved — and it lives in this crate rather than the app's
@@ -195,6 +197,10 @@ pub struct Endpoint {
     /// saved connection itself, `None` elsewhere, so a test's call writes no
     /// file.
     pub audit_as: Option<String>,
+    /// Is the connection marked read-only — what `propose_sql` judges a
+    /// statement against, as the panel's Run will. From the saved connection,
+    /// never the blob; `false` where nothing has said.
+    pub read_only: bool,
 }
 
 impl Endpoint {
@@ -231,6 +237,8 @@ impl Endpoint {
             schema: true,
             host: Host::Standalone,
             audit_as: None,
+            // `propose_sql` is the one reader, and it is panel-only.
+            read_only: false,
         }
     }
 
@@ -409,11 +417,12 @@ pub enum McpTool {
     DescribeTable,
     SearchObjects,
     ProposeTableChange,
+    ProposeSql,
 }
 
 impl McpTool {
     /// Every tool, in the order `tools/list` advertises them.
-    pub const ALL: [McpTool; 8] = [
+    pub const ALL: [McpTool; 9] = [
         McpTool::RunQuery,
         McpTool::Explain,
         McpTool::SampleRows,
@@ -422,6 +431,7 @@ impl McpTool {
         McpTool::DescribeTable,
         McpTool::SearchObjects,
         McpTool::ProposeTableChange,
+        McpTool::ProposeSql,
     ];
 
     /// The name on the wire.
@@ -435,6 +445,7 @@ impl McpTool {
             McpTool::DescribeTable => "describe_table",
             McpTool::SearchObjects => "search_objects",
             McpTool::ProposeTableChange => "propose_table_change",
+            McpTool::ProposeSql => "propose_sql",
         }
     }
 
@@ -451,6 +462,7 @@ impl McpTool {
             McpTool::DescribeTable => "mcp__schemaic__describe_table",
             McpTool::SearchObjects => "mcp__schemaic__search_objects",
             McpTool::ProposeTableChange => "mcp__schemaic__propose_table_change",
+            McpTool::ProposeSql => "mcp__schemaic__propose_sql",
         }
     }
 
@@ -477,7 +489,8 @@ impl McpTool {
             | McpTool::ListSchema
             | McpTool::DescribeTable
             | McpTool::SearchObjects
-            | McpTool::ProposeTableChange => false,
+            | McpTool::ProposeTableChange
+            | McpTool::ProposeSql => false,
         }
     }
 
@@ -503,7 +516,8 @@ impl McpTool {
         match self {
             // A plan names the tables and indexes of a statement the model
             // wrote — what `run_query` on the same text would tell it.
-            McpTool::RunQuery | McpTool::Explain => false,
+            // `propose_sql` reads nothing at all: the guard is text only.
+            McpTool::RunQuery | McpTool::Explain | McpTool::ProposeSql => false,
             // A name search is the existence oracle `propose_table_change`'s
             // note above describes, asked on purpose. `sample_rows` resolves
             // its table against the catalogue, which is the same oracle, and
@@ -525,7 +539,7 @@ impl McpTool {
     /// session and `sample_rows` reads on one too, `explain` plans without the
     /// analysing form that would run the statement, `search_objects`,
     /// `list_databases` and the other listings read only the catalogue, and
-    /// `propose_table_change` runs nothing — its DDL goes to the user's
+    /// `propose_table_change` and `propose_sql` run nothing — the DDL or the statement goes to the user's
     /// preview. Asked per tool all the same, so a new one has to answer.
     pub fn read_only(self) -> bool {
         match self {
@@ -536,7 +550,8 @@ impl McpTool {
             | McpTool::ListSchema
             | McpTool::DescribeTable
             | McpTool::SearchObjects
-            | McpTool::ProposeTableChange => true,
+            | McpTool::ProposeTableChange
+            | McpTool::ProposeSql => true,
         }
     }
 
@@ -551,7 +566,10 @@ impl McpTool {
     /// the one that stops describing it.
     pub fn needs_panel(self) -> bool {
         match self {
-            McpTool::ProposeTableChange => true,
+            // `propose_sql`'s answer tells the model to hand the statement over
+            // in a ```sql block, which the panel gives Insert and Run; outside
+            // it, a code block is all there is.
+            McpTool::ProposeTableChange | McpTool::ProposeSql => true,
             McpTool::RunQuery
             | McpTool::Explain
             | McpTool::SampleRows
@@ -602,10 +620,10 @@ const NO_DATA_ACCESS_STANDALONE: &str = "Refused: this connection's AI data acce
 
 /// What the server says when a panel-only tool is called from outside the
 /// panel. Says what to do instead, for the reason the other two do.
-const NO_PANEL: &str = "Refused: propose_table_change hands its result to Schemaic's AI panel, \
-     which turns it into a change preview, and this server was started outside the panel by \
-     `schemaic mcp`. Describe the change to the user instead — list_schema and describe_table \
-     have the table's current definition.";
+const NO_PANEL: &str = "Refused: propose_table_change and propose_sql hand their result to \
+     Schemaic's AI panel, which turns it into a change preview or a statement to insert and run, \
+     and this server was started outside the panel by `schemaic mcp`. Describe the change to the \
+     user instead — list_schema and describe_table have the table's current definition.";
 
 /// The refusal a tool call earns from the connection's levels and the host,
 /// if any. Pure, so the gate is unit-tested without a live endpoint.
@@ -862,6 +880,34 @@ pub fn tools_list(
                 },
                 "required": ["table", "ops"]
             }
+        },
+        {
+            "name": "propose_sql",
+            "description": format!(
+                "Check a {} statement you mean to offer the user — an UPDATE, an INSERT, a fix to \
+                 their query — against Schemaic's write guard. **This runs nothing.** It says \
+                 whether the statement would be refused outright (a read-only connection, no \
+                 database), or whether Schemaic will ask the user before running it (a DELETE or \
+                 UPDATE with no WHERE, a DROP). Call it before proposing anything that writes. \
+                 When it comes back valid, put the statement in a ```sql block in your reply: the \
+                 user can Insert it into a query tab or Run it. For a change to a table's \
+                 structure, use propose_table_change instead.",
+                dialect.engine_label(),
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sql": {
+                        "type": "string",
+                        "description": "The statement, or statements, to check."
+                    },
+                    "database": {
+                        "type": "string",
+                        "description": "Where it would run. Defaults to the connection's active database."
+                    }
+                },
+                "required": ["sql"]
+            }
         }
     ]);
     if let Some(list) = tools.as_array_mut() {
@@ -974,6 +1020,7 @@ async fn answer(endpoint: &Endpoint, name: &str, args: &Value) -> (String, bool)
         schema,
         host,
         audit_as: _,
+        read_only,
     } = endpoint;
     let (reads_data, schema, host) = (*reads_data, *schema, *host);
     let database = database.as_deref();
@@ -1025,8 +1072,57 @@ async fn answer(endpoint: &Endpoint, name: &str, args: &Value) -> (String, bool)
             None => ("search_objects needs a `query`.".to_string(), true),
         },
         McpTool::ProposeTableChange => propose_change(db, database, arg("database"), args).await,
+        McpTool::ProposeSql => propose_sql(
+            arg("sql").unwrap_or(""),
+            schemaic_core::sql::GuardPolicy {
+                read_only: *read_only,
+                // The panel's Run asks again under the user's own setting;
+                // this answers what the guard says of the statement itself.
+                confirm_writes: false,
+                dialect: dialect_of(db),
+                no_database: tool_database(args, database).is_none(),
+            },
+        ),
     };
     (text, is_error)
+}
+
+/// `propose_sql`'s answer: what the write guard (`sql::run_verdict`) says of
+/// `sql`, worded for the model — and the instruction to hand it over in a
+/// fenced `sql` block, which the panel gives **Insert** and **Run**.
+///
+/// **Advice, not a gate.** Nothing runs here, and the statement the user
+/// runs is judged again by the guard on the run action — so a `Confirm` is
+/// passed on as "Schemaic will ask first", never as permission, and the model
+/// is never told the guard has been satisfied. A `Block` is the one answer
+/// worth refusing on: proposing a write on a read-only connection asks the
+/// user for something the product will not do.
+fn propose_sql(sql: &str, policy: schemaic_core::sql::GuardPolicy) -> (String, bool) {
+    use schemaic_core::sql::RunVerdict;
+    let Some(stmt) = crate::query::normalize_stmt(sql) else {
+        return ("propose_sql needs the `sql` to propose.".to_string(), true);
+    };
+    let stmts = schemaic_core::sql::executable_statements(stmt, policy.dialect);
+    let hand_over = "Put it in a ```sql block in your reply: the user can Insert it into a \
+                     query tab or Run it, and Schemaic's guard checks it again then.";
+    match schemaic_core::sql::run_verdict(&stmts, policy) {
+        RunVerdict::Block(why) => (
+            format!(
+                "Refused: {} Don't propose it; tell the user what you would change and why.",
+                why.message()
+            ),
+            true,
+        ),
+        RunVerdict::Confirm(why) => (
+            format!(
+                "Valid. Nothing has run. Schemaic will ask the user before running it: {} \
+                 Say so when you propose it. {hand_over}",
+                why.message()
+            ),
+            false,
+        ),
+        RunVerdict::Allow => (format!("Valid. Nothing has run. {hand_over}"), false),
+    }
 }
 
 /// The connection's SQL dialect — shared by the read-only gate, the DDL
@@ -1137,7 +1233,7 @@ where
 ///
 /// **The wording stays here** rather than coming from `NoRows::message`, which
 /// is the CLI's: that one points a refused write at `schemaic exec`, and the
-/// assistant's route to a write is `propose_table_change`. Same refusal, right
+/// assistant's route to a write is `propose_table_change` or `propose_sql`. Same refusal, right
 /// advice for whoever is reading it.
 async fn run_query(db: &Db, database: Option<&str>, sql: &str) -> (String, bool) {
     match crate::query::read_only_query(db, database, sql, MCP_ROW_CAP, QUERY_TIMEOUT).await {
@@ -2532,6 +2628,7 @@ mod tests {
             schema,
             host,
             audit_as: None,
+            read_only: false,
         }
     }
 
@@ -2566,6 +2663,62 @@ mod tests {
         let long = "x".repeat(super::AUDIT_ERROR_CHARS + 50);
         let cut = super::audit_entry(&e, "prod", "explain", &args, &long, true);
         assert_eq!(cut.error.unwrap().len(), super::AUDIT_ERROR_CHARS);
+    }
+
+    fn policy(read_only: bool, no_database: bool) -> schemaic_core::sql::GuardPolicy {
+        schemaic_core::sql::GuardPolicy {
+            read_only,
+            confirm_writes: false,
+            dialect: schemaic_core::intel::SqlDialect::MySql,
+            no_database,
+        }
+    }
+
+    /// **The guard's three answers, worded for the model** — and none of them
+    /// tells it the statement ran, or that the guard has been satisfied.
+    #[test]
+    fn propose_sql_passes_on_the_guards_verdict() {
+        let (ok, err) = super::propose_sql("UPDATE t SET a = 1 WHERE id = 1", policy(false, false));
+        assert!(!err && ok.starts_with("Valid. Nothing has run."), "{ok}");
+        assert!(ok.contains("```sql"), "{ok}");
+
+        let (ask, err) = super::propose_sql("DELETE FROM t", policy(false, false));
+        assert!(
+            !err && ask.contains("ask the user before running it"),
+            "{ask}"
+        );
+
+        let (refused, err) =
+            super::propose_sql("UPDATE t SET a = 1 WHERE id = 1", policy(true, false));
+        assert!(err && refused.starts_with("Refused:"), "{refused}");
+        assert!(!refused.contains("```sql"), "a refusal hands nothing over");
+
+        let (empty, err) = super::propose_sql("  ;  ", policy(false, false));
+        assert!(err && empty.contains("needs the `sql`"), "{empty}");
+
+        // No database on PostgreSQL: an unscoped CREATE would land in the
+        // maintenance database, which the guard refuses outright.
+        let mut pg = policy(false, true);
+        pg.dialect = schemaic_core::intel::SqlDialect::Postgres;
+        let (unscoped, err) = super::propose_sql("CREATE TABLE t (a int)", pg);
+        assert!(err && unscoped.starts_with("Refused:"), "{unscoped}");
+    }
+
+    /// A read on a read-only connection is a read: valid, as Run would find it.
+    #[test]
+    fn propose_sql_lets_a_read_through_on_a_read_only_connection() {
+        let (ok, err) = super::propose_sql("SELECT 1", policy(true, false));
+        assert!(!err, "{ok}");
+    }
+
+    /// Panel-only, like `propose_table_change`: outside the panel nobody gives
+    /// the code block Insert and Run.
+    #[test]
+    fn propose_sql_is_offered_in_the_panel_only_and_reads_nothing() {
+        use super::{Host, McpTool};
+        assert!(McpTool::ProposeSql.offered(false, false, Host::Panel));
+        assert!(!McpTool::ProposeSql.offered(true, true, Host::Standalone));
+        assert!(!McpTool::ProposeSql.reads_row_data() && !McpTool::ProposeSql.reads_schema());
     }
 
     /// A front end's endpoint is audited; the defaults are not, so no test

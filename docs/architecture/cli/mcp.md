@@ -1,11 +1,11 @@
 # `cli/mcp.rs`
 
-`cli/mcp.rs` — the **MCP (stdio) server**: newline-delimited JSON-RPC on stdin/stdout, and eight
+`cli/mcp.rs` — the **MCP (stdio) server**: newline-delimited JSON-RPC on stdin/stdout, and nine
 tools, none of which writes anything. It was `app/mcp.rs` until `schemaic mcp` needed it, and it
 lives here so that the second way in is the same server rather than a copy of its gates —
-`schemaic-cli` cannot reach into `schemaic-app`, which depends on it. The eight (`run_query`,
+`schemaic-cli` cannot reach into `schemaic-app`, which depends on it. The nine (`run_query`,
 `explain`, `sample_rows`, `list_databases`, `list_schema`, `describe_table`, `search_objects`,
-`propose_table_change`, in `McpTool::ALL`'s order, which is `tools/list`'s) are described
+`propose_table_change`, `propose_sql`, in `McpTool::ALL`'s order, which is `tools/list`'s) are described
 for **this** connection's engine and listed for **this** connection's access levels and **this** host:
 `tools_list(engine, reads_data, schema, host)` builds
 `run_query`'s advertised statement heads from `schemaic_core::sql::read_only_heads`, the same list
@@ -23,8 +23,10 @@ app wrote — already tunnelled, and never on a command line (`ai.rs`'s entry ha
 proposal echoed into a fenced block becomes a change preview. Standalone nothing of ours reads
 it, so the tool would tell the model the user has a preview to review when they have a block of
 JSON, and an assistant that believes the user reviewed a change is the one that stops describing
-it. `McpTool::needs_panel` is true for that tool alone; standalone it is withheld from the
-listing and refused on call with `NO_PANEL`, which tells the model to describe the change instead
+it. `McpTool::needs_panel` is true for that tool and for `propose_sql` (below), whose answer
+hands a statement over in a fenced `sql` block that only the panel turns into *Insert* and
+*Run*; standalone both are withheld from the listing and refused on call with `NO_PANEL`, which
+names the two and tells the model to describe the change instead
 (`the_proposal_tool_is_withheld_outside_the_panel`). Every other tool is the connection's
 decision, not the host's. **The host changes what a refusal advises, never whether it
 refuses**: the panel's `NO_DATA_ACCESS` says the user can attach rows from a result grid, a
@@ -32,7 +34,8 @@ gesture an outside client does not have, so `NO_DATA_ACCESS_STANDALONE` names th
 data* level in Schemaic's connection settings instead
 (`rows_are_withheld_standalone_with_advice_that_fits_the_client`).
 **`Endpoint` is the server's, and the app's `McpEndpoint` is an alias of it** — `db`,
-`database`, `samples`, `hidden`, `schema`, `host`, `audit_as`. It was a struct in `app/ai.rs`, which this
+`database`, `samples`, `hidden`, `schema`, `host`, `audit_as`, `read_only` (the connection's
+read-only flag, which only `propose_sql` reads). It was a struct in `app/ai.rs`, which this
 crate cannot name. `Endpoint::standalone(db, database, ai_data)` is the other constructor, and
 each field it sets is a decision rather than a default. `samples` is
 `ai_data.unwrap_or_default().may_query()` — rows only at `AiData::Full`: `OnRequest` is the level
@@ -84,7 +87,7 @@ the write log, and a failed append is a line on stderr, the server's log, never 
 Smoke-tested through `schemaic mcp` over stdio under a throwaway `APPDATA`: a `describe_table`,
 a refused `run_query` with its value masked and the refusal as its error, and an unknown tool
 each got their line.
-**The eight are a type — `McpTool` — and that is what makes the advertised array and the gates one
+**The nine are a type — `McpTool` — and that is what makes the advertised array and the gates one
 set.** They used to be written out independently in five places the compiler related to nothing:
 the `json!` array in `tools_list`, a `==` in `reads_row_data`, a `matches!` in `reads_schema`,
 `call_tool`'s dispatch with its `other =>` catch-all, and `ai.rs`'s two `mcp__schemaic__*` `const`
@@ -181,8 +184,8 @@ that got the next fix would have kept it. So this calls
 `query::DEFAULT_TIMEOUT` itself, read where it is defined rather than restated — and
 `normalize_stmt` and its tests left with the function. **The wording stays here**: `NoRows` is
 matched arm by arm into this server's own sentences, because `NoRows::message` points a refused
-write at `schemaic exec` and the assistant's route to a write is `propose_table_change` — in the
-panel; standalone it has none. Same refusal, right advice for whoever is reading it.
+write at `schemaic exec` and the assistant's route to a write is `propose_table_change` or
+`propose_sql` — in the panel; standalone it has none. Same refusal, right advice for whoever is reading it.
 `NoRows::DbRefused` — a standing refusal of the database layer's, such as a read-only PostgreSQL
 session that would not open on a path shadowing a builtin (`query.rs`'s entry) — answers
 "Rejected before the query ran: …" with the refusal's sentence and no advice of its own
@@ -335,10 +338,10 @@ spec tells it to walk away from, and `2025-03-26` is answered `2024-11-05`
 (`the_answer_is_the_newest_version_the_client_can_know`). The loop keeps what was agreed, and
 `tools/list` goes through `annotated`: from `2025-03-26` on — the revision that introduced
 them — every tool carries `annotations: {readOnlyHint}` from `McpTool::read_only`, an
-exhaustive match that answers `true` for all eight (`run_query` and `sample_rows` read on a
+exhaustive match that answers `true` for all nine (`run_query` and `sample_rows` read on a
 read-only session, `explain` plans without the analysing form that would run the statement,
-`search_objects` and `list_databases` read only the catalogue, `propose_table_change` runs
-nothing). A `2024-11-05` session, or a `tools/list` sent before the
+`search_objects` and `list_databases` read only the catalogue, `propose_table_change` and
+`propose_sql` run nothing). A `2024-11-05` session, or a `tools/list` sent before the
 handshake, gets the list as it always was
 (`a_2025_session_is_told_every_tool_is_read_only`).
 **`search_objects` is Find-Anywhere's question asked over this server's two reads, not a third
@@ -433,3 +436,35 @@ is `deny_unknown_fields` on purpose — an invented key has to fail loudly, sinc
 one is a change the user was promised and wouldn't get. The tag is advertised from the constant
 the app extracts on (`the_proposal_tool_advertises_the_tag_the_app_looks_for`), so the two can't
 drift into a block nothing picks up.
+**`propose_sql {sql, database?}` is the same self-check for a statement rather than a structure
+change, and it reads nothing.** The pure `propose_sql(sql, policy)` normalises the text
+(`query::normalize_stmt`; an empty one is an error, "propose_sql needs the `sql` to propose."),
+splits it with `sql::executable_statements` and asks `sql::run_verdict` — the write guard itself,
+not a copy of it — under a `GuardPolicy` that `answer` builds by hand: `read_only` from the
+endpoint's, `no_database` when neither the call nor the endpoint names one (`tool_database`), the
+connection's dialect, and `confirm_writes` **off**. A `Block` is the one refusal — "Refused: …
+Don't propose it; tell the user what you would change and why.", as an error and with nothing
+handed over — since proposing a write on a read-only connection asks the user for something the
+product will not do. A `Confirm` comes back "Valid. Nothing has run. Schemaic will ask the user
+before running it: …" with the guard's reason and an instruction to say so, `Allow` as "Valid.
+Nothing has run."; both end by telling the model to put the statement in a fenced `sql` block,
+which `ui::markdown`'s `code_block` gives *Insert* and *Run*. **It is advice, not a gate.**
+Nothing runs and no request is minted: what the user runs from the block goes `CodeActions` →
+`TabsActions::run` → `run_verdict` again, under the user's own `confirm_writes` — which is why
+this one asks with the setting off, answering what the guard says of the statement rather than
+of the user's preference — so the model is told Schemaic *will ask*, never that the guard has
+been satisfied. It is `needs_panel` for
+`propose_table_change`'s reason (above); neither data gate applies, `reads_row_data` and
+`reads_schema` both answering `false` because the guard reads the text alone, so in the panel it
+is offered at every level (`propose_sql_is_offered_in_the_panel_only_and_reads_nothing`); and
+`read_only` is `true`. `Endpoint::read_only` exists for it alone: `false` in `standalone()`, where
+the tool is never offered, and in `endpoint_from_value`; the panel's subprocess takes it from the
+saved connection and never from the blob (`ai.rs`'s entry). The verdicts are pinned by
+`propose_sql_passes_on_the_guards_verdict` — an `UPDATE … WHERE` valid with the block
+instruction, a bare `DELETE` passed on as asking first, the same `UPDATE` refused on a read-only
+connection with no block, an empty statement an error — and
+`propose_sql_lets_a_read_through_on_a_read_only_connection`. **Not pinned**: the `no_database`
+refusal, and the policy `answer` builds from the endpoint — both tests hand `propose_sql` a
+policy directly. The roadmap's "in the panel, opens the usual preview" was taken to mean the
+fenced block's *Insert* and *Run*, the panel's usual surface for SQL: there is no SQL preview
+modal, so no new app surface was added.

@@ -304,8 +304,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   second copy of the gate beside the one `mcp.rs` already had. Both live in `schemaic-cli` now, and
   `schemaic mcp` is a second way into that same server rather than a new path: its `run_query` is
   the same call, the connection it serves has passed `cli/select.rs`'s `cli_access` gate like every
-  subcommand's, and the one tool that could lead toward a write, `propose_table_change`, is not
-  offered there at all. The server's `explain` tool, and `schemaic explain` through the same
+  subcommand's, and the two tools that could lead toward a write, `propose_table_change` and
+  `propose_sql`, are not offered there at all. `propose_sql` asks `sql::run_verdict` itself, but
+  as advice to the model and nothing more: it runs nothing and mints no request, and the statement
+  the user runs from the panel's code block is judged again on the run action. The server's `explain` tool, and `schemaic explain` through the same
   function, are the same gate again — `query::gate`, inside `read_only_explain` — and **the same
   session half**: it passes `Db::explain` `read_only = true`,
   which puts even the plain `EXPLAIN` on a read-only session, since planning ran a writing function

@@ -67,6 +67,10 @@ On its own, the assistant can look things up with Schemaic's tools:
 - *Explain a query* — the plan, without running it, under the same data access rule.
 - *Check a table change* — it can work out the SQL for a change it wants to suggest, without
   running anything.
+- *Check a statement* — before it offers SQL that writes data, it checks it against the same
+  guard **Run** uses, without running it. If the connection is read-only, it's told not to offer
+  the statement; if Schemaic will ask you before running it — a `DELETE` or `UPDATE` with no
+  `WHERE`, a `DROP` — it's told to say so.
 
 None of these tools can change the database. How that's enforced is under
 [Data access](data-access.md#how-queries-stay-read-only). Every call the assistant makes to them
@@ -110,8 +114,8 @@ schemaic mcp -c "Shop (prod)"
 
 The connection needs **CLI access** turned on in its settings, and its **AI data access** level
 applies here too, with one difference: there's no grid to attach rows from, so rows are sent only
-at **Let it read data**. The tool that proposes table changes is left out, since there's no
-preview on the other end to review one. Setup for particular clients is in
+at **Let it read data**. The tools that propose a table change or check a statement to offer are
+left out, since there's no panel on the other end to review or run what they hand over. Setup for particular clients is in
 [Command line](../cli/README.md).
 
 ## In this section

@@ -47,9 +47,8 @@ The headless release's decisions are taken; the other entries' are not. What an 
 
 They ship in this order, one release each. Releases 2 and 3 merge if 3 turns out small.
 
-1. **Headless:** every CLI entry, plus the MCP server's audit log, several connections in one
-   server, `compare_schemas` and `propose_sql`. All of it is in `schemaic-cli` and shares the
-   CLI's guards.
+1. **Headless:** the MCP server's several connections in one server and `compare_schemas` are
+   what is left of it. All of it is in `schemaic-cli` and shares the CLI's guards.
 2. **Performance:** *Workload and performance insight* with the MCP performance tools, which share
    its backend, plus the Server Activity keyboard path.
 3. **Data and editor:** *Compare and sync table data*, the custom keymap and the two chart kinds.
@@ -154,14 +153,6 @@ A tool that wraps `cli/compare.rs` and returns the migration as text. It execute
 - **Decided:** both sides are connections this server was given, so it lands after *Several
   connections*. It reads only the catalogue, so like `list_schema` it needs no data level. Both
   sides are the same engine, as in the CLI.
-
-### `propose_sql`
-
-Today the only proposal tool is `propose_table_change`. Add a `propose_sql` that validates through
-`run_verdict` and, in the panel, opens the usual preview. It executes nothing.
-
-- **Decided:** panel only, like `propose_table_change`. A standalone server has nobody reading
-  the proposal.
 
 ### Performance tools
 

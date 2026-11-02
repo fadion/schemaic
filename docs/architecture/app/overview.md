@@ -1156,7 +1156,7 @@ password to the keyring left everything around it in the blob — host, port, us
 plan, sign-in mode, init SQL, signing target — so whatever could rewrite the endpoint file, or set
 `$SCHEMAIC_MCP_ENDPOINT`, could have the subprocess fetch the saved password from the keyring and
 send it to a host of its own with TLS off, attach init SQL of its own to the session, or (with the
-data levels above) widen what it reads. `saved_db(v, lookup) -> Result<Option<(Db, AiData, String)>, String>`
+data levels above) widen what it reads. `saved_db(v, lookup) -> Result<Option<(Db, Connection)>, String>`
 now answers a blob that carries a `conn_id` with `Db::connect(&saved, tunnel)` — how `main.rs`
 builds the app's own `Db`, less the lazy password source, `keyring_connection` having read the
 password into `saved` already — so all of those are the saved connection's. The blob supplies only what
@@ -1170,10 +1170,17 @@ connection too**: it is that connection's `AiData::may_query`, not a session cho
 narrowing only, as `schemaic mcp`'s `Endpoint::standalone` derives it outright (release review
 S2-L5-03, `the_saved_data_level_bounds_the_blobs_samples`; before it a rewritten `"samples": true`
 offered `run_query` on a `SchemaOnly` connection). **So is the name the agent log records** — the
-`String`, the saved connection's `name`, which `endpoint_from_blob` sets as the endpoint's
+saved connection's `name`, which `endpoint_from_blob` sets as the endpoint's
 `audit_as` (`cli/mcp.rs`); `endpoint_from_value` leaves it `None`, so a blob with no `conn_id` is
-served unlogged, and a rewritten blob cannot file the calls under another connection's name
-(`the_subprocess_connects_where_the_saved_connection_points` asserts the saved one).
+served unlogged, and a rewritten blob cannot file the calls under another connection's name.
+**And so is the read-only flag** `propose_sql` judges a statement against — `endpoint_from_blob`
+copies the saved connection's `read_only` into the endpoint's, and `endpoint_from_value` leaves it
+`false`, so a rewritten blob cannot tell the tool a read-only connection takes writes (a blob
+with no `conn_id` therefore gets `false` whatever the connection is). `saved_db` hands back the
+saved `Connection` itself, where it used to return a `(Db, AiData, String)` of two of its fields.
+`the_subprocess_connects_where_the_saved_connection_points` asserts the name and
+the flag (its fixture is read-only, so the flag is the saved one's and not a default that
+agrees) — of `saved_db`'s answer, not of the endpoint `endpoint_from_blob` builds from it.
 What stays the blob's is the session's choice:
 the selected `database`, `schema` and `hidden`. **The residual**: the
 tunnel port is still the blob's, so a same-user process that rewrites it can point the subprocess
@@ -1350,7 +1357,9 @@ the prompt as well as in the tool's own description, because the shape it replac
 a code block for the user to run) is the one every model reaches for by default. It is stated
 whether or not queries are allowed, since proposing reads the schema and that was never the gated
 part, and the tag comes from the constant the renderer reads
-(`the_prompt_names_the_fence_tag_the_renderer_reads`). Its **tools line** names the tools the
+(`the_prompt_names_the_fence_tag_the_renderer_reads`). The same `propose_line` ends by telling
+the model to call `propose_sql` before offering a statement that writes data — it says whether
+Schemaic would refuse it or ask the user first, and nothing runs (`cli/mcp.rs`). Its **tools line** names the tools the
 connection's `AiData` level leaves the session: `list_databases`, `list_schema`,
 `search_objects` and `describe_table` at every level, `sample_rows`, `run_query` and `explain`
 at `Full` alone; and at *Schema context: None* the withheld-schema sentence names
