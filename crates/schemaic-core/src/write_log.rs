@@ -328,6 +328,12 @@ pub fn abandoned(database: Option<&str>, why: &str) -> Entry {
 /// `entry` as the line the log holds — masked unless `keep_values`, and
 /// masked regardless when it carries a credential — without the newline.
 pub fn line(entry: &Entry, dialect: SqlDialect, keep_values: bool) -> String {
+    serde_json::to_string(&masked(entry, dialect, keep_values)).unwrap_or_default()
+}
+
+/// `entry` as [`line`] writes it, before it is serialised — for a log that
+/// does more to the masked text, as the agent log cuts it.
+pub fn masked(entry: &Entry, dialect: SqlDialect, keep_values: bool) -> Entry {
     let mut e = entry.clone();
     let credential = crate::sql::carries_credential(&e.sql, dialect);
     if !keep_values || credential {
@@ -335,7 +341,7 @@ pub fn line(entry: &Entry, dialect: SqlDialect, keep_values: bool) -> String {
         e.error = e.error.map(|m| crate::prompt::redact_engine_error(&m));
         e.masked = true;
     }
-    serde_json::to_string(&e).unwrap_or_default()
+    e
 }
 
 /// Append `entry` to the log under the config directory. An error is the

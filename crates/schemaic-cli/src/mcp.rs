@@ -149,6 +149,10 @@ fn annotated(mut tools: Value, protocol: &str) -> Value {
     tools
 }
 
+/// The lines an endpoint recorded, kept in memory — see
+/// [`Endpoint::audit_sink`].
+pub type AuditSink = std::sync::Arc<std::sync::Mutex<Vec<schemaic_core::write_log::Entry>>>;
+
 /// One connection a server serves, under the name a tool call picks it by.
 pub struct Named<'a> {
     pub name: &'a str,
@@ -172,11 +176,35 @@ const LIST_CONNECTIONS: &str = "list_connections";
 fn listing(endpoints: &[Named<'_>]) -> Value {
     let first = endpoints[0].endpoint;
     if endpoints.len() == 1 {
-        return tools_list(first.db.engine(), first.samples, first.schema, first.host);
+        // No other connection to name, so no `source_connection` — as there
+        // is no `connection`.
+        let mut tools = tools_list(first.db.engine(), first.samples, first.schema, first.host);
+        for t in tools.as_array_mut().into_iter().flatten() {
+            if let Some(props) = t["inputSchema"]["properties"].as_object_mut() {
+                props.remove("source_connection");
+            }
+        }
+        return tools;
     }
     let reads_data = endpoints.iter().any(|n| n.endpoint.samples);
     let schema = endpoints.iter().any(|n| n.endpoint.schema);
+    // `describe_table` promises sample rows only when **every** connection
+    // sends them: a model told to expect them on one that does not plans its
+    // turn around rows that never come.
+    let all_rows = endpoints.iter().all(|n| n.endpoint.samples);
     let mut tools = tools_list(first.db.engine(), reads_data, schema, first.host);
+    if reads_data && !all_rows {
+        for t in tools.as_array_mut().into_iter().flatten() {
+            if t["name"] == McpTool::DescribeTable.name() {
+                t["description"] = Value::String(
+                    "One table in depth: its CREATE TABLE (or CREATE VIEW) definition including \
+                     indexes, its foreign keys, and — where the connection sends rows, which \
+                     list_connections says — a few sample rows."
+                        .to_string(),
+                );
+            }
+        }
+    }
     // **Each tool asked of each connection's own levels**, not of the levels
     // OR-ed apart: a tool that needs rows *and* the catalogue is offered by
     // neither of a connection with rows but no schema and one with the
@@ -215,60 +243,86 @@ fn listing(endpoints: &[Named<'_>]) -> Value {
 /// The connection a call's `connection` argument names, or the first when it
 /// names none — or why it cannot be served.
 fn pick<'a>(endpoints: &'a [Named<'a>], args: &Value) -> Result<&'a Endpoint, String> {
-    match args
-        .get("connection")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
+    match name_arg(endpoints, args, "connection")? {
         None => Ok(endpoints[0].endpoint),
-        Some(want) => endpoints
-            .iter()
-            .find(|n| n.name == want)
-            .map(|n| n.endpoint)
-            .ok_or_else(|| {
-                let names: Vec<&str> = endpoints.iter().map(|n| n.name).collect();
-                format!(
-                    "No connection named {want:?} on this server; it serves {}.",
-                    names.join(", ")
-                )
-            }),
+        Some(want) => find_named(endpoints, want).map(|n| n.endpoint),
+    }
+}
+
+/// A connection-naming argument: `None` when absent, `null` or empty — the
+/// default — or **why it is not a name**.
+///
+/// **A value that is not a string is refused, not taken for absent.** A
+/// model writing a connection called `2024` as the number `2024` was
+/// answered on the default connection, silently, and an agent comparing the
+/// two got the same connection's answer twice.
+fn name_arg<'v>(
+    endpoints: &[Named<'_>],
+    args: &'v Value,
+    key: &str,
+) -> Result<Option<&'v str>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str()).filter(|s| !s.is_empty())),
+        Some(_) => Err(format!(
+            "`{key}` must be a connection's name, as a string; {}",
+            serves(endpoints)
+        )),
+    }
+}
+
+/// The served connection named `want`, or a refusal that says what is served.
+fn find_named<'a>(endpoints: &'a [Named<'a>], want: &str) -> Result<&'a Named<'a>, String> {
+    endpoints.iter().find(|n| n.name == want).ok_or_else(|| {
+        format!(
+            "No connection named {want:?} on this server; {}",
+            serves(endpoints)
+        )
+    })
+}
+
+/// What a refusal says this server serves — its connections' names, or, for
+/// a server whose one connection has none to give, that there is one.
+fn serves(endpoints: &[Named<'_>]) -> String {
+    let names: Vec<&str> = endpoints
+        .iter()
+        .map(|n| n.name)
+        .filter(|n| !n.is_empty())
+        .collect();
+    if names.is_empty() {
+        "it serves one connection: leave the argument out.".to_string()
+    } else {
+        format!("it serves {}.", names.join(", "))
     }
 }
 
 /// The other connection a `compare_schemas` call names, when it names one —
 /// the one call that needs two endpoints, so [`serve_on`] answers it rather
 /// than `call_tool`, which is handed one.
-fn cross_connection_source<'a>(name: &str, args: &'a Value) -> Option<&'a str> {
+fn cross_connection_source<'a>(name: &str, args: &'a Value) -> Option<&'a Value> {
     (name == McpTool::CompareSchemas.name())
-        .then(|| args.get("source_connection").and_then(Value::as_str))
+        .then(|| args.get("source_connection"))
         .flatten()
-        .filter(|s| !s.is_empty())
+        .filter(|v| !v.is_null() && v.as_str() != Some(""))
 }
 
 /// `compare_schemas` across two served connections: each resolved by name,
 /// each held to its own levels as `call_tool` holds one (`refusal_for`), and
 /// the call logged under the target's name, as any call is under its own.
-async fn compare_across(
-    endpoints: &[Named<'_>],
-    source_name: &str,
-    name: &str,
-    args: &Value,
-) -> Value {
+async fn compare_across(endpoints: &[Named<'_>], name: &str, args: &Value) -> Value {
     let by_name = |want: Option<&str>| match want {
         None => Ok(&endpoints[0]),
-        Some(w) => endpoints.iter().find(|n| n.name == w).ok_or_else(|| {
-            let names: Vec<&str> = endpoints.iter().map(|n| n.name).collect();
-            format!(
-                "No connection named {w:?} on this server; it serves {}.",
-                names.join(", ")
-            )
-        }),
+        Some(w) => find_named(endpoints, w),
     };
-    let target_name = args
-        .get("connection")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty());
-    let sides = by_name(target_name).and_then(|t| by_name(Some(source_name)).map(|s| (t, s)));
+    // A name that is not a string is refused for either side, never read as
+    // the default.
+    let target_name = name_arg(endpoints, args, "connection");
+    let source_name = name_arg(endpoints, args, "source_connection");
+    let sides = target_name.clone().and_then(|t| {
+        let s = source_name?;
+        by_name(t).and_then(|t| by_name(s).map(|s| (t, s)))
+    });
+    let target_name = target_name.ok().flatten();
     let (text, is_error) = match sides {
         Err(why) => (why, true),
         Ok((t, s)) => {
@@ -290,10 +344,11 @@ async fn compare_across(
     };
     // Logged under the target when it was found, else the default's name.
     let logged = sides_target(endpoints, target_name);
+    let answer = Answer::from((text, is_error));
     if let Some(connection) = &logged.audit_as {
-        record(logged, connection, name, args, &text, is_error);
+        record(logged, connection, name, args, &answer);
     }
-    json!({ "content": [ { "type": "text", "text": text } ], "isError": is_error })
+    json!({ "content": [ { "type": "text", "text": answer.text }], "isError": answer.is_error })
 }
 
 /// The endpoint a call's log line goes under: the one it named, else the
@@ -379,6 +434,11 @@ pub struct Endpoint {
     /// saved connection itself, `None` elsewhere, so a test's call writes no
     /// file.
     pub audit_as: Option<String>,
+    /// Where an audited call's line goes instead of `agent_log.jsonl` — a
+    /// test's vector, so that *whether and under which connection* a call is
+    /// recorded can be pinned without writing the user's log. `None` writes
+    /// the file.
+    pub audit_sink: Option<AuditSink>,
     /// Is the connection marked read-only — what `propose_sql` judges a
     /// statement against, as the panel's Run will. From the saved connection,
     /// never the blob; `false` where nothing has said.
@@ -424,6 +484,7 @@ impl Endpoint {
             schema: true,
             host: Host::Standalone,
             audit_as: None,
+            audit_sink: None,
             // `propose_sql` is the one reader, and it is panel-only.
             read_only: false,
             level_from_flag: false,
@@ -446,16 +507,26 @@ impl Endpoint {
 
 /// Run the stdio JSON-RPC loop until stdin closes, against the resolved
 /// endpoint (its `database` is the default schema `USE`d for `run_query`).
+///
+/// **Its one connection is named after the saved one** (`audit_as`), so a
+/// model that names the active connection — the panel's prompt says which —
+/// reaches it rather than a refusal listing nothing.
 pub async fn serve(endpoint: Endpoint) {
+    let name = sole_name(&endpoint);
     serve_on(
         &[Named {
-            name: "",
+            name: &name,
             endpoint: &endpoint,
         }],
         BufReader::new(tokio::io::stdin()),
         tokio::io::stdout(),
     )
     .await;
+}
+
+/// The name [`serve`] gives its one connection: the saved connection's.
+fn sole_name(endpoint: &Endpoint) -> String {
+    endpoint.audit_as.clone().unwrap_or_default()
 }
 
 /// [`serve`] for several connections, each under its name; the first is the
@@ -569,14 +640,20 @@ where
                     // name: the agent log is "every call", not every tool.
                     let first = endpoints[0].endpoint;
                     if let Some(connection) = &first.audit_as {
-                        record(first, connection, &name, &args, "", false);
+                        record(
+                            first,
+                            connection,
+                            &name,
+                            &args,
+                            &(String::new(), false).into(),
+                        );
                     }
                     Some(json!({
                         "content": [ { "type": "text", "text": list_connections(endpoints) } ],
                         "isError": false
                     }))
-                } else if let Some(source) = cross_connection_source(&name, &args) {
-                    Some(compare_across(endpoints, source, &name, &args).await)
+                } else if cross_connection_source(&name, &args).is_some() {
+                    Some(compare_across(endpoints, &name, &args).await)
                 } else {
                     match pick(endpoints, &args) {
                         Ok(endpoint) => Some(call_tool(endpoint, &name, &args).await),
@@ -586,7 +663,8 @@ where
                             // `list_connections` is.
                             let first = endpoints[0].endpoint;
                             if let Some(connection) = &first.audit_as {
-                                record(first, connection, &name, &args, &why, true);
+                                let refused = (why.clone(), true).into();
+                                record(first, connection, &name, &args, &refused);
                             }
                             Some(error(why))
                         }
@@ -1243,28 +1321,52 @@ fn tool_database<'a>(args: &'a Value, default: Option<&'a str>) -> Option<&'a st
 /// endpoint says so — refusals and unknown names included, since a call an
 /// agent was refused is as much a part of what it tried as one it was given.
 async fn call_tool(endpoint: &Endpoint, name: &str, args: &Value) -> Value {
-    let (text, is_error) = Box::pin(answer(endpoint, name, args)).await;
+    let a = Box::pin(answer(endpoint, name, args)).await;
     if let Some(connection) = &endpoint.audit_as {
-        record(endpoint, connection, name, args, &text, is_error);
+        record(endpoint, connection, name, args, &a);
     }
-    json!({ "content": [ { "type": "text", "text": text } ], "isError": is_error })
+    json!({ "content": [ { "type": "text", "text": a.text } ], "isError": a.is_error })
 }
 
-/// How long an error's text may run in the agent log. An error is Schemaic's
-/// sentence or the engine's — never rows — but a long one is no clearer.
-const AUDIT_ERROR_CHARS: usize = 500;
-
-/// The agent-log line for one call, appended — a failure to write is said on
-/// stderr, which is the server's log, and never fails the call.
-fn record(
-    endpoint: &Endpoint,
-    connection: &str,
-    name: &str,
-    args: &Value,
-    text: &str,
+/// A tool's answer: its text, whether it is an error, and — for an answer
+/// that showed the agent rows — how many, which the agent log keeps.
+#[derive(Debug)]
+struct Answer {
+    text: String,
     is_error: bool,
-) {
-    let line = audit_entry(endpoint, connection, name, args, text, is_error);
+    rows: Option<u64>,
+}
+
+impl Answer {
+    /// An answer that showed `rows` rows.
+    fn with_rows(text: String, rows: usize) -> Answer {
+        Answer {
+            text,
+            is_error: false,
+            rows: Some(rows as u64),
+        }
+    }
+}
+
+impl From<(String, bool)> for Answer {
+    fn from((text, is_error): (String, bool)) -> Answer {
+        Answer {
+            text,
+            is_error,
+            rows: None,
+        }
+    }
+}
+
+/// The agent-log line for one call, appended — to the endpoint's
+/// [`AuditSink`] where it has one, else to the file; a failure to write is
+/// said on stderr, which is the server's log, and never fails the call.
+fn record(endpoint: &Endpoint, connection: &str, name: &str, args: &Value, answer: &Answer) {
+    let line = audit_entry(endpoint, connection, name, args, answer);
+    if let Some(sink) = &endpoint.audit_sink {
+        sink.lock().unwrap_or_else(|p| p.into_inner()).push(line);
+        return;
+    }
     let keep =
         schemaic_core::persist::load_json::<schemaic_core::persist::UiState>("ui_state.json")
             .write_log_values;
@@ -1274,15 +1376,16 @@ fn record(
 }
 
 /// [`record`]'s line: the tool, the database it ran in (the call's own or the
-/// endpoint's), its SQL, the table or search it named, and an error's text —
-/// never a successful answer's, which is the data the agent was shown.
+/// endpoint's), its SQL, what else it named — a table, a search, or the
+/// other side of a comparison — an error's text, never a successful answer's,
+/// which is the data the agent was shown, and how many rows that answer held.
+/// The text is masked, then cut, by `agent_log::line`.
 fn audit_entry(
     endpoint: &Endpoint,
     connection: &str,
     name: &str,
     args: &Value,
-    text: &str,
-    is_error: bool,
+    answer: &Answer,
 ) -> schemaic_core::write_log::Entry {
     use schemaic_core::agent_log::{Caller, entry};
     let arg = |key: &str| {
@@ -1294,8 +1397,16 @@ fn audit_entry(
         Host::Panel => Caller::Panel,
         Host::Standalone => Caller::Standalone,
     };
-    let subject = arg("table").or(arg("query"));
-    let error: Option<String> = is_error.then(|| text.chars().take(AUDIT_ERROR_CHARS).collect());
+    // A comparison read a second catalogue, which the line has to name: the
+    // other connection's, or this one's other database.
+    let compared = (name == McpTool::CompareSchemas.name()).then(|| {
+        let side = arg("source_connection").unwrap_or(connection);
+        match arg("source_database") {
+            Some(db) => format!("from {side}.{db}"),
+            None => format!("from {side}"),
+        }
+    });
+    let subject = arg("table").or(arg("query")).or(compared.as_deref());
     entry(
         caller,
         connection,
@@ -1303,12 +1414,13 @@ fn audit_entry(
         name,
         arg("sql").unwrap_or(""),
         subject,
-        error.as_deref(),
+        answer.is_error.then_some(answer.text.as_str()),
+        answer.rows.filter(|_| !answer.is_error),
     )
 }
 
 /// A tool's answer — its text, and whether it is an error.
-async fn answer(endpoint: &Endpoint, name: &str, args: &Value) -> (String, bool) {
+async fn answer(endpoint: &Endpoint, name: &str, args: &Value) -> Answer {
     let Endpoint {
         db,
         database,
@@ -1318,7 +1430,9 @@ async fn answer(endpoint: &Endpoint, name: &str, args: &Value) -> (String, bool)
         schema: _,
         host: _,
         audit_as: _,
-        read_only,
+        audit_sink: _,
+        // `propose_policy`'s, which reads it off `endpoint`.
+        read_only: _,
         level_from_flag: _,
     } = endpoint;
     let reads_data = *reads_data;
@@ -1327,10 +1441,10 @@ async fn answer(endpoint: &Endpoint, name: &str, args: &Value) -> (String, bool)
     // stale `tools/list` must not reach the DB through a tool this connection
     // withheld.
     let Some(tool) = McpTool::from_name(name) else {
-        return (format!("Unknown tool: {name}"), true);
+        return (format!("Unknown tool: {name}"), true).into();
     };
     if let Some(why) = refusal_on(endpoint, tool) {
-        return (why.to_string(), true);
+        return (why.to_string(), true).into();
     }
     let arg = |key: &str| {
         args.get(key)
@@ -1340,10 +1454,28 @@ async fn answer(endpoint: &Endpoint, name: &str, args: &Value) -> (String, bool)
     // Exhaustive, with no catch-all: the unknown name was refused above, so a
     // new variant fails to compile here rather than falling into an arm
     // written for something else.
-    let (text, is_error) = match tool {
+    let answered: (String, bool) = match tool {
+        // The three that show rows answer with their count.
         McpTool::RunQuery => {
             let sql = args.get("sql").and_then(|s| s.as_str()).unwrap_or("");
-            run_query(db, tool_database(args, database), sql).await
+            return run_query(db, tool_database(args, database), sql).await;
+        }
+        McpTool::SampleRows => {
+            return match (arg("table"), sample_limit(args)) {
+                (None, _) => ("sample_rows needs a `table`.".to_string(), true).into(),
+                (_, Err(e)) => (e, true).into(),
+                (Some(table), Ok(n)) => {
+                    Box::pin(sample_rows(db, database, arg("database"), table, n)).await
+                }
+            };
+        }
+        McpTool::DescribeTable => {
+            return match arg("table") {
+                Some(table) => {
+                    describe_table(db, database, arg("database"), table, reads_data).await
+                }
+                None => ("describe_table needs a `table`.".to_string(), true).into(),
+            };
         }
         McpTool::Explain => {
             let sql = args.get("sql").and_then(|s| s.as_str()).unwrap_or("");
@@ -1351,21 +1483,11 @@ async fn answer(endpoint: &Endpoint, name: &str, args: &Value) -> (String, bool)
         }
         // **Boxed**, so each adds a pointer to this future rather than its
         // own state: the serve loop holds `call_tool`'s future on the stack,
-        // and inlining these two overflowed a debug test thread's 2 MiB in
-        // `a_call_is_gated_by_its_own_level_not_the_others`.
-        McpTool::SampleRows => match (arg("table"), sample_limit(args)) {
-            (None, _) => ("sample_rows needs a `table`.".to_string(), true),
-            (_, Err(e)) => (e, true),
-            (Some(table), Ok(n)) => {
-                Box::pin(sample_rows(db, database, arg("database"), table, n)).await
-            }
-        },
+        // and inlining these overflowed a debug test thread's 2 MiB in
+        // `a_call_is_gated_by_its_own_level_not_the_others` (`sample_rows`
+        // above is boxed for the same reason).
         McpTool::ListDatabases => Box::pin(list_databases(db, hidden, database)).await,
         McpTool::ListSchema => list_schema(db, arg("database"), database, hidden, reads_data).await,
-        McpTool::DescribeTable => match arg("table") {
-            Some(table) => describe_table(db, database, arg("database"), table, reads_data).await,
-            None => ("describe_table needs a `table`.".to_string(), true),
-        },
         McpTool::SearchObjects => match arg("query").map(str::trim).filter(|q| !q.is_empty()) {
             Some(query) => search_objects(db, query, arg("database"), database, hidden).await,
             None => ("search_objects needs a `query`.".to_string(), true),
@@ -1376,19 +1498,25 @@ async fn answer(endpoint: &Endpoint, name: &str, args: &Value) -> (String, bool)
         McpTool::CompareSchemas => {
             Box::pin(compare_schemas((endpoint, ""), (endpoint, ""), args)).await
         }
-        McpTool::ProposeSql => propose_sql(
-            arg("sql").unwrap_or(""),
-            schemaic_core::sql::GuardPolicy {
-                read_only: *read_only,
-                // The panel's Run asks again under the user's own setting;
-                // this answers what the guard says of the statement itself.
-                confirm_writes: false,
-                dialect: dialect_of(db),
-                no_database: tool_database(args, database).is_none(),
-            },
-        ),
+        McpTool::ProposeSql => {
+            propose_sql(arg("sql").unwrap_or(""), propose_policy(endpoint, args))
+        }
     };
-    (text, is_error)
+    answered.into()
+}
+
+/// The guard policy `propose_sql` judges a statement under: the endpoint's
+/// read-only mark, its dialect, and whether the call has a database at all —
+/// its own, or the endpoint's.
+fn propose_policy(endpoint: &Endpoint, args: &Value) -> schemaic_core::sql::GuardPolicy {
+    schemaic_core::sql::GuardPolicy {
+        read_only: endpoint.read_only,
+        // The panel's Run asks again under the user's own setting; this
+        // answers what the guard says of the statement itself.
+        confirm_writes: false,
+        dialect: dialect_of(&endpoint.db),
+        no_database: tool_database(args, endpoint.database.as_deref()).is_none(),
+    }
 }
 
 /// `compare_schemas`' answer: the script that makes one database's structure
@@ -1410,14 +1538,27 @@ async fn compare_schemas(
 ) -> (String, bool) {
     let ((target, target_name), (source, source_name)) = (target, source);
     let two = !std::ptr::eq(target, source);
-    let source_db = args
-        .get("source_database")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .or(source.database.as_deref());
-    let (Some(target_db), Some(source_db)) =
-        (tool_database(args, target.database.as_deref()), source_db)
-    else {
+    // **Each side resolved as `schemaic compare` resolves it**: the engine's
+    // implied database first — SQLite's `main`, which `fetch_schema` reads
+    // whatever it is called — then the argument, then the default. Taken raw,
+    // `source_database: "staging"` on SQLite read `main` twice and answered
+    // "main already matches staging" for a database that does not exist.
+    fn side<'a>(e: &'a Endpoint, named: Option<&'a str>) -> Option<&'a str> {
+        e.db.implied_database().or(named).or(e.database.as_deref())
+    }
+    let source_db = side(
+        source,
+        args.get("source_database")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty()),
+    );
+    let target_db = side(
+        target,
+        args.get("database")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty()),
+    );
+    let (Some(target_db), Some(source_db)) = (target_db, source_db) else {
         return (
             "compare_schemas needs a database on each side: name `database` (the one the \
              script would change) and `source_database` (the one to match)."
@@ -1447,17 +1588,28 @@ async fn compare_schemas(
                 .collect()
         })
         .unwrap_or_default();
+    // `schemaic compare`'s deadline, not a statement's: two whole catalogues
+    // are read, which on a large schema takes longer than thirty seconds,
+    // and the model has no argument to raise it.
     let (lt, rt) = (CancellationToken::new(), CancellationToken::new());
     let (left, right) = tokio::join!(
-        with_deadline(target.db.fetch_schema(target_db, lt.clone()), lt),
-        with_deadline(source.db.fetch_schema(source_db, rt.clone()), rt)
+        with_deadline_for(
+            COMPARE_TIMEOUT,
+            target.db.fetch_schema(target_db, lt.clone()),
+            lt
+        ),
+        with_deadline_for(
+            COMPARE_TIMEOUT,
+            source.db.fetch_schema(source_db, rt.clone()),
+            rt
+        )
     );
     let read = |got, db: &str| match got {
         Some(Ok(s)) => Ok(s),
         Some(Err(e)) => Err(format!("Error reading the schema of {db}: {e}")),
         None => Err(format!(
             "Reading the schema of {db} timed out ({}s) and was cancelled.",
-            QUERY_TIMEOUT.as_secs()
+            COMPARE_TIMEOUT.as_secs()
         )),
     };
     let (left, right) = match (read(left, target_db), read(right, source_db)) {
@@ -1580,10 +1732,27 @@ async fn with_deadline<F>(fut: F, token: CancellationToken) -> Option<F::Output>
 where
     F: std::future::Future,
 {
+    with_deadline_for(QUERY_TIMEOUT, fut, token).await
+}
+
+/// How long `compare_schemas` gives each catalogue — `schemaic compare`'s own
+/// default.
+const COMPARE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(crate::args::COMPARE_TIMEOUT_SECS);
+
+/// [`with_deadline`] under a deadline of `timeout`.
+async fn with_deadline_for<F>(
+    timeout: std::time::Duration,
+    fut: F,
+    token: CancellationToken,
+) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
     tokio::pin!(fut);
     tokio::select! {
         r = &mut fut => Some(r),
-        _ = tokio::time::sleep(QUERY_TIMEOUT) => {
+        _ = tokio::time::sleep(timeout) => {
             token.cancel();
             // Kept alive across the cancel so the driver's KILL branch runs —
             // abandoning the future leaves the statement running on the server.
@@ -1642,10 +1811,10 @@ where
 /// is the CLI's: that one points a refused write at `schemaic exec`, and the
 /// assistant's route to a write is `propose_table_change` or `propose_sql`. Same refusal, right
 /// advice for whoever is reading it.
-async fn run_query(db: &Db, database: Option<&str>, sql: &str) -> (String, bool) {
+async fn run_query(db: &Db, database: Option<&str>, sql: &str) -> Answer {
     match crate::query::read_only_query(db, database, sql, MCP_ROW_CAP, QUERY_TIMEOUT).await {
-        Ok(rs) => (format_table(&rs), false),
-        Err(e) => no_rows_reply(e),
+        Ok(rs) => Answer::with_rows(format_table(&rs), rs.row_count()),
+        Err(e) => no_rows_reply(e).into(),
     }
 }
 
@@ -2206,29 +2375,32 @@ async fn describe_table(
     database: Option<&str>,
     table: &str,
     samples: bool,
-) -> (String, bool) {
+) -> Answer {
     let Some(database) = database.or(default_db) else {
         return (
             "No database given and the connection has no default — pass a `database`.".to_string(),
             true,
-        );
+        )
+            .into();
     };
     let token = CancellationToken::new();
     let schema = match with_deadline(db.fetch_schema(database, token.clone()), token).await {
         Some(Ok(s)) => s,
-        Some(Err(e)) => return (format!("Error reading schema for {database}: {e}"), true),
+        Some(Err(e)) => return (format!("Error reading schema for {database}: {e}"), true).into(),
         None => {
             return (
                 format!("Reading the schema for {database} timed out (30s) and was cancelled."),
                 true,
-            );
+            )
+                .into();
         }
     };
     let Some(info) = find_described(&schema, table) else {
         return (
             format!("Table {table} not found in {database}. Call list_schema to see what exists."),
             true,
-        );
+        )
+            .into();
     };
 
     let dialect = dialect_of(db);
@@ -2239,16 +2411,21 @@ async fn describe_table(
     // Sample rows read real data, so they follow the panel's "run queries"
     // setting — with it off the assistant still gets the DDL and the keys.
     if !samples {
-        return (out, false);
+        return (out, false).into();
     }
     out.push_str(&format!("\nSample rows (up to {SAMPLE_ROWS}):\n"));
     // A sample is a bonus, so a failure or a timeout degrades to an
     // "(unavailable: …)" line: the table's DDL and keys are still returned.
     match sample(db, database, info, SAMPLE_ROWS).await {
-        Ok(rs) => out.push_str(&format_table(&rs)),
-        Err(e) => out.push_str(&format!("(unavailable: {e})")),
+        Ok(rs) => {
+            out.push_str(&format_table(&rs));
+            Answer::with_rows(out, rs.row_count())
+        }
+        Err(e) => {
+            out.push_str(&format!("(unavailable: {e})"));
+            (out, false).into()
+        }
     }
-    (out, false)
 }
 
 /// The first `n` rows of `info`, unordered, every column — `describe_table`'s
@@ -2330,33 +2507,36 @@ async fn sample_rows(
     database: Option<&str>,
     table: &str,
     n: usize,
-) -> (String, bool) {
+) -> Answer {
     let Some(database) = database.or(default_db) else {
         return (
             "No database given and the connection has no default — pass a `database`.".to_string(),
             true,
-        );
+        )
+            .into();
     };
     let token = CancellationToken::new();
     let schema = match with_deadline(db.fetch_schema(database, token.clone()), token).await {
         Some(Ok(s)) => s,
-        Some(Err(e)) => return (format!("Error reading schema for {database}: {e}"), true),
+        Some(Err(e)) => return (format!("Error reading schema for {database}: {e}"), true).into(),
         None => {
             return (
                 format!("Reading the schema for {database} timed out (30s) and was cancelled."),
                 true,
-            );
+            )
+                .into();
         }
     };
     let Some(info) = find_described(&schema, table) else {
         return (
             format!("Table {table} not found in {database}. Call list_schema to see what exists."),
             true,
-        );
+        )
+            .into();
     };
     match sample(db, database, info, n).await {
-        Ok(rs) => (format_table(&rs), false),
-        Err(e) => (format!("Could not read {table}: {e}"), true),
+        Ok(rs) => Answer::with_rows(format_table(&rs), rs.row_count()),
+        Err(e) => (format!("Could not read {table}: {e}"), true).into(),
     }
 }
 
@@ -3049,6 +3229,7 @@ mod tests {
             schema,
             host,
             audit_as: None,
+            audit_sink: None,
             read_only: false,
             level_from_flag: false,
         }
@@ -3061,30 +3242,76 @@ mod tests {
     fn the_agent_log_line_holds_the_ask_and_an_errors_reason_only() {
         let e = unreachable(true, true, super::Host::Standalone);
         let args = serde_json::json!({ "sql": "SELECT * FROM t", "database": "shop" });
-        let ok = super::audit_entry(&e, "prod", "run_query", &args, "| a |\n| 1 |", false);
+        let rows = super::Answer::with_rows("| a |\n| 1 |".to_string(), 1);
+        let ok = super::audit_entry(&e, "prod", "run_query", &args, &rows);
         assert_eq!(ok.sql, "SELECT * FROM t");
         assert_eq!(ok.database.as_deref(), Some("shop"));
         assert_eq!(ok.detail.as_deref(), Some("run_query (mcp)"));
         assert_eq!(ok.error, None, "a successful answer is not copied");
-        let refused =
-            super::audit_entry(&e, "prod", "run_query", &args, "Refused: not a read.", true);
+        assert_eq!(ok.rows, Some(1), "its row count is");
+        let said = ("Refused: not a read.".to_string(), true).into();
+        let refused = super::audit_entry(&e, "prod", "run_query", &args, &said);
         assert_eq!(refused.error.as_deref(), Some("Refused: not a read."));
+        assert_eq!(refused.rows, None);
         let panel = unreachable(true, true, super::Host::Panel);
         let described = super::audit_entry(
             &panel,
             "prod",
             "describe_table",
             &serde_json::json!({ "table": "orders" }),
-            "…",
-            false,
+            &("…".to_string(), false).into(),
         );
         assert_eq!(
             described.detail.as_deref(),
             Some("describe_table orders (panel)")
         );
-        let long = "x".repeat(super::AUDIT_ERROR_CHARS + 50);
-        let cut = super::audit_entry(&e, "prod", "explain", &args, &long, true);
-        assert_eq!(cut.error.unwrap().len(), super::AUDIT_ERROR_CHARS);
+    }
+
+    /// **A comparison's line names the other side it read** — the source
+    /// connection, or this one's other database — so an agent reading prod's
+    /// whole catalogue is not recorded as a call on dev alone.
+    #[test]
+    fn a_comparisons_line_names_its_source() {
+        let e = unreachable(true, true, super::Host::Standalone);
+        let ok = ("Nothing has run.".to_string(), false).into();
+        let across = super::audit_entry(
+            &e,
+            "dev",
+            "compare_schemas",
+            &serde_json::json!({ "database": "app", "source_connection": "prod", "source_database": "app" }),
+            &ok,
+        );
+        assert_eq!(
+            across.detail.as_deref(),
+            Some("compare_schemas from prod.app (mcp)")
+        );
+        let same = super::audit_entry(
+            &e,
+            "dev",
+            "compare_schemas",
+            &serde_json::json!({ "database": "staging", "source_database": "secret_db" }),
+            &ok,
+        );
+        assert_eq!(
+            same.detail.as_deref(),
+            Some("compare_schemas from dev.secret_db (mcp)")
+        );
+    }
+
+    /// **`propose_sql` judges a statement under the endpoint's own read-only
+    /// mark and database**, the call's database standing in for a missing
+    /// default — the policy `answer` builds, pinned.
+    #[test]
+    fn propose_sql_takes_its_policy_from_the_endpoint() {
+        let mut e = unreachable(true, true, super::Host::Panel);
+        let none = serde_json::json!({});
+        let p = super::propose_policy(&e, &none);
+        assert!(!p.read_only && p.no_database && !p.confirm_writes);
+        assert!(!super::propose_policy(&e, &serde_json::json!({ "database": "shop" })).no_database);
+        e.read_only = true;
+        e.database = Some("shop".to_string());
+        let p = super::propose_policy(&e, &none);
+        assert!(p.read_only && !p.no_database);
     }
 
     fn policy(read_only: bool, no_database: bool) -> schemaic_core::sql::GuardPolicy {
@@ -3216,16 +3443,6 @@ mod tests {
     #[tokio::test]
     async fn compare_schemas_refuses_before_reading() {
         let e = unreachable(true, true, super::Host::Standalone);
-        let (none, err) =
-            super::compare_schemas((&e, "a"), (&e, "a"), &serde_json::json!({})).await;
-        assert!(err && none.contains("a database on each side"), "{none}");
-        let (same, err) = super::compare_schemas(
-            (&e, "a"),
-            (&e, "a"),
-            &serde_json::json!({ "database": "main", "source_database": "main" }),
-        )
-        .await;
-        assert!(err && same.contains("Both sides are main"), "{same}");
         let pg = schemaic_db::Db::from_parts(
             schemaic_db::Engine::Postgres,
             "127.0.0.1".into(),
@@ -3236,6 +3453,26 @@ mod tests {
         );
         let mut other = unreachable(true, true, super::Host::Standalone);
         other.db = pg;
+        let (none, err) =
+            super::compare_schemas((&other, "b"), (&other, "b"), &serde_json::json!({})).await;
+        assert!(err && none.contains("a database on each side"), "{none}");
+        let (same, err) = super::compare_schemas(
+            (&e, "a"),
+            (&e, "a"),
+            &serde_json::json!({ "database": "main", "source_database": "main" }),
+        )
+        .await;
+        assert!(err && same.contains("Both sides are main"), "{same}");
+        // **SQLite's one database is `main` whatever a side is called**, as
+        // `schemaic compare` resolves it: a name that is not there is not a
+        // second database that happens to match.
+        let (named, err) = super::compare_schemas(
+            (&e, "a"),
+            (&e, "a"),
+            &serde_json::json!({ "source_database": "staging" }),
+        )
+        .await;
+        assert!(err && named.contains("Both sides are main"), "{named}");
         let (engines, err) = super::compare_schemas(
             (&e, "a"),
             (&other, "b"),
@@ -3301,6 +3538,121 @@ mod tests {
         assert!(!names.contains(&"sample_rows".to_string()), "{names:?}");
         assert!(names.contains(&"run_query".to_string()), "{names:?}");
         assert!(names.contains(&"list_schema".to_string()), "{names:?}");
+    }
+
+    /// **Every call is recorded, and under the connection it reached** —
+    /// the four `record` sites driven through the real serve loop into an
+    /// in-memory sink: a call naming `b`, `list_connections`, a name the
+    /// server does not serve, a refusal, a cross-connection comparison, and a
+    /// `connection` that is not a string, which is refused rather than
+    /// answered on the default.
+    #[tokio::test]
+    async fn every_call_is_recorded_under_the_connection_it_reached() {
+        let sink = super::AuditSink::default();
+        let audited = |samples: bool, name: &str| {
+            let mut e = unreachable(samples, true, super::Host::Standalone).audited_as(name);
+            e.audit_sink = Some(sink.clone());
+            e
+        };
+        let (a, b) = (audited(true, "a"), audited(false, "b"));
+        let named = [
+            super::Named {
+                name: "a",
+                endpoint: &a,
+            },
+            super::Named {
+                name: "b",
+                endpoint: &b,
+            },
+        ];
+        let call = |tool: &str, args: &str| {
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":\
+                 {{\"name\":\"{tool}\",\"arguments\":{args}}}}}\n"
+            )
+        };
+        let input = [
+            call("describe_table", r#"{"table":"t","connection":"b"}"#),
+            call("list_connections", "{}"),
+            call("run_query", r#"{"sql":"SELECT 1","connection":"c"}"#),
+            call("run_query", r#"{"sql":"SELECT 1","connection":"b"}"#),
+            call(
+                "compare_schemas",
+                r#"{"connection":"b","source_connection":"a"}"#,
+            ),
+            call("run_query", r#"{"sql":"SELECT 1","connection":2}"#),
+        ]
+        .concat();
+        let got = exchange_many(&named, input.as_bytes()).await;
+        let lines = sink.lock().unwrap();
+        let under: Vec<&str> = lines.iter().map(|l| l.connection.as_str()).collect();
+        assert_eq!(under, ["b", "a", "a", "b", "b", "a"], "{lines:?}");
+        assert_eq!(
+            lines[4].detail.as_deref(),
+            Some("compare_schemas from a (mcp)")
+        );
+        // The number is refused, in words that say what a name is.
+        let last = got.last().unwrap();
+        assert_eq!(last["result"]["isError"], true);
+        let text = last["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("as a string") && text.contains("a, b"),
+            "{text}"
+        );
+    }
+
+    /// **The panel's one connection answers to its saved name**, and its
+    /// listing offers no `source_connection` to name another; a refusal never
+    /// lists an empty set of names.
+    #[test]
+    fn a_one_connection_server_is_named_and_offers_no_other() {
+        let e = unreachable(true, true, super::Host::Panel).audited_as("Local");
+        assert_eq!(super::sole_name(&e), "Local");
+        let only = [super::Named {
+            name: "",
+            endpoint: &e,
+        }];
+        let tools = super::listing(&only);
+        let compare = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "compare_schemas")
+            .unwrap();
+        assert!(compare["inputSchema"]["properties"]["source_connection"].is_null());
+        assert!(!super::serves(&only).ends_with("serves ."));
+    }
+
+    /// **`describe_table` promises sample rows only where every connection
+    /// sends them** — a several-connection listing is asked of the OR of the
+    /// levels, which promised rows on a connection that sends none.
+    #[test]
+    fn a_mixed_listing_does_not_promise_rows_everywhere() {
+        let (rows, none) = (
+            unreachable(true, true, super::Host::Standalone),
+            unreachable(false, true, super::Host::Standalone),
+        );
+        let named = [
+            super::Named {
+                name: "prod",
+                endpoint: &none,
+            },
+            super::Named {
+                name: "stage",
+                endpoint: &rows,
+            },
+        ];
+        let tools = super::listing(&named);
+        let d = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "describe_table")
+            .unwrap()["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(d.contains("where the connection sends rows"), "{d}");
     }
 
     /// **Each call is judged by its own connection** — a tool the listing

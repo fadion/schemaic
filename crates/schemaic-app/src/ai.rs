@@ -607,6 +607,7 @@ fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
         // Set from the saved connection in `endpoint_from_blob`, never the
         // blob: until then nothing is logged.
         audit_as: None,
+        audit_sink: None,
         // Likewise the saved connection's, set in `endpoint_from_blob`.
         read_only: false,
         // The panel's connection is always a saved one.
@@ -1250,11 +1251,16 @@ fn inline_cwd(harness: Harness) -> Result<PathBuf, String> {
 /// harness reads costs nothing, and a harness-identity check fails to the unsafe
 /// side for the next CLI added. One list, so the one-shot and the chat turn
 /// cannot come to clear different sets.
+///
+/// **And the CLI's `--url` password variable** (`schemaic_core::PASSWORD_ENV`):
+/// exported in a terminal the app was started from, it reached every
+/// harness's shell, whose `printenv` hands an agent the database password.
 fn inherited_env_to_clear() -> impl Iterator<Item = &'static str> {
     crate::opencode::OpenCodeConfig::env_remove()
         .iter()
         .chain(crate::copilot::CopilotHome::env_remove())
         .copied()
+        .chain(std::iter::once(schemaic_core::PASSWORD_ENV))
 }
 
 /// A private path for Codex's `-o`, named so the startup sweep collects it if
@@ -5394,6 +5400,13 @@ mod tests {
     ///
     /// Named literally, because both harnesses' `env()` need a directory to
     /// build and the suite touches no filesystem.
+    /// **The CLI's `--url` password variable never reaches an agent.** It is
+    /// the one database secret the app knows by name in its own environment.
+    #[test]
+    fn the_clis_password_variable_is_cleared_from_every_agent() {
+        assert!(inherited_env_to_clear().any(|k| k == schemaic_core::PASSWORD_ENV));
+    }
+
     #[test]
     fn no_seal_variable_is_also_cleared() {
         let cleared: Vec<&str> = inherited_env_to_clear().collect();

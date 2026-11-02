@@ -1042,6 +1042,9 @@ async fn serve_mcp(conns: &[Connection], target: &McpTarget) -> Exit {
     let mut endpoints = Vec::with_capacity(selected.len());
     let mut tunnels = Vec::with_capacity(selected.len());
     for (i, (conn, a)) in selected.iter().zip(&args).enumerate() {
+        if let Some(line) = mcp_connecting(conn, selected.len() > 1) {
+            eprintln!("{line}");
+        }
         let (db, tunnel) = match connect(conn, a, query::DEFAULT_TIMEOUT).await {
             Ok(v) => v,
             Err(exit) => return exit,
@@ -1144,22 +1147,45 @@ fn mcp_notice(
         ));
     }
     if database.is_none() {
+        // A `--url` connection (id 0) has no name `databases -c` knows and no
+        // settings in Schemaic: its default is the URL's own.
+        let url = conn.id == 0;
         if first {
+            let lists = if url {
+                "`schemaic databases --url <the same URL>` lists them".to_string()
+            } else {
+                format!(
+                    "`schemaic databases -c {}` lists them",
+                    shell_word(&conn.name)
+                )
+            };
             s.push_str(&format!(
                 "; no default database, so the tools run where the server puts them unless a \
-                 call names one — pass -d <database> to set it (`schemaic databases -c {}` lists \
-                 them)",
-                shell_word(&conn.name),
+                 call names one — pass -d <database> to set it ({lists})"
             ));
         } else {
             // `-d` is the first connection's; this one is told per call.
-            s.push_str(
+            s.push_str(&format!(
                 "; no default database, so the tools run where the server puts them unless a \
-                 call names one with `database`, or pick a default for it in Schemaic",
-            );
+                 call names one with `database`, or {}",
+                if url {
+                    "put one in its URL"
+                } else {
+                    "pick a default for it in Schemaic"
+                }
+            ));
         }
     }
     s
+}
+
+/// Said before each connection of a several-connection `schemaic mcp` is
+/// opened, so that what opening it says next — a keyring notice, a tunnel
+/// that failed, all worded for a one-connection command — follows a line
+/// naming it rather than the previous connection's "serving" line. `None`
+/// with one connection, whose subject is never in doubt.
+fn mcp_connecting(conn: &Connection, several: bool) -> Option<String> {
+    several.then(|| format!("schemaic mcp: connecting '{}'", conn.name))
 }
 
 /// A connection name as it can be pasted back after `-c`: quoted when it has a
@@ -1400,7 +1426,7 @@ fn no_database_hint(connection: &str, how: NoDatabaseFailure) -> String {
 
 /// Where a `--url` connection's password may come from when it is not piped.
 /// Read for a `--url` only: a saved connection's password is the keyring's.
-const PASSWORD_ENV: &str = "SCHEMAIC_PASSWORD";
+use schemaic_core::PASSWORD_ENV;
 
 /// [`no_database_hint`] for the connection `args` names: a saved one echoed
 /// back by name, a `--url` told to name its database there or with `-d`.
@@ -4221,6 +4247,22 @@ mod tests {
         assert!(
             n.contains("no default database") && !n.contains("-d"),
             "{n}"
+        );
+        // **A `--url` connection has neither a name `-c` knows nor settings
+        // in Schemaic**: its advice is the URL's.
+        let url = one_off_connection("mysql://u@h", false, true).unwrap();
+        let n = mcp_notice(&url, true, None, true, false);
+        assert!(n.contains("databases --url") && !n.contains("-c "), "{n}");
+        let n = mcp_notice(&url, true, None, false, true);
+        assert!(
+            n.contains("in its URL") && !n.contains("in Schemaic"),
+            "{n}"
+        );
+        // And with several, each connect is announced by name first.
+        assert_eq!(mcp_connecting(&c, false), None);
+        assert_eq!(
+            mcp_connecting(&c, true).as_deref(),
+            Some("schemaic mcp: connecting 'pg'")
         );
     }
 

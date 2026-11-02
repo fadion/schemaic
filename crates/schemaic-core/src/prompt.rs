@@ -205,6 +205,13 @@ const SPLIT_VALUE_ANCHORS: &[(&str, &str, Option<&str>)] = &[
     ("Failing row contains (", ")", None),
     (")=(", ")", Some("Key (")),
     ("Token \"", "\" is invalid", None),
+    // SQL Server's Msg 245 and Msg 2627/2601 — see `redact_line`.
+    (
+        " value '",
+        "' to data type ",
+        Some("Conversion failed when converting"),
+    ),
+    ("duplicate key value is (", ")", None),
 ];
 
 /// The closing phrase of a value this line **opens and does not close**.
@@ -340,6 +347,20 @@ fn redact_line(line: &str) -> String {
     // driver's full `Display`: the offending token, then an echo of the data.
     out = redact_between(&out, "Token \"", "\" is invalid");
     out = redact_to_end_of_line(&out, "JSON data, line ", ": ");
+    // SQL Server, which had no rule here until its values were found reaching
+    // the prompt whole. Msg 245 and kin: `Conversion failed when converting
+    // the nvarchar value 'V' to data type int.` — no colon, so MySQL's shape
+    // above misses it; anchored on its prose, since ` value '` alone is too
+    // common a phrase to default-deny. Msg 2627/2601: `The duplicate key
+    // value is (V).`, the object and index names quoted earlier in the
+    // sentence kept. Msg 8152's `Truncated value: 'V'` is MySQL's shape and
+    // already answered.
+    if out.contains("Conversion failed when converting") {
+        out = redact_between(&out, " value '", "' to data type ");
+    }
+    out = try_redact(&out, "duplicate key value is (", ").")
+        .or_else(|| try_redact(&out, "duplicate key value is (", ")"))
+        .unwrap_or(out);
     // PostgreSQL's quoted-literal family — the one **default-deny** rule.
     redact_trailing_quoted_value(&out).unwrap_or(out)
 }
@@ -1260,6 +1281,50 @@ mod tests {
         assert!(!val.contains("'a'"), "{val}");
         assert!(!val.contains("'b'"), "{val}");
         assert!(val.contains("`t`.`u`.`age`"), "{val}");
+    }
+
+    /// **SQL Server's value-quoting messages are redacted too** — Msg 245's
+    /// conversion failure, 2627/2601's duplicate key, and 8152's truncated
+    /// value, which shares MySQL's ` value: '` shape — while the object and
+    /// index names they quote mid-sentence are kept. There was no SQL Server
+    /// rule at all, so each reached the prompt and the agent log whole.
+    #[test]
+    fn redaction_covers_sql_server_value_messages() {
+        let conv = redact_engine_error(
+            "Conversion failed when converting the nvarchar value 'ann@example.com' \
+             to data type int. (Msg 245, line 1)",
+        );
+        assert!(!conv.contains("ann@"), "{conv}");
+        assert!(conv.contains("to data type int"), "{conv}");
+        let dup = redact_engine_error(
+            "Violation of PRIMARY KEY constraint 'PK_users'. Cannot insert duplicate key \
+             in object 'dbo.users'. The duplicate key value is (ann@example.com).",
+        );
+        assert!(!dup.contains("ann@"), "{dup}");
+        assert!(
+            dup.contains("'PK_users'") && dup.contains("'dbo.users'"),
+            "{dup}"
+        );
+        let unique = redact_engine_error(
+            "Cannot insert duplicate key row in object 'dbo.users' with unique index \
+             'ix_email'. The duplicate key value is (ann@example.com, 7).",
+        );
+        assert!(
+            !unique.contains("ann@") && unique.contains("'ix_email'"),
+            "{unique}"
+        );
+        let cut = redact_engine_error(
+            "String or binary data would be truncated in table 'shop.dbo.t', column 'c'. \
+             Truncated value: 'ann@example.co'.",
+        );
+        assert!(!cut.contains("ann@") && cut.contains("column 'c'"), "{cut}");
+        // A value with a newline in it, or cut off, still goes to the end.
+        let split = redact_engine_error(
+            "Conversion failed when converting the varchar value 'line one\nSECRET' to data type int.",
+        );
+        assert!(!split.contains("SECRET"), "{split}");
+        let open = redact_engine_error("The duplicate key value is (SECRET-TOKEN");
+        assert!(!open.contains("SECRET"), "{open}");
     }
 
     /// **The families, not one member each.** Every string here was captured off

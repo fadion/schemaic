@@ -122,6 +122,15 @@ pub const APP_ID: &str = "io.github.fadion.Schemaic";
 /// connection it was handed (the app's `ai::grant_allows`).
 pub const AGENT_CHILD_ENV: &str = "SCHEMAIC_AGENT_CHILD";
 
+/// The environment variable a `--url` connection's password may come from on
+/// the command line (`schemaic query --url …`, `schemaic mcp --url …`).
+///
+/// **Here rather than in the CLI because the app has to know the name too**:
+/// it clears it from the AI panel's agent processes, which inherit the app's
+/// environment and keep a shell — a user who exported it for the CLI and
+/// started the app from that terminal handed the agent a database password.
+pub const PASSWORD_ENV: &str = "SCHEMAIC_PASSWORD";
+
 /// Current app version (mirrors the workspace package version).
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 

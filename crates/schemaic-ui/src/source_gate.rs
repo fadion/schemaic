@@ -866,7 +866,9 @@ mod mcp_deadline_gate {
                 .map(|(_, l)| *l)
                 .collect::<Vec<_>>()
                 .join("\n");
-            if !window.contains("with_deadline(") {
+            // `with_deadline_for` is the same deadline under a duration of its
+            // own — `compare_schemas`' catalogues get `schemaic compare`'s.
+            if !window.contains("with_deadline(") && !window.contains("with_deadline_for(") {
                 offenders.push(*line_no);
             }
         }

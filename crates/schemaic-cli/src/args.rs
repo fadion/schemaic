@@ -430,7 +430,7 @@ const EXPORT_TIMEOUT_SECS: u64 = 3600;
 
 /// `compare`'s default `--timeout`: two whole catalogues are read, which on a
 /// large schema takes longer than one statement's thirty seconds.
-const COMPARE_TIMEOUT_SECS: u64 = 120;
+pub(crate) const COMPARE_TIMEOUT_SECS: u64 = 120;
 
 /// `exec`'s `--timeout`, or its default: a statement's thirty seconds, or for
 /// a script [`EXPORT_TIMEOUT_SECS`] — a dump being restored is a whole
