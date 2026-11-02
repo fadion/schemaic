@@ -69,7 +69,8 @@ On its own, the assistant can look things up with Schemaic's tools:
   running anything.
 
 None of these tools can change the database. How that's enforced is under
-[Data access](data-access.md#how-queries-stay-read-only).
+[Data access](data-access.md#how-queries-stay-read-only). Every call the assistant makes to them
+is recorded in the [agent log](../cli/mcp.md#the-agent-log).
 
 ## Acting on an answer
 

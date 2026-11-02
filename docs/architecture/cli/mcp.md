@@ -32,7 +32,7 @@ gesture an outside client does not have, so `NO_DATA_ACCESS_STANDALONE` names th
 data* level in Schemaic's connection settings instead
 (`rows_are_withheld_standalone_with_advice_that_fits_the_client`).
 **`Endpoint` is the server's, and the app's `McpEndpoint` is an alias of it** — `db`,
-`database`, `samples`, `hidden`, `schema`, `host`. It was a struct in `app/ai.rs`, which this
+`database`, `samples`, `hidden`, `schema`, `host`, `audit_as`. It was a struct in `app/ai.rs`, which this
 crate cannot name. `Endpoint::standalone(db, database, ai_data)` is the other constructor, and
 each field it sets is a decision rather than a default. `samples` is
 `ai_data.unwrap_or_default().may_query()` — rows only at `AiData::Full`: `OnRequest` is the level
@@ -65,6 +65,25 @@ does not exist`. On PostgreSQL nothing else reaches another database
 (`run_query_takes_a_database_and_uses_it`). The panel lists the same tools, so it has the
 argument too, which the SCHEMA eye's rule already allows for: `run_query` answers in full, a
 hidden database included.
+**Every call is recorded in the agent log (`core::agent_log`), refused ones included.**
+`call_tool` is now `answer` — the dispatch, refusals and the unknown-name reply included,
+returning `(text, is_error)` and awaited `Box::pin`ned — then `record` when the endpoint is
+audited, then the JSON wrap; a call the agent was refused is as much a part of what it tried as
+one it was given, so a gate's refusal and an unknown tool get a line too. `audit_as` is what
+decides it: the connection's saved name, set by the two front ends from the saved connection
+itself — `serve_mcp` through `Endpoint::audited_as(&conn.name)`, the panel's subprocess from
+`ai::saved_db`'s lookup and never from the endpoint blob, which an agent could rewrite — and
+`None` from `Endpoint::standalone` and every literal, so no test that drives the serve loop
+writes the user's log (`only_an_audited_endpoint_logs`). The line is the pure `audit_entry`: the
+tool, the database it ran in (`tool_database`, the call's own or the endpoint's), the `sql`
+argument, the `table` argument or else the `query` as its subject, the host as its `Caller`, and
+**an error's text only** — cut to `AUDIT_ERROR_CHARS` (500), and never a successful answer's,
+which is the rows the agent was shown (`the_agent_log_line_holds_the_ask_and_an_errors_reason_only`).
+`record` reads `ui_state.json`'s `write_log_values` on every call, as `schemaic exec` does for
+the write log, and a failed append is a line on stderr, the server's log, never a failed call.
+Smoke-tested through `schemaic mcp` over stdio under a throwaway `APPDATA`: a `describe_table`,
+a refused `run_query` with its value masked and the refusal as its error, and an unknown tool
+each got their line.
 **The eight are a type — `McpTool` — and that is what makes the advertised array and the gates one
 set.** They used to be written out independently in five places the compiler related to nothing:
 the `json!` array in `tools_list`, a `==` in `reads_row_data`, a `matches!` in `reads_schema`,
@@ -79,7 +98,7 @@ answered for it: five `non-exhaustive patterns` errors when that was checked, be
 `json!` array survives, each tool's input
 schema being JSON, but every entry in it is filtered back through `McpTool::from_name` before it is
 listed — a `json!` array is not a type, and matching each advertised name back to a variant is what
-makes the array and the gates one set rather than two that agree today; `call_tool` refuses an
+makes the array and the gates one set rather than two that agree today; `answer` refuses an
 unknown name up front and then matches with **no catch-all**; and
 `McpTool::offered(reads_data, schema, host)` is the one place the gates are combined — three
 now, the host the third — so the listing, the refusal and the panel's allow-list cannot disagree
@@ -303,7 +322,7 @@ not only the listing**, and that composition has tests of its own through the se
 `a_standalone_call_to_a_withheld_tool_is_refused_by_the_server` and
 `a_call_is_gated_by_its_own_level_not_the_others`, on an endpoint whose SQLite file does not
 exist so a call wrongly let through fails at once — because `refusal_for` alone was tested, and
-forcing `Host::Panel` or swapping the two levels at `call_tool`'s call site kept the suite
+forcing `Host::Panel` or swapping the two levels at `refusal_for`'s call site (in `answer`) kept the suite
 green. **The handshake speaks
 `2025-06-18` and `2024-11-05`** (`SUPPORTED_PROTOCOLS`, newest first). The newer one costs a
 stdio, tools-only server nothing: its breaking changes are HTTP's and the removal of batching,
@@ -374,7 +393,7 @@ past 50 it wants a query, and `run_query` is there. **It answers both gates yes.
 because resolving the table against the catalogue is the existence oracle
 `propose_table_change`'s note describes. So a data level below `Full` withholds it, and so
 does *Schema context: None*; it is not `needs_panel`.
-**Both new arms in `call_tool` are `Box::pin`ned**, which a tidy-up would undo: inlined, their
+**Both new arms in `answer` (`call_tool`'s body until the agent log) are `Box::pin`ned**, which a tidy-up would undo: inlined, their
 state made `call_tool`'s future large enough that the existing
 `a_call_is_gated_by_its_own_level_not_the_others` overflowed a debug test thread's 2 MiB stack,
 the serve loop holding that future on the stack. Boxed, each adds a pointer. Their gate test,

@@ -449,7 +449,8 @@ which is where an SSH tunnel is opened — **once, and held (`_tunnel`) for the 
 lifetime**; every tool call is still its own database connection, `Db` connecting per operation.
 *Once* also means never reopened: after the tunnel drops, every tool call fails until the
 client restarts the server — a known limit, left as it is. Then `mcp::Endpoint::standalone` over `default_database(-d, conn)` and the connection's
-`ai_data`, one line on stderr, and `mcp::serve` until the client closes stdin — exit 0. **No
+`ai_data`, `.audited_as(&conn.name)` so every tool call is recorded in the agent log under the
+saved name (`core::agent_log`, `cli/mcp.rs`), one line on stderr, and `mcp::serve` until the client closes stdin — exit 0. **No
 database connection is made before the first tool call**, deliberately: a database that is down
 right now is an error the model sees on that call and may retry, not a server that never
 started. stdout is the protocol's, so the line goes to stderr, which MCP clients keep as the

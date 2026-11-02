@@ -20,7 +20,9 @@ appending at once do not interleave inside a line. Its error is the caller's to 
 and never to turn into the write failing: the write it records has already happened.
 `Entry { ts, source, connection, database, sql, detail, rows, outcome, error, masked }` — `ts`
 in Unix milliseconds, `Source` one of `editor`/`script`/`grid`/`ddl`/`import`/`copy`/`cli`/
-`restore`, `connection` the name the user saved. `Outcome` is `ok`/`failed`/`cancelled` and
+`restore`, `connection` the name the user saved. **`agent` is a `Source` this file never holds**:
+it is the MCP server's tool calls, written in this format to `core::agent_log`'s own file — the
+server writes nothing, and its reads in here would bury the writes this record exists for. `Outcome` is `ok`/`failed`/`cancelled` and
 **`unknown`, for a write the client lost track of** — `schemaic exec`'s deadline passing after the
 statement was sent, which may or may not have taken effect (exit 5, under `cli/exec.rs`), an
 `exec --script` its deadline abandoned past the unwind grace with no count (`cli/run.rs`), a

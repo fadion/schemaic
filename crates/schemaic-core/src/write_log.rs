@@ -20,7 +20,8 @@
 //! whatever they ran. *Restore from file* hands the file to the engine's own
 //! client in the terminal, so it is logged as it is launched, its outcome
 //! unknown ([`Source::Restore`]). The MCP server has no write tool, so it has
-//! nothing to log. **How a statement ended** is [`Entry::landed`]'s, from a
+//! nothing to log here; its calls go to [`crate::agent_log`]'s own file, in
+//! this format. **How a statement ended** is [`Entry::landed`]'s, from a
 //! [`Ran`] each front end maps its own state onto, and which statements of a
 //! Run All get a line is [`batch_logged`]'s — decisions that lived in an app
 //! closure and a CLI function, untested, until a typed `COMMIT` of an aborted
@@ -68,6 +69,10 @@ pub enum Source {
     /// the file in `detail`: the client, not Schemaic, sees how it ends, so
     /// its outcome is [`Outcome::Unknown`].
     Restore,
+    /// A call an AI agent made to the MCP server's tools. Written to
+    /// [`crate::agent_log`]'s file, never this one: the server writes
+    /// nothing, and its reads are a different record.
+    Agent,
 }
 
 /// How the write ended, as far as the client can tell.

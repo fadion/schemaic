@@ -9,6 +9,7 @@
 pub mod accepted;
 pub mod access;
 pub mod activity;
+pub mod agent_log;
 pub mod aggregate;
 pub mod blob;
 pub mod body_search;

@@ -190,6 +190,11 @@ pub struct Endpoint {
     /// publishes the catalogue through `schemaic tables` and `describe`.
     pub schema: bool,
     pub host: Host,
+    /// The connection's name, when every tool call is to be recorded in the
+    /// agent log (`core::agent_log`) — set by the two front ends from the
+    /// saved connection itself, `None` elsewhere, so a test's call writes no
+    /// file.
+    pub audit_as: Option<String>,
 }
 
 impl Endpoint {
@@ -225,7 +230,15 @@ impl Endpoint {
             hidden: HashSet::new(),
             schema: true,
             host: Host::Standalone,
+            audit_as: None,
         }
+    }
+
+    /// The same endpoint, its calls recorded in the agent log under the
+    /// connection named `name`.
+    pub fn audited_as(mut self, name: &str) -> Endpoint {
+        self.audit_as = Some(name.to_string());
+        self
     }
 }
 
@@ -883,7 +896,76 @@ fn tool_database<'a>(args: &'a Value, default: Option<&'a str>) -> Option<&'a st
         .or(default)
 }
 
+/// One `tools/call`: the tool's answer, recorded in the agent log when the
+/// endpoint says so — refusals and unknown names included, since a call an
+/// agent was refused is as much a part of what it tried as one it was given.
 async fn call_tool(endpoint: &Endpoint, name: &str, args: &Value) -> Value {
+    let (text, is_error) = Box::pin(answer(endpoint, name, args)).await;
+    if let Some(connection) = &endpoint.audit_as {
+        record(endpoint, connection, name, args, &text, is_error);
+    }
+    json!({ "content": [ { "type": "text", "text": text } ], "isError": is_error })
+}
+
+/// How long an error's text may run in the agent log. An error is Schemaic's
+/// sentence or the engine's — never rows — but a long one is no clearer.
+const AUDIT_ERROR_CHARS: usize = 500;
+
+/// The agent-log line for one call, appended — a failure to write is said on
+/// stderr, which is the server's log, and never fails the call.
+fn record(
+    endpoint: &Endpoint,
+    connection: &str,
+    name: &str,
+    args: &Value,
+    text: &str,
+    is_error: bool,
+) {
+    let line = audit_entry(endpoint, connection, name, args, text, is_error);
+    let keep =
+        schemaic_core::persist::load_json::<schemaic_core::persist::UiState>("ui_state.json")
+            .write_log_values;
+    if let Err(e) = schemaic_core::agent_log::append(&line, dialect_of(&endpoint.db), keep) {
+        eprintln!("schemaic: couldn't append to the agent log: {e}");
+    }
+}
+
+/// [`record`]'s line: the tool, the database it ran in (the call's own or the
+/// endpoint's), its SQL, the table or search it named, and an error's text —
+/// never a successful answer's, which is the data the agent was shown.
+fn audit_entry(
+    endpoint: &Endpoint,
+    connection: &str,
+    name: &str,
+    args: &Value,
+    text: &str,
+    is_error: bool,
+) -> schemaic_core::write_log::Entry {
+    use schemaic_core::agent_log::{Caller, entry};
+    let arg = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    };
+    let caller = match endpoint.host {
+        Host::Panel => Caller::Panel,
+        Host::Standalone => Caller::Standalone,
+    };
+    let subject = arg("table").or(arg("query"));
+    let error: Option<String> = is_error.then(|| text.chars().take(AUDIT_ERROR_CHARS).collect());
+    entry(
+        caller,
+        connection,
+        tool_database(args, endpoint.database.as_deref()),
+        name,
+        arg("sql").unwrap_or(""),
+        subject,
+        error.as_deref(),
+    )
+}
+
+/// A tool's answer — its text, and whether it is an error.
+async fn answer(endpoint: &Endpoint, name: &str, args: &Value) -> (String, bool) {
     let Endpoint {
         db,
         database,
@@ -891,6 +973,7 @@ async fn call_tool(endpoint: &Endpoint, name: &str, args: &Value) -> Value {
         hidden,
         schema,
         host,
+        audit_as: _,
     } = endpoint;
     let (reads_data, schema, host) = (*reads_data, *schema, *host);
     let database = database.as_deref();
@@ -898,13 +981,10 @@ async fn call_tool(endpoint: &Endpoint, name: &str, args: &Value) -> Value {
     // stale `tools/list` must not reach the DB through a tool this connection
     // withheld.
     let Some(tool) = McpTool::from_name(name) else {
-        return json!({
-            "content": [ { "type": "text", "text": format!("Unknown tool: {name}") } ],
-            "isError": true
-        });
+        return (format!("Unknown tool: {name}"), true);
     };
     if let Some(why) = refusal_for(tool, reads_data, schema, host) {
-        return json!({ "content": [ { "type": "text", "text": why } ], "isError": true });
+        return (why.to_string(), true);
     }
     let arg = |key: &str| {
         args.get(key)
@@ -946,7 +1026,7 @@ async fn call_tool(endpoint: &Endpoint, name: &str, args: &Value) -> Value {
         },
         McpTool::ProposeTableChange => propose_change(db, database, arg("database"), args).await,
     };
-    json!({ "content": [ { "type": "text", "text": text } ], "isError": is_error })
+    (text, is_error)
 }
 
 /// The connection's SQL dialect — shared by the read-only gate, the DDL
@@ -2451,7 +2531,58 @@ mod tests {
             hidden: Default::default(),
             schema,
             host,
+            audit_as: None,
         }
+    }
+
+    /// **A refused call is logged with the refusal, and an answered one never
+    /// with its answer** — the agent log records what was asked, and an error's
+    /// sentence; the rows a query returned are the data it exists not to copy.
+    #[test]
+    fn the_agent_log_line_holds_the_ask_and_an_errors_reason_only() {
+        let e = unreachable(true, true, super::Host::Standalone);
+        let args = serde_json::json!({ "sql": "SELECT * FROM t", "database": "shop" });
+        let ok = super::audit_entry(&e, "prod", "run_query", &args, "| a |\n| 1 |", false);
+        assert_eq!(ok.sql, "SELECT * FROM t");
+        assert_eq!(ok.database.as_deref(), Some("shop"));
+        assert_eq!(ok.detail.as_deref(), Some("run_query (mcp)"));
+        assert_eq!(ok.error, None, "a successful answer is not copied");
+        let refused =
+            super::audit_entry(&e, "prod", "run_query", &args, "Refused: not a read.", true);
+        assert_eq!(refused.error.as_deref(), Some("Refused: not a read."));
+        let panel = unreachable(true, true, super::Host::Panel);
+        let described = super::audit_entry(
+            &panel,
+            "prod",
+            "describe_table",
+            &serde_json::json!({ "table": "orders" }),
+            "…",
+            false,
+        );
+        assert_eq!(
+            described.detail.as_deref(),
+            Some("describe_table orders (panel)")
+        );
+        let long = "x".repeat(super::AUDIT_ERROR_CHARS + 50);
+        let cut = super::audit_entry(&e, "prod", "explain", &args, &long, true);
+        assert_eq!(cut.error.unwrap().len(), super::AUDIT_ERROR_CHARS);
+    }
+
+    /// A front end's endpoint is audited; the defaults are not, so no test
+    /// that drives `call_tool` writes the user's log.
+    #[test]
+    fn only_an_audited_endpoint_logs() {
+        let db = schemaic_db::Db::from_parts(
+            schemaic_db::Engine::Sqlite,
+            String::new(),
+            0,
+            String::new(),
+            String::new(),
+            "x.sqlite".to_string(),
+        );
+        let e = super::Endpoint::standalone(db, None, None);
+        assert_eq!(e.audit_as, None);
+        assert_eq!(e.audited_as("prod").audit_as.as_deref(), Some("prod"));
     }
 
     /// **`sample_rows`' `limit` is a count it can honour or a refusal** —

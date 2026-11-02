@@ -1001,7 +1001,8 @@ async fn serve_mcp(conns: &[Connection], target: &McpTarget) -> Exit {
         db,
         default_database(target.database.as_deref(), conn),
         conn.ai_data,
-    );
+    )
+    .audited_as(&conn.name);
     eprintln!(
         "{}",
         mcp_notice(conn, endpoint.samples, endpoint.database.as_deref())

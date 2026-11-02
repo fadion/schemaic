@@ -131,17 +131,6 @@ with a sync script.
 
 ## MCP server
 
-### Audit log of agent calls
-
-`exec` writes to the write log, but MCP reads are logged nowhere. On a production connection, what
-the agent looked at matters too.
-
-- **Decided:** a separate `agent_log.jsonl` beside the write log, in its format and with its
-  masking. Each line holds the tool, the connection, the database, the SQL, the row count, the
-  outcome, and whether the call came from the panel or a standalone server.
-- **Decided:** on by default. Agent reads are frequent, so unlike the write log it is capped:
-  past a size limit it rolls over to one `.1` file.
-
 ### Several connections in one server
 
 One process serves one connection today, so working across databases needs one client entry per

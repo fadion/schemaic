@@ -307,9 +307,10 @@ fn endpoint_from_blob(
 ) -> Result<McpEndpoint, String> {
     let saved = saved_db(v, lookup)?;
     let mut endpoint = endpoint_from_value(v);
-    if let Some((db, ai_data)) = saved {
+    if let Some((db, ai_data, name)) = saved {
         endpoint.db = db;
         endpoint.samples &= ai_data.may_query();
+        endpoint.audit_as = Some(name);
     }
     Ok(endpoint)
 }
@@ -449,7 +450,7 @@ fn endpoint_blob(
 fn saved_db(
     v: &serde_json::Value,
     lookup: impl Fn(u64) -> Result<schemaic_core::connection::Connection, String>,
-) -> Result<Option<(Db, schemaic_core::connection::AiData)>, String> {
+) -> Result<Option<(Db, schemaic_core::connection::AiData, String)>, String> {
     let Some(id) = v.get("conn_id").and_then(|x| x.as_u64()) else {
         return Ok(None);
     };
@@ -467,6 +468,9 @@ fn saved_db(
     Ok(Some((
         Db::connect(&saved, tunnel),
         saved.ai_data.unwrap_or_default(),
+        // The agent log's name for it — the saved connection's, never the
+        // blob's, for the reason everything else here is.
+        saved.name.clone(),
     )))
 }
 
@@ -602,6 +606,9 @@ fn endpoint_from_value(v: &serde_json::Value) -> McpEndpoint {
         // Only the app writes a blob, so a blob is the panel by construction —
         // not a field the blob could get wrong.
         host: Host::Panel,
+        // Set from the saved connection in `endpoint_from_blob`, never the
+        // blob: until then nothing is logged.
+        audit_as: None,
     }
 }
 
@@ -4681,7 +4688,9 @@ mod tests {
             "conn_id": 42, "host": "evil.example", "port": 1, "user": "root",
             "engine": "mysql", "tls": null, "init_sql": "", "auth": "Password",
         });
-        let (db, _) = saved_db(&forged, lookup(saved.clone())).unwrap().unwrap();
+        let (db, _, name) = saved_db(&forged, lookup(saved.clone())).unwrap().unwrap();
+        // The agent log names the saved connection, not anything the blob says.
+        assert_eq!(name, saved.name);
         let (host, port, user, pass, _) = db.parts();
         assert_eq!(
             (host, port, user, pass),
@@ -4694,7 +4703,7 @@ mod tests {
         saved.ssh.enabled = true;
         saved.ssh.host = "bastion.example".into();
         let tunnelled = serde_json::json!({ "conn_id": 42, "host": "evil.example", "port": 40123 });
-        let (db, _) = saved_db(&tunnelled, lookup(saved.clone()))
+        let (db, _, _) = saved_db(&tunnelled, lookup(saved.clone()))
             .unwrap()
             .unwrap();
         assert_eq!(db.parts().0, "127.0.0.1");

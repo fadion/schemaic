@@ -644,7 +644,8 @@ the confirmed restore's client argv is built and just before it goes to the pane
 outcome is `unknown`, the terminal's client and not Schemaic seeing how it ends, and its detail
 `restore <file> into <db>, run in the terminal`, with no `sql`.
 **Not logged**: EXPLAIN ANALYZE, which `Db::explain` always rolls back or never executes; a view
-re-run, a read Schemaic built; the MCP server, which has no write tool; and SQL Server's *Back
+re-run, a read Schemaic built; the MCP server, which has no write tool — its calls go to the
+agent log instead (`core::agent_log`), masked by the same setting; and SQL Server's *Back
 up*, whose `BACKUP DATABASE … WITH COPY_ONLY` writes a file and `msdb`'s history on the server
 (`launch::backup_writes_server`, which is why read-only refuses it) but changes no data in any
 database. The setting is
@@ -1155,7 +1156,7 @@ password to the keyring left everything around it in the blob — host, port, us
 plan, sign-in mode, init SQL, signing target — so whatever could rewrite the endpoint file, or set
 `$SCHEMAIC_MCP_ENDPOINT`, could have the subprocess fetch the saved password from the keyring and
 send it to a host of its own with TLS off, attach init SQL of its own to the session, or (with the
-data levels above) widen what it reads. `saved_db(v, lookup) -> Result<Option<(Db, AiData)>, String>`
+data levels above) widen what it reads. `saved_db(v, lookup) -> Result<Option<(Db, AiData, String)>, String>`
 now answers a blob that carries a `conn_id` with `Db::connect(&saved, tunnel)` — how `main.rs`
 builds the app's own `Db`, less the lazy password source, `keyring_connection` having read the
 password into `saved` already — so all of those are the saved connection's. The blob supplies only what
@@ -1168,7 +1169,12 @@ connection too**: it is that connection's `AiData::may_query`, not a session cho
 `endpoint_from_blob` — the composition `mcp_endpoint_from_env` runs — ANDs the blob's flag with it,
 narrowing only, as `schemaic mcp`'s `Endpoint::standalone` derives it outright (release review
 S2-L5-03, `the_saved_data_level_bounds_the_blobs_samples`; before it a rewritten `"samples": true`
-offered `run_query` on a `SchemaOnly` connection). What stays the blob's is the session's choice:
+offered `run_query` on a `SchemaOnly` connection). **So is the name the agent log records** — the
+`String`, the saved connection's `name`, which `endpoint_from_blob` sets as the endpoint's
+`audit_as` (`cli/mcp.rs`); `endpoint_from_value` leaves it `None`, so a blob with no `conn_id` is
+served unlogged, and a rewritten blob cannot file the calls under another connection's name
+(`the_subprocess_connects_where_the_saved_connection_points` asserts the saved one).
+What stays the blob's is the session's choice:
 the selected `database`, `schema` and `hidden`. **The residual**: the
 tunnel port is still the blob's, so a same-user process that rewrites it can point the subprocess
 at a loopback listener of its own. **The sign-in mode is the saved connection's, and an Entra or

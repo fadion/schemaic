@@ -47,6 +47,25 @@ any. `run_query` and `explain` pass the same read-only check as
 
 The level is read when the server starts. If you change it, restart the server from your client.
 
+## The agent log
+
+Every call an agent makes to these tools is recorded in `agent_log.jsonl`, in the settings folder
+beside the [write log](exec.md#the-write-log). That covers the app's own
+[AI assistant](../ai/README.md) as well as `schemaic mcp`, and calls that were refused. It's on
+for every saved connection.
+
+Each line is one call: when it was made, the connection and database, the tool and the table or
+search it named, whether it came from the panel (`panel`) or `schemaic mcp` (`mcp`), and whether
+it succeeded — with the reason, when it was refused or failed. For `run_query` and `explain` the
+line holds the SQL too, its values masked unless **Keep values in the write log** is on in
+**Settings** › **Query**. SQL that carries a password is masked either way.
+
+A successful call's answer — the rows or definitions the agent was shown — is never copied into
+the log.
+
+The file is capped at 8 MiB. Past that it's renamed `agent_log.jsonl.1`, replacing the previous
+one, and a new file starts, so the log keeps the most recent calls and drops the oldest.
+
 ## When something is missing
 
 The server writes a line to stderr as it starts — most clients show it in the server's log. It
