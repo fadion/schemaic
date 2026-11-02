@@ -179,7 +179,7 @@ pub fn missing_with_ddl_result(v: &[Suggestion]) -> ResultSet {
             .enumerate()
             .map(|(i, s)| {
                 let mut row = missing_row(i, s);
-                let ddl = s.ddl.trim_end();
+                let ddl = without_closing_go(&s.ddl);
                 row.push(if ddl.is_empty() {
                     Value::Null
                 } else {
@@ -189,6 +189,17 @@ pub fn missing_with_ddl_result(v: &[Suggestion]) -> ResultSet {
             })
             .collect(),
     )
+}
+
+/// `ddl` without trailing whitespace and without the editor script's closing
+/// `GO` line — sqlcmd's batch separator, not T-SQL, so a driver handed the
+/// cell would send it as a word. Only a last line that is `GO` alone goes.
+fn without_closing_go(ddl: &str) -> &str {
+    let ddl = ddl.trim_end();
+    match ddl.rsplit_once('\n') {
+        Some((head, last)) if last.trim().eq_ignore_ascii_case("go") => head.trim_end(),
+        _ => ddl,
+    }
 }
 
 /// Each suggestion's DDL, **whole** — a table cell is cut to a few dozen
@@ -430,6 +441,31 @@ mod tests {
             rs.cell(1, last).map(|c| c.to_value()),
             Some(Value::Null)
         ));
+    }
+
+    /// **The editor script's closing `GO` is not part of the statement.** It
+    /// is sqlcmd's batch separator, which a driver handed the cell would send
+    /// to the server as a word — seen live on SQL Server 2022, where the cell
+    /// read `CREATE INDEX … ;\nGO`. Only a trailing separator line goes: a
+    /// `GO` inside a name or between batches is the script's own.
+    #[test]
+    fn the_cli_ddl_cell_drops_the_scripts_closing_go() {
+        let s = |ddl: &str| Suggestion {
+            index: MissingIndex::default(),
+            ddl: ddl.to_string(),
+        };
+        let rs = missing_with_ddl_result(&[
+            s("CREATE INDEX [IX_a] ON [t] ([a]);\nGO\n"),
+            s("CREATE INDEX [IX_GO] ON [t] ([a]);\r\ngo"),
+            s("CREATE INDEX [IX_b] ON [t] ([b]);\nGO\nCREATE INDEX [IX_c] ON [t] ([c]);\nGO"),
+        ]);
+        let last = rs.columns.len() - 1;
+        assert_eq!(cell(&rs, 0, last), "CREATE INDEX [IX_a] ON [t] ([a]);");
+        assert_eq!(cell(&rs, 1, last), "CREATE INDEX [IX_GO] ON [t] ([a]);");
+        assert_eq!(
+            cell(&rs, 2, last),
+            "CREATE INDEX [IX_b] ON [t] ([b]);\nGO\nCREATE INDEX [IX_c] ON [t] ([c]);"
+        );
     }
 
     #[test]

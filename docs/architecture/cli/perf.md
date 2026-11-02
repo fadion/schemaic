@@ -23,7 +23,11 @@ rows — the two share `missing_columns` and `missing_row`, so the numbering and
 drift apart — plus `ddl`, each statement whole with its trailing newline trimmed, and `NULL` where
 the table was not in the schema read rather than `""`. A CLI row is not cut as a tool cell is, and
 a `--format json` reader wants the statement on its row, with no numbered text to match it
-against (`the_cli_suggestion_table_carries_each_ddl_whole`). `suggestions(schema, dialect, missing)` pairs
+against (`the_cli_suggestion_table_carries_each_ddl_whole`). **Nor does the cell keep the editor
+script's closing `GO`** (`without_closing_go`): it is sqlcmd's batch separator rather than T-SQL,
+so a driver handed the cell would send it to the server as a word — the first live run on SQL
+Server 2022 showed `…INCLUDE ([Total]);\nGO`. Only a last line that is `GO` alone is dropped; one
+between batches is the script's own (`the_cli_ddl_cell_drops_the_scripts_closing_go`). `suggestions(schema, dialect, missing)` pairs
 each `MissingIndex` with `workload::suggestion_ddl` against the table as `schema` read it, under a
 `ddl::Target` of the dialect and the schema's flavour — the differ's statement, not one of this
 file's. The table is found by name, and by namespace too when the DMV gave one; a table the
