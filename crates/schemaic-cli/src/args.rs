@@ -370,11 +370,18 @@ pub fn completion_script(shell: clap_complete::Shell) -> String {
 #[derive(clap::Args, Debug, PartialEq, Eq)]
 pub struct McpTarget {
     /// Saved connection, by id or by name — or `#<id>`, which is only ever
-    /// the id.
-    #[arg(short = 'c', long, env = "SCHEMAIC_CONNECTION")]
-    pub connection: String,
-    /// The database the tools default to. Defaults to the connection's own;
-    /// `schemaic databases` lists the names.
+    /// the id. Repeat to serve several: every tool then takes a `connection`
+    /// argument, and the first is the default.
+    #[arg(
+        id = "connection",
+        short = 'c',
+        long = "connection",
+        env = "SCHEMAIC_CONNECTION",
+        required = true
+    )]
+    pub connections: Vec<String>,
+    /// The database the tools default to — the first connection's. Defaults
+    /// to the connection's own; `schemaic databases` lists the names.
     #[arg(short = 'd', long, env = "SCHEMAIC_DATABASE", value_parser = non_blank)]
     pub database: Option<String>,
 }
@@ -1379,16 +1386,27 @@ mod tests {
         let Command::Mcp { target } = cli.command else {
             panic!("expected mcp");
         };
-        assert_eq!(target.connection, "prod");
+        assert_eq!(target.connections, vec!["prod".to_string()]);
         assert_eq!(target.database.as_deref(), Some("shop"));
         assert_eq!(
             parse(&["schemaic", "mcp", "-c", "prod"]).unwrap().command,
             Command::Mcp {
                 target: McpTarget {
-                    connection: "prod".to_string(),
+                    connections: vec!["prod".to_string()],
                     database: None,
                 }
             }
+        );
+        // Repeated, it serves several, in the order given.
+        let Command::Mcp { target } = parse(&["schemaic", "mcp", "-c", "prod", "-c", "stage"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected mcp");
+        };
+        assert_eq!(
+            target.connections,
+            vec!["prod".to_string(), "stage".to_string()]
         );
         for extra in [
             &["--password-stdin"][..],

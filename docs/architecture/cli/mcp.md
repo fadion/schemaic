@@ -302,8 +302,48 @@ dev-dependency on `schemaic-ui` would compile Floem into its tests, and a second
 is the thing `source_gate` exists to prevent. They read the file through
 `workspace_source("schemaic-cli/mcp.rs")`, which fails by name if the file moves again rather
 than scanning nothing.
-**The loop is `serve_on(&endpoint, reader, writer)`, and `serve` only hands it stdin and
-stdout** — any `AsyncBufRead` and `AsyncWrite`, so the protocol itself is tested rather than
+**One process can serve several connections, and one connection is still the server it always
+was.** `serve_on` takes a slice of `Named { name, endpoint }`; `serve(endpoint)` wraps one under
+the name `""` — the panel's `--mcp-serve` path, which has one and always will — and
+`serve_many(Vec<(String, Endpoint)>)` is what `schemaic mcp` calls, with one or several, each
+under its saved name (`run.rs`'s `serve_mcp`). What `tools/list` answers is the pure
+`listing(endpoints)`. **With one it is `tools_list` exactly as before** — no `connection`
+argument, no `list_connections` — so the panel and every client already configured against one
+`-c` see the listing they saw (`one_connection_lists_no_connection_argument`). With several,
+every tool's `inputSchema` gains an optional `connection` ("Defaults to <first>"), a
+`list_connections` tool is appended, and the tools are the **union** of what each connection
+offers — each tool asked `McpTool::offered` against each connection's own pair of levels, never
+against the levels OR-ed apart, which would list `sample_rows` for one connection with rows but
+no catalogue beside another with the reverse, though neither offers it
+(`several_connections_list_the_union_and_a_connection_argument`,
+`the_union_asks_each_connection_its_own_levels`). A call is then routed by the
+pure `pick(endpoints, args)` — the `connection` argument's non-empty value by name, else the
+first; a name not served is an error naming the ones that are — where *name* is the saved
+connection name `serve_mcp` gave it, never the id or `#<id>` that `-c` also accepts — and handed to that endpoint's own
+`call_tool`, so **the listing is the union but every call is judged by its own connection**:
+`refusal_for` against that connection's levels, refused in that connection's words, and recorded
+in the agent log under that connection's `audit_as`. A tool listed because another connection
+offers it is the stale-listing case the server-side refusal was already the backstop for
+(`a_call_is_judged_by_the_connection_it_names`, through `serve_on`: `run_query` named at the
+withheld connection refused, an unknown name refused with `a, b`, and `list_connections`
+answering). **The cost is in the descriptions**: they are `tools_list`'s, so they name the
+*first* connection's engine and its `run_query` heads, and `describe_table`'s promises samples
+when any connection sends them — the exact over-promise
+`describe_table_promises_samples_only_when_it_sends_them` closed for one connection. On a
+mixed-engine or mixed-level server the per-connection truth is `list_connections`', which names
+each one's engine, default database and whether its rows may be read ("you may read them" or
+"withheld"), the first marked `(the default)`. It is the server's own, not an `McpTool` — it reads
+nothing, so `annotated` gives it `readOnlyHint: true` by name — and is answered in `serve_on`
+itself, never reaching `call_tool`, so it is `record`ed there by hand, under the first
+connection's `audit_as`: the agent log is every call, not every `McpTool`. **So is a call
+naming a connection that is not served** — `pick`'s error is answered before any endpoint has
+been chosen, so it too is `record`ed under the first connection's `audit_as`, as a failure with
+the refusal's text. `list_connections` is answered only when there is
+more than one connection; on a one-connection server the name falls through to `pick` and
+`call_tool`'s unknown-tool reply. `host` is the first endpoint's too, which is moot while
+`serve_many`'s only caller builds every endpoint `Host::Standalone`.
+**The loop is `serve_on(&endpoints, reader, writer)`, and `serve`/`serve_many` only hand it stdin
+and stdout** — any `AsyncBufRead` and `AsyncWrite`, so the protocol itself is tested rather than
 only the pure pieces it calls: the tests drive it with a `&[u8]` and a `Vec<u8>`, and no request
 they send reaches the database. It reads **bytes, then UTF-8**, a line at a time
 (`read_until(b'\n')`, then `str::from_utf8`). It was `while let Ok(Some(line)) =

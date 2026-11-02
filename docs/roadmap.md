@@ -47,8 +47,8 @@ The headless release's decisions are taken; the other entries' are not. What an 
 
 They ship in this order, one release each. Releases 2 and 3 merge if 3 turns out small.
 
-1. **Headless:** the MCP server's several connections in one server and `compare_schemas` are
-   what is left of it. All of it is in `schemaic-cli` and shares the CLI's guards.
+1. **Headless:** `compare_schemas` and `--url` on `schemaic mcp` are what is left of it. All of it
+   is in `schemaic-cli` and shares the CLI's guards.
 2. **Performance:** *Workload and performance insight* with the MCP performance tools, which share
    its backend, plus the Server Activity keyboard path.
 3. **Data and editor:** *Compare and sync table data*, the custom keymap and the two chart kinds.
@@ -130,21 +130,15 @@ with a sync script.
 
 ## MCP server
 
-### Several connections in one server
+### `--url` on `schemaic mcp`
 
-One process serves one connection today, so working across databases needs one client entry per
-connection.
+The other commands take a one-off `--url` connection; `mcp` does not yet.
 
-- **Decided:** repeat `-c`. The first is the default for a tool called without a `connection`
-  argument; `list_connections` names the rest. There is no `--all`: each client config names
-  exactly what it exposes.
 - **Decided:** `--url` works here as on the other commands, with `--ai-data` for its data level,
   defaulting to schema only — the one CLI command that reads the level. Its password comes from
   `SCHEMAIC_PASSWORD` only: stdin is the protocol's.
-- **Trap:**
-  - Each connection still needs CLI access.
-  - The `AiData` level is read per connection, not once for the server.
-  - SSH tunnels open lazily, per connection.
+- **Trap:** with several connections, a `--url` one has no saved name for `list_connections` and
+  the agent log; it needs one given or derived, and two must not collide.
 
 ### `compare_schemas`
 

@@ -983,31 +983,72 @@ async fn run_export(
 /// **stdout is the protocol's**, so what this says goes to stderr, which MCP
 /// clients keep as the server's log — and the one line said is what is being
 /// served, which is the first question when a tool is missing.
+///
+/// **Several `-c`s serve several connections** (`mcp::serve_many`), each
+/// selected and gated on its own CLI access before any is opened, each with its
+/// own data level; the first is the default for a call that names none, and
+/// `-d` is the first one's. Every tunnel opens at the start, as one
+/// connection's always has — a server that comes up has every connection it
+/// lists reachable.
 async fn serve_mcp(conns: &[Connection], target: &McpTarget) -> Exit {
-    let args = ConnArgs {
-        connection: Some(target.connection.clone()),
-        ..Default::default()
-    };
-    let conn = match select_conn(conns, &args) {
-        Ok(c) => c,
-        Err(exit) => return exit,
-    };
-    let conn = &*conn;
-    let (db, _tunnel) = match connect(conn, &args, query::DEFAULT_TIMEOUT).await {
-        Ok(v) => v,
-        Err(exit) => return exit,
-    };
-    let endpoint = crate::mcp::Endpoint::standalone(
-        db,
-        default_database(target.database.as_deref(), conn),
-        conn.ai_data,
-    )
-    .audited_as(&conn.name);
-    eprintln!(
-        "{}",
-        mcp_notice(conn, endpoint.samples, endpoint.database.as_deref())
-    );
-    crate::mcp::serve(endpoint).await;
+    let args: Vec<ConnArgs> = target
+        .connections
+        .iter()
+        .map(|c| ConnArgs {
+            connection: Some(c.clone()),
+            ..Default::default()
+        })
+        .collect();
+    // Every one selected — and its CLI access asked — before any is dialled.
+    let mut selected = Vec::with_capacity(args.len());
+    for a in &args {
+        match select_conn(conns, a) {
+            Ok(c) => selected.push(c),
+            Err(exit) => return exit,
+        }
+    }
+    // **The same connection twice is refused by what was selected, not by
+    // spelling**: `-c 1 -c shop` may name one connection by its id and its
+    // name, and would serve it twice under one name.
+    if let Some(twice) = selected
+        .iter()
+        .enumerate()
+        .find(|(i, c)| selected[..*i].iter().any(|s| s.id == c.id))
+        .map(|(_, c)| c)
+    {
+        warn(&format!("'{}' is given twice", twice.name));
+        return Exit::Usage;
+    }
+    let mut endpoints = Vec::with_capacity(selected.len());
+    let mut tunnels = Vec::with_capacity(selected.len());
+    for (i, (conn, a)) in selected.iter().zip(&args).enumerate() {
+        let (db, tunnel) = match connect(conn, a, query::DEFAULT_TIMEOUT).await {
+            Ok(v) => v,
+            Err(exit) => return exit,
+        };
+        tunnels.push(tunnel);
+        let flag = if i == 0 {
+            target.database.as_deref()
+        } else {
+            None
+        };
+        let endpoint =
+            crate::mcp::Endpoint::standalone(db, default_database(flag, conn), conn.ai_data)
+                .audited_as(&conn.name);
+        eprintln!(
+            "{}",
+            mcp_notice(
+                conn,
+                endpoint.samples,
+                endpoint.database.as_deref(),
+                i == 0,
+                selected.len() > 1,
+            )
+        );
+        endpoints.push((conn.name.clone(), endpoint));
+    }
+    crate::mcp::serve_many(endpoints).await;
+    drop(tunnels);
     Exit::Ok
 }
 
@@ -1021,25 +1062,45 @@ async fn serve_mcp(conns: &[Connection], target: &McpTarget) -> Exit {
 /// server engine with neither `-d` nor a saved default, every tool that needs
 /// one has to be told, call by call; an agent that does not know that sees
 /// `relation does not exist` for a table `list_schema` just showed it.
-fn mcp_notice(conn: &Connection, rows: bool, database: Option<&str>) -> String {
+///
+/// `first` is whether this is the first `-c` — the one `-d` sets — and
+/// `several` whether the server serves more than one, where a withheld tool is
+/// still listed (another connection may offer it) and refused per call.
+fn mcp_notice(
+    conn: &Connection,
+    rows: bool,
+    database: Option<&str>,
+    first: bool,
+    several: bool,
+) -> String {
     let mut s = format!(
         "schemaic mcp: serving connection '{}' on stdin/stdout",
         conn.name
     );
     if !rows {
         s.push_str(&format!(
-            "; run_query, explain and sample_rows are withheld — its AI data access is \"{}\" \
+            "; run_query, explain and sample_rows are {} — its AI data access is \"{}\" \
              (set \"{}\" in Schemaic's connection settings to allow them)",
+            if several { "refused on it" } else { "withheld" },
             conn.ai_data.unwrap_or_default().label(),
             schemaic_core::connection::AiData::Full.label(),
         ));
     }
     if database.is_none() {
-        s.push_str(&format!(
-            "; no default database, so the tools run where the server puts them unless a call \
-             names one — pass -d <database> to set it (`schemaic databases -c {}` lists them)",
-            shell_word(&conn.name),
-        ));
+        if first {
+            s.push_str(&format!(
+                "; no default database, so the tools run where the server puts them unless a \
+                 call names one — pass -d <database> to set it (`schemaic databases -c {}` lists \
+                 them)",
+                shell_word(&conn.name),
+            ));
+        } else {
+            // `-d` is the first connection's; this one is told per call.
+            s.push_str(
+                "; no default database, so the tools run where the server puts them unless a \
+                 call names one with `database`, or pick a default for it in Schemaic",
+            );
+        }
     }
     s
 }
@@ -3390,15 +3451,36 @@ mod tests {
         let c = conn("shop");
         assert!(!c.cli_access, "the fixture is unexposed");
         let target = McpTarget {
-            connection: "1".to_string(),
+            connections: vec!["1".to_string()],
             database: None,
         };
-        assert_eq!(serve_mcp(&[c], &target).await, Exit::Refused);
+        assert_eq!(
+            serve_mcp(std::slice::from_ref(&c), &target).await,
+            Exit::Refused
+        );
         let target = McpTarget {
-            connection: "nope".to_string(),
+            connections: vec!["nope".to_string()],
             database: None,
         };
         assert_eq!(serve_mcp(&[], &target).await, Exit::Usage);
+        // **Every connection is gated before any is opened**: an exposed one
+        // first and an unexposed one after is refused without dialling the
+        // first — whose host here would not answer.
+        let mut open = conn("shop");
+        open.id = 2;
+        open.name = "open".to_string();
+        open.cli_access = true;
+        let target = McpTarget {
+            connections: vec!["open".to_string(), "1".to_string()],
+            database: None,
+        };
+        assert_eq!(serve_mcp(&[open.clone(), c], &target).await, Exit::Refused);
+        // One connection named by its name and by its id is still twice.
+        let target = McpTarget {
+            connections: vec!["open".to_string(), "#2".to_string()],
+            database: None,
+        };
+        assert_eq!(serve_mcp(&[open], &target).await, Exit::Usage);
     }
 
     /// On a server engine `-d` wins, else the connection's own, else none —
@@ -3422,18 +3504,27 @@ mod tests {
         use schemaic_core::connection::AiData;
         let mut c = conn("");
         c.name = "Prod EU".to_string();
-        let n = mcp_notice(&c, false, Some("shop"));
+        let n = mcp_notice(&c, false, Some("shop"), true, false);
         assert!(n.contains("'Prod EU'"), "{n}");
         assert!(
             n.contains(AiData::OnRequest.label()),
             "a never-chosen level is the default: {n}"
         );
         assert!(n.contains(AiData::Full.label()), "{n}");
+        assert!(n.contains("withheld"), "{n}");
         c.ai_data = Some(AiData::SchemaOnly);
-        assert!(mcp_notice(&c, false, Some("shop")).contains(AiData::SchemaOnly.label()));
-        let n = mcp_notice(&c, true, Some("shop"));
+        assert!(
+            mcp_notice(&c, false, Some("shop"), true, false).contains(AiData::SchemaOnly.label())
+        );
+        let n = mcp_notice(&c, true, Some("shop"), true, false);
         assert!(!n.contains("run_query"), "{n}");
         assert!(!n.contains("-d"), "a default was given: {n}");
+        // Beside other connections the tool is still listed, and refused here.
+        let n = mcp_notice(&c, false, Some("shop"), true, true);
+        assert!(
+            n.contains("refused on it") && !n.contains("withheld"),
+            "{n}"
+        );
     }
 
     /// **No default database is said at start-up**, with the fix. Both real
@@ -3444,10 +3535,16 @@ mod tests {
     fn the_mcp_notice_says_when_there_is_no_default_database() {
         let mut c = conn("");
         c.name = "pg".to_string();
-        let n = mcp_notice(&c, true, None);
+        let n = mcp_notice(&c, true, None, true, false);
         assert!(n.contains("no default database"), "{n}");
         assert!(n.contains("-d"), "{n}");
         assert!(n.contains("schemaic databases -c pg"), "{n}");
+        // `-d` is the first connection's: a later one is told per call.
+        let n = mcp_notice(&c, true, None, false, true);
+        assert!(
+            n.contains("no default database") && !n.contains("-d"),
+            "{n}"
+        );
     }
 
     const MYSQL_1046: &str =

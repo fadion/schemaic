@@ -445,12 +445,12 @@ No unit test drives `run_import`, so its order is the code's.
 an unknown one exit 2, before the keyring is read, and the MCP client shows a server that failed
 to start, with that line as its log, rather than one with a tool list
 (`mcp_refuses_a_connection_without_cli_access`). Then `connect` under `query::DEFAULT_TIMEOUT`,
-which is where an SSH tunnel is opened — **once, and held (`_tunnel`) for the server's
+which is where an SSH tunnel is opened — **once, and held (`tunnels`) for the server's
 lifetime**; every tool call is still its own database connection, `Db` connecting per operation.
 *Once* also means never reopened: after the tunnel drops, every tool call fails until the
 client restarts the server — a known limit, left as it is. Then `mcp::Endpoint::standalone` over `default_database(-d, conn)` and the connection's
 `ai_data`, `.audited_as(&conn.name)` so every tool call is recorded in the agent log under the
-saved name (`core::agent_log`, `cli/mcp.rs`), one line on stderr, and `mcp::serve` until the client closes stdin — exit 0. **No
+saved name (`core::agent_log`, `cli/mcp.rs`), one line on stderr, and `mcp::serve_many` until the client closes stdin — exit 0. **No
 database connection is made before the first tool call**, deliberately: a database that is down
 right now is an error the model sees on that call and may retry, not a server that never
 started. stdout is the protocol's, so the line goes to stderr, which MCP clients keep as the
@@ -464,3 +464,27 @@ databases -c <name>` that lists what to give it. An agent that does not know tha
 `relation does not exist` for a table `list_schema` just showed it
 (`the_mcp_notice_says_when_there_is_no_default_database`). `connect` is handed a `ConnArgs` with
 `password_stdin: false`, `mcp` having no such flag.
+**Several `-c`s are the same steps, phased so that exit 3 stays true of all of them.** **Every**
+connection goes through `select_conn` before any is dialled, so an exposed one followed by an
+unexposed one is exit 3 without the first being opened. Then the same connection given twice is
+refused, exit 2 — compared by the selected connections' ids, not by spelling, so `-c open -c #2`
+naming one connection by its name and its id is caught. Only then is each `connect`ed in turn, its tunnel opened and pushed onto a `Vec`
+held for the server's life, its `Endpoint::standalone(…).audited_as(&conn.name)` built and its
+own `mcp_notice` line written, and the lot handed to `mcp::serve_many` under the saved names — a
+single `-c` takes the same path, as a list of one. `-d` is the first connection's; the others take
+`default_database(None, conn)`. **The notice is told which of the two it is speaking for**
+(`mcp_notice(conn, rows, database, first, several)`), because two of its sentences were true only
+of a lone connection. With several, a connection below *Let it read data* has its row tools
+"refused on it" rather than "withheld": the listing is the union, so another connection may still
+have them listed. And the no-default-database hint offers `-d` only on the first line — `-d` is
+the first connection's — telling a later one to name `database` per call or pick a default for it
+in Schemaic (`the_mcp_notice_explains_a_withheld_query_tool`,
+`the_mcp_notice_says_when_there_is_no_default_database`). The names a tool call's `connection`
+picks by are the saved `conn.name`s, while `-c` also takes an id or `#<id>`: a server started with
+`-c 3` is still addressed as its connection's name, which `list_connections` and the notice both
+print. **Every tunnel opens at the start**, as one connection's always
+did: a server that comes up has every connection it lists reachable, rather than one that fails a
+connection on its first call. Any one failing to `connect` ends the start with its exit, as a lone
+one's did, and the tunnels already opened drop with it. `mcp_refuses_a_connection_without_cli_access` covers the phasing — the
+exposed-then-unexposed pair refused with the exposed one's host never dialled, and a duplicate
+`-c` a usage error.

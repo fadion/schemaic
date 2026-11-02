@@ -217,7 +217,12 @@ request; the flag is absent rather than present and refusing. `-c` and `-d` keep
 `SCHEMAIC_CONNECTION`/`SCHEMAIC_DATABASE` fallbacks and `-d` the same `non_blank`, and there are
 no output flags, since nothing here prints rows
 (`mcp_takes_a_connection_and_a_database_and_nothing_from_stdin`, which holds `--password-stdin`,
-`--format` and `--limit` to parse errors). The cost is the headless case `--password-stdin`
+`--format` and `--limit` to parse errors). **`-c` repeats**: `connections` is a `Vec<String>`,
+`required = true`, in the order given, and serving several is `cli/mcp.rs`'s `serve_many`; the
+first is the default for a tool call that names none, and `-d` is that first connection's alone.
+The field was renamed from `connection` but the arg keeps `id = "connection"`, which is what
+`SCHEMAIC_CONNECTION` and the env-lookup tests resolve through — the variable still supplies one
+connection. The same test now parses `-c prod -c stage` into both, in order. The cost is the headless case `--password-stdin`
 exists for: a connection whose password the keyring cannot serve has no `schemaic mcp`. Nor does
 `McpTarget` take `--url` yet — and a one-off connection's AI data level, the one field only
 `mcp` reads, is left at its default (`run.rs`'s `one_off_connection`).

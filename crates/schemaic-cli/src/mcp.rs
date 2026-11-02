@@ -136,12 +136,124 @@ fn annotated(mut tools: Value, protocol: &str) -> Value {
         return tools;
     }
     for t in tools.as_array_mut().into_iter().flatten() {
-        let Some(tool) = McpTool::from_name(t["name"].as_str().unwrap_or("")) else {
-            continue;
+        let name = t["name"].as_str().unwrap_or("");
+        // `list_connections` is the server's own, not an `McpTool`: it names
+        // what this process was given and reads nothing.
+        let read_only = match McpTool::from_name(name) {
+            Some(tool) => tool.read_only(),
+            None if name == LIST_CONNECTIONS => true,
+            None => continue,
         };
-        t["annotations"] = json!({ "readOnlyHint": tool.read_only() });
+        t["annotations"] = json!({ "readOnlyHint": read_only });
     }
     tools
+}
+
+/// One connection a server serves, under the name a tool call picks it by.
+pub struct Named<'a> {
+    pub name: &'a str,
+    pub endpoint: &'a Endpoint,
+}
+
+/// The tool that names a several-connection server's connections — offered
+/// only when there is more than one, so a one-connection server's listing is
+/// exactly what it always was.
+const LIST_CONNECTIONS: &str = "list_connections";
+
+/// What `tools/list` advertises for `endpoints`.
+///
+/// **One connection is the listing it always was.** Several add a `connection`
+/// argument to every tool and a `list_connections` tool, and offer a tool when
+/// **any** connection's levels offer it — each call is still judged by its own
+/// connection's levels ([`refusal_for`]), so a tool listed for one connection
+/// is refused for another that withholds it, in that connection's words. The
+/// descriptions name the first connection's engine; `list_connections` names
+/// each one's.
+fn listing(endpoints: &[Named<'_>]) -> Value {
+    let first = endpoints[0].endpoint;
+    if endpoints.len() == 1 {
+        return tools_list(first.db.engine(), first.samples, first.schema, first.host);
+    }
+    let reads_data = endpoints.iter().any(|n| n.endpoint.samples);
+    let schema = endpoints.iter().any(|n| n.endpoint.schema);
+    let mut tools = tools_list(first.db.engine(), reads_data, schema, first.host);
+    // **Each tool asked of each connection's own levels**, not of the levels
+    // OR-ed apart: a tool that needs rows *and* the catalogue is offered by
+    // neither of a connection with rows but no schema and one with the
+    // reverse, though the OR-ed pair would list it.
+    if let Some(list) = tools.as_array_mut() {
+        list.retain(|t| {
+            McpTool::from_name(t["name"].as_str().unwrap_or("")).is_some_and(|tool| {
+                endpoints
+                    .iter()
+                    .any(|n| tool.offered(n.endpoint.samples, n.endpoint.schema, n.endpoint.host))
+            })
+        });
+    }
+    let pick = json!({
+        "type": "string",
+        "description": format!(
+            "Which connection, as list_connections names it. Defaults to {}.",
+            endpoints[0].name
+        )
+    });
+    for t in tools.as_array_mut().into_iter().flatten() {
+        t["inputSchema"]["properties"]["connection"] = pick.clone();
+    }
+    if let Some(list) = tools.as_array_mut() {
+        list.push(json!({
+            "name": LIST_CONNECTIONS,
+            "description": "The connections this server was given: each one's name, engine, \
+                            default database, and whether you may read its rows. Pass a name \
+                            as any other tool's `connection`.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }));
+    }
+    tools
+}
+
+/// The connection a call's `connection` argument names, or the first when it
+/// names none — or why it cannot be served.
+fn pick<'a>(endpoints: &'a [Named<'a>], args: &Value) -> Result<&'a Endpoint, String> {
+    match args
+        .get("connection")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        None => Ok(endpoints[0].endpoint),
+        Some(want) => endpoints
+            .iter()
+            .find(|n| n.name == want)
+            .map(|n| n.endpoint)
+            .ok_or_else(|| {
+                let names: Vec<&str> = endpoints.iter().map(|n| n.name).collect();
+                format!(
+                    "No connection named {want:?} on this server; it serves {}.",
+                    names.join(", ")
+                )
+            }),
+    }
+}
+
+/// `list_connections`' answer.
+fn list_connections(endpoints: &[Named<'_>]) -> String {
+    let mut out = String::from("Connections on this server:\n");
+    for (i, n) in endpoints.iter().enumerate() {
+        let e = n.endpoint;
+        out.push_str(&format!(
+            "- {}{} — {}, default database {}; rows: {}\n",
+            n.name,
+            if i == 0 { " (the default)" } else { "" },
+            e.db.engine().as_str(),
+            e.database.as_deref().unwrap_or("(none)"),
+            if e.samples {
+                "you may read them"
+            } else {
+                "withheld"
+            },
+        ));
+    }
+    out
 }
 
 /// Who started this server — and so where a tool's result can lead.
@@ -254,7 +366,25 @@ impl Endpoint {
 /// endpoint (its `database` is the default schema `USE`d for `run_query`).
 pub async fn serve(endpoint: Endpoint) {
     serve_on(
-        &endpoint,
+        &[Named {
+            name: "",
+            endpoint: &endpoint,
+        }],
+        BufReader::new(tokio::io::stdin()),
+        tokio::io::stdout(),
+    )
+    .await;
+}
+
+/// [`serve`] for several connections, each under its name; the first is the
+/// default for a call that names none ([`listing`]).
+pub async fn serve_many(endpoints: Vec<(String, Endpoint)>) {
+    let named: Vec<Named<'_>> = endpoints
+        .iter()
+        .map(|(name, endpoint)| Named { name, endpoint })
+        .collect();
+    serve_on(
+        &named,
         BufReader::new(tokio::io::stdin()),
         tokio::io::stdout(),
     )
@@ -263,7 +393,7 @@ pub async fn serve(endpoint: Endpoint) {
 
 /// [`serve`] over any reader and writer, so the protocol loop itself — not
 /// just the pure pieces it calls — is tested.
-async fn serve_on<R, W>(endpoint: &Endpoint, input: R, mut stdout: W)
+async fn serve_on<R, W>(endpoints: &[Named<'_>], input: R, mut stdout: W)
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -339,15 +469,7 @@ where
                 }))
             }
             "tools/list" => Some(json!({
-                "tools": annotated(
-                    tools_list(
-                        endpoint.db.engine(),
-                        endpoint.samples,
-                        endpoint.schema,
-                        endpoint.host,
-                    ),
-                    protocol,
-                )
+                "tools": annotated(listing(endpoints), protocol)
             })),
             "tools/call" => {
                 let name = req
@@ -359,7 +481,33 @@ where
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or(json!({}));
-                Some(call_tool(endpoint, &name, &args).await)
+                let error = |text: String| json!({ "content": [ { "type": "text", "text": text } ], "isError": true });
+                if name == LIST_CONNECTIONS && endpoints.len() > 1 {
+                    // Logged like any call, under the default connection's
+                    // name: the agent log is "every call", not every tool.
+                    let first = endpoints[0].endpoint;
+                    if let Some(connection) = &first.audit_as {
+                        record(first, connection, &name, &args, "", false);
+                    }
+                    Some(json!({
+                        "content": [ { "type": "text", "text": list_connections(endpoints) } ],
+                        "isError": false
+                    }))
+                } else {
+                    match pick(endpoints, &args) {
+                        Ok(endpoint) => Some(call_tool(endpoint, &name, &args).await),
+                        Err(why) => {
+                            // Refused before any connection was chosen, so
+                            // logged under the default's name, as
+                            // `list_connections` is.
+                            let first = endpoints[0].endpoint;
+                            if let Some(connection) = &first.audit_as {
+                                record(first, connection, &name, &args, &why, true);
+                            }
+                            Some(error(why))
+                        }
+                    }
+                }
             }
             "ping" => Some(json!({})),
             // Anything else is not implemented here. A notification (no id)
@@ -2556,8 +2704,20 @@ mod tests {
 
     /// [`exchange`] against a given endpoint.
     async fn exchange_on(endpoint: &super::Endpoint, input: &[u8]) -> Vec<serde_json::Value> {
+        exchange_many(
+            &[super::Named {
+                name: "only",
+                endpoint,
+            }],
+            input,
+        )
+        .await
+    }
+
+    /// [`exchange`] against several named endpoints.
+    async fn exchange_many(endpoints: &[super::Named<'_>], input: &[u8]) -> Vec<serde_json::Value> {
         let mut out = Vec::new();
-        super::serve_on(endpoint, input, &mut out).await;
+        super::serve_on(endpoints, input, &mut out).await;
         String::from_utf8(out)
             .expect("the server writes UTF-8")
             .lines()
@@ -2719,6 +2879,136 @@ mod tests {
         assert!(McpTool::ProposeSql.offered(false, false, Host::Panel));
         assert!(!McpTool::ProposeSql.offered(true, true, Host::Standalone));
         assert!(!McpTool::ProposeSql.reads_row_data() && !McpTool::ProposeSql.reads_schema());
+    }
+
+    fn tool_names(listing: &serde_json::Value) -> Vec<String> {
+        listing
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// **One connection is the listing it always was** — no `connection`
+    /// argument, no `list_connections` — which is what keeps the panel's
+    /// server and every existing client unchanged.
+    #[test]
+    fn one_connection_lists_no_connection_argument() {
+        let e = unreachable(true, true, super::Host::Standalone);
+        let listing = super::listing(&[super::Named {
+            name: "a",
+            endpoint: &e,
+        }]);
+        assert!(!tool_names(&listing).contains(&"list_connections".to_string()));
+        for t in listing.as_array().unwrap() {
+            assert!(
+                t["inputSchema"]["properties"]["connection"].is_null(),
+                "{t}"
+            );
+        }
+    }
+
+    /// Several connections: every tool takes a `connection`, `list_connections`
+    /// is offered, and a tool is listed when **any** connection offers it.
+    #[test]
+    fn several_connections_list_the_union_and_a_connection_argument() {
+        let rows = unreachable(true, true, super::Host::Standalone);
+        let no_rows = unreachable(false, true, super::Host::Standalone);
+        let listing = super::listing(&[
+            super::Named {
+                name: "a",
+                endpoint: &no_rows,
+            },
+            super::Named {
+                name: "b",
+                endpoint: &rows,
+            },
+        ]);
+        let names = tool_names(&listing);
+        assert!(names.contains(&"run_query".to_string()), "{names:?}");
+        assert!(names.contains(&"list_connections".to_string()));
+        for t in listing.as_array().unwrap() {
+            if t["name"] != "list_connections" {
+                assert!(
+                    t["inputSchema"]["properties"]["connection"].is_object(),
+                    "{t}"
+                );
+            }
+        }
+    }
+
+    /// A tool needing rows and the catalogue is offered only by a connection
+    /// with both — not by one with rows and another with the catalogue.
+    #[test]
+    fn the_union_asks_each_connection_its_own_levels() {
+        let rows_only = unreachable(true, false, super::Host::Standalone);
+        let schema_only = unreachable(false, true, super::Host::Standalone);
+        let listing = super::listing(&[
+            super::Named {
+                name: "a",
+                endpoint: &rows_only,
+            },
+            super::Named {
+                name: "b",
+                endpoint: &schema_only,
+            },
+        ]);
+        let names = tool_names(&listing);
+        assert!(!names.contains(&"sample_rows".to_string()), "{names:?}");
+        assert!(names.contains(&"run_query".to_string()), "{names:?}");
+        assert!(names.contains(&"list_schema".to_string()), "{names:?}");
+    }
+
+    /// **Each call is judged by its own connection** — a tool the listing
+    /// offers for one connection is refused for another that withholds it, in
+    /// that one's words; an unknown name is refused with the names there are.
+    #[tokio::test]
+    async fn a_call_is_judged_by_the_connection_it_names() {
+        let rows = unreachable(true, true, super::Host::Standalone);
+        let no_rows = unreachable(false, true, super::Host::Standalone);
+        let named = [
+            super::Named {
+                name: "a",
+                endpoint: &rows,
+            },
+            super::Named {
+                name: "b",
+                endpoint: &no_rows,
+            },
+        ];
+        let call = |args: &str| {
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":\
+                 {{\"name\":\"run_query\",\"arguments\":{args}}}}}\n"
+            )
+        };
+        let text = |got: &[serde_json::Value]| {
+            got[0]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let refused = exchange_many(
+            &named,
+            call(r#"{"sql":"SELECT 1","connection":"b"}"#).as_bytes(),
+        )
+        .await;
+        assert!(text(&refused).starts_with("Refused:"), "{}", text(&refused));
+        let unknown = exchange_many(
+            &named,
+            call(r#"{"sql":"SELECT 1","connection":"c"}"#).as_bytes(),
+        )
+        .await;
+        assert!(text(&unknown).contains("a, b"), "{}", text(&unknown));
+        assert_eq!(unknown[0]["result"]["isError"], true);
+        let listed = exchange_many(
+            &named,
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"list_connections\",\"arguments\":{}}}\n",
+        )
+        .await;
+        let l = text(&listed);
+        assert!(l.contains("a (the default)") && l.contains("- b"), "{l}");
     }
 
     /// A front end's endpoint is audited; the defaults are not, so no test
