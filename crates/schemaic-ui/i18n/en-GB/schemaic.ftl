@@ -3359,7 +3359,6 @@ perf-problem-duplicate = Duplicates { $of }
 perf-problem-redundant = Covered by { $by }, whose key begins with this one's
 perf-usage-note = Usage counts start again when the server restarts or its statistics are reset, so an index used only by a monthly job can look unused. Check before dropping one.
 perf-usage-uncounted = This server reports no index usage counts, so no index can be called unused — only duplicates and prefixes are shown.
-perf-drop-index = Drop
 perf-create-index = Create index
 perf-missing-title = Missing indexes the optimiser recorded since the last restart
 perf-missing-none = None recorded.

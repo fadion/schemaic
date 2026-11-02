@@ -2728,7 +2728,6 @@ perf-problem-duplicate = Doppelt zu { $of }
 perf-problem-redundant = Abgedeckt von { $by }, dessen Schlüssel mit diesem beginnt
 perf-usage-note = Die Nutzungszähler beginnen von vorn, wenn der Server neu startet oder seine Statistik zurückgesetzt wird, daher kann ein Index, den nur ein monatlicher Job nutzt, ungenutzt aussehen. Prüfe das, bevor du einen löschst.
 perf-usage-uncounted = Dieser Server meldet keine Index-Nutzungszähler, daher lässt sich kein Index als ungenutzt bezeichnen — es werden nur Duplikate und Präfixe gezeigt.
-perf-drop-index = Löschen
 perf-create-index = Index erstellen
 perf-missing-title = Fehlende Indizes, die der Optimierer seit dem letzten Neustart erfasst hat
 perf-missing-none = Keine erfasst.

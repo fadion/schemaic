@@ -2857,7 +2857,6 @@ perf-problem-duplicate = Dyfishon { $of }
 perf-problem-redundant = Mbuluar nga { $by }, çelësi i të cilit fillon si ky
 perf-usage-note = Numërimet e përdorimit fillojnë nga e para kur serveri rinis ose statistikat e tij rivendosen, ndaj një indeks që përdoret vetëm nga një punë mujore mund të duket i papërdorur. Kontrolloni para se të fshini një të tillë.
 perf-usage-uncounted = Ky server nuk raporton numërime përdorimi të indeksëve, ndaj asnjë indeks nuk mund të quhet i papërdorur — shfaqen vetëm të dyfishtat dhe prefiksët.
-perf-drop-index = Fshi
 perf-create-index = Krijo indeks
 perf-missing-title = Indeksët që mungojnë, të regjistruar nga optimizuesi që nga rinisja e fundit
 perf-missing-none = Asnjë i regjistruar.

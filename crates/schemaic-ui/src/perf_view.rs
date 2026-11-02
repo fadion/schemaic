@@ -36,6 +36,7 @@ use schemaic_core::workload::{
 use crate::consts::MONO_FAMILY;
 use crate::i18n::{self, tr};
 use crate::theme::{font_body, font_hint};
+use crate::tooltip::TooltipExt;
 use crate::widgets::{
     ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, autohide, dismiss_layer,
     focus_root_with_ring, modal_footer_split, modal_pad_h, modal_title_owned, modal_w, panel_style,
@@ -52,6 +53,10 @@ fn panel_w() -> f64 {
 
 /// Fixed, for `server_vars_view::PANEL_H`'s reason.
 const PANEL_H: f64 = 600.0;
+
+/// How long a read runs before the view says it is reading. Below this an
+/// answer reads as instant, and a line shown for it is only a flash.
+const LOADING_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
 // ── what the view reads ──────────────────────────────────────────────────────
 
@@ -120,6 +125,35 @@ pub(crate) fn perf_overlay(ctx: PerfCtx) -> impl IntoView {
     let state = ctx.overlay.perf_state;
     let preview_open = ctx.ddl.preview;
 
+    // **The loading line waits before it shows.** A local server answers a
+    // tab switch inside a frame, so a line drawn the instant the state turned
+    // `Loading` flashed for one frame in the body and the footer on every
+    // switch — read as a flicker, not as news. It appears only once a read has
+    // run for `LOADING_DELAY`, so a fast server never shows it and a slow one
+    // still says it is working. A sequence number retires a timer a later
+    // state superseded — `dividers::DelayedHover`'s rule — and both signals
+    // are made here, in the overlay's stable scope rather than the per-open
+    // `dyn_container`, so a timer out at a close never reads a disposed one.
+    let slow = RwSignal::new(false);
+    {
+        let seq: RwSignal<u64> = RwSignal::new(0);
+        create_effect(move |_| {
+            let loading = state.with(|s| matches!(s, PerfState::Loading));
+            let mine = seq.get_untracked().wrapping_add(1);
+            seq.set(mine);
+            if slow.get_untracked() {
+                slow.set(false);
+            }
+            if loading {
+                floem::action::exec_after(LOADING_DELAY, move |_| {
+                    if seq.try_get_untracked() == Some(mine) {
+                        slow.set(true);
+                    }
+                });
+            }
+        });
+    }
+
     // The fetch keys on the target, the list and the order, above the
     // container for `server_vars_view`'s reason. The order only matters to
     // the statements, so a change of it on another list fetches nothing.
@@ -158,7 +192,7 @@ pub(crate) fn perf_overlay(ctx: PerfCtx) -> impl IntoView {
             let Some(t) = open else {
                 return empty().into_any();
             };
-            modal(body_ctx.clone(), t)
+            modal(body_ctx.clone(), t, slow)
         },
     )
     // **Hidden while the preview it raised is up** — `copy_table_view`'s rule.
@@ -171,7 +205,7 @@ pub(crate) fn perf_overlay(ctx: PerfCtx) -> impl IntoView {
     })
 }
 
-fn modal(ctx: PerfCtx, t: PerfTarget) -> AnyView {
+fn modal(ctx: PerfCtx, t: PerfTarget, slow: RwSignal<bool>) -> AnyView {
     let target = ctx.overlay.perf;
     let view = ctx.overlay.perf_view;
     let order = ctx.overlay.perf_order;
@@ -225,7 +259,7 @@ fn modal(ctx: PerfCtx, t: PerfTarget) -> AnyView {
         scroll(
             dyn_container(
                 move || state.get(),
-                move |st| body(&rows_ctx, &rows_target, st),
+                move |st| body(&rows_ctx, &rows_target, st, slow),
             )
             .style(|s| s.width_full().flex_col()),
         )
@@ -251,7 +285,7 @@ fn modal(ctx: PerfCtx, t: PerfTarget) -> AnyView {
             (fetch)(t.clone(), v, order.get_untracked());
         }
     };
-    let footer = footer(state, refresh, close.clone(), ring.clone());
+    let footer = footer(slow, refresh, close.clone(), ring.clone());
 
     let panel = v_stack((title, strip, list, footer))
         .on_click_stop(|_| {})
@@ -318,9 +352,21 @@ fn order_switch(order: RwSignal<StatementOrder>) -> impl IntoView {
 
 // ── the body ─────────────────────────────────────────────────────────────────
 
-fn body(ctx: &PerfCtx, t: &PerfTarget, st: PerfState) -> AnyView {
+fn body(ctx: &PerfCtx, t: &PerfTarget, st: PerfState, slow: RwSignal<bool>) -> AnyView {
     match st {
-        PerfState::Loading => message(icons::CLOCK, theme::text_faint, tr!("perf-loading")),
+        // Blank until `slow` says the read is taking a while.
+        PerfState::Loading => dyn_container(
+            move || slow.get(),
+            |slow| {
+                if slow {
+                    message(icons::CLOCK, theme::text_faint, tr!("perf-loading"))
+                } else {
+                    empty().into_any()
+                }
+            },
+        )
+        .style(|s| s.width_full())
+        .into_any(),
         PerfState::Failed(e) => message(icons::TRIANGLE_ALERT, theme::error, e),
         PerfState::Loaded(data) => match &*data {
             PerfData::Statements(StatementReport::Unavailable(u)) => unavailable(u),
@@ -364,24 +410,8 @@ fn unavailable(u: &Unavailable) -> AnyView {
     };
     let mut rows = vec![message(icons::CIRCLE_QUESTION, theme::text_faint, reason)];
     if let Some(sql) = u.enable_sql() {
-        let copy = crate::widgets::key_pressable(
-            text(tr!("perf-copy")).style(|s| {
-                s.font_size(font_hint())
-                    .color(theme::text_dim())
-                    .padding_horiz(theme::scaled(8.0))
-                    .padding_vert(theme::scaled(3.0))
-            }),
-            4.0,
-            move || {
-                let _ = floem::Clipboard::set_contents(sql.to_string());
-            },
-        )
-        .style(|s| {
-            s.border(1.0)
-                .border_color(theme::border())
-                .border_radius(4.0)
-                .flex_shrink(0.0_f32)
-                .hover(|s| s.background(theme::row_hover_soft()))
+        let copy = row_icon(icons::COPY, tr!("perf-copy"), move || {
+            let _ = floem::Clipboard::set_contents(sql.to_string());
         });
         rows.push(
             v_stack((
@@ -526,26 +556,24 @@ fn table_name(schema: Option<&str>, table: &str) -> String {
     schemaic_core::schema::display_name(schema, table)
 }
 
-/// A small bordered button inside a row, reachable from the keyboard
-/// ([`crate::widgets::key_pressable`]).
-fn row_button(label: String, on_press: impl Fn() + 'static) -> AnyView {
-    crate::widgets::key_pressable(
-        text(label).style(|s| {
-            s.font_size(font_hint())
-                .color(theme::text())
-                .padding_horiz(theme::scaled(9.0))
-                .padding_vert(theme::scaled(3.0))
-        }),
-        4.0,
-        on_press,
-    )
-    .style(|s| {
-        s.border(1.0)
-            .border_color(theme::border())
-            .border_radius(4.0)
-            .flex_shrink(0.0_f32)
-            .hover(|s| s.background(theme::row_hover_soft()))
-    })
+/// An icon button inside a row, with what it does in a tooltip, reachable
+/// from the keyboard ([`crate::widgets::key_pressable`]).
+///
+/// **The list editors' face** (`table_designer`'s row buttons): a 15px glyph
+/// in 5px of padding that is the hitbox, no background, the colour going from
+/// dim to full on hover — colour being the whole affordance, as for every icon
+/// button in the app. The face carries no click listener of its own:
+/// `key_pressable` wraps it in the one that answers both the pointer and the
+/// keyboard, and a second would fire twice.
+fn row_icon(glyph: &'static str, tip: String, on_press: impl Fn() + 'static) -> AnyView {
+    let face = container(icons::icon(glyph, 15.0))
+        .style(|s| {
+            s.padding(theme::scaled(5.0))
+                .color(theme::text_dim())
+                .hover(|s| s.color(theme::text()))
+        })
+        .tooltip(move || text(tip.clone()).style(crate::widgets::tooltip_style));
+    crate::widgets::key_pressable(face, 4.0, on_press)
 }
 
 /// Is `table` loaded in the schema tree, so a draft edit has a model to start
@@ -645,7 +673,7 @@ fn finding_row(ctx: &PerfCtx, t: &PerfTarget, f: &IndexFinding) -> AnyView {
         let (conn, schema_ui, ddl) = (ctx.conn, ctx.schema, ctx.ddl);
         let database = t.database.clone().unwrap_or_default();
         let (schema, table, index) = (f.schema.clone(), f.table.clone(), f.index.clone());
-        row_button(tr!("perf-drop-index"), move || {
+        row_icon(icons::TRASH_2, tr!("tree-drop-index"), move || {
             let index = index.clone();
             crate::table_designer::preview_draft_edit(
                 conn,
@@ -710,7 +738,7 @@ fn missing_row(ctx: &PerfCtx, t: &PerfTarget, m: &MissingIndex) -> AnyView {
         let (conn, schema_ui, ddl) = (ctx.conn, ctx.schema, ctx.ddl);
         let database = t.database.clone().unwrap_or_default();
         let m = m.clone();
-        row_button(tr!("perf-create-index"), move || {
+        row_icon(icons::PLUS, tr!("perf-create-index"), move || {
             // `add_to` is the same edit `workload::suggestion_ddl` makes for
             // the MCP tool, so the two front ends create one index.
             let suggestion = m.clone();
@@ -833,15 +861,20 @@ fn message(icon: &'static str, color: fn() -> floem::peniko::Color, text: String
 }
 
 /// Refresh and Close; the left side says nothing the list doesn't.
+///
+/// `slow` is true only while a read has run past `LOADING_DELAY`.
 fn footer(
-    state: RwSignal<PerfState>,
+    slow: RwSignal<bool>,
     refresh: impl Fn() + 'static,
     close: Rc<dyn Fn()>,
     ring: FocusRing,
 ) -> AnyView {
-    let status = label(move || match state.get() {
-        PerfState::Loading => tr!("perf-loading"),
-        _ => String::new(),
+    let status = label(move || {
+        if slow.get() {
+            tr!("perf-loading")
+        } else {
+            String::new()
+        }
     })
     .style(|s| {
         s.font_size(font_hint())

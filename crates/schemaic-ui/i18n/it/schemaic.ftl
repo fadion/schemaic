@@ -2860,7 +2860,6 @@ perf-problem-duplicate = Duplica { $of }
 perf-problem-redundant = Coperto da { $by }, la cui chiave inizia come questa
 perf-usage-note = I conteggi di utilizzo ripartono quando il server si riavvia o le sue statistiche vengono azzerate, quindi un indice usato solo da un job mensile può sembrare inutilizzato. Verifica prima di eliminarne uno.
 perf-usage-uncounted = Questo server non riporta conteggi di utilizzo degli indici, quindi nessun indice può essere definito inutilizzato: vengono mostrati solo duplicati e prefissi.
-perf-drop-index = Elimina
 perf-create-index = Crea indice
 perf-missing-title = Indici mancanti registrati dall'ottimizzatore dall'ultimo riavvio
 perf-missing-none = Nessuno registrato.

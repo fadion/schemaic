@@ -2857,7 +2857,6 @@ perf-problem-duplicate = Dubbel van { $of }
 perf-problem-redundant = Gedekt door { $by }, waarvan de sleutel met deze begint
 perf-usage-note = Gebruikstellingen beginnen opnieuw wanneer de server herstart of de statistieken worden gereset, dus een index die alleen door een maandelijkse taak wordt gebruikt kan ongebruikt lijken. Controleer dit voordat je er een verwijdert.
 perf-usage-uncounted = Deze server rapporteert geen indexgebruikstellingen, dus geen enkele index kan ongebruikt worden genoemd — alleen dubbele indexen en prefixen worden getoond.
-perf-drop-index = Verwijderen
 perf-create-index = Index maken
 perf-missing-title = Ontbrekende indexen die de optimizer sinds de laatste herstart heeft vastgelegd
 perf-missing-none = Geen vastgelegd.

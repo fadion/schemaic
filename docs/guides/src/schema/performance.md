@@ -22,8 +22,8 @@ Right-click a row and choose **Copy statement** to take it into a query tab. A l
 says when the counting started: every figure is since then.
 
 The figures come from a source that has to be turned on in the server. When it's off, the view
-says which source and why. Where one statement turns it on, the view shows it with a **Copy**
-button; run it in a query tab yourself, since Schemaic never runs it for you.
+says which source and why. Where one statement turns it on, the view shows it with a copy icon
+beside it (**Copy**); run it in a query tab yourself, since Schemaic never runs it for you.
 [Performance tools](../cli/mcp.md#performance-tools) lists each engine's source and what turning
 it on takes. SQLite keeps no statement statistics, and the view says so.
 
@@ -43,7 +43,8 @@ On SQL Server a second list, **Missing indexes the optimiser recorded since the 
 shows the indexes the optimiser wished it had, with how often and how much it expected to gain.
 Each is one estimate: check it against the indexes above it before creating one.
 
-**Drop** on a finding, and **Create index** on a missing index, open the SQL preview, where you
+The bin icon on a finding (**Drop index**), and the plus icon on a missing index
+(**Create index**), open the SQL preview, where you
 read the statement and apply it. Both appear only for tables the schema tree has loaded for this
 connection. If one is missing, expand the database in the tree, then press **Refresh** in the
 view.

@@ -69,7 +69,7 @@ reason `StatementReport::Unavailable` reaches the body whole. Its reason is the 
 that is what the MCP tool tells an agent about the same server
 (`english_says_every_missing_source_as_core_does`, `NoPermission`'s `$error` included); where
 `enable_sql()` has a statement it follows under *To turn it on, run this in a query tab:*, in
-mono, with a *Copy* beside it — copied to the clipboard, never run from here. A source that is on
+mono, with a copy icon beside it (tooltip *Copy*) — copied to the clipboard, never run from here. A source that is on
 and has recorded nothing says so. Each statement row is `history::preview`'s one flowing line,
 held to two lines by a `max_height` and `clip()`, with its figures under it joined by middle
 dots — total, mean, calls, rows where the source counts them, and the database where it records
@@ -79,8 +79,14 @@ lives. Calls and rows are plurals on `i18n::count` (`the_counted_figures_read_in
 A ready list ends *Counted since …* where the source dates its counters. **The statement's text
 is copied by a right-click only** (*Copy statement*, on the generic `popup_menu` channel at the
 pointer); the rows have no keyboard route to it.
-**Index findings each carry a *Drop*, and SQL Server's suggestions a *Create index*, and both are
-draft edits**: `table_designer::preview_draft_edit` with an edit that removes the index from the
+**Index findings each carry a *Drop index*, and SQL Server's suggestions a *Create index*, and both are
+draft edits**. Both, and the source's copy, are `row_icon`s: a glyph (`TRASH_2`, `PLUS`, `COPY`)
+with its label as the tooltip, on the list editors' face — `table_designer`'s row buttons, 15px in
+5px of padding, no background, dim to full colour on hover — inside `widgets::key_pressable`,
+which holds the one click listener so the keyboard and the pointer press it once. They shipped as
+bordered text buttons, the only ones of their kind in the app; *Drop index* is the tree's
+`tree-drop-index` rather than a message of this view's own. The edits are
+`table_designer::preview_draft_edit` with an edit that removes the index from the
 draft by name, or adds the suggestion with `MissingIndex::add_to` — the same edit
 `workload::suggestion_ddl` makes for the MCP tool, so the two front ends create one index — and
 the statement the user reads is `ddl::diff`'s, through `preview_of`, so *generated DDL is never
@@ -111,7 +117,14 @@ Refresh. The modal is 860 wide (`modal_w`) at a fixed `PANEL_H` of 600 for
 `server_vars_view::PANEL_H`'s reason; the *Statements | Indexes | Sizes* pills and, on Statements
 only, *Total time | Mean time | Calls* (`pills`, over `widgets::pill_tab_style`) sit in a strip
 under the title, and the footer is *Reading the server's statistics…* while loading, beside
-Refresh and Close; Escape and the dismiss layer close it too. **Its words are the catalogue's**
+Refresh and Close. **That line, and the body's, wait `LOADING_DELAY` (250 ms) before they show**:
+a local server answers a switch of tab or order inside a frame, and a line drawn the instant the
+state turned `Loading` flashed for that one frame on every switch. `perf_overlay` keeps a `slow`
+signal, set by an effect on `perf_state` through an `exec_after` that a sequence number retires
+when a later state supersedes it (`dividers::DelayedHover`'s rule), and made in the overlay's
+stable scope rather than the per-open `dyn_container` so a timer out at a close never reads a
+disposed signal; the body's `Loading` arm is blank until it is true. Nothing tests it — it is
+timing in a view; Escape and the dismiss layer close it too. **Its words are the catalogue's**
 (`perf-*`, `palette-performance` and its hint, and the gear's `tree-performance`); Close is the
 shared `dialog-close`. English stays: the statements' text, the servers' names for indexes and
 tables, and a fetch failure's message.

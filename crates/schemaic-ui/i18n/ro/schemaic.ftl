@@ -2956,7 +2956,6 @@ perf-problem-duplicate = Duplică { $of }
 perf-problem-redundant = Acoperit de { $by }, a cărui cheie începe ca a acestuia
 perf-usage-note = Contoarele de utilizare reîncep când serverul repornește sau statisticile lui sunt resetate, deci un index folosit doar de o sarcină lunară poate părea neutilizat. Verifică înainte de a elimina unul.
 perf-usage-uncounted = Acest server nu raportează contoare de utilizare a indexurilor, deci niciun index nu poate fi numit neutilizat — sunt afișate doar duplicatele și prefixele.
-perf-drop-index = Elimină
 perf-create-index = Creează index
 perf-missing-title = Indexuri lipsă înregistrate de optimizator de la ultima repornire
 perf-missing-none = Niciunul înregistrat.
