@@ -541,11 +541,28 @@ pub fn substitute(
     for r in &refs {
         let value = value_of(&r.name).expect("every name has a value; checked above");
         out.push_str(&sql[cut..r.start]);
-        out.push_str(&render(&r.name, value, dialect)?);
+        let text = apart_from(out.chars().last(), render(&r.name, value, dialect)?);
+        out.push_str(&text);
         cut = r.end;
     }
     out.push_str(&sql[cut..]);
     Ok(out)
+}
+
+/// `text` as spliced after `prev`, **kept from joining it into `--`**.
+///
+/// A negative number after a `-` — `3-:n` with `-1` — sent `3--1`, a line
+/// comment on PostgreSQL, SQLite and SQL Server, so the rest of the line, a
+/// later `WHERE` condition included, was dropped without a word (MySQL, whose
+/// `--` needs a space after it, computed it). A space between them is valid
+/// wherever the number is, and only there is one added — [`template_position`]
+/// asks the same question, so the positions it maps follow.
+fn apart_from(prev: Option<char>, text: String) -> String {
+    if prev == Some('-') && text.starts_with('-') {
+        format!(" {text}")
+    } else {
+        text
+    }
 }
 
 /// The SQL text one value becomes.
@@ -642,18 +659,24 @@ pub fn template_position(
     // Characters consumed so far, in the template and in what was sent.
     let (mut in_template, mut in_sent) = (0usize, 0usize);
     let mut cut = 0;
+    // The last character sent so far, for [`apart_from`].
+    let mut last: Option<char> = None;
     for r in scan(template, dialect) {
-        let plain = template[cut..r.start].chars().count();
+        let plain_text = &template[cut..r.start];
+        let plain = plain_text.chars().count();
         if target < in_sent + plain {
             return Some(in_template + (target - in_sent) + 1);
         }
         in_template += plain;
         in_sent += plain;
+        last = plain_text.chars().last().or(last);
         let value = bindings
             .iter()
             .find(|b| b.name == r.name)
             .and_then(|b| b.value.as_ref())?;
-        let rendered = render(&r.name, value, dialect).ok()?.chars().count();
+        let text = apart_from(last, render(&r.name, value, dialect).ok()?);
+        last = text.chars().last().or(last);
+        let rendered = text.chars().count();
         if target < in_sent + rendered {
             return Some(in_template + 1);
         }
@@ -1021,6 +1044,31 @@ mod tests {
             ),
             Ok("SELECT NULL, 42".to_string())
         );
+    }
+
+    /// **A negative number never joins the `-` before it into `--`**, which
+    /// is a line comment on PostgreSQL, SQLite and SQL Server: `3-:n` with
+    /// `-1` sent `3--1`, and the rest of the line — a later `WHERE`
+    /// condition — was silently dropped.
+    #[test]
+    fn a_negative_number_after_a_minus_is_not_a_comment() {
+        let ms = SqlDialect::MsSql;
+        let sql = "SELECT id FROM t WHERE id >= 3-:n AND tenant = 1";
+        let n = [bound("n", ParamValue::Number("-1".to_string()))];
+        for dialect in [PG, LITE, ms, MY] {
+            let sent = substitute(sql, &n, dialect).unwrap();
+            assert_eq!(sent, "SELECT id FROM t WHERE id >= 3- -1 AND tenant = 1");
+            let b = sent.as_bytes();
+            assert!(
+                (0..b.len()).all(|i| crate::sql::skip_noncode(b, i, dialect).is_none()),
+                "{dialect:?}: {sent}"
+            );
+        }
+        // And the error position maps through the space it added: the `A`
+        // of `AND` in what was sent is the `A` in the template.
+        let at = sql.find("AND").unwrap();
+        let sent_at = "SELECT id FROM t WHERE id >= 3- -1 AND".len() - 2;
+        assert_eq!(template_position(sql, &n, PG, sent_at), Some(at + 1));
     }
 
     #[test]
