@@ -13,19 +13,45 @@ seconds is continuous churn in a panel whose subject is load. A refused kill lan
 through `ActivityState::Failed` threw away the snapshot someone was reading mid-incident, banner
 included, and with auto-refresh Off nothing brought it back. `Failed` means "there is no
 snapshot"; a kill the server declined leaves the snapshot perfectly good.
-**Left-click is inert on purpose**: everything a row offers ends someone else's work, so
-both kills live in the right-click menu (with *Cancel query* dimmed rather than absent on a
+**Left-click takes no action on purpose**: everything a row offers ends someone else's work, so
+both kills live in the row's menu (with *Cancel query* dimmed rather than absent on a
 session with nothing running, so the menu keeps one shape), and the confirm is raised by the
-*app*, not here, so no route to a kill can skip it. **The lock-wait banner's Kill is the one that
-answers the keyboard**, through `widgets::key_pressable` — navigable, Enter and Space press it,
+*app*, not here, so no route to a kill can skip it. A click only moves the keyboard cursor
+(below). **The lock-wait banner's Kill answers the keyboard**
+through `widgets::key_pressable` — navigable, Enter and Space press it,
 and the pointer too, which it lost for a spell when adopting that helper *replaced* its
 `on_click_stop` and nothing put the mouse half back (the helper binds both listeners itself now;
 *Floem 0.2 gotchas*) — because it is built by hand rather than through `widgets::action_button`, whose family is the
 modal-footer one and needs a `FocusRing` this panel has none of. It carries the id it will kill in
 its label: a button reading just *Kill* on a panel where several sessions are killable is the one
-misread that cannot be undone. The **per-row** Kill and Cancel — a session row's and a lock
-row's alike — hang off a right-click menu with no keyboard opener and are still pointer-only,
-which is why `README.md`'s accessibility sentence was narrowed to claim only what is true.
+misread that cannot be undone. **The per-row Kill and Cancel answer it too, through a cursor over
+the list** (`Nav`, `list_keys`) — a session row's and a lock row's alike: ArrowUp/Down, Home and
+End move it, and `Shift+F10`, the `ContextMenu` key or Enter raise the cursor row's menu, Enter
+as well because a row has no other action for it to take. They were pointer-only before it, and
+`README.md`'s accessibility sentence named Server Activity as the exception. Focus lives on the
+list's **scroll box** (`takes_pointer_focus` + `keyboard_navigable`), never on a row, as in the
+schema tree: this container is rebuilt on every poll, so a focused row would be disposed under
+the keyboard two to thirty seconds after it was reached. For the same reason the cursor is a
+`core::activity::RowKey` — an identity, never an index, since after a re-sort an index names
+whoever sorted into that slot and the action the cursor exists for is a kill. The steps and the
+menu key both read the rows through `drawn_sessions`/`drawn_locks`, the one definition the
+builders draw from too, so the cursor cannot land on a row the search or `RENDER_CAP` left off
+screen; and the menu key asks `live_cursor` first, so a cursor whose session has gone opens
+nothing rather than the menu of the row now in its place. The menu is the same
+`row_menu`/`lock_menu` the right-click builds (`ListKeys::menu`), so the two routes cannot offer
+different entries for one row, opened **at the row** — `PopupAnchor::BelowBox` on the window box
+the cursor row publishes from `on_move`/`on_resize` in `with_cursor` — because the pointer may be
+anywhere, and with `set_menu_return(menu_return(..))` armed back to the list, since the menu
+panel is a `focus_root` with none above it out here and its teardown would leave the list deaf
+(*Popup menus*). The return is `Nav::arm_menu_return`, which a row's **secondary press** calls
+too — on the press, so it is in the slot before the row's right-click handler raises the menu —
+and it arms only while the list already holds the keyboard, the schema tree's `arm_menu_return`
+rule: a right-click from elsewhere takes nothing from the list and is given nothing back. The
+cursor's `row_selected` highlight shows only while the list holds focus.
+Scrolling the cursor into view is **one-shot** — `Nav::reveal`, set by a step and cleared by the
+row that answers it in a deferred `scroll_to` — and not on every rebuild, so a poll does not
+yank a list the wheel has scrolled away from the cursor. The kill itself is unchanged by the
+route: `ActivityActions::kill`, its read-only refusal and the app's confirm.
 **The read-only flag reaches every kill surface as a `Memo`, never as its value** — the banner's
 `Kill <id>`, a session row's menu and a lock row's — and that
 distinction is the whole of a bug the memo's own comment had already predicted in the imperative:
@@ -43,7 +69,7 @@ escaped — `kill_session` refuses before the confirm — so what was missing is
 action is unavailable. The memo is now read where reading is meaningful: `.get()` in the style
 closure, which re-runs; `.get_untracked()` in the press and in the tip, which want the answer at
 the moment they are asked; and again in the right-click handlers that build the row and lock
-menus, which is later still than the row. The clock in the title bar wears the same grey as
+menus, and in `ListKeys::menu` for the menu key, which is later still than the row. The clock in the title bar wears the same grey as
 the refresh icon beside it: it was tinted while polling, on the reasoning that "Off" and "every
 2s" look identical between ticks, but two icons a few pixels apart in different colours read as
 one of them being *active* in the toggle sense. The interval is stated where a state belongs —

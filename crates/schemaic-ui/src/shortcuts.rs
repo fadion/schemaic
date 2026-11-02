@@ -59,6 +59,7 @@ pub(crate) enum Group {
     AiPanel,
     Terminal,
     ErDiagram,
+    ServerActivity,
 }
 
 impl Group {
@@ -72,6 +73,7 @@ impl Group {
             Group::AiPanel => tr!("shortcuts-group-ai-panel"),
             Group::Terminal => tr!("shortcuts-group-terminal"),
             Group::ErDiagram => tr!("shortcuts-group-er-diagram"),
+            Group::ServerActivity => tr!("shortcuts-group-server-activity"),
         }
     }
 }
@@ -171,6 +173,15 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
             // The same menu the right-click builds, opened at the row rather
             // than at the pointer.
             ("Shift+F10", || tr!("shortcuts-context-menu")),
+        ],
+    ),
+    (
+        Group::ServerActivity,
+        &[
+            // The row's right-click menu — *Cancel query*, *Kill session* —
+            // at the cursor row; Enter too, since a row has no other action.
+            ("Shift+F10", || tr!("shortcuts-context-menu")),
+            ("Enter", || tr!("shortcuts-context-menu")),
         ],
     ),
     (

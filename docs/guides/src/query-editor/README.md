@@ -98,6 +98,12 @@ Settings › **Terminal**. Its database button opens the connection's own comman
 (`mysql`, `psql`, `sqlite3`, `sqlcmd`) already signed in. It isn't offered on a read-only
 connection, since the client wouldn't be read-only.
 
+**Server activity** lists the server's sessions and locks. Right-click a row for **Cancel query**
+or **Kill session**, each confirmed before it runs. From the keyboard, click in the list or
+<kbd>Tab</kbd> to it, move with <kbd>↑</kbd>/<kbd>↓</kbd>, <kbd>Home</kbd> and <kbd>End</kbd>,
+and press <kbd>Shift</kbd>+<kbd>F10</kbd>, the <kbd>Menu</kbd> key or <kbd>Enter</kbd> to open
+the same menu at the highlighted row.
+
 ## In this section
 
 - [Writing SQL](writing-sql.md) — completion, checks as you type, formatting, find and replace.

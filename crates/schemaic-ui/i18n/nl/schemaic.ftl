@@ -199,6 +199,7 @@ shortcuts-group-schema-tree = Schemaboom
 shortcuts-group-ai-panel = AI-paneel
 shortcuts-group-terminal = Terminal
 shortcuts-group-er-diagram = ER-diagram
+shortcuts-group-server-activity = Serveractiviteit
 
 ## Shortcuts modal › rows (the keys beside them are never translated)
 

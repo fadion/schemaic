@@ -199,6 +199,7 @@ shortcuts-group-schema-tree = Дърво на схемата
 shortcuts-group-ai-panel = Панел за ИИ
 shortcuts-group-terminal = Терминал
 shortcuts-group-er-diagram = ER диаграма
+shortcuts-group-server-activity = Активност на сървъра
 
 ## Shortcuts modal › rows (the keys beside them are never translated)
 

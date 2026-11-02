@@ -6,7 +6,9 @@
 //! been in that state, its statement (monospace, wrapped to ~3 lines then
 //! clipped), and a note when it is waiting on a lock or holding one someone else
 //! wants. Right-clicking a row offers to cancel its statement or terminate it
-//! outright, both behind the shared confirm.
+//! outright, both behind the shared confirm — and so does the keyboard: the
+//! arrows walk a cursor over the rows and Shift+F10, the Menu key or Enter
+//! raise the cursor row's menu ([`list_keys`]).
 //!
 //! Above the list: a counts line, and — when a lock wait is in progress — a
 //! banner naming the waiter, the holder, and a Kill button for the holder. The
@@ -25,7 +27,7 @@ use floem::kurbo::Point;
 use floem::prelude::*;
 use floem::reactive::create_effect;
 
-use schemaic_core::activity::{self, KillFrom, KillKind, SessionInfo, SessionState};
+use schemaic_core::activity::{self, KillFrom, KillKind, RowKey, SessionInfo, SessionState};
 
 use crate::consts::{MONO_FAMILY, SEARCH_DEBOUNCE_MS};
 use crate::i18n::tr;
@@ -75,6 +77,297 @@ fn kill_label(kind: KillKind) -> String {
 
 /// [`crate::ActivityActions::kill`]: the session, the kind, and which list asked.
 type KillFn = Rc<dyn Fn(i64, KillKind, KillFrom)>;
+
+/// The list's keyboard cursor — the panel's way to the row menus without a
+/// pointer.
+///
+/// **Focus lives on the list's scroll box, never on a row**, as in the schema
+/// tree: the rows are rebuilt on every poll, and a focused row would be
+/// disposed under the keyboard two to thirty seconds after it was reached. The
+/// box survives the rebuild, so it keeps the keys, and the cursor is a
+/// [`RowKey`] that the rebuilt rows recognise themselves by.
+#[derive(Clone, Copy)]
+struct Nav {
+    cursor: RwSignal<Option<RowKey>>,
+    focused: RwSignal<bool>,
+    /// The cursor row's box in window coordinates `(x0, x1, y0, y1)`, published
+    /// by the row itself (`with_cursor`) for the menu key to open at.
+    at: RwSignal<Option<(f64, f64, f64, f64)>>,
+    /// One-shot: the row to scroll into view, set by a step and cleared by the
+    /// row that answers it. Not every rebuild — a poll must not yank a list
+    /// the wheel has scrolled away from the cursor.
+    reveal: RwSignal<Option<RowKey>>,
+    /// The scroll box that holds the keys, for a menu's focus return.
+    list: RwSignal<Option<floem::ViewId>>,
+}
+
+impl Nav {
+    fn new() -> Self {
+        Nav {
+            cursor: RwSignal::new(None),
+            focused: RwSignal::new(false),
+            at: RwSignal::new(None),
+            reveal: RwSignal::new(None),
+            list: RwSignal::new(None),
+        }
+    }
+
+    /// Hand the keyboard back to the list when the menu about to open closes.
+    ///
+    /// Armed only while the list **already** holds the keyboard — the schema
+    /// tree's rule (`schema_tree::arm_menu_return`). A menu panel is a
+    /// `focus_root` with none above it out here, so its teardown drops focus;
+    /// for the menu key that would leave the list deaf, and for a right-click
+    /// made while the list had the keys, the same. A right-click from
+    /// elsewhere takes nothing from the list and gets no return.
+    fn arm_menu_return(self) {
+        if !self.focused.get_untracked() {
+            return;
+        }
+        if let Some(id) = self.list.get_untracked() {
+            crate::widgets::set_menu_return(crate::widgets::menu_return(move || {
+                id.request_focus()
+            }));
+        }
+    }
+
+    /// Tracked: called from a row's style, which repaints on a change.
+    fn is_cursor(self, key: &RowKey) -> bool {
+        self.focused.get() && self.cursor.with(|c| c.as_ref() == Some(key))
+    }
+}
+
+/// The sessions the list draws, in its order: those the search matches, then
+/// the first [`activity::RENDER_CAP`]. One definition for the builder and the
+/// keys, so the cursor can never step onto a row that isn't on screen.
+fn drawn_sessions<'a>(
+    sessions: &'a [SessionInfo],
+    q: &str,
+    words: &StateWords,
+) -> (Vec<&'a SessionInfo>, usize) {
+    let matched = sessions
+        .iter()
+        .filter(|s| activity::matches_query_with(s, q, |st| words.of(st)))
+        .collect::<Vec<_>>();
+    let (rows, undrawn) = activity::render_slice(&matched);
+    (rows.to_vec(), undrawn)
+}
+
+/// [`drawn_sessions`] for the *Locks* list.
+fn drawn_locks<'a>(
+    list: &'a activity::LockList,
+    q: &str,
+    waits: &str,
+) -> (Vec<&'a activity::LockInfo>, usize) {
+    let matched: Vec<&activity::LockInfo> = list
+        .locks
+        .iter()
+        .filter(|l| activity::lock_matches_with(l, q, waits))
+        .collect();
+    let (rows, undrawn) = activity::render_slice(&matched);
+    (rows.to_vec(), undrawn)
+}
+
+/// Attach the cursor to a built row: its highlight, a primary click moving the
+/// cursor here, the box it publishes while it is the cursor, and the one-shot
+/// scroll into view.
+fn with_cursor(view: floem::AnyView, nav: Nav, key: RowKey) -> floem::AnyView {
+    let id = view.id();
+    // `on_move` is the window origin; `on_resize`'s rect is view-local, so only
+    // its size is taken — the schema tree's `with_nav_scroll` reads them the
+    // same way.
+    let origin = RwSignal::new(Point::ZERO);
+    let size = RwSignal::new((0.0_f64, 0.0_f64));
+    let painted = key.clone();
+    let clicked = key.clone();
+    let view = view
+        .style(move |s| {
+            if nav.is_cursor(&painted) {
+                s.background(theme::row_selected())
+            } else {
+                s
+            }
+        })
+        // A click selects and nothing more — no row action is a click away
+        // (`session_row`'s doc); it is where the keyboard starts from.
+        .on_click_cont(move |_| nav.cursor.set(Some(clicked.clone())))
+        // Before the row's own right-click handler raises its menu, on the
+        // press: the return has to be in the slot when the panel builds.
+        .on_event_cont(floem::event::EventListener::PointerDown, move |e| {
+            if let floem::event::Event::PointerDown(pe) = e
+                && pe.button.is_secondary()
+            {
+                nav.arm_menu_return();
+            }
+        })
+        .on_move(move |p| origin.set(p))
+        .on_resize(move |r| size.set((r.width(), r.height())))
+        .into_any();
+    let at_key = key.clone();
+    create_effect(move |_| {
+        if nav.is_cursor(&at_key) {
+            let o = origin.get();
+            let (w, h) = size.get();
+            nav.at.set(Some((o.x, o.x + w, o.y, o.y + h)));
+        }
+    });
+    create_effect(move |_| {
+        if nav.reveal.with(|r| r.as_ref() == Some(&key)) {
+            // Next tick, against settled layout — see `with_nav_scroll`.
+            floem::action::exec_after(Duration::ZERO, move |_| {
+                id.scroll_to(None);
+                nav.reveal.set(None);
+            });
+        }
+    });
+    view
+}
+
+/// What [`list_keys`] reads: the same signals the list is built from, so the
+/// keys see the rows on screen, and what the row menus are built with.
+struct ListKeys {
+    view: RwSignal<crate::ActivityView>,
+    state: RwSignal<ActivityState>,
+    locks: RwSignal<crate::LocksState>,
+    search: RwSignal<String>,
+    kill: KillFn,
+    overlay: OverlayUi,
+    menus: crate::widgets::MenuFlags,
+    read_only: floem::reactive::Memo<bool>,
+    dialect: floem::reactive::Memo<schemaic_core::intel::SqlDialect>,
+}
+
+impl ListKeys {
+    /// The rows drawn now, in order — [`drawn_sessions`] or [`drawn_locks`].
+    fn rows(&self) -> Vec<RowKey> {
+        let q = self.search.get_untracked();
+        if self.view.get_untracked() == crate::ActivityView::Locks {
+            return self.locks.with_untracked(|lk| match lk {
+                crate::LocksState::Loaded(list) => {
+                    let waits = tr!("activity-lock-waits-for");
+                    let (rows, _) = drawn_locks(list, &q, &waits);
+                    rows.into_iter().map(RowKey::of_lock).collect()
+                }
+                _ => Vec::new(),
+            });
+        }
+        self.state.with_untracked(|st| match st {
+            ActivityState::Loaded { sessions, .. } => {
+                let (rows, _) = drawn_sessions(sessions, &q, &StateWords::new());
+                rows.into_iter().map(RowKey::of_session).collect()
+            }
+            _ => Vec::new(),
+        })
+    }
+
+    /// The menu the row's right-click raises — the same builder, so the two
+    /// routes cannot offer different entries for one row. Enablement is read
+    /// now, at the key, for the reason the right-click reads it at the click.
+    fn menu(&self, key: &RowKey) -> Option<Vec<MenuEntry>> {
+        let read_only = self.read_only.get_untracked();
+        let dialect = self.dialect.get_untracked();
+        match key {
+            RowKey::Session(id) => self.state.with_untracked(|st| match st {
+                ActivityState::Loaded { sessions, .. } => sessions
+                    .iter()
+                    .find(|s| s.id == *id)
+                    .map(|s| row_menu(s, self.kill.clone(), read_only, dialect)),
+                _ => None,
+            }),
+            RowKey::Lock { .. } => self.locks.with_untracked(|lk| match lk {
+                crate::LocksState::Loaded(list) => list
+                    .locks
+                    .iter()
+                    .find(|l| RowKey::of_lock(l) == *key)
+                    .map(|l| lock_menu(l, self.kill.clone(), read_only, dialect)),
+                _ => None,
+            }),
+        }
+    }
+}
+
+/// The list's keyboard: the arrows, Home and End move the cursor over the rows
+/// drawn, and **Shift+F10, the Menu key or Enter** raise the cursor row's menu —
+/// *Cancel query*, *Kill session*, each behind the shared confirm as from a
+/// right-click. Enter too, because a row has no other action for it to take.
+///
+/// Opened **at the row**, below it, since the pointer may be anywhere; and with
+/// a focus return armed, because the menu panel is a `focus_root` with none
+/// above it out here and its teardown would otherwise leave the list deaf
+/// (`widgets::set_menu_return`).
+fn list_keys(view: impl IntoView + 'static, nav: Nav, k: ListKeys) -> floem::AnyView {
+    use floem::event::{Event, EventListener, EventPropagation};
+    use floem::keyboard::{Key, Modifiers, NamedKey};
+    // A click in the list puts the keyboard here, and the workspace root's
+    // dismissal has no other way to know — see `widgets::note_pointer_focus`.
+    let v = crate::widgets::takes_pointer_focus(view);
+    nav.list.set(Some(v.id()));
+    v.keyboard_navigable()
+        .on_event(EventListener::FocusGained, move |_| {
+            // Guarded: a menu's focus return fires on a list already focused,
+            // and an unchanged `set` still restyles every row.
+            if !nav.focused.get_untracked() {
+                nav.focused.set(true);
+            }
+            EventPropagation::Continue
+        })
+        .on_event(EventListener::FocusLost, move |_| {
+            if nav.focused.get_untracked() {
+                nav.focused.set(false);
+            }
+            EventPropagation::Continue
+        })
+        .on_event(EventListener::KeyDown, move |e| {
+            let Event::KeyDown(ke) = e else {
+                return EventPropagation::Continue;
+            };
+            let plain = ke.modifiers.is_empty();
+            let step = match ke.key.logical_key {
+                Key::Named(NamedKey::ArrowDown) if plain => Some(activity::CursorStep::Down),
+                Key::Named(NamedKey::ArrowUp) if plain => Some(activity::CursorStep::Up),
+                Key::Named(NamedKey::Home) if plain => Some(activity::CursorStep::First),
+                Key::Named(NamedKey::End) if plain => Some(activity::CursorStep::Last),
+                _ => None,
+            };
+            if let Some(step) = step {
+                let rows = k.rows();
+                let next = nav
+                    .cursor
+                    .with_untracked(|c| activity::step_cursor(&rows, c.as_ref(), step));
+                nav.reveal.set(next.clone());
+                nav.cursor.set(next);
+                return EventPropagation::Stop;
+            }
+            let menu_key = match &ke.key.logical_key {
+                Key::Named(NamedKey::ContextMenu) | Key::Named(NamedKey::Enter) => plain,
+                Key::Named(NamedKey::F10) => ke.modifiers == Modifiers::SHIFT,
+                _ => false,
+            };
+            if !menu_key {
+                return EventPropagation::Continue;
+            }
+            // **Against the rows drawn now.** The cursor's session may have
+            // ended since it was reached; its key then opens nothing rather
+            // than the menu of whichever row took its place.
+            let rows = k.rows();
+            let entries = nav.cursor.with_untracked(|c| {
+                activity::live_cursor(&rows, c.as_ref()).and_then(|key| k.menu(key))
+            });
+            if let Some(entries) = entries {
+                k.menus.close_except(Some(crate::widgets::MenuId::Popup));
+                k.overlay.popup_anchor.set(
+                    nav.at
+                        .get_untracked()
+                        .map(|(x0, x1, y0, y1)| crate::PopupAnchor::BelowBox(x0, x1, y0, y1)),
+                );
+                k.overlay.popup_width.set(160.0);
+                nav.arm_menu_return();
+                k.overlay.popup_menu.set(Some(entries));
+            }
+            EventPropagation::Stop
+        })
+        .into_any()
+}
 
 /// The dot beside a session id, and the colour its state word is written in.
 ///
@@ -212,6 +505,8 @@ pub(crate) fn activity_panel(
     )
     .style(|s| s.width_full().flex_shrink(0.0_f32));
 
+    let nav = Nav::new();
+    let keys_kill = kill.clone();
     let list = dyn_container(
         move || (view.get(), state.get(), locks.get(), search.get()),
         move |(v, st, lk, q)| {
@@ -224,9 +519,16 @@ pub(crate) fn activity_panel(
                     (ActivityState::Unsupported, _) => {
                         list_message(sqlite_has_no_sessions(), theme::text_muted)
                     }
-                    (_, crate::LocksState::Loaded(list)) => {
-                        locks_list(&list, &q, kill.clone(), overlay, menus, read_only, dialect)
-                    }
+                    (_, crate::LocksState::Loaded(list)) => locks_list(
+                        &list,
+                        &q,
+                        kill.clone(),
+                        overlay,
+                        menus,
+                        read_only,
+                        dialect,
+                        nav,
+                    ),
                     (_, crate::LocksState::Failed(e)) => list_message(e, theme::error),
                     // The connection could not be reached at all — the refresh
                     // says so on the sessions state, before it asks for either
@@ -260,11 +562,15 @@ pub(crate) fn activity_panel(
             // Matched against the state word the row shows, worded once here
             // rather than once per row per keystroke.
             let words = StateWords::new();
-            let matched = sessions
-                .iter()
-                .filter(|s| activity::matches_query_with(s, &q, |st| words.of(st)))
-                .collect::<Vec<_>>();
-            if matched.is_empty() {
+            // **Only the front of the list becomes views.** This whole container
+            // is rebuilt on every poll — two to thirty seconds apart — so each row
+            // is a teardown and a re-layout, text shaping included, and five
+            // hundred of them is continuous churn in a panel whose subject is
+            // load. `prepare` has already sorted what deserves attention to the
+            // top; the rest is reachable through the search box and is counted
+            // below rather than silently dropped.
+            let (rows, undrawn) = drawn_sessions(sessions, &q, &words);
+            if rows.is_empty() {
                 return list_message(
                     if term.is_some() {
                         tr!("activity-sessions-no-match")
@@ -276,28 +582,24 @@ pub(crate) fn activity_panel(
                     theme::text_muted,
                 );
             }
-            // **Only the front of the list becomes views.** This whole container
-            // is rebuilt on every poll — two to thirty seconds apart — so each row
-            // is a teardown and a re-layout, text shaping included, and five
-            // hundred of them is continuous churn in a panel whose subject is
-            // load. `prepare` has already sorted what deserves attention to the
-            // top; the rest is reachable through the search box and is counted
-            // below rather than silently dropped.
-            let (rows, undrawn) = activity::render_slice(&matched);
             let kill = kill.clone();
             // One clone per row, into the view that owns it — the row and its
             // context menu share it rather than taking a copy each.
             let mut items = rows
                 .iter()
                 .map(|s| {
-                    session_row(
-                        Rc::new((*s).clone()),
-                        term.clone(),
-                        kill.clone(),
-                        overlay,
-                        menus,
-                        read_only,
-                        dialect,
+                    with_cursor(
+                        session_row(
+                            Rc::new((*s).clone()),
+                            term.clone(),
+                            kill.clone(),
+                            overlay,
+                            menus,
+                            read_only,
+                            dialect,
+                        ),
+                        nav,
+                        RowKey::of_session(s),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -316,6 +618,21 @@ pub(crate) fn activity_panel(
 
     let scrolled =
         autohide(scroll(list)).style(|s| s.flex_grow(1.0_f32).width_full().min_height(0.0));
+    let scrolled = list_keys(
+        scrolled,
+        nav,
+        ListKeys {
+            view,
+            state,
+            locks,
+            search,
+            kill: keys_kill,
+            overlay,
+            menus,
+            read_only,
+            dialect,
+        },
+    );
 
     v_stack((
         title_row,
@@ -691,9 +1008,8 @@ fn banner(
     // half of that contract — navigable, and Enter/Space press it — so the one
     // action that ends a lock wait is reachable without a pointer. It was not,
     // which made the README's "every destructive action can be reached and
-    // confirmed from the keyboard" false at this site; the per-row Kill, which
-    // hangs off a right-click menu with no keyboard opener, is still pointer-only
-    // and the README now says so.
+    // confirmed from the keyboard" false at this site. The per-row kills have
+    // their own route now, the list's cursor and its menu key (`list_keys`).
     //
     // **Dimmed and inert on a read-only connection.** `kill_session` refuses
     // before the confirm and there is no "Run anyway", but a fully enabled
@@ -1033,6 +1349,7 @@ fn locks_header(list: &activity::LockList) -> floem::AnyView {
 /// The *Locks* list: the locks [`activity::lock_matches_with`] the search, the
 /// front [`activity::RENDER_CAP`] of them as rows for the sessions list's
 /// reason, the rest counted.
+#[allow(clippy::too_many_arguments)]
 fn locks_list(
     list: &activity::LockList,
     q: &str,
@@ -1041,15 +1358,12 @@ fn locks_list(
     menus: crate::widgets::MenuFlags,
     read_only: floem::reactive::Memo<bool>,
     dialect: floem::reactive::Memo<schemaic_core::intel::SqlDialect>,
+    nav: Nav,
 ) -> floem::AnyView {
     // Matched against the verb the rows draw, in the interface's language.
     let waits = tr!("activity-lock-waits-for");
-    let matched: Vec<&activity::LockInfo> = list
-        .locks
-        .iter()
-        .filter(|l| activity::lock_matches_with(l, q, &waits))
-        .collect();
-    if matched.is_empty() {
+    let (rows, undrawn) = drawn_locks(list, q, &waits);
+    if rows.is_empty() {
         return list_message(
             if !q.trim().is_empty() {
                 tr!("activity-locks-no-match")
@@ -1061,10 +1375,15 @@ fn locks_list(
             theme::text_muted,
         );
     }
-    let (rows, undrawn) = activity::render_slice(&matched);
     let mut items: Vec<floem::AnyView> = rows
         .iter()
-        .map(|l| lock_row(l, kill.clone(), overlay, menus, read_only, dialect))
+        .map(|l| {
+            with_cursor(
+                lock_row(l, kill.clone(), overlay, menus, read_only, dialect),
+                nav,
+                RowKey::of_lock(l),
+            )
+        })
         .collect();
     if undrawn > 0 {
         items.push(list_message(

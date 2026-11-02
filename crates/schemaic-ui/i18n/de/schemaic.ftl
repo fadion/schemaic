@@ -199,6 +199,7 @@ shortcuts-group-schema-tree = Schemabaum
 shortcuts-group-ai-panel = KI-Bereich
 shortcuts-group-terminal = Terminal
 shortcuts-group-er-diagram = ER-Diagramm
+shortcuts-group-server-activity = Serveraktivität
 
 ## Shortcuts modal › rows
 

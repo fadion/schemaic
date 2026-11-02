@@ -451,6 +451,191 @@ pub fn render_slice<T>(rows: &[T]) -> (&[T], usize) {
     (&rows[..shown], rows.len() - shown)
 }
 
+/// Which row the panel's keyboard cursor is on.
+///
+/// **An identity, never a position.** The list is rebuilt and re-sorted on every
+/// poll, so an index that pointed at session 41 before a poll points at whoever
+/// sorted into that slot after it — and the action the cursor exists for is a
+/// kill. A session is its id. A lock is everything its row shows, since one
+/// session can hold several and each row's menu is enabled by its own lock
+/// ([`LockInfo::offers`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowKey {
+    Session(i64),
+    Lock {
+        session: i64,
+        object: String,
+        kind: String,
+        mode: String,
+        granted: bool,
+    },
+}
+
+impl RowKey {
+    pub fn of_session(s: &SessionInfo) -> Self {
+        RowKey::Session(s.id)
+    }
+
+    pub fn of_lock(l: &LockInfo) -> Self {
+        RowKey::Lock {
+            session: l.session,
+            object: l.object.clone(),
+            kind: l.kind.clone(),
+            mode: l.mode.clone(),
+            granted: l.granted,
+        }
+    }
+}
+
+/// A key that moves the panel's cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorStep {
+    Down,
+    Up,
+    First,
+    Last,
+}
+
+/// Where the cursor goes on `step`, over the rows drawn now.
+///
+/// A cursor whose row has gone — killed, finished, filtered out — is no cursor:
+/// Down and First start at the top, Up and Last at the bottom, as they would
+/// from nowhere. It does not resume at the vanished row's old index, for
+/// [`RowKey`]'s reason. Steps stop at either end rather than wrapping.
+pub fn step_cursor(rows: &[RowKey], cur: Option<&RowKey>, step: CursorStep) -> Option<RowKey> {
+    let last = rows.len().checked_sub(1)?;
+    let at = cur.and_then(|c| rows.iter().position(|r| r == c));
+    let to = match (step, at) {
+        (CursorStep::First, _) | (CursorStep::Down, None) => 0,
+        (CursorStep::Last, _) | (CursorStep::Up, None) => last,
+        (CursorStep::Down, Some(i)) => (i + 1).min(last),
+        (CursorStep::Up, Some(i)) => i.saturating_sub(1),
+    };
+    Some(rows[to].clone())
+}
+
+/// The cursor, if its row is still drawn — what the menu key acts on. A key
+/// pressed after the cursor's session went must open nothing rather than the
+/// menu of whatever is in its place.
+pub fn live_cursor<'a>(rows: &[RowKey], cur: Option<&'a RowKey>) -> Option<&'a RowKey> {
+    cur.filter(|c| rows.contains(c))
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    fn keys(ids: &[i64]) -> Vec<RowKey> {
+        ids.iter().copied().map(RowKey::Session).collect()
+    }
+
+    #[test]
+    fn an_empty_list_has_no_cursor_to_move_to() {
+        for step in [
+            CursorStep::Down,
+            CursorStep::Up,
+            CursorStep::First,
+            CursorStep::Last,
+        ] {
+            assert_eq!(step_cursor(&[], None, step), None);
+            assert_eq!(step_cursor(&[], Some(&RowKey::Session(1)), step), None);
+        }
+    }
+
+    #[test]
+    fn from_nowhere_down_starts_at_the_top_and_up_at_the_bottom() {
+        let rows = keys(&[7, 8, 9]);
+        assert_eq!(
+            step_cursor(&rows, None, CursorStep::Down),
+            Some(RowKey::Session(7))
+        );
+        assert_eq!(
+            step_cursor(&rows, None, CursorStep::Up),
+            Some(RowKey::Session(9))
+        );
+    }
+
+    #[test]
+    fn steps_follow_the_session_not_the_slot_it_was_in() {
+        // Session 8 was second; a poll re-sorted it to the top.
+        let rows = keys(&[8, 7, 9]);
+        let cur = RowKey::Session(8);
+        assert_eq!(
+            step_cursor(&rows, Some(&cur), CursorStep::Down),
+            Some(RowKey::Session(7))
+        );
+    }
+
+    #[test]
+    fn steps_stop_at_either_end() {
+        let rows = keys(&[1, 2]);
+        let top = RowKey::Session(1);
+        let bottom = RowKey::Session(2);
+        assert_eq!(
+            step_cursor(&rows, Some(&top), CursorStep::Up),
+            Some(top.clone())
+        );
+        assert_eq!(
+            step_cursor(&rows, Some(&bottom), CursorStep::Down),
+            Some(bottom.clone())
+        );
+        assert_eq!(
+            step_cursor(&rows, Some(&bottom), CursorStep::First),
+            Some(top)
+        );
+        assert_eq!(
+            step_cursor(&rows, Some(&RowKey::Session(1)), CursorStep::Last),
+            Some(bottom)
+        );
+    }
+
+    #[test]
+    fn a_vanished_cursor_restarts_rather_than_resuming_at_its_old_index() {
+        let rows = keys(&[1, 2, 3]);
+        let gone = RowKey::Session(42);
+        assert_eq!(
+            step_cursor(&rows, Some(&gone), CursorStep::Down),
+            Some(RowKey::Session(1))
+        );
+        assert_eq!(
+            step_cursor(&rows, Some(&gone), CursorStep::Up),
+            Some(RowKey::Session(3))
+        );
+    }
+
+    #[test]
+    fn the_menu_key_acts_only_on_a_cursor_still_drawn() {
+        let rows = keys(&[1, 2]);
+        assert_eq!(
+            live_cursor(&rows, Some(&RowKey::Session(2))),
+            Some(&RowKey::Session(2))
+        );
+        assert_eq!(live_cursor(&rows, Some(&RowKey::Session(5))), None);
+        assert_eq!(live_cursor(&rows, None), None);
+    }
+
+    #[test]
+    fn two_locks_of_one_session_are_two_rows() {
+        let lock = |object: &str, granted| LockInfo {
+            session: 5,
+            object: object.into(),
+            kind: "row".into(),
+            mode: "X".into(),
+            granted,
+            blocked_by: vec![],
+            killable: true,
+        };
+        let a = RowKey::of_lock(&lock("t1", true));
+        let b = RowKey::of_lock(&lock("t2", true));
+        let c = RowKey::of_lock(&lock("t1", false));
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, RowKey::Session(5));
+        let rows = vec![a.clone(), b.clone()];
+        assert_eq!(step_cursor(&rows, Some(&a), CursorStep::Down), Some(b));
+    }
+}
+
 /// The counts line above the list.
 ///
 /// **`truncated` is a field rather than a parameter to one method**, and that is

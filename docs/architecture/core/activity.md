@@ -227,3 +227,19 @@ nothing to cancel — and neither on a lock that is not `killable`. The pins are
 snapshot lookup), `a_server_process_lock_is_neither_offered_nor_confirmed`,
 `a_confirm_for_a_session_known_only_by_id_names_the_id` and
 `a_lock_row_offers_a_cancel_only_while_it_waits`.
+**The panel's keyboard cursor is a `RowKey`, an identity and never a position.** The list is
+rebuilt and re-sorted on every poll, so an index that pointed at session 41 before a poll points
+at whoever sorted into that slot after it — and the action the cursor exists for is a kill. A
+session row is its id (`RowKey::of_session`); a lock row is everything the row shows — session,
+object, kind, mode and `granted` (`RowKey::of_lock`) — since one session can hold several locks
+and each row's menu is enabled by its own (`LockInfo::offers`). `step_cursor` moves it by a
+`CursorStep` (`Down`/`Up`/`First`/`Last`) over the keys of the rows drawn now, stopping at
+either end rather than wrapping. A cursor whose row has gone — killed, finished, filtered out —
+is no cursor: Down and First start at the top, Up and Last at the bottom, as they would from
+nowhere, and it does **not** resume at the vanished row's old slot, which would be the index
+again by another route. `live_cursor` is what the menu key acts on — the cursor only while its
+row is still drawn, so a key pressed after its session ended opens nothing rather than the menu
+of whatever took its place. The pins are `cursor_tests`:
+`steps_follow_the_session_not_the_slot_it_was_in`,
+`a_vanished_cursor_restarts_rather_than_resuming_at_its_old_index`,
+`the_menu_key_acts_only_on_a_cursor_still_drawn` and `two_locks_of_one_session_are_two_rows`.

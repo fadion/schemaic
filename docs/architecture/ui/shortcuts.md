@@ -64,7 +64,7 @@ new variant fails to compile until it is listed — a list the test walks is onl
 completeness. Palette and menus draw one keycap, `widgets::keycap`.
 **A group is an identity, its heading is text, and the two are kept apart for translation.**
 `Group` is an enum (`Global`, `Editor`, `ResultsGrid`, `SchemaTree`, `AiPanel`, `Terminal`,
-`ErDiagram`) whose `label()` is the `tr!` heading, because `KEY_FILES`, `COMMAND_KEYS` and
+`ErDiagram`, `ServerActivity`) whose `label()` is the `tr!` heading, because `KEY_FILES`, `COMMAND_KEYS` and
 `MenuKey::row` all name groups for the tests above and none of that may change with the
 language — a heading string would have made every one of those checks depend on the locale. A
 row's description is a `Describe = fn() -> String`, a non-capturing closure over `tr!`, so

@@ -199,6 +199,7 @@ shortcuts-group-schema-tree = Albero dello schema
 shortcuts-group-ai-panel = Pannello IA
 shortcuts-group-terminal = Terminale
 shortcuts-group-er-diagram = Diagramma ER
+shortcuts-group-server-activity = Attività del server
 
 ## Shortcuts modal › rows (the keys beside them are never translated)
 

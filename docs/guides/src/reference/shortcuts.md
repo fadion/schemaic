@@ -86,6 +86,16 @@ the tab, use **Run** in the command palette.
 | <kbd>Enter</kbd> | Open the selected table, column or object |
 | <kbd>Shift</kbd>+<kbd>F10</kbd> | Context menu for the selected row |
 
+## Server activity
+
+| Keys | Does |
+|---|---|
+| <kbd>Shift</kbd>+<kbd>F10</kbd> | Context menu for the selected row |
+| <kbd>Enter</kbd> | Context menu for the selected row |
+
+The menu offers **Cancel query** and **Kill session** for that row's session. Move between rows
+with the arrow keys, <kbd>Home</kbd> and <kbd>End</kbd>.
+
 ## AI panel
 
 | Keys | Does |

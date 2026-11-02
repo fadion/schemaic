@@ -49,7 +49,7 @@ They ship in this order, one release each. Releases 1 and 2 merge if 2 turns out
 headless release before them has landed.
 
 1. **Performance:** *Workload and performance insight* with the MCP performance tools, which share
-   its backend, plus the Server Activity keyboard path.
+   its backend.
 2. **Data and editor:** *Compare and sync table data*, the custom keymap and the two chart kinds.
 3. **DuckDB**, alone. A new engine answers every capability predicate and needs its own read-only
    allowlist, so it gets a release with nothing else in it.
@@ -60,8 +60,6 @@ headless release before them has landed.
 
 Each of these is a one-session change.
 
-- **Server Activity:** Kill session and Cancel query can only be reached with a right-click, apart
-  from the lock-wait banner's Kill. Give them a keyboard path.
 - **Charts:** add scatter and stacked bar.
 
 ### Custom keymap

@@ -483,6 +483,11 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   one. A menu on a ringed control can be — `suggest_chevron`, the Live Monitor's Export dropdown,
   and the grid toolbar's Copy / Save / AI dropdowns since the strip gained its ring — and the
   **schema tree** answers `Shift+F10` and the `ContextMenu` key on the row the nav cursor is on.
+  So do **Server Activity's** session and lock rows, Enter as well, on the panel's own cursor
+  (`activity_panel::list_keys`): the tree's shape — focus on the list's scroll box, the cursor row
+  publishing its box from `on_move`/`on_resize` — with the menu hung below the row's whole box
+  (`PopupAnchor::BelowBox`) rather than at a content corner, and the cursor a
+  `core::activity::RowKey` because that list is rebuilt and re-sorted on every poll.
   The grid's cell and header menus, the editor's, the tab strip's and the connection list's still
   need a right-click.
   The tree's route is worth reading before copying it: focus lives on the tree **container**, never

@@ -82,12 +82,10 @@ schema-aware intelligence, built to feel instant.
 ### Accessibility
 
 Schemaic is **keyboard-operable but not screen-reader accessible**. Every modal
-has a focus ring and a Tab order, destructive actions in modals, the schema tree
-and the results grid can be reached and confirmed from the keyboard, the
-header's **?** lists every shortcut, and **Settings → Appearance → Interface
-scale** enlarges the whole interface up to 160%. The exception is the Server
-Activity panel, where a row's *Kill session* and *Cancel query* need a
-right-click (the lock-wait banner's **Kill** button is keyboard-reachable).
+has a focus ring and a Tab order, destructive actions in modals, the schema tree,
+the results grid and the Server Activity panel can be reached and confirmed from
+the keyboard, the header's **?** lists every shortcut, and **Settings →
+Appearance → Interface scale** enlarges the whole interface up to 160%.
 
 Floem 0.2 exposes no accessibility tree, so Narrator, VoiceOver and Orca have
 nothing to read. If you rely on a screen reader, Schemaic can't serve you yet.

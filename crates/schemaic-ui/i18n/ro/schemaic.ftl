@@ -203,6 +203,7 @@ shortcuts-group-schema-tree = Arborele schemei
 shortcuts-group-ai-panel = Panoul AI
 shortcuts-group-terminal = Terminal
 shortcuts-group-er-diagram = Diagramă ER
+shortcuts-group-server-activity = Activitate server
 
 ## Shortcuts modal › rows (the keys beside them are never translated)
 

@@ -199,6 +199,7 @@ shortcuts-group-schema-tree = Pema e skemës
 shortcuts-group-ai-panel = Paneli AI
 shortcuts-group-terminal = Terminali
 shortcuts-group-er-diagram = Diagrami ER
+shortcuts-group-server-activity = Aktiviteti i serverit
 
 ## Shortcuts modal › rows (the keys beside them are never translated)
 
