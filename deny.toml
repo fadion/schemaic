@@ -65,10 +65,12 @@ ignore = [
     # russh's `rsa` feature if RSA SSH keys aren't needed).
     "RUSTSEC-2023-0071",
     # `zip` < 9.0: SUID/SGID bits kept on extraction (-0367), symlinks whose
-    # targets leave the destination (-0368), and permissions applied through
-    # symlinks (-0369). All three are in `ZipArchive::extract` and the stream
+    # targets leave the destination (-0368), permissions applied through
+    # symlinks (-0369), and an abort sizing a symlink target from its declared
+    # length (-0429). All four are in `ZipArchive::extract` and the stream
     # extractor, writing an archive out to disk — and nothing in this tree calls
-    # either. calamine (an imported `.xlsx`) and core's `import`/`export` open an
+    # either (checked again for -0429, now that `schemaic import` opens an
+    # `.xlsx` with nobody at the keyboard: calamine and core read entries only). calamine (an imported `.xlsx`) and core's `import`/`export` open an
     # archive in memory and read entries by name; rust_xlsxwriter only writes;
     # velopack never extracts through `zip`. Not fixable by an upgrade yet:
     # calamine 0.36.1, the newest, requires `zip` ^8.6, so moving our own
@@ -78,6 +80,7 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
 ]
 
 [bans]
