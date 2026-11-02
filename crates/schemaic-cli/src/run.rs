@@ -64,6 +64,10 @@ pub enum Exit {
     /// only under `query --fail-on-cap`, for a caller that reads stdout and not
     /// stderr. Not 4: nothing failed, and retrying returns the same cap.
     Capped = 6,
+    /// `import`: the file was checked whole and has problems, each listed on
+    /// stderr; nothing was written. Not 3: no guard refused, and the fix is
+    /// in the file — not 2, since the command line was right.
+    Rejected = 7,
 }
 
 /// The exit for a read that returned rows: [`Exit::Capped`] if the cap bit and
@@ -462,6 +466,43 @@ async fn dispatch(command: Command) -> Exit {
             )
             .await
         }
+        Command::Import {
+            file: path,
+            table,
+            target,
+            format,
+            no_header,
+            delimiter,
+            sheet,
+            nulls,
+            trim,
+            maps,
+            skips,
+            timeout,
+        } => {
+            let reading = crate::import::Reading {
+                format,
+                no_header,
+                delimiter,
+                sheet,
+                nulls,
+                trim,
+            };
+            let load = ImportLoad {
+                path: &path,
+                table: &table,
+                reading: &reading,
+                maps: &maps,
+                skips: &skips,
+            };
+            run_import(
+                &file.connections,
+                &target,
+                load,
+                Duration::from_secs(timeout),
+            )
+            .await
+        }
         Command::Mcp { target } => serve_mcp(&file.connections, &target).await,
     }
 }
@@ -666,7 +707,7 @@ async fn run_dump(
             .map(|t| schemaic_core::schema::display_name(t.schema.as_deref(), &t.name))
             .collect()
     } else {
-        match resolve_dump_tables(&list, &tables) {
+        match resolve_tables(&list, &tables) {
             Ok(t) => t,
             Err(e) => {
                 warn(&e);
@@ -782,7 +823,7 @@ fn dump_timeout_note(timeout: Duration, name: &str, partial: bool) -> String {
     )
 }
 
-/// The tables `dump -t` names, spelled as the dump's plan matches them
+/// The tables `dump -t` and `import -t` name, spelled as the dump's plan matches them
 /// (`schema::display_name`), resolved against the server's `list` the way
 /// `compare -t` resolves one: as the tree labels it (`orders`,
 /// `sales.orders`), else spelled with its schema (`public.orders`, which a
@@ -795,7 +836,7 @@ fn dump_timeout_note(timeout: Duration, name: &str, partial: bool) -> String {
 /// used to take `-t` at its word: SQL Server's documented `-t orders` found
 /// nothing (exit 4, "retrying may work"), and one missing name beside a
 /// found one wrote a dump a table short with exit 0.
-fn resolve_dump_tables(
+fn resolve_tables(
     list: &schemaic_core::schema::DbSchema,
     names: &[String],
 ) -> Result<Vec<String>, String> {
@@ -829,7 +870,7 @@ fn resolve_dump_tables(
                 .collect();
             match bare.as_slice() {
                 [one] => Ok(one.clone()),
-                [] => Err(format!("no table or view named '{name}' to dump")),
+                [] => Err(format!("no table or view named '{name}'")),
                 several => Err(format!(
                     "'{name}' names a table in more than one schema ({}); qualify it",
                     several.join(", ")
@@ -2090,6 +2131,334 @@ fn script_exit(outcome: &schemaic_core::script::RunOutcome) -> Exit {
     }
 }
 
+/// What `schemaic import` loads, and how — the command's own flags, apart
+/// from where it goes.
+struct ImportLoad<'a> {
+    path: &'a std::path::Path,
+    table: &'a str,
+    reading: &'a crate::import::Reading,
+    maps: &'a [(String, String)],
+    skips: &'a [String],
+}
+
+/// How many problems the check collects before it stops counting, as the
+/// app's import does, and how many of them are printed.
+const IMPORT_MAX_ISSUES: usize = 200;
+const IMPORT_SHOWN_ISSUES: usize = 20;
+
+/// `schemaic import`: the app's two passes over a file — check it whole, then
+/// load it in one transaction (`Db::import_rows`) — with the app's own
+/// mapping (`import::auto_map`) corrected by `--map`/`--skip`.
+///
+/// **Select, refuse, read the file's columns, connect, check, load.** A
+/// read-only connection is refused before the file is opened; a file with any
+/// problem is refused after the whole of it has been read and before a row is
+/// written — [`Exit::Rejected`], every problem on stderr, as the app's modal
+/// lists them rather than failing one row at a time.
+async fn run_import(
+    conns: &[Connection],
+    target: &Target,
+    load: ImportLoad<'_>,
+    timeout: Duration,
+) -> Exit {
+    use schemaic_core::import as core_import;
+    let conn = match select_conn(conns, &target.conn) {
+        Ok(c) => c,
+        Err(exit) => return exit,
+    };
+    // **An import is a write**, and the app offers none on a read-only
+    // connection; there is no `--yes` for it, as there is none for an INSERT.
+    if conn.read_only {
+        warn(&format!(
+            "refused: {}",
+            schemaic_core::sql::GuardReason::ReadOnly.message()
+        ));
+        return Exit::Refused;
+    }
+    let Some(database) = database_for(target, conn) else {
+        warn("`import` needs a database to load into");
+        hint(&no_database_hint(
+            &target.conn.connection,
+            NoDatabaseFailure::Refused,
+        ));
+        return Exit::Refused;
+    };
+    let path = load.path.to_path_buf();
+    let name = path.display().to_string();
+    let open = {
+        let path = path.clone();
+        move || std::fs::File::open(&path).map(std::io::BufReader::new)
+    };
+    // The head is for the CSV sniffer only; a short or empty read is still a
+    // head, and an unreadable file is said here, before anything is dialled.
+    let head = {
+        use std::io::Read as _;
+        let mut head = Vec::new();
+        match std::fs::File::open(&path) {
+            Ok(f) => {
+                let _ = f.take(64 * 1024).read_to_end(&mut head);
+            }
+            Err(e) => {
+                warn(&format!("could not read {name}: {e}"));
+                return Exit::Usage;
+            }
+        }
+        head
+    };
+    let (format, cfg) = match crate::import::read_config(&name, load.reading, Some(&head)) {
+        Ok(v) => v,
+        Err(why) => {
+            warn(&why);
+            return Exit::Usage;
+        }
+    };
+    let file_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    if let Some(too_big) = core_import::xlsx_size_refusal(format, file_bytes) {
+        warn(&too_big.message());
+        return Exit::Usage;
+    }
+    if let Some(w) = core_import::memory_warning(format, file_bytes) {
+        warn(&w.message());
+    }
+    // The file's columns, and nothing else: the check below reads every row.
+    let columns = match core_import::probe_sample(&open, format, &cfg, 1) {
+        Ok(sample) => sample.columns,
+        Err(e) => {
+            warn(&format!("{name}: {e}"));
+            return Exit::Usage;
+        }
+    };
+
+    let (db, _tunnel) = match connect(conn, &target.conn, query::DEFAULT_TIMEOUT).await {
+        Ok(v) => v,
+        Err(exit) => return exit,
+    };
+    let token = tokio_util::sync::CancellationToken::new();
+    let schema = match crate::deadline::with_deadline(
+        db.fetch_schema(&database, token.clone()),
+        token,
+        query::DEFAULT_TIMEOUT,
+    )
+    .await
+    {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => {
+            warn(&format!("could not read {database}'s tables: {e}"));
+            return Exit::Failed;
+        }
+        None => {
+            warn(&format!(
+                "reading {database}'s tables timed out after {}s",
+                query::DEFAULT_TIMEOUT.as_secs()
+            ));
+            return Exit::Failed;
+        }
+    };
+    // **`dump -t`'s resolver, not `describe`'s lenient lookup**: a bare name
+    // two schemas share is refused here, since this one writes, and loading
+    // into whichever schema happened to come first is a wrong table in silence.
+    let found = resolve_tables(&schema, &[load.table.to_string()])
+        .map(|labels| labels.into_iter().next())
+        .map(|label| label.and_then(|l| schema.find_by_display(&l).cloned()));
+    let table = match found {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            warn(&format!("no table named '{}' in {database}", load.table));
+            return Exit::Usage;
+        }
+        Err(why) => {
+            warn(&why);
+            return Exit::Usage;
+        }
+    };
+    if table.is_view {
+        warn(&format!(
+            "{} is a view; import loads into a table",
+            table.name
+        ));
+        return Exit::Usage;
+    }
+    let mapping = core_import::auto_map(&columns, &table, cfg.dialect.has_header);
+    let mapping =
+        match crate::import::apply_overrides(mapping, &columns, &table, load.maps, load.skips) {
+            Ok(m) => m,
+            Err(why) => {
+                warn(&why);
+                return Exit::Usage;
+            }
+        };
+    if core_import::insert_columns(&mapping, &table).is_empty() {
+        warn(&format!(
+            "no column of {name} matches a column of {}; --map one, e.g. --map 'file_column={}'",
+            table.name,
+            table
+                .columns
+                .first()
+                .map(|c| c.name.as_str())
+                .unwrap_or("column")
+        ));
+        return Exit::Usage;
+    }
+    for note in crate::import::skipped(&mapping, &columns, load.skips) {
+        warn(&note);
+    }
+    let missing = mapping.missing_required(&table);
+    if !missing.is_empty() {
+        warn(&format!(
+            "nothing in the file fills {}, which can't be NULL and has no default; \
+             the load will likely fail",
+            missing.join(", ")
+        ));
+    }
+    let dialect = db.engine().dialect();
+
+    // Pass 1 — the whole file, nothing written.
+    let checked = {
+        let (open, cfg, table, mapping) =
+            (open.clone(), cfg.clone(), table.clone(), mapping.clone());
+        tokio::task::spawn_blocking(move || {
+            let f = open().map_err(|e| e.to_string())?;
+            core_import::validate(
+                f,
+                format,
+                &cfg,
+                &table,
+                &mapping,
+                dialect,
+                IMPORT_MAX_ISSUES,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .await
+    };
+    let validation = match checked {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            warn(&format!("{name}: {e}"));
+            return Exit::Usage;
+        }
+        Err(e) => {
+            warn(&format!("the file check stopped unexpectedly: {e}"));
+            return Exit::Failed;
+        }
+    };
+    if !validation.issues.is_empty() {
+        for issue in validation.issues.iter().take(IMPORT_SHOWN_ISSUES) {
+            warn(&crate::import::issue_line(issue));
+        }
+        let shown = validation.issues.len().min(IMPORT_SHOWN_ISSUES);
+        if let Some(tail) =
+            core_import::issue_tail(shown, validation.issues.len(), validation.more_issues)
+        {
+            warn(&tail);
+        }
+        warn(&format!("{name} was not imported; nothing was written"));
+        return Exit::Rejected;
+    }
+
+    // Pass 2 — the load, in one transaction.
+    let built = {
+        let (open, cfg, table, mapping) =
+            (open.clone(), cfg.clone(), table.clone(), mapping.clone());
+        tokio::task::spawn_blocking(move || {
+            let f = open().map_err(|e| e.to_string())?;
+            core_import::row_iter(f, format, &cfg, &table, &mapping, dialect)
+                .map_err(|e| e.to_string())
+        })
+        .await
+    };
+    let mut rows = match built {
+        Ok(Ok(it)) => it,
+        Ok(Err(e)) => {
+            warn(&format!("{name}: {e}"));
+            return Exit::Usage;
+        }
+        Err(e) => {
+            warn(&format!("the file reader stopped unexpectedly: {e}"));
+            return Exit::Failed;
+        }
+    };
+    let insert: Vec<String> = core_import::insert_columns(&mapping, &table)
+        .iter()
+        .map(|&i| table.columns[i].name.clone())
+        .collect();
+    let qualified = [
+        Some(database.as_str()),
+        table.schema.as_deref(),
+        Some(table.name.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(".");
+    let entry = schemaic_core::write_log::Entry::now(
+        schemaic_core::write_log::Source::Import,
+        &conn.name,
+        Some(&database),
+        "",
+    )
+    .with_detail(format!("import {name} into {qualified}"));
+    let token = tokio_util::sync::CancellationToken::new();
+    use crate::deadline::{Deadlined, with_deadline_unwound};
+    let loaded = with_deadline_unwound(
+        db.import_rows(
+            schemaic_db::ImportTarget {
+                database: &database,
+                schema: table.schema.as_deref(),
+                table: &table.name,
+                columns: &insert,
+                ..Default::default()
+            },
+            &mut rows,
+            token.clone(),
+        ),
+        token,
+        timeout,
+    )
+    .await;
+    use schemaic_core::write_log::Outcome;
+    let (entry, exit) = match loaded {
+        // A load that committed while the cancel was on its way did import:
+        // the report never claims less than the engine delivered either.
+        Deadlined::InTime(Ok(n)) | Deadlined::Late(Some(Ok(n))) => {
+            warn(&format!(
+                "imported {n} {} into {qualified}",
+                schemaic_core::text::plural(n as usize, "row", "rows")
+            ));
+            (entry.ended(Ok(Some(n))), Exit::Ok)
+        }
+        Deadlined::InTime(Err(e)) => {
+            let message = e.to_string();
+            warn(&message);
+            (entry.ended(Err(message)), Exit::Failed)
+        }
+        // Cancelled by the deadline, and the transaction rolled back as the
+        // engine allows — `import_rows`' error says when it could not.
+        Deadlined::Late(Some(Err(e))) => {
+            let said = match e {
+                schemaic_db::DbError::Cancelled => format!(
+                    "stopped after {}s and rolled back; nothing was imported",
+                    timeout.as_secs()
+                ),
+                e => e.to_string(),
+            };
+            warn(&said);
+            (entry.ended_as(Outcome::Cancelled, Some(said)), Exit::Failed)
+        }
+        Deadlined::Late(None) => {
+            let said = format!(
+                "stopped after {}s and the server did not answer the cancel; \
+                 check the table before importing again",
+                timeout.as_secs()
+            );
+            warn(&said);
+            (entry.ended_as(Outcome::Unknown, Some(said)), Exit::Unknown)
+        }
+    };
+    append_to_write_log(&entry, dialect);
+    exit
+}
+
 /// The write log's entry for an `exec` of `sql`, stamped before it runs — or
 /// `None` for a statement that does not write (`exec` runs reads too), which
 /// the log has no business holding. `write_log::is_logged` errs toward a write.
@@ -2229,21 +2598,21 @@ mod tests {
     fn a_dump_table_is_found_by_label_qualified_or_bare_name() {
         let mssql = listed(&[(Some("dbo"), "orders"), (Some("sales"), "customers")]);
         assert_eq!(
-            resolve_dump_tables(&mssql, &names(&["orders", "sales.customers"])),
+            resolve_tables(&mssql, &names(&["orders", "sales.customers"])),
             Ok(names(&["dbo.orders", "sales.customers"]))
         );
         assert_eq!(
-            resolve_dump_tables(&mssql, &names(&["dbo.orders", "customers"])),
+            resolve_tables(&mssql, &names(&["dbo.orders", "customers"])),
             Ok(names(&["dbo.orders", "sales.customers"]))
         );
         let pg = listed(&[(Some("public"), "orders")]);
         assert_eq!(
-            resolve_dump_tables(&pg, &names(&["public.orders"])),
+            resolve_tables(&pg, &names(&["public.orders"])),
             Ok(names(&["orders"]))
         );
         let mysql = listed(&[(None, "orders")]);
         assert_eq!(
-            resolve_dump_tables(&mysql, &names(&["orders"])),
+            resolve_tables(&mysql, &names(&["orders"])),
             Ok(names(&["orders"]))
         );
         // Where the server's names ignore case (a `_CI_` SQL Server database,
@@ -2253,10 +2622,10 @@ mod tests {
             ..listed(&[(Some("dbo"), "orders")])
         };
         assert_eq!(
-            resolve_dump_tables(&ci, &names(&["Orders", "DBO.ORDERS"])),
+            resolve_tables(&ci, &names(&["Orders", "DBO.ORDERS"])),
             Ok(names(&["dbo.orders", "dbo.orders"]))
         );
-        assert!(resolve_dump_tables(&mssql, &names(&["Orders"])).is_err());
+        assert!(resolve_tables(&mssql, &names(&["Orders"])).is_err());
     }
 
     /// A name the server does not have, or one two schemas share, is the
@@ -2265,9 +2634,9 @@ mod tests {
     #[test]
     fn a_dump_table_that_is_not_there_or_is_ambiguous_is_refused() {
         let list = listed(&[(Some("dbo"), "orders"), (Some("sales"), "orders")]);
-        let missing = resolve_dump_tables(&list, &names(&["dbo.orders", "nope"])).unwrap_err();
+        let missing = resolve_tables(&list, &names(&["dbo.orders", "nope"])).unwrap_err();
         assert!(missing.contains("'nope'"), "{missing}");
-        let ambiguous = resolve_dump_tables(&list, &names(&["orders"])).unwrap_err();
+        let ambiguous = resolve_tables(&list, &names(&["orders"])).unwrap_err();
         assert!(
             ambiguous.contains("dbo.orders") && ambiguous.contains("sales.orders"),
             "{ambiguous}"
@@ -2363,7 +2732,7 @@ mod tests {
 
     /// Every outcome, spelled so that a new variant fails to compile here
     /// until it is added to the list — and so to the help's check below.
-    fn every_exit() -> [Exit; 6] {
+    fn every_exit() -> [Exit; 7] {
         fn _exhaustive(e: Exit) {
             match e {
                 Exit::Ok
@@ -2371,7 +2740,8 @@ mod tests {
                 | Exit::Refused
                 | Exit::Failed
                 | Exit::Unknown
-                | Exit::Capped => {}
+                | Exit::Capped
+                | Exit::Rejected => {}
             }
         }
         [
@@ -2381,6 +2751,7 @@ mod tests {
             Exit::Failed,
             Exit::Unknown,
             Exit::Capped,
+            Exit::Rejected,
         ]
     }
 
@@ -2440,6 +2811,7 @@ mod tests {
         assert_eq!(Exit::Failed as u8, 4);
         assert_eq!(Exit::Unknown as u8, 5);
         assert_eq!(Exit::Capped as u8, 6);
+        assert_eq!(Exit::Rejected as u8, 7);
     }
 
     fn plan(rows: usize, truncated: bool) -> schemaic_core::plan::QueryPlan {

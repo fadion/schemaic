@@ -2,16 +2,18 @@
 
 `cli/run.rs` — dispatch, and the module that owns the output contract. **stdout is data; stderr
 is everything else** — no banners, no warnings, no progress — which is what makes `--format=json`
-safe to parse and `--format=csv` safe to redirect. The other half is `Exit`, and it has **six**
+safe to parse and `--format=csv` safe to redirect. The other half is `Exit`, and it has **seven**
 outcomes rather than two: 0 ok, 2 usage (including a connection, `-f` file or `describe` table that is not there), 3 a guard
 refusal, 4 a server or connection failure, 5 a **write** whose deadline passed after it was
-sent, 6 a read `--limit` cut short, under `query --fail-on-cap` only. A new outcome gets a new
-number, never an old one's. A caller that can only tell success from failure
+sent, 6 a read `--limit` cut short, under `query --fail-on-cap` only, 7 an `import` whose file
+the check refused, nothing written (`Exit::Rejected`). A new outcome gets a new
+number, never an old one's — 7 is not 3, because no guard refused and the fix is in the file,
+and not 2, because the command line was right. A caller that can only tell success from failure
 retries the refusal that will never succeed and gives up on the timeout that would have;
 `the_exit_codes_are_the_documented_ones` pins the numbers, because scripts depend on them.
 **The top-level `--help` lists them** (`args.rs`'s `AFTER_HELP`), and
-`the_help_lists_every_exit_code_and_no_other` holds the list to `every_exit()` — all six
-variants, beside a nested `_exhaustive` `match` so a seventh fails to compile until it is added
+`the_help_lists_every_exit_code_and_no_other` holds the list to `every_exit()` — all seven
+variants, beside a nested `_exhaustive` `match` so an eighth fails to compile until it is added
 there, and so to the help. `the_help_lists_every_format` does the same for the formats against
 `Format::NAMES`, and checks `query --help` names each. Both were seen red before the section
 existed.
@@ -212,7 +214,7 @@ all of their display names. That is the command's default and not the request's
 — to `core::dump::plan` an empty list still means nothing was chosen, and the modal's empty
 selection is unchanged; the order is not taken from the listing either, the driver's own fresh
 introspection deciding it. **A `-t` name is resolved against that listing before it reaches
-`plan`** — the pure `resolve_dump_tables`, the way `cli::compare::resolve` resolves `compare -t`:
+`plan`** — the pure `resolve_tables`, shared with `import -t`, the way `cli::compare::resolve` resolves `compare -t`:
 by label (`schema::display_name`), else `schema.name` (PostgreSQL's `public.orders`, which the
 label leaves bare), else a bare name only one schema has (SQL Server's `orders` for
 `dbo.orders`), exactly or ignoring case where `DbSchema::names_ignore_case` — which SQL
@@ -372,6 +374,48 @@ timeout, and the statements before it may have been applied — exit 4's "retryi
 would repeat them (`a_scripts_exit_says_whether_retrying_is_safe`,
 `a_scripts_report_counts_what_ran_and_names_the_failure`). No test drives `run_script` itself, so
 its order — the scan before the connect, the stamp check between the reads — is the code's.
+**`import` is `run_import`, the app's *Import* without the window: select, refuse, read the
+file's columns, connect, check, load.** `select_conn` first, with exits 2 and 3 as everywhere.
+**A `read_only` connection is refused next, before the file is opened** — a `warn` in
+`GuardReason::ReadOnly`'s words and exit 3, with no flag to answer it, the app offering no import
+on such a connection either. It is asked of the saved `Connection` inline here, not through a
+minted request: an import runs no SQL the user wrote, so neither `run_verdict` nor
+`script_verdict` has a statement to judge. No database (`database_for`) is a `warn`, the
+no-database `hint:`'s `Refused` arm, and **exit 3**, on purpose: an import is a write, and a
+write with nowhere to go is a guard-shaped refusal, as `exec`'s `Block(GuardReason::NoDatabase)`
+is — where the read commands' (`dump`, `tables`, `describe`) want of one is exit 2. Then the file, all before anything is dialled: the first 64 KiB
+as the CSV sniffer's head, an unreadable file being exit 2; `import::read_config` (`cli/import.rs`),
+whose refusals are exit 2; `core::import::xlsx_size_refusal`, exit 2, and `memory_warning`, a
+warning only — both the modal's; and `probe_sample` for the file's column names alone, the check
+below reading every row anyway. Then `connect` under `query::DEFAULT_TIMEOUT` and a fresh
+`Db::fetch_schema` under `with_deadline` at the same bound (a failure or timeout exit 4); `-t`
+resolved by `resolve_tables`, `dump -t`'s resolver, over that schema and then looked up with
+`find_by_display` (`cli/import.rs` has why not the lenient lookup), a table that is not there, a
+bare name two schemas share, or a view being exit 2. Then the mapping: `auto_map` over the file's columns, corrected by
+`import::apply_overrides` (a refusal exit 2), and **nothing mapped is exit 2 naming `--map`**,
+`insert_columns` being empty. A column left out is `import::skipped`'s sentence on stderr, and
+`Mapping::missing_required` a warning that the load will likely fail — both warnings, the
+modal's, not refusals. **Pass 1 is `validate` over the whole file on `spawn_blocking`**, collecting
+up to `IMPORT_MAX_ISSUES` (200, the app's figure) and printing the first `IMPORT_SHOWN_ISSUES`
+(20) through `import::issue_line`, then `issue_tail(shown, total, more_issues)` — `shown` being
+the 20 printed and not the 200 collected, the composition `core::import`'s entry records the
+modal getting wrong once — then "<file> was not imported; nothing was written" and
+**`Exit::Rejected`, 7**. **Pass 2 is `row_iter` on `spawn_blocking` feeding `Db::import_rows`**,
+one transaction, its `ImportTarget` the table's schema and name and `insert_columns`' names,
+under `with_deadline_unwound` at the import's own `--timeout`. The ending is said on stderr —
+stdout stays empty: **a commit, in time or inside the unwind grace, is success**,
+`imported N rows into db.schema.table` and exit 0, since a load that committed while the cancel
+was on its way did import and the report never claims less than the engine delivered; an error
+in time is exit 4; a late error is exit 4 too, `DbError::Cancelled` said as "stopped after Ns and
+rolled back; nothing was imported" and any other late error in its own words (it is
+`import_rows`' own error that says when a rollback could not be made); and `Late(None)` —
+abandoned past the grace with no answer — is **exit 5**, saying the server did not answer the
+cancel and to check the table before importing again. **It writes the app's record**: a
+`Source::Import` entry under the connection's saved name, no `sql`, detail `import <path> into
+<db.schema.table>` — `import_run`'s own shape — stamped after the check and ended `ok` with the
+row count, `failed` with the message, `cancelled` for either late error, and `unknown` for
+`Late(None)`, appended through `append_to_write_log` with its exit-status-preserving warning.
+No unit test drives `run_import`, so its order is the code's.
 **`mcp` is `serve_mcp`, and it keeps the order that makes exit 3 true.** `select_conn` first, so
 `cli_access` gates it like every subcommand: a connection the user never exposed is exit 3 and
 an unknown one exit 2, before the keyring is read, and the MCP client shows a server that failed

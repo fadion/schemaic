@@ -49,7 +49,8 @@ const AFTER_HELP: &str = concat!(
      transport, MySQL sql_mode, a read-only PostgreSQL path); your statement never ran\n",
     "  4  The server or the connection failed; retrying may work\n",
     "  5  A write timed out after it was sent and may have been applied; check before retrying\n",
-    "  6  query --fail-on-cap: --limit cut the rows short (they were still printed)",
+    "  6  query --fail-on-cap: --limit cut the rows short (they were still printed)\n",
+    "  7  import: the file has problems (listed on stderr); nothing was written",
 );
 
 #[derive(Parser, Debug, PartialEq, Eq)]
@@ -275,6 +276,56 @@ pub enum Command {
         #[arg(long, value_parser = at_least_one_second())]
         timeout: Option<u64>,
     },
+    /// Load a CSV, TSV, JSON or Excel file into an existing table.
+    ///
+    /// The app's Import: the file's columns are matched to the table's by
+    /// header name (by position with --no-header), the whole file is checked
+    /// before anything is written, and the rows go in as one transaction. A
+    /// file with any problem is refused and nothing is written (exit 7); the
+    /// problems go to stderr.
+    Import {
+        /// The file to load.
+        file: std::path::PathBuf,
+        /// The table to load into (`orders`, or `sales.orders` outside the
+        /// default schema).
+        #[arg(short = 't', long = "table")]
+        table: String,
+        #[command(flatten)]
+        target: Target,
+        /// csv, json or xlsx. Defaults to what the file's extension names
+        /// (.csv, .tsv, .txt, .json, .xlsx).
+        #[arg(long = "format")]
+        format: Option<String>,
+        /// The file has no header row: its columns map to the table's by
+        /// position.
+        #[arg(long)]
+        no_header: bool,
+        /// The field separator for CSV — `,`, `;`, `|`, or `tab`. Guessed from
+        /// the file when absent.
+        #[arg(long, value_parser = parse_delimiter)]
+        delimiter: Option<u8>,
+        /// Which Excel sheet to read. The first when absent.
+        #[arg(long)]
+        sheet: Option<String>,
+        /// A CSV field that means NULL. Repeat for several; an empty field
+        /// is NULL when none is given.
+        #[arg(long = "null", value_name = "TEXT")]
+        nulls: Vec<String>,
+        /// Strip the spaces around every field.
+        #[arg(long)]
+        trim: bool,
+        /// Load a file column into a table column the names don't match:
+        /// `"Full Name=name"`. Repeat for each.
+        #[arg(long = "map", value_name = "FILE_COLUMN=TABLE_COLUMN", value_parser = crate::import::parse_map)]
+        maps: Vec<(String, String)>,
+        /// Leave a file column out. Repeat for each.
+        #[arg(long = "skip", value_name = "FILE_COLUMN")]
+        skips: Vec<String>,
+        /// Seconds before the load is stopped and rolled back — an hour by
+        /// default.
+        #[arg(long, default_value_t = EXPORT_TIMEOUT_SECS, value_parser = at_least_one_second())]
+        timeout: u64,
+    },
     /// Serve a connection to an AI agent over MCP, on stdin/stdout.
     ///
     /// For an MCP client to spawn, not for a terminal: the agent gets
@@ -403,6 +454,7 @@ impl Command {
             Command::Export { .. }
             | Command::Dump { .. }
             | Command::Compare { .. }
+            | Command::Import { .. }
             | Command::Mcp { .. }
             | Command::Version
             | Command::Completions { .. } => None,
@@ -580,6 +632,18 @@ fn non_blank(s: &str) -> Result<String, String> {
     }
 }
 
+/// `import --delimiter`'s parser: one ASCII character, or `tab` — a literal
+/// tab is the one separator a shell makes awkward to type.
+fn parse_delimiter(s: &str) -> Result<u8, String> {
+    match s {
+        "tab" | "\\t" | "\t" => Ok(b'\t'),
+        _ if s.len() == 1 && s.is_ascii() && s != "\"" => Ok(s.as_bytes()[0]),
+        _ => Err(format!(
+            "'{s}' is not a delimiter; give one character, or `tab`"
+        )),
+    }
+}
+
 /// `--limit`'s parser: zero rows is a typo, not a request.
 fn at_least_one_row() -> clap::builder::RangedU64ValueParser<usize> {
     clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
@@ -666,6 +730,7 @@ pub fn wants_cli(argv: &[String]) -> bool {
                 | "dump"
                 | "compare"
                 | "exec"
+                | "import"
                 | "mcp"
                 | "version"
                 | "completions"
@@ -856,6 +921,67 @@ mod tests {
                 ],
                 "{sub}"
             );
+        }
+    }
+
+    #[test]
+    fn import_takes_a_file_a_table_and_its_reading_flags() {
+        let cli = parse(&[
+            "schemaic",
+            "import",
+            "p.csv",
+            "-t",
+            "people",
+            "-c",
+            "1",
+            "--delimiter",
+            "tab",
+            "--null",
+            "NULL",
+            "--null",
+            "\\N",
+            "--map",
+            "Full Name=name",
+            "--skip",
+            "x",
+            "--no-header",
+        ])
+        .unwrap();
+        let Command::Import {
+            file,
+            table,
+            delimiter,
+            nulls,
+            maps,
+            skips,
+            no_header,
+            timeout,
+            ..
+        } = cli.command
+        else {
+            panic!("expected an import");
+        };
+        assert_eq!(file, std::path::PathBuf::from("p.csv"));
+        assert_eq!(table, "people");
+        assert_eq!(delimiter, Some(b'\t'));
+        assert_eq!(nulls, vec!["NULL".to_string(), "\\N".to_string()]);
+        assert_eq!(maps, vec![("Full Name".to_string(), "name".to_string())]);
+        assert_eq!(skips, vec!["x".to_string()]);
+        assert!(no_header);
+        assert_eq!(timeout, EXPORT_TIMEOUT_SECS);
+        assert!(
+            parse(&["schemaic", "import", "p.csv", "-c", "1"]).is_err(),
+            "no table"
+        );
+    }
+
+    #[test]
+    fn a_delimiter_is_one_character_or_tab() {
+        assert_eq!(parse_delimiter(";"), Ok(b';'));
+        assert_eq!(parse_delimiter("tab"), Ok(b'\t'));
+        assert_eq!(parse_delimiter("\\t"), Ok(b'\t'));
+        for bad in ["", ";;", "\"", "é"] {
+            assert!(parse_delimiter(bad).is_err(), "{bad:?}");
         }
     }
 

@@ -60,3 +60,6 @@ Otherwise the rows go in inside one transaction, so a failure leaves the table a
 A CSV is read as it goes, so its size doesn't matter. JSON and Excel files are held in memory
 while they load, and the window warns you when that will take a lot. An Excel workbook larger
 than 512 MiB isn't opened at all — save the sheet as CSV and import that instead.
+
+To load a file from a script or a scheduled job instead, use the command line's
+[`schemaic import`](../cli/import.md).

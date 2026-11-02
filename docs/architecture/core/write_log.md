@@ -1,7 +1,7 @@
 # `core/write_log.rs`
 
-`write_log.rs` — **the write log**: an append-only record of every write the app and
-`schemaic exec` ran — when, on which connection and database, what ran, how many rows it
+`write_log.rs` — **the write log**: an append-only record of every write the app,
+`schemaic exec` and `schemaic import` ran — when, on which connection and database, what ran, how many rows it
 touched and how it ended — one JSON object a line in `<config_dir>/write_log.jsonl` (`FILE`).
 **It is not the history, and the difference is the point.** `history.json` is capped at
 `MAX_PER_CONN`, folds a re-run statement onto its newest run, deletes the runs a batch never
@@ -23,8 +23,9 @@ in Unix milliseconds, `Source` one of `editor`/`script`/`grid`/`ddl`/`import`/`c
 `restore`, `connection` the name the user saved. `Outcome` is `ok`/`failed`/`cancelled` and
 **`unknown`, for a write the client lost track of** — `schemaic exec`'s deadline passing after the
 statement was sent, which may or may not have taken effect (exit 5, under `cli/exec.rs`), an
-`exec --script` its deadline abandoned past the unwind grace with no count (`cli/run.rs`), and
-every *Restore from file*, which is logged as it launches and ends in the terminal's client,
+`exec --script` its deadline abandoned past the unwind grace with no count (`cli/run.rs`), a
+`schemaic import` load abandoned the same way (`Source::Import`, the app's import's source, not
+`Cli`), and every *Restore from file*, which is logged as it launches and ends in the terminal's client,
 out of Schemaic's sight (`launch::restore_log_entry`). `sql`
 is empty where a path has no statement to name — an import, a restore, a file that ran to the
 end — and

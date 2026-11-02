@@ -1,7 +1,7 @@
 # `schemaic-cli`
 
 `schemaic-cli` — Schemaic without a window: `schemaic list` / `databases` / `ping` / `tables` /
-`describe` / `query` / `explain` / `export` / `dump` / `compare` / `exec` / `mcp` / `version` / `completions` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
+`describe` / `query` / `explain` / `export` / `dump` / `compare` / `exec` / `import` / `mcp` / `version` / `completions` / `help`, so a person or an agent can run SQL against a saved connection with the app closed and without being
 handed a credential. It also holds the **MCP server** (`mcp.rs`), which has two ways in — the
 app's `--mcp-serve` for the AI panel, and `schemaic mcp -c <conn>` for any MCP client. Its whole
 dependency list is `schemaic-core`, `schemaic-conn`, `schemaic-db`, `clap`, `clap_complete` (default features off, for `completions`), `serde_json`, `tokio`

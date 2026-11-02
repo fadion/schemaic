@@ -37,6 +37,7 @@
 - [Command line](cli/README.md)
   - [Reading and exporting](cli/reading.md)
   - [Running writes](cli/exec.md)
+  - [Importing a file](cli/import.md)
   - [MCP server](cli/mcp.md)
 
 # Reference

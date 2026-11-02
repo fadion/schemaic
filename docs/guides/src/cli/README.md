@@ -73,13 +73,14 @@ password from a pipe instead: `cat pw.txt | schemaic ping -c prod --password-std
 | `dump`       | Writes a database's tables to a `.sql` file that recreates them              |
 | `compare`    | Prints the SQL that would make one database's structure match another's      |
 | `exec`       | Runs one statement that writes, or a whole `.sql` script with `--script`     |
+| `import`     | Loads a CSV, TSV, JSON or Excel file into an existing table                  |
 | `mcp`        | Serves a connection to an AI agent over MCP                                  |
 | `version`    | Prints the version                                                           |
 | `completions` | Prints a tab-completion script for your shell                                |
 
 `schemaic <command> --help` gives every flag. Each command that waits on a server takes
-`--timeout`, in seconds: 30 by default, two minutes for `compare`, an hour for `export`, `dump`
-and `exec --script`.
+`--timeout`, in seconds: 30 by default, two minutes for `compare`, an hour for `export`, `dump`,
+`import` and `exec --script`.
 
 ## Output
 
@@ -106,9 +107,11 @@ to stderr, so stdout is always safe to pipe or parse. `--format` picks the shape
 | 4    | The server or the connection failed. Retrying may work                                 |
 | 5    | A write timed out after it was sent and may have been applied. Check before retrying   |
 | 6    | `query --fail-on-cap` only: `--limit` cut the rows short (they were still printed)     |
+| 7    | `import` only: the file has problems, listed on stderr. Nothing was written            |
 
 ## In this section
 
 - [Reading and exporting](reading.md) — `query`, `explain`, `export`, `dump` and `compare`.
 - [Running writes](exec.md) — `exec`, the questions it asks first, and running a whole script.
+- [Importing a file](import.md) — `import`, loading a CSV, JSON or Excel file into a table.
 - [MCP server](mcp.md) — hand a connection to an AI agent in your editor or desktop app.

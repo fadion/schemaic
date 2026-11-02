@@ -1,6 +1,6 @@
 //! Schemaic without a window: the headless front end behind `schemaic list`,
 //! `databases`, `ping`, `tables`, `describe`, `query`, `explain`, `export`,
-//! `dump`, `compare`, `exec` and `mcp` — and
+//! `dump`, `compare`, `exec`, `import`, `mcp` and `completions` — and
 //! the MCP server itself, which the app's `--mcp-serve` runs too.
 //!
 //! **Why it is a library and not a binary.** It has two front ends and they
@@ -30,6 +30,7 @@ pub mod deadline;
 pub mod dump;
 pub mod exec;
 pub mod format;
+pub mod import;
 pub mod mcp;
 pub mod query;
 pub mod run;

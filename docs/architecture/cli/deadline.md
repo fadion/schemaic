@@ -28,7 +28,9 @@ the future gave while unwinding inside the grace, `Late(None)` that it was aband
 `with_deadline` folds both `Late`s to `None`, as it always answered. The unwound answer is thrown
 away for a read, which changed nothing, but not for `exec --script`: `Db::run_script` returns how
 many statements it got through before the token stopped it, and that count is the one thing a
-timed-out script's caller needs (`an_unwound_answer_is_kept_and_an_abandoned_one_is_none`). The
+timed-out script's caller needs (`an_unwound_answer_is_kept_and_an_abandoned_one_is_none`).
+`schemaic import` keeps it for the same kind of reason: `Db::import_rows` that committed inside
+the grace did import, and reporting it stopped would claim less than the engine delivered. The
 gate below counts it as wrapped, `with_deadline` being a prefix of its name.
 **It is deliberately not a merge with `mcp.rs`'s `with_deadline`**, and the server moving into
 this crate did not merge them: that one wraps a read none of the subcommands makes

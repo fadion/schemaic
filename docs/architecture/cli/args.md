@@ -21,7 +21,7 @@ connected to the database named after the user, the unscoped landing the exec gu
 no-database arm exists to stop, reached without the guard seeing it
 (`a_blank_database_is_refused_at_parse_time`, `a_zero_timeout_or_limit_is_refused`).
 **`-c` falls back to `SCHEMAIC_CONNECTION` and `-d` to `SCHEMAIC_DATABASE`** (clap's `env`; a
-flag on the command line wins), on `query`, `explain`, `export`, `dump`, `exec`, `tables` and `describe` alike, `-c` on
+flag on the command line wins), on `query`, `explain`, `export`, `dump`, `exec`, `import`, `tables` and `describe` alike, `-c` on
 `databases` and `ping`
 (through `ConnArgs`), both on `mcp` (through `McpTarget`) and both on `compare`, whose
 `--source-*` pair has no fallback (below), so an agent's shell is pointed at a connection and a database once. A `SCHEMAIC_DATABASE` that is set
@@ -43,9 +43,9 @@ field of each one's own, so `--no-header` is on all of them at once
 (`no_header_is_on_every_row_printing_subcommand`).
 `OutputArgs::output()` is `format::Output::new`, and whether the pair goes together is judged
 there rather than by clap; `Command::output_args()` hands it to `run.rs`, `None` for `version`,
-`completions`, `mcp`, `export`, `dump` and `compare` — `export` and `dump` write their rows to a file, `export`
-in a format of its own, and `compare` prints a script rather than rows, so none of the three
-has a stdout format to judge.
+`completions`, `mcp`, `export`, `dump`, `compare` and `import` — `export` and `dump` write their rows to a file, `export`
+in a format of its own, `compare` prints a script rather than rows, and `import` prints nothing to
+stdout at all, so none of the four has a stdout format to judge.
 **`explain` is `query`'s inputs and nothing a read does not take**: `SqlArgs`, `Target` and
 `OutputArgs` as `query` has them, comment-led SQL included, and `--timeout` at
 `DEFAULT_TIMEOUT_SECS`. It has no `--yes`, for `query`'s reason; no `--limit`, the plan being
@@ -80,6 +80,20 @@ is a script, not rows. Its `--timeout` is `COMPARE_TIMEOUT_SECS`, 120 s, because
 catalogues are read and a large one takes longer than one statement's 30 s
 (`compare_takes_a_target_a_source_and_tables`, which holds `--password-stdin` and `--format`
 to parse errors and a blank `--source-database` to a validation error).
+**`import` takes a file, a table and the reading flags, and no statement**: the positional `FILE`,
+`-t`/`--table` required (one, unlike `dump`'s), a whole `Target`, and the flags `cli/import.rs`
+turns into a `Reading` — `--format` (a bare `Option<String>`, as `export`'s, `None` meaning the
+extension decides), `--no-header`, `--delimiter`, `--sheet`, `--null` (repeatable), `--trim` —
+plus `--map FILE_COLUMN=TABLE_COLUMN` (repeatable, parsed by `import::parse_map`) and `--skip`
+(repeatable). Which flag belongs to which format is judged by `import::read_config`, not by
+clap. `--delimiter` is `parse_delimiter`: one ASCII character, or `tab` (or `\t`, either as typed
+or as the real character), a literal tab being the separator a shell makes awkward to type; `"`
+is refused (`a_delimiter_is_one_character_or_tab`). **No `--yes`**: typing `import` is the
+caller saying this writes, as an `INSERT` through `exec` needs none, and a read-only connection
+is refused outright in `run.rs`, which no flag could answer anyway. Its `--timeout` defaults to
+`EXPORT_TIMEOUT_SECS`, an hour, the load being a whole file's rows, and still refuses `0`
+(`import_takes_a_file_a_table_and_its_reading_flags`, which also holds a missing `-t` to a parse
+error).
 **The top-level `--help` ends with the formats and the exit codes** (`AFTER_HELP`, as `Cli`'s
 `after_help`), since a script's author reads the help and would otherwise have had to find
 either in the README; `OutputArgs::format`'s doc line names the five, so each subcommand's
@@ -163,7 +177,7 @@ how the statement spells it, and the name must be one the statement could spell 
 `each_statement_command_takes_repeated_params`). Parsing a `-p` decides nothing about the
 statement: binding it, and every refusal that depends on the statement, is `run.rs`'s `bind`.
 **`ConnArgs` is `Target` without the database** — `-c` and `--password-stdin`, flattened into
-`Target { conn, database }` for `query`, `explain`, `export`, `dump`, `exec`, `tables` and `describe`, and taken alone by the
+`Target { conn, database }` for `query`, `explain`, `export`, `dump`, `exec`, `import`, `tables` and `describe`, and taken alone by the
 two subcommands with
 no database to run in: `databases` lists the names `-d` takes, and `ping` asks whether the
 server answers at all, so neither has a `-d` and passing one is a parse error
@@ -203,7 +217,8 @@ app's own binary a new subcommand does not reach the CLI until its name is added
 `databases` and `ping` were, and `tables` and `describe` after them — the test was seen red
 until both names went in (`every_subcommand_routes_to_the_cli`) — and `mcp`, which is not
 the app's `--mcp-serve` above though both start the one server, and `export` after it,
-`dump` after that, `explain` after that, `compare` after that, and `completions` after that.
+`dump` after that, `explain` after that, `compare` after that, `completions` after that, and
+`import` after that.
 `schemaic.com` calls
 `run::main` without asking, so a missing name shows everywhere except through it. **That test
 and `the_help_text_names_every_subcommand` read the names off clap's `Command`**

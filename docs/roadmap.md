@@ -131,19 +131,6 @@ with a sync script.
 
 ## CLI
 
-### `schemaic import`
-
-Import CSV, TSV, JSON and Excel into an existing table. The logic already exists in core: column
-mapping (`import::auto_map`) and the pre-flight problem report (`import::validate`).
-
-- **Decided:** the mapping is the app's default — by header name, or by position with
-  `--no-header` — plus `--map file_col=table_col` and `--skip file_col` for the exceptions.
-- **Decided:** a file with any pre-flight problem is refused and nothing is written, as in the
-  app. The problems go to stderr, and the run exits 7, a new code meaning "file rejected, nothing
-  written" (3 stays the guard's refusal).
-- **Decided:** refused on a read-only connection; no `--yes` (it is an `INSERT`); recorded in the
-  write log as `Source::Import`.
-
 ### A one-off connection
 
 For containers and CI, where there is no GUI to save a connection in. Saving one from the CLI is

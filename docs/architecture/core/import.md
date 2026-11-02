@@ -14,7 +14,11 @@ transaction); and `missing_required` warns on `!nullable && !auto_increment && d
 && generated.is_none()` rather than on "integer primary key", which was silent on a natural
 `INT` key and noisy about every defaulted column. `validate` reads the whole file and returns
 *every* `Issue` with its line before anything is written, then `row_iter` streams coerced rows
-for the load. **A row the stream cannot hand over is a `RowError`, not a sentence** —
+for the load. **There are two drivers of that contract, and neither has a copy of it**: the
+import modal (`ui/import_view.rs`, through `SchemaActions::import_run`) and `schemaic import` (`cli/run.rs`'s
+`run_import`, with `cli/import.rs` standing in for the person at the preview — the header is
+the flag's there rather than `sniff`'s guess, and `--map`/`--skip` correct `auto_map`'s answer).
+**A row the stream cannot hand over is a `RowError`, not a sentence** —
 `RowIter`'s item is `Result<Vec<Value>, RowError>`, and so is `db::RowSource`'s, which a copy's
 read feeds too: `Issue` is `RowCtx::row`'s backstop for a file that changed underneath the
 import since `validate` passed it, carrying only the record's first problem since the load is
@@ -57,7 +61,8 @@ the view asked about — so the pin is a source gate in the view
 (`the_problem_list_discloses_its_own_cap_and_not_only_cores`). The decision is
 `issue_tail_of`, answering an `IssueTail` (`Cut`, `Uncounted`, `CutAndUncounted`) whose
 `message` is the English; `issue_tail` is now only that English over it, and the view words the
-value itself, so the gate asks for `issue_tail_of(` (under `import_view.rs`).
+value itself, so the gate asks for `issue_tail_of(` (under `import_view.rs`). `schemaic import`
+calls `issue_tail` too, passing the 20 lines it prints as `shown`; no gate watches that call.
 `build_insert` reuses `export::ident_sql`/`sql_literal`, so quoting can't drift
 from the SQL export; it is the statement every engine's load runs, SQL Server's included, which
 renders its batches as literals rather than binding them for a parameter ceiling (under
