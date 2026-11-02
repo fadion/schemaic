@@ -19,7 +19,7 @@ every advertised head back through the gate.
 --mcp-serve`, spawned by whichever agent CLI the AI panel launched, over the endpoint blob the
 app wrote — already tunnelled, and never on a command line (`ai.rs`'s entry has the plumbing).
 `Host::Standalone` is `schemaic mcp -c <conn>`, spawned by any MCP client, over an endpoint
-`run.rs`'s `serve_mcp` builds from a saved connection. What differs is who reads the model's
+`run.rs`'s `serve_mcp` builds from a saved connection or a `--url`. What differs is who reads the model's
 *reply*. In the panel the app does, and that is the whole of `propose_table_change`'s worth — a
 proposal echoed into a fenced block becomes a change preview. Standalone nothing of ours reads
 it, so the tool would tell the model the user has a preview to review when they have a block of
@@ -33,7 +33,9 @@ decision, not the host's. **The host changes what a refusal advises, never wheth
 refuses**: the panel's `NO_DATA_ACCESS` says the user can attach rows from a result grid, a
 gesture an outside client does not have, so `NO_DATA_ACCESS_STANDALONE` names the *Let it read
 data* level in Schemaic's connection settings instead
-(`rows_are_withheld_standalone_with_advice_that_fits_the_client`).
+(`rows_are_withheld_standalone_with_advice_that_fits_the_client`). That advice is still wrong
+for a `schemaic mcp --url` connection, which has no settings in Schemaic and whose level is
+`--ai-data`'s — a known leftover; only the start-up notice says so (`run.rs`'s `serve_mcp`).
 **`Endpoint` is the server's, and the app's `McpEndpoint` is an alias of it** — `db`,
 `database`, `samples`, `hidden`, `schema`, `host`, `audit_as`, `read_only` (the connection's
 read-only flag, which only `propose_sql` reads). It was a struct in `app/ai.rs`, which this
@@ -75,7 +77,8 @@ returning `(text, is_error)` and awaited `Box::pin`ned — then `record` when th
 audited, then the JSON wrap; a call the agent was refused is as much a part of what it tried as
 one it was given, so a gate's refusal and an unknown tool get a line too. `audit_as` is what
 decides it: the connection's saved name, set by the two front ends from the saved connection
-itself — `serve_mcp` through `Endpoint::audited_as(&conn.name)`, the panel's subprocess from
+itself (or, for `schemaic mcp --url`, the name `parse_url` suggested) — `serve_mcp` through
+`Endpoint::audited_as(&conn.name)`, the panel's subprocess from
 `ai::saved_db`'s lookup and never from the endpoint blob, which an agent could rewrite — and
 `None` from `Endpoint::standalone` and every literal, so no test that drives the serve loop
 writes the user's log (`only_an_audited_endpoint_logs`). The line is the pure `audit_entry`: the
@@ -307,7 +310,7 @@ than scanning nothing.
 was.** `serve_on` takes a slice of `Named { name, endpoint }`; `serve(endpoint)` wraps one under
 the name `""` — the panel's `--mcp-serve` path, which has one and always will — and
 `serve_many(Vec<(String, Endpoint)>)` is what `schemaic mcp` calls, with one or several, each
-under its saved name (`run.rs`'s `serve_mcp`). What `tools/list` answers is the pure
+under its saved name, or a `--url`'s suggested one (`run.rs`'s `serve_mcp`). What `tools/list` answers is the pure
 `listing(endpoints)`. **With one it is `tools_list` exactly as before** — no `connection`
 argument, no `list_connections` — so the panel and every client already configured against one
 `-c` see the listing they saw (`one_connection_lists_no_connection_argument`). With several,
@@ -319,8 +322,8 @@ no catalogue beside another with the reverse, though neither offers it
 (`several_connections_list_the_union_and_a_connection_argument`,
 `the_union_asks_each_connection_its_own_levels`). A call is then routed by the
 pure `pick(endpoints, args)` — the `connection` argument's non-empty value by name, else the
-first; a name not served is an error naming the ones that are — where *name* is the saved
-connection name `serve_mcp` gave it, never the id or `#<id>` that `-c` also accepts — and handed to that endpoint's own
+first; a name not served is an error naming the ones that are — where *name* is the
+connection name `serve_mcp` gave it (saved, or a `--url`'s suggested one), never the id or `#<id>` that `-c` also accepts — and handed to that endpoint's own
 `call_tool`, so **the listing is the union but every call is judged by its own connection**:
 `refusal_for` against that connection's levels, refused in that connection's words, and recorded
 in the agent log under that connection's `audit_as`. A tool listed because another connection

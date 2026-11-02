@@ -186,7 +186,7 @@ server answers at all, so neither has a `-d` and passing one is a parse error
 `run.rs`'s `select_conn` and `connect` take `&ConnArgs`, which is what lets every subcommand
 above share them — and `compare` and `mcp`, which have no `ConnArgs` of their own, build one with
 only `connection` set (`..Default::default()`, which `ConnArgs` derives for them) to use them
-too; neither takes `--url`.
+too, and `mcp` one more with only `url` set for its `--url` (below); `compare` takes no `--url`.
 **`--url` (`SCHEMAIC_URL`) is a connection given rather than saved**, for a container or a CI job
 with no Schemaic setup — `postgresql://user@host/db`, `mysql://…`, `sqlserver://…`, `sqlite:path`,
 whatever `core::conn_import::parse_url` reads. `-c` is `required_unless_present = "url"` and
@@ -211,21 +211,32 @@ answer without one. `tables` has `--limit` at `DEFAULT_LIMIT`, like `query`; `de
 none, and passing one is a parse error — it names one table, so there is nothing to cap, and
 `run.rs` holds it to a memory bound instead (`tables_takes_a_target_and_a_limit`,
 `describe_takes_one_table_and_a_target`). Both default `--timeout` to `DEFAULT_TIMEOUT_SECS`.
-**`mcp` takes `McpTarget` — `-c` and `-d`, and deliberately no `--password-stdin`.** Stdin is
+**`mcp` takes `McpTarget` — `-c`, `--url`, `--ai-data` and `-d`, and deliberately no
+`--password-stdin`.** Stdin is
 the MCP client's JSON-RPC stream, so a password read from it would be the client's first
 request; the flag is absent rather than present and refusing. `-c` and `-d` keep the
 `SCHEMAIC_CONNECTION`/`SCHEMAIC_DATABASE` fallbacks and `-d` the same `non_blank`, and there are
 no output flags, since nothing here prints rows
 (`mcp_takes_a_connection_and_a_database_and_nothing_from_stdin`, which holds `--password-stdin`,
 `--format` and `--limit` to parse errors). **`-c` repeats**: `connections` is a `Vec<String>`,
-`required = true`, in the order given, and serving several is `cli/mcp.rs`'s `serve_many`; the
+`required_unless_present = "url"`, in the order given, and serving several is `cli/mcp.rs`'s `serve_many`; the
 first is the default for a tool call that names none, and `-d` is that first connection's alone.
 The field was renamed from `connection` but the arg keeps `id = "connection"`, which is what
 `SCHEMAIC_CONNECTION` and the env-lookup tests resolve through — the variable still supplies one
 connection. The same test now parses `-c prod -c stage` into both, in order. The cost is the headless case `--password-stdin`
-exists for: a connection whose password the keyring cannot serve has no `schemaic mcp`. Nor does
-`McpTarget` take `--url` yet — and a one-off connection's AI data level, the one field only
-`mcp` reads, is left at its default (`run.rs`'s `one_off_connection`).
+exists for: a connection whose password the keyring cannot serve has no `schemaic mcp` — unless
+it is given as a `--url`, whose password comes from `SCHEMAIC_PASSWORD` instead.
+**`--url` is one more connection, served after the `-c`s, not in place of them**
+— so with any `-c` it is not the default — and `--ai-data schema-only|on-request|full`
+(`parse_ai_data`) is its AI data level, the one field of a connection only `mcp` reads, which
+`parse_url` leaves unset. `McpTarget` now derives `Default`, which is how `run.rs`'s tests build
+one. Unlike `ConnArgs`, `-c` has no `conflicts_with = "url"`: both are served, neither ranked
+above the other — **which is why `mcp`'s `--url` reads no `SCHEMAIC_URL`**: beside a typed `-c`,
+an exported one would quietly add a connection to the agent's server, where a one-connection
+command refuses the pair (`ConnArgs::source`). A URL served to an agent is typed into the client's
+config or not served at all. The level's absence and
+`--ai-data` without a `--url` are `run.rs`'s to settle (`mcp_takes_a_url_and_its_data_level`,
+which also holds `mcp` with neither `-c` nor `--url` to a parse error).
 **`wants_cli` is the routing predicate, and it is an allowlist of the *first* argument rather
 than "are there any arguments".** This binary is re-invoked with argv by things that are not the
 CLI — the Velopack installer and updater (`--veloapp-install`, `--veloapp-updated`,

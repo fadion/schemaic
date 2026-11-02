@@ -1,6 +1,6 @@
 # MCP server
 
-`schemaic mcp` hands saved connections to an AI agent that speaks
+`schemaic mcp` hands connections to an AI agent that speaks
 [MCP](https://modelcontextprotocol.io) — an editor's assistant, a desktop app. It's the same
 server Schemaic's own [AI assistant](../ai/README.md) uses; you only need this command for an
 agent outside the app.
@@ -23,6 +23,29 @@ stdout, and stops it when it's done.
 Add `"--database=shop"` to the arguments to give the tools a default database. Without one, on a
 server engine, the agent has to name the database in every call.
 
+## Without a saved connection
+
+In a container or a CI job, where Schemaic isn't set up, give the connection with `--url` in place
+of `-c` — in the arguments themselves: unlike the other commands, `mcp` doesn't read
+`SCHEMAIC_URL`, so an exported one can't quietly add a connection to the agent's server. It takes
+the same forms as
+[`--url` on the other commands](README.md#a-connection-without-saving-it):
+
+```json
+{ "mcpServers": { "app": { "command": "schemaic", "args": ["mcp", "--url", "sqlite:/data/app.db", "--ai-data", "full"] } } }
+```
+
+- *Its password comes only from `SCHEMAIC_PASSWORD`.* There's no `--password-stdin`, since stdin
+  is the agent's, and a URL that carries a password is refused. Most clients take an `env` block
+  beside `args` to set it.
+- *`--ai-data` sets what the agent may read*, in place of **AI data access**: `schema-only` (the
+  default), `on-request` or `full`. Only `full` lets it run read-only queries and read sample rows;
+  `on-request` gives it no rows, as there's nothing to attach them from. `--ai-data` is refused
+  without `--url` — a saved connection's level is set in the app.
+- *Its name comes from the URL*: the file name for SQLite (`app.db` above), otherwise
+  `<database>@<host>`. That's the name the agent and the [agent log](#the-agent-log) see.
+- *Nothing is saved*, and **CLI access** doesn't apply.
+
 ## Serving several connections
 
 Repeat `-c` to serve more than one connection from the same server:
@@ -33,7 +56,7 @@ Repeat `-c` to serve more than one connection from the same server:
 
 - Each connection needs **CLI access**, and each keeps its own **AI data access**. They are all
   checked before any is opened, so one without CLI access stops the server before it starts.
-- Every tool takes an extra `connection` argument, the connection's saved name. A call that leaves
+- Every tool takes an extra `connection` argument, the connection's name. A call that leaves
   it out goes to the first `-c`.
 - The agent gets a `list_connections` tool: each connection's name, engine, default database, and
   whether it may read rows.
@@ -42,14 +65,16 @@ Repeat `-c` to serve more than one connection from the same server:
   connection's **AI data access**.
 - `-d` sets the first connection's default database. The others use their own.
 - A connection given twice is refused.
+- A [`--url`](#without-a-saved-connection) can join them. It's served after the `-c`s, so it's
+  never the default, and it can't share a name with a saved connection being served.
 
-The server takes no password. It reads the connection's from the OS keyring, so nothing secret
-goes into the client's configuration file — however many connections it serves.
+The server takes no password for a saved connection. It reads it from the OS keyring, so nothing
+secret goes into the client's configuration file — however many connections it serves.
 
 ## What the agent gets
 
 Nothing the server offers writes to the database. What it can read depends on the connection's
-**AI data access**:
+**AI data access** (for a `--url`, on `--ai-data`, where `full` is **Let it read data**):
 
 | Tool             | What it does                                            | Offered                     |
 |------------------|---------------------------------------------------------|-----------------------------|
@@ -86,7 +111,7 @@ The level is read when the server starts. If you change it, restart the server f
 Every call an agent makes to these tools is recorded in `agent_log.jsonl`, in the settings folder
 beside the [write log](exec.md#the-write-log). That covers the app's own
 [AI assistant](../ai/README.md) as well as `schemaic mcp`, and calls that were refused. It's on
-for every saved connection.
+for every connection, a `--url` one included, under its name.
 
 Each line is one call: when it was made, the connection and database, the tool and the table or
 search it named, whether it came from the panel (`panel`) or `schemaic mcp` (`mcp`), and whether

@@ -367,7 +367,7 @@ pub fn completion_script(shell: clap_complete::Shell) -> String {
 /// [`Target`] for `mcp`: a connection and a database, and **no
 /// `--password-stdin`** — stdin is the MCP client's JSON-RPC stream, so a
 /// password read from it would be the client's first request.
-#[derive(clap::Args, Debug, PartialEq, Eq)]
+#[derive(clap::Args, Debug, Default, PartialEq, Eq)]
 pub struct McpTarget {
     /// Saved connection, by id or by name — or `#<id>`, which is only ever
     /// the id. Repeat to serve several: every tool then takes a `connection`
@@ -377,13 +377,41 @@ pub struct McpTarget {
         short = 'c',
         long = "connection",
         env = "SCHEMAIC_CONNECTION",
-        required = true
+        required_unless_present = "url"
     )]
     pub connections: Vec<String>,
+    /// A connection given here rather than saved, served after any `-c`s —
+    /// see `schemaic query --help`. It may not carry a password: that comes
+    /// from SCHEMAIC_PASSWORD, stdin being the protocol's.
+    ///
+    /// **No `SCHEMAIC_URL` here**, unlike the other commands: `mcp` serves a
+    /// `--url` *beside* its `-c`s rather than instead of one, so an exported
+    /// variable would quietly add a connection to the agent's server. An MCP
+    /// client's config spells its arguments out anyway.
+    #[arg(long, value_name = "URL")]
+    pub url: Option<String>,
+    /// With --url: what the agent may read — schema-only (the default),
+    /// on-request (no rows, as there is nothing to attach them from here) or
+    /// full (it may run read-only queries and read sample rows).
+    #[arg(long, value_parser = parse_ai_data)]
+    pub ai_data: Option<schemaic_core::connection::AiData>,
     /// The database the tools default to — the first connection's. Defaults
     /// to the connection's own; `schemaic databases` lists the names.
     #[arg(short = 'd', long, env = "SCHEMAIC_DATABASE", value_parser = non_blank)]
     pub database: Option<String>,
+}
+
+/// `--ai-data`'s parser: the three levels, in words a command line can hold.
+fn parse_ai_data(s: &str) -> Result<schemaic_core::connection::AiData, String> {
+    use schemaic_core::connection::AiData;
+    match s {
+        "schema-only" => Ok(AiData::SchemaOnly),
+        "on-request" => Ok(AiData::OnRequest),
+        "full" => Ok(AiData::Full),
+        _ => Err(format!(
+            "'{s}' is not a level; use schema-only, on-request or full"
+        )),
+    }
 }
 
 /// What `schemaic version` prints: clap's own `--version` text, so the
@@ -1063,6 +1091,33 @@ mod tests {
         assert!(target.conn.read_only);
     }
 
+    /// `mcp` takes a `--url` in place of, or beside, its `-c`s, and its data
+    /// level by name.
+    #[test]
+    fn mcp_takes_a_url_and_its_data_level() {
+        use schemaic_core::connection::AiData;
+        let Command::Mcp { target } = parse(&[
+            "schemaic",
+            "mcp",
+            "--url",
+            "mysql://u@h/d",
+            "--ai-data",
+            "full",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("expected mcp");
+        };
+        assert!(target.connections.is_empty());
+        assert_eq!(target.url.as_deref(), Some("mysql://u@h/d"));
+        assert_eq!(target.ai_data, Some(AiData::Full));
+        assert_eq!(parse_ai_data("schema-only"), Ok(AiData::SchemaOnly));
+        assert_eq!(parse_ai_data("on-request"), Ok(AiData::OnRequest));
+        assert!(parse_ai_data("everything").is_err());
+        assert!(parse(&["schemaic", "mcp"]).is_err(), "neither -c nor --url");
+    }
+
     #[test]
     fn a_delimiter_is_one_character_or_tab() {
         assert_eq!(parse_delimiter(";"), Ok(b';'));
@@ -1393,7 +1448,7 @@ mod tests {
             Command::Mcp {
                 target: McpTarget {
                     connections: vec!["prod".to_string()],
-                    database: None,
+                    ..Default::default()
                 }
             }
         );

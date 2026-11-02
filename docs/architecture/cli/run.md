@@ -65,8 +65,9 @@ by every process on the machine and lands in the shell's history, the exposure t
 CLI keeps a password out of, so the message points at `--password-stdin` and `SCHEMAIC_PASSWORD`
 instead (`a_url_with_a_password_is_refused`). **`cli_access` is `true`** — the person typed the
 connection, and the flag exists to keep a *saved* one out of reach until they say so — `read_only`
-is `--read-only`'s, and the AI data level stays the default, since only `mcp` reads it and `mcp`
-takes no `--url` (`a_url_connection_has_cli_access_and_the_read_only_asked_for`). Every caller
+is `--read-only`'s, and the AI data level is left as `parse_url` left it, unset — only `mcp` reads
+it, and `serve_mcp` sets it from `--ai-data` (below)
+(`a_url_connection_has_cli_access_and_the_read_only_asked_for`). Every caller
 then shadows `let conn = &*conn;`, so nothing downstream knows which it got. In `connect`, **a
 `--url` connection never asks the keyring**: it was never saved, so the keyring holds nothing of
 it, and its id is the parser's placeholder `0`, which could name another connection's entries
@@ -450,7 +451,7 @@ lifetime**; every tool call is still its own database connection, `Db` connectin
 *Once* also means never reopened: after the tunnel drops, every tool call fails until the
 client restarts the server — a known limit, left as it is. Then `mcp::Endpoint::standalone` over `default_database(-d, conn)` and the connection's
 `ai_data`, `.audited_as(&conn.name)` so every tool call is recorded in the agent log under the
-saved name (`core::agent_log`, `cli/mcp.rs`), one line on stderr, and `mcp::serve_many` until the client closes stdin — exit 0. **No
+saved name (a `--url`'s suggested one, below) (`core::agent_log`, `cli/mcp.rs`), one line on stderr, and `mcp::serve_many` until the client closes stdin — exit 0. **No
 database connection is made before the first tool call**, deliberately: a database that is down
 right now is an error the model sees on that call and may retry, not a server that never
 started. stdout is the protocol's, so the line goes to stderr, which MCP clients keep as the
@@ -468,7 +469,9 @@ databases -c <name>` that lists what to give it. An agent that does not know tha
 connection goes through `select_conn` before any is dialled, so an exposed one followed by an
 unexposed one is exit 3 without the first being opened. Then the same connection given twice is
 refused, exit 2 — compared by the selected connections' ids, not by spelling, so `-c open -c #2`
-naming one connection by its name and its id is caught. Only then is each `connect`ed in turn, its tunnel opened and pushed onto a `Vec`
+naming one connection by its name and its id is caught — and so are two connections that share a
+**name**, since a tool call picks one by name and the second would be unreachable. Ids are
+compared only when non-zero, a `--url` connection's being the parser's placeholder `0`. Only then is each `connect`ed in turn, its tunnel opened and pushed onto a `Vec`
 held for the server's life, its `Endpoint::standalone(…).audited_as(&conn.name)` built and its
 own `mcp_notice` line written, and the lot handed to `mcp::serve_many` under the saved names — a
 single `-c` takes the same path, as a list of one. `-d` is the first connection's; the others take
@@ -488,3 +491,21 @@ connection on its first call. Any one failing to `connect` ends the start with i
 one's did, and the tunnels already opened drop with it. `mcp_refuses_a_connection_without_cli_access` covers the phasing — the
 exposed-then-unexposed pair refused with the exposed one's host never dialled, and a duplicate
 `-c` a usage error.
+**A `--url` is one more connection in that list, after the `-c`s**, so with any of them it is not
+the default. It becomes a `ConnArgs { url }` and goes through the same `select_conn`, so
+`one_off_connection`'s two rules hold here as everywhere — a password in the URL refused, exit 2,
+and `cli_access` implied. Its password is `SCHEMAIC_PASSWORD`'s alone (`connect`'s URL branch),
+stdin being the protocol's. **Its AI data level is `--ai-data`'s, else `AiData::SchemaOnly`** — a
+level nobody chose is the narrowest, as a saved connection's never-chosen one sends no rows
+either — set on the selected `Cow` before the duplicate check; `--ai-data` without a `--url` is
+refused first, exit 2, because a saved connection's level is the app's to set. The name it is served, logged (`audited_as`) and picked by is the one
+`parse_url` suggests, which is why the duplicate check compares names: a saved connection of that
+name beside it would make one of the two unreachable. `mcp_notice` knows one by its id `0` and,
+when its rows are withheld, says to pass `--ai-data full` rather than to change a setting in
+Schemaic it does not have (`mcp_refuses_a_stray_level_and_a_url_that_shares_a_name`,
+`the_mcp_notice_explains_a_withheld_query_tool`). **Not yet followed through**: the per-call
+refusal, `mcp.rs`'s `NO_DATA_ACCESS_STANDALONE`, still tells the model to have the level changed
+in Schemaic, which for a `--url` connection should be `--ai-data` — and `one_off_connection`'s
+refusal of a password-carrying URL still offers `--password-stdin`, which `mcp` does not have.
+Smoke-tested by the change's author against an empty profile: `mcp --url sqlite:<file> --ai-data
+full` answered `run_query`, and without `--ai-data` refused it at *Schema only*.

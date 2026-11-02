@@ -42,16 +42,16 @@ service it is (`AGENTS.md`).
 ---
 
 The entries below are grouped by surface and ordered roughly cheapest first within each group.
-The headless release's decisions are taken; the other entries' are not. What an entry lists under
-*Open* is for the user to settle before work starts, and the traps are the ones known today.
+None of their decisions has been taken yet. What an entry lists under *Open* is for the user to
+settle before work starts, and the traps are the ones known today.
 
-They ship in this order, one release each. Releases 2 and 3 merge if 3 turns out small.
+They ship in this order, one release each. Releases 1 and 2 merge if 2 turns out small. The
+headless release before them has landed.
 
-1. **Headless:** `--url` on `schemaic mcp` is what is left of it.
-2. **Performance:** *Workload and performance insight* with the MCP performance tools, which share
+1. **Performance:** *Workload and performance insight* with the MCP performance tools, which share
    its backend, plus the Server Activity keyboard path.
-3. **Data and editor:** *Compare and sync table data*, the custom keymap and the two chart kinds.
-4. **DuckDB**, alone. A new engine answers every capability predicate and needs its own read-only
+2. **Data and editor:** *Compare and sync table data*, the custom keymap and the two chart kinds.
+3. **DuckDB**, alone. A new engine answers every capability predicate and needs its own read-only
    allowlist, so it gets a release with nothing else in it.
 
 ## Desktop app
@@ -128,16 +128,6 @@ with a sync script.
 - **Open:** cross-engine sync, or same engine only, as schema compare is today?
 
 ## MCP server
-
-### `--url` on `schemaic mcp`
-
-The other commands take a one-off `--url` connection; `mcp` does not yet.
-
-- **Decided:** `--url` works here as on the other commands, with `--ai-data` for its data level,
-  defaulting to schema only — the one CLI command that reads the level. Its password comes from
-  `SCHEMAIC_PASSWORD` only: stdin is the protocol's.
-- **Trap:** with several connections, a `--url` one has no saved name for `list_connections` and
-  the agent log; it needs one given or derived, and two must not collide.
 
 ### Performance tools
 

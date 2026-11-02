@@ -991,7 +991,12 @@ async fn run_export(
 /// connection's always has — a server that comes up has every connection it
 /// lists reachable.
 async fn serve_mcp(conns: &[Connection], target: &McpTarget) -> Exit {
-    let args: Vec<ConnArgs> = target
+    // `--ai-data` is a `--url` connection's level; a saved one's is the app's.
+    if target.ai_data.is_some() && target.url.is_none() {
+        warn("--ai-data is for a --url connection; a saved one's is set in Schemaic");
+        return Exit::Usage;
+    }
+    let mut args: Vec<ConnArgs> = target
         .connections
         .iter()
         .map(|c| ConnArgs {
@@ -999,24 +1004,54 @@ async fn serve_mcp(conns: &[Connection], target: &McpTarget) -> Exit {
             ..Default::default()
         })
         .collect();
+    // A `--url` comes after the `-c`s, so with any it is not the default.
+    // No `--password-stdin`: stdin is the protocol's, so its password is
+    // `SCHEMAIC_PASSWORD`'s (`connect`).
+    if let Some(url) = &target.url {
+        args.push(ConnArgs {
+            url: Some(url.clone()),
+            ..Default::default()
+        });
+    }
     // Every one selected — and its CLI access asked — before any is dialled.
     let mut selected = Vec::with_capacity(args.len());
     for a in &args {
         match select_conn(conns, a) {
-            Ok(c) => selected.push(c),
+            Ok(mut c) => {
+                if a.url.is_some() {
+                    // **Schema only unless asked**: a level nobody chose is
+                    // the narrowest, as a saved connection's never-chosen one
+                    // sends no rows either.
+                    c.to_mut().ai_data = Some(
+                        target
+                            .ai_data
+                            .unwrap_or(schemaic_core::connection::AiData::SchemaOnly),
+                    );
+                }
+                selected.push(c)
+            }
             Err(exit) => return exit,
         }
     }
     // **The same connection twice is refused by what was selected, not by
     // spelling**: `-c 1 -c shop` may name one connection by its id and its
-    // name, and would serve it twice under one name.
+    // name, and would serve it twice under one name. And two under one name —
+    // a `--url`'s suggested name beside a saved connection of that name — are
+    // refused too: a tool call picks a connection by name.
     if let Some(twice) = selected
         .iter()
         .enumerate()
-        .find(|(i, c)| selected[..*i].iter().any(|s| s.id == c.id))
+        .find(|(i, c)| {
+            selected[..*i]
+                .iter()
+                .any(|s| (s.id == c.id && c.id != 0) || s.name == c.name)
+        })
         .map(|(_, c)| c)
     {
-        warn(&format!("'{}' is given twice", twice.name));
+        warn(&format!(
+            "'{}' is given twice — two connections cannot share a name on one server",
+            twice.name
+        ));
         return Exit::Usage;
     }
     let mut endpoints = Vec::with_capacity(selected.len());
@@ -1078,12 +1113,20 @@ fn mcp_notice(
         conn.name
     );
     if !rows {
+        // A `--url` connection was never saved, so its level is the flag's —
+        // the id 0 `parse_url` leaves is the mark of one.
+        let fix = if conn.id == 0 {
+            "pass --ai-data full to allow them".to_string()
+        } else {
+            format!(
+                "set \"{}\" in Schemaic's connection settings to allow them",
+                schemaic_core::connection::AiData::Full.label()
+            )
+        };
         s.push_str(&format!(
-            "; run_query, explain and sample_rows are {} — its AI data access is \"{}\" \
-             (set \"{}\" in Schemaic's connection settings to allow them)",
+            "; run_query, explain and sample_rows are {} — its AI data access is \"{}\" ({fix})",
             if several { "refused on it" } else { "withheld" },
             conn.ai_data.unwrap_or_default().label(),
-            schemaic_core::connection::AiData::Full.label(),
         ));
     }
     if database.is_none() {
@@ -3452,7 +3495,7 @@ mod tests {
         assert!(!c.cli_access, "the fixture is unexposed");
         let target = McpTarget {
             connections: vec!["1".to_string()],
-            database: None,
+            ..Default::default()
         };
         assert_eq!(
             serve_mcp(std::slice::from_ref(&c), &target).await,
@@ -3460,7 +3503,7 @@ mod tests {
         );
         let target = McpTarget {
             connections: vec!["nope".to_string()],
-            database: None,
+            ..Default::default()
         };
         assert_eq!(serve_mcp(&[], &target).await, Exit::Usage);
         // **Every connection is gated before any is opened**: an exposed one
@@ -3472,15 +3515,39 @@ mod tests {
         open.cli_access = true;
         let target = McpTarget {
             connections: vec!["open".to_string(), "1".to_string()],
-            database: None,
+            ..Default::default()
         };
         assert_eq!(serve_mcp(&[open.clone(), c], &target).await, Exit::Refused);
         // One connection named by its name and by its id is still twice.
         let target = McpTarget {
             connections: vec!["open".to_string(), "#2".to_string()],
-            database: None,
+            ..Default::default()
         };
         assert_eq!(serve_mcp(&[open], &target).await, Exit::Usage);
+    }
+
+    /// **`--ai-data` belongs to a `--url`**, and a `--url` whose name a saved
+    /// connection already has is refused — a tool call picks by name — both
+    /// before anything is dialled.
+    #[tokio::test]
+    async fn mcp_refuses_a_stray_level_and_a_url_that_shares_a_name() {
+        let target = McpTarget {
+            connections: vec!["1".to_string()],
+            ai_data: Some(schemaic_core::connection::AiData::Full),
+            ..Default::default()
+        };
+        assert_eq!(serve_mcp(&[conn("shop")], &target).await, Exit::Usage);
+
+        let url = "mysql://app@unreachable.invalid/shop";
+        let mut saved = conn("shop");
+        saved.name = one_off_connection(url, false).unwrap().name;
+        saved.cli_access = true;
+        let target = McpTarget {
+            connections: vec![saved.name.clone()],
+            url: Some(url.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(serve_mcp(&[saved], &target).await, Exit::Usage);
     }
 
     /// On a server engine `-d` wins, else the connection's own, else none —
@@ -3521,6 +3588,13 @@ mod tests {
         assert!(!n.contains("-d"), "a default was given: {n}");
         // Beside other connections the tool is still listed, and refused here.
         let n = mcp_notice(&c, false, Some("shop"), true, true);
+        // A `--url` connection's level is its flag's, not a setting in the app.
+        let url = one_off_connection("mysql://u@h/d", false).unwrap();
+        let u = mcp_notice(&url, false, Some("d"), true, false);
+        assert!(
+            u.contains("--ai-data full") && !u.contains("connection settings"),
+            "{u}"
+        );
         assert!(
             n.contains("refused on it") && !n.contains("withheld"),
             "{n}"

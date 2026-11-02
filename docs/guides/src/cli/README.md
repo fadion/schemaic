@@ -62,8 +62,9 @@ password from a pipe instead: `cat pw.txt | schemaic ping -c prod --password-std
 ## A connection without saving it
 
 In a container or a CI job, where Schemaic isn't set up, give the connection with `--url` (or
-`SCHEMAIC_URL`) in place of `-c`. Every command that takes `-c` takes it, except `compare` and
-`mcp`, which need saved connections.
+`SCHEMAIC_URL`) in place of `-c`. Every command that takes `-c` takes it, except `compare`,
+which needs saved connections. `mcp` takes it too, with its own rules — see
+[Without a saved connection](mcp.md#without-a-saved-connection).
 
 ```sh
 schemaic query "SELECT count(*) FROM people" --url "sqlite:/data/app.db" --format csv
@@ -82,7 +83,7 @@ SCHEMAIC_PASSWORD="$DB_PASSWORD" schemaic query "SELECT 1" --url "mysql://app@db
   It only goes with `--url`; a saved connection is made read-only in the app.
 - *A database.* If the URL names none, pass `-d` or end the URL with `/<database>`.
 - `-c` and `--url` together are refused, even when one comes from the environment — unset the
-  variable you don't mean.
+  variable you don't mean. `mcp` is the exception: it serves both.
 
 ## The commands
 
