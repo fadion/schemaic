@@ -36,8 +36,10 @@ the same forms as
 ```
 
 - *Its password comes only from `SCHEMAIC_PASSWORD`.* There's no `--password-stdin`, since stdin
-  is the agent's, and a URL that carries a password is refused. Most clients take an `env` block
-  beside `args` to set it.
+  is the agent's, and a URL that carries a password or any other secret is refused. Most clients
+  take an `env` block beside `args` to set it. A URL that signs in as you (Windows or Microsoft
+  Entra) is refused too, and one that asks for a read-only session is read-only — the same rules
+  as the other commands.
 - *`--ai-data` sets what the agent may read*, in place of **AI data access**: `schema-only` (the
   default), `on-request` or `full`. Only `full` lets it run read-only queries and read sample rows;
   `on-request` gives it no rows, as there's nothing to attach them from. `--ai-data` is refused

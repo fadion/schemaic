@@ -3745,7 +3745,7 @@ import-added = { $count ->
 import-added-foreign = { $count ->
         [one] { $count } verbinding toegevoegd.
        *[other] { $count } verbindingen toegevoegd.
-    } Alleen-lezen en het omgevingslabel worden niet overgenomen uit een andere client — stel ze in via Verbindingen beheren voor alles wat ertoe doet.
+    } Het omgevingslabel wordt niet overgenomen uit een andere client, en alleen-lezen alleen waar de URL erom vroeg — stel ze in via Verbindingen beheren voor alles wat ertoe doet.
 conn-delete-title = ‘{ $name }’ verwijderen
 conn-delete-question = Dit verwijdert de verbinding, het opgeslagen wachtwoord, het opgeslagen AI-gesprek, de querygeschiedenis en de tabbladen ervan. Dit kan niet ongedaan worden gemaakt.
 conn-delete-keyring-kept = Schemaic kon de sleutelhanger van het besturingssysteem niet bereiken, dus het opgeslagen wachtwoord en de SSH-geheimen van de verwijderde verbinding staan **er nog in**.

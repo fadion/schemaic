@@ -4479,7 +4479,7 @@ import-added = { $count ->
 import-added-foreign = { $count ->
         [one] Added { $count } connection.
        *[other] Added { $count } connections.
-    } Read-only and the environment badge are not carried over from another client — set them in Manage connections for anything that matters.
+    } The environment badge is not carried over from another client, and read-only only where its URL asked for it — set them in Manage connections for anything that matters.
 conn-delete-title = Delete “{ $name }”
 conn-delete-question = This deletes the connection, its stored password, its saved AI conversation, its query history and its tabs. It can't be undone.
 # A notice shown after a delete; its two lines are shown one under the other.

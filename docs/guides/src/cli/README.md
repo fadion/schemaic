@@ -74,13 +74,22 @@ SCHEMAIC_PASSWORD="$DB_PASSWORD" schemaic query "SELECT 1" --url "mysql://app@db
 - *Forms.* `postgresql://user@host:port/db`, `mysql://` or `mariadb://`, `sqlserver://` and
   `sqlite:path`; a SQL Server `Server=…;` connection string, a JDBC URL and a `DATABASE_URL=…`
   line work too — the same forms as pasting a URL into the app.
-- *No password in the URL.* One that carries a password is refused (exit 2), since a command
-  line ends up in the process list and your shell history. Pipe it with `--password-stdin` or set
-  `SCHEMAIC_PASSWORD`, which is read only for a `--url` connection.
+- *No secret in the URL.* One that carries a password or any other secret is refused (exit 2) —
+  `user:pass@`, `password=`, but also `sslpassword=`, `passwd=` or `trustStorePassword=` — since a
+  command line ends up in the process list and your shell history. Pipe the password with
+  `--password-stdin` or set `SCHEMAIC_PASSWORD`, which is read only for a `--url` connection.
+- *A password sign-in only.* A URL that signs in as you — Windows sign-in
+  (`Integrated Security=true`) or Microsoft Entra (`Authentication=ActiveDirectoryDefault`) — is
+  refused, as it would hand your identity to whatever host the URL names. So is an Entra method
+  Schemaic can't perform. Save the connection in Schemaic to sign in that way.
 - *Nothing is saved*, and the keyring isn't touched. **CLI access** doesn't apply: you typed the
   connection yourself.
 - *Read-only.* Add `--read-only` to refuse writes as a saved read-only connection does (exit 3).
-  It only goes with `--url`; a saved connection is made read-only in the app.
+  It only goes with `--url`; a saved connection is made read-only in the app. A URL that asks
+  for a read-only session is read-only without it: SQLite's `?mode=ro` or `immutable=1`,
+  PostgreSQL's `target_session_attrs=read-only` (or `standby`) or
+  `options=-c default_transaction_read_only=on`, SQL Server's `ApplicationIntent=ReadOnly`.
+  `--read-only` can add read-only, never take it away.
 - *A database.* If the URL names none, pass `-d` or end the URL with `/<database>`.
 - `-c` and `--url` together are refused, even when one comes from the environment — unset the
   variable you don't mean. `mcp` is the exception: it serves both.

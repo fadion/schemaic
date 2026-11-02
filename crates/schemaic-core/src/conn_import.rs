@@ -863,10 +863,45 @@ fn closing_quote(s: &str, closer: u8) -> Option<usize> {
     None
 }
 
-/// Does this parameter name hold a secret? The same spellings [`apply_params`]
-/// reads a password out of.
+/// Does this parameter name hold a secret? The spellings [`apply_params`]
+/// reads a password out of, **and every other key naming a password or a
+/// secret** — libpq's `sslpassword`, JDBC's `trustStorePassword` and
+/// `clientCertificateKeyStorePassword`, a `client_secret` — which no parser
+/// reads and which are secrets on screen all the same.
 fn is_password_key(k: &str) -> bool {
-    matches!(normalize_key(k).as_str(), "password" | "pwd" | "pass")
+    let k = normalize_key(k);
+    matches!(k.as_str(), "pwd" | "pass" | "passwd")
+        || k.contains("password")
+        || k.contains("secret")
+}
+
+/// A URL read for a connection **nobody will review** — `schemaic … --url`,
+/// where the string is the connection's whole configuration and no form shows
+/// what was made of it.
+#[derive(Debug)]
+pub struct UrlReading {
+    /// The connection, as [`parse_url`] returns it.
+    pub connection: Connection,
+    /// What the review list would have said beside it
+    /// ([`ImportNote::ExternalLogin`]).
+    pub notes: Vec<ImportNote>,
+    /// Whether the text **held a secret**, whether or not the connection kept
+    /// it: an Entra password the parser clears, and a key it never reads
+    /// (`sslpassword`, `trustStorePassword`), are on the command line all the
+    /// same. Asked of [`redacted`], which hides exactly what is a secret in
+    /// every grammar the parser reads.
+    pub carried_secret: bool,
+}
+
+/// [`parse_url`], keeping what an unreviewed caller has to judge it on —
+/// see [`UrlReading`].
+pub fn read_url(input: &str) -> Result<UrlReading, UrlError> {
+    let (connection, notes) = parse_url_noted(input)?;
+    Ok(UrlReading {
+        connection,
+        notes,
+        carried_secret: redacted(input) != input,
+    })
 }
 
 /// Does this keyword name the server? The spellings [`parse_connection_string`]
@@ -1260,6 +1295,7 @@ fn parse_mssql_url(
             "trustservercertificate" => trust = truthy(&v),
             // SQLAlchemy's `mssql+pyodbc://…?driver=ODBC+Driver+18+…`.
             "driver" => driver = Some(v),
+            "applicationintent" => c.read_only = asks_read_only("applicationintent", &v),
             key => {
                 sign_in.read(key, &v);
             }
@@ -1443,6 +1479,7 @@ fn parse_connection_string(s: &str) -> Result<(Connection, Vec<ImportNote>), Url
                 trust_seen = true;
             }
             key if sign_in.read(key, &v) => {}
+            "applicationintent" => c.read_only = asks_read_only("applicationintent", &v),
             "driver" | "provider" if !names_sql_server_driver(&v) => {
                 return Err(UrlError::UnknownScheme(v));
             }
@@ -1811,8 +1848,12 @@ fn parse_url_scan(text: &str) -> ImportScan {
 }
 
 fn parse_sqlite_url(rest: &str) -> Result<Connection, UrlError> {
-    // Strip the query (`?mode=ro`) and fragment; neither names the file.
-    let path = rest.split(['?', '#']).next().unwrap_or("");
+    // Strip the query (`?mode=ro`) and fragment; neither names the file. The
+    // query's read-only request is kept, though: see [`asks_read_only`].
+    let without_fragment = rest.split('#').next().unwrap_or("");
+    let (path, query) = without_fragment
+        .split_once('?')
+        .unwrap_or((without_fragment, ""));
     // `sqlite:///abs/path` — the authority is empty, so two slashes are the
     // URL's and the third is the path's. `sqlite://relative.db` has no third.
     let path = path.strip_prefix("//").unwrap_or(path);
@@ -1828,7 +1869,45 @@ fn parse_sqlite_url(rest: &str) -> Result<Connection, UrlError> {
     }
     let mut c = blank(SQLITE);
     c.file = path;
+    c.read_only = parse_query(query)
+        .iter()
+        .any(|(k, v)| asks_read_only(&normalize_key(k), v));
     Ok(c)
+}
+
+/// Does this parameter — `key` normalised — ask for a **read-only session**?
+///
+/// SQLite's URI `mode=ro` and `immutable=1`; libpq's `target_session_attrs`
+/// of `read-only` or `standby` and a `default_transaction_read_only` set
+/// through `options`; SQL Server's `ApplicationIntent=ReadOnly`. Each is how
+/// the engine's own client is told not to write — `sqlite3`, `psql` and
+/// `sqlcmd` given the string refuse a write — so a connection read from one
+/// is read-only, rather than the one word that said so being dropped as a
+/// parameter Schemaic has no field for. `prefer-standby` is not one: it
+/// falls back to a primary.
+fn asks_read_only(key: &str, v: &str) -> bool {
+    let value = normalize_key(v);
+    match key {
+        "mode" => value == "ro",
+        "immutable" => truthy(v),
+        "targetsessionattrs" => matches!(value.as_str(), "readonly" | "standby"),
+        "applicationintent" => value == "readonly",
+        "options" => {
+            // `-c default_transaction_read_only=on`, however spaced; libpq
+            // also takes `--default-transaction-read-only=on`.
+            let options = v.to_ascii_lowercase().replace('-', "_");
+            options
+                .match_indices("default_transaction_read_only")
+                .any(|(at, word)| {
+                    options[at + word.len()..]
+                        .trim_start()
+                        .strip_prefix('=')
+                        .and_then(|r| r.split_whitespace().next())
+                        .is_some_and(truthy)
+                })
+        }
+        _ => false,
+    }
 }
 
 fn parse_server_url(engine: &str, rest: &str) -> Result<Connection, UrlError> {
@@ -1990,7 +2069,8 @@ fn apply_params(c: &mut Connection, params: &[(String, String)]) {
         }
         match normalize_key(k).as_str() {
             "user" | "username" | "uid" => set_if_empty(&mut c.user, v),
-            "password" | "pwd" | "pass" => set_if_empty(&mut c.password, v),
+            // `passwd` is MySQLdb's.
+            "password" | "pwd" | "pass" | "passwd" => set_if_empty(&mut c.password, v),
             "database" | "dbname" | "db" => set_if_empty(&mut c.database, v),
             "sslmode" => {
                 if let Some(m) = sslmode_from_str(v) {
@@ -2014,6 +2094,7 @@ fn apply_params(c: &mut Connection, params: &[(String, String)]) {
             }
             "sslcert" => set_if_empty(&mut c.tls.client_cert_path, v),
             "sslkey" => set_if_empty(&mut c.tls.client_key_path, v),
+            key if asks_read_only(key, v) => c.read_only = true,
             _ => {}
         }
     }
@@ -4620,6 +4701,55 @@ mod tests {
             url("sqlite:///var/db/app.db?mode=ro").file,
             "/var/db/app.db"
         );
+    }
+
+    /// **A read-only request is a read-only connection**, in each engine's
+    /// own spelling — and only a request: `mode=rw`, `prefer-standby`, an
+    /// `options` turning it off are not.
+    #[test]
+    fn a_url_asking_for_a_read_only_session_is_read_only() {
+        for u in [
+            "sqlite:///var/db/app.db?mode=ro",
+            "sqlite:///var/db/app.db?immutable=1",
+            "postgres://h/d?target_session_attrs=standby",
+            "postgres://h/d?options=-c%20default_transaction_read_only%3Don",
+            "postgres://h/d?options=--default-transaction-read-only%3Dtrue",
+            "Server=tcp:h;Database=d;ApplicationIntent=ReadOnly",
+            "jdbc:sqlserver://h;databaseName=d;applicationIntent=ReadOnly",
+        ] {
+            assert!(url(u).read_only, "{u}");
+        }
+        for u in [
+            "sqlite:///var/db/app.db?mode=rw",
+            "postgres://h/d?target_session_attrs=prefer-standby",
+            "postgres://h/d?options=-c%20default_transaction_read_only%3Doff",
+            "postgres://h/d?options=-c%20statement_timeout%3D5",
+            "Server=tcp:h;Database=d;ApplicationIntent=ReadWrite",
+        ] {
+            assert!(!url(u).read_only, "{u}");
+        }
+    }
+
+    /// **`read_url` says whether the text held a secret**, kept or not — an
+    /// Entra password the parser clears, a key it does not read — and not
+    /// for a user with no password.
+    #[test]
+    fn read_url_reports_a_secret_the_connection_did_not_keep() {
+        let carried = |u: &str| read_url(u).unwrap().carried_secret;
+        assert!(carried("postgres://u:pw@h/d"));
+        assert!(carried("postgres://u@h/d?sslpassword=k"));
+        assert!(carried("mysql://u@h/d?passwd=p"));
+        assert!(carried(
+            "jdbc:sqlserver://h;databaseName=d;trustStorePassword=t"
+        ));
+        let entra =
+            "Server=tcp:h;Database=d;Authentication=ActiveDirectoryPassword;User Id=u;Password=E";
+        let r = read_url(entra).unwrap();
+        assert!(r.connection.password.is_empty() && r.carried_secret);
+        assert!(r.notes.contains(&ImportNote::ExternalLogin));
+        assert!(!carried("postgres://u@h/d?sslmode=require"));
+        assert!(!carried("Server=tcp:h;Database=d;User Id=u"));
+        assert!(!carried("sqlite:///var/db/app.db"));
     }
 
     #[test]

@@ -1010,10 +1010,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   defaulting — `ai::mcp_endpoint_from_env` returns `Err`, because the fallback was a
   `127.0.0.1:3306` endpoint with every access gate back on. Don't add new plaintext-secret surfaces.
   **`schemaic --url` puts a URL on argv, and squares with this by refusing any that carries a
-  credential**: `cli/run.rs`'s `one_off_connection` refuses a URL whose parse filled the password
-  — a userinfo or a JDBC `?password=` alike — without repeating it, and the password comes from
-  `--password-stdin` or the `SCHEMAIC_PASSWORD` environment variable, neither of which is argv
-  (`a_url_with_a_password_is_refused`). The URL is input, parsed once into a `Connection` that
+  credential**: `cli/run.rs`'s `one_off_connection` refuses a URL whose text held a secret —
+  `conn_import::read_url`'s `carried_secret`, asked of the redactor, so a userinfo, a JDBC
+  `?password=`, an Entra password the parser drops and an `sslpassword` it never reads alike —
+  without repeating it, and the password comes from `--password-stdin` or the
+  `SCHEMAIC_PASSWORD` environment variable, neither of which is argv
+  (`a_url_with_a_password_is_refused`, `a_url_carrying_any_secret_is_refused`). It used to ask
+  whether the parse had *filled* the password, which the last two of those passed. The URL is input, parsed once into a `Connection` that
   then goes through `connect` like any other — never the connection's identity, and never saved.
   **"Never in a log" includes a log the environment asked for.** `app::logging`'s
   `log_directives`/`filter_for` append `russh=warn`, `russh_cryptovec=warn` and `russh_util=warn`

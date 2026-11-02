@@ -3880,7 +3880,7 @@ import-added-foreign = { $count ->
         [one] S-a adăugat { $count } conexiune.
         [few] S-au adăugat { $count } conexiuni.
        *[other] S-au adăugat { $count } de conexiuni.
-    } Doar citire și eticheta de mediu nu sunt preluate din alt client — setează-le în Gestionează conexiunile pentru tot ce contează.
+    } Eticheta de mediu nu este preluată din alt client, iar doar citire numai acolo unde URL-ul a cerut-o — setează-le în Gestionează conexiunile pentru tot ce contează.
 conn-delete-title = Șterge „{ $name }”
 conn-delete-question = Aceasta șterge conexiunea, parola stocată, conversația AI salvată, istoricul interogărilor și filele ei. Acțiunea nu poate fi anulată.
 conn-delete-keyring-kept = Schemaic nu a putut accesa keyring-ul sistemului, așa că parola stocată și secretele SSH ale conexiunii șterse **sunt încă în el**.

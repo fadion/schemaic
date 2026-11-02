@@ -174,11 +174,29 @@ Both used to import as an ordinary ticked row whose host was the sub-protocol or
 name, the database lost (`a_jdbc_sub_protocol_is_not_the_host`,
 `a_host_less_pgjdbc_url_is_localhost`) — and since project discovery reads every project the
 IDE lists, they arrived without the user picking the file.
-**`schemaic --url` is `parse_url`'s one caller outside an import** (`cli/run.rs`'s
-`one_off_connection`), so whatever it accepts is what the CLI accepts. There the `id: 0` is never
-replaced, which is why the CLI never asks the keyring for that connection, and a parse that
-fills `password` — a userinfo or a JDBC `?password=` alike — is refused rather than used, the
-password being on argv; `cli/run.md` has both.
+**`schemaic --url` is this module's one caller outside an import** (`cli/run.rs`'s
+`one_off_connection`), so whatever it accepts is what the CLI accepts. It calls **`read_url`**, not
+`parse_url`: a `UrlReading` is the connection, the notes the review list would have shown beside
+it, and **`carried_secret`** — `redacted(input) != input`, whether the text held a secret whether
+or not the connection kept one. The CLI refuses on that rather than on `password`, because an
+Entra password the parser clears and a key no parser reads are on argv all the same, and asking
+`redacted` keeps the question the one that already hides exactly the secrets in every grammar
+here (`read_url_reports_a_secret_the_connection_did_not_keep`). For it, **`is_password_key`
+widened** from the spellings `apply_params` reads (`pwd`, `pass`, `passwd` — MySQLdb's, which
+`apply_params` now reads too) to every key containing `password` or `secret`: libpq's
+`sslpassword`, JDBC's `trustStorePassword`, a `client_secret` — which the not-imported list,
+asking the same function, now hides too. There the `id: 0` is never replaced, which is why the CLI never asks the keyring for that
+connection; `cli/run.md` has that and the refusals.
+**A URL that asks for a read-only session imports read-only** (`asks_read_only`): SQLite's
+`mode=ro` and `immutable=1`, libpq's `target_session_attrs` of `read-only` or `standby` and a
+`default_transaction_read_only` set through `options` (either `-c` spelling), SQL Server's
+`ApplicationIntent=ReadOnly`. Each is how the engine's own client is told not to write, and it
+used to be dropped as a parameter Schemaic had no field for — on a `--url`, the one place the
+person had said it. `parse_sqlite_url`, `apply_params`, `parse_mssql_url` and
+`parse_connection_string` set `Connection::read_only` from it, so an import row from such a
+string arrives read-only too. Only a request counts: `mode=rw`, `prefer-standby` (which falls
+back to a primary) and an `options` turning it off do not
+(`a_url_asking_for_a_read_only_session_is_read_only`).
 **SQL Server has a grammar of its own, and it is not a URL's.** `engine_for_scheme` takes
 `sqlserver` (JDBC, Prisma) and `mssql` (SQLAlchemy's `mssql+pyodbc`, node) as `MSSQL`, and jTDS's
 `jdbc:jtds:sqlserver://` has its `jtds:` stripped under the `jdbc:` one. What follows is
@@ -536,7 +554,8 @@ that does not parse as the envelope — bad JSON, no `schemaic_connections` key 
 (`a_file_that_is_not_an_export_is_unreadable`). Unlike every other source, the row arrives as
 written rather than through `blank`, so read-only, the environment and the folder come across —
 Schemaic's own guard rails, which the reason other sources blank them (guessing another tool's
-is worse) does not reach — and `import_chosen`'s closing notice that they were *not carried
+is worse) does not reach; another source's read-only comes across only where its URL asked for
+one in so many words (`asks_read_only`, above) — and `import_chosen`'s closing notice that they were *not carried
 over* is said only when a row from another client was among those added. The import still
 re-picks the colour and uniquifies the name, as it does for any row.
 `EXPORT_FILE_SUFFIX` (`schemaic-connections.json`) is the end of an export's file name and the

@@ -634,7 +634,8 @@ fn footer(
     // row as a `text_ellipsis()` slot about 350 px wide, and the sentence it
     // carries is ~190 characters — so the user read `Added 3 connections.
     // Read-only and the en…` and the warning the line exists to deliver, that
-    // read-only and the environment badge are *not* carried over, never reached
+    // the environment badge is *not* carried over (nor read-only, unless the
+    // source's URL asked for it), never reached
     // the screen at all. The slot was sized for the sentence it was first given.
     //
     // That row is `modal_footer_noted`'s, not a `v_stack` handed to

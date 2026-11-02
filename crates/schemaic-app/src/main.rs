@@ -18683,9 +18683,9 @@ mod app_tests {
         assert_eq!(tr!("import-added", count = 4), "Added 4 connections.");
         assert_eq!(
             tr!("import-added-foreign", count = 1),
-            "Added 1 connection. Read-only and the environment badge are not carried \
-             over from another client — set them in Manage connections for anything \
-             that matters."
+            "Added 1 connection. The environment badge is not carried over from another \
+             client, and read-only only where its URL asked for it — set them in Manage \
+             connections for anything that matters."
         );
     }
 

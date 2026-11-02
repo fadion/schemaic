@@ -37,8 +37,11 @@ ticked, with a note where something needs your attention:
 Untick what you don't want and press **Import**. Imported passwords go to the keyring, like any
 other.
 
-Read-only mode and the environment badge are never brought over from another client: set them on
-anything that matters before you use it. See [Safeguards](safeguards.md).
+The environment badge is never brought over from another client, and read-only mode only where a
+URL — pasted, or a DBeaver or DataGrip connection's — asks for a read-only session, such as
+SQLite's `?mode=ro`, PostgreSQL's `target_session_attrs=read-only` or SQL Server's
+`ApplicationIntent=ReadOnly`. Set both on anything that matters before you use it. See
+[Safeguards](safeguards.md).
 
 ## Sharing your connections
 

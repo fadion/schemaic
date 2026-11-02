@@ -58,18 +58,37 @@ than either, and whichever bound is shorter answers first.
 **A `--url` connection takes the same two steps, and is built rather than looked up.**
 `select_conn` returns a `Cow<'a, Connection>`: `Borrowed` for a saved one, through
 `select::select` and its CLI-access gate exactly as before, and `Owned` for a URL, through
-`one_off_connection(url, read_only, stdin_is_protocol)` — `core::conn_import::parse_url`, then
-three decisions.
-**A URL that carries a password is refused**, exit 2, and the password is never repeated
-(a JDBC `?password=` counts, `parse_url` having read it into the same field): argv is readable
-by every process on the machine and lands in the shell's history, the exposure the rest of this
-CLI keeps a password out of, so the message points at `--password-stdin` and `SCHEMAIC_PASSWORD`
-instead — or at `SCHEMAIC_PASSWORD` alone when `ConnArgs::stdin_is_protocol` is set (`mcp`'s,
-below), since offering a flag the command does not have sends the user to a parse error
-(`a_url_with_a_password_is_refused`, both wordings). **`cli_access` is `true`** — the person typed the
-connection, and the flag exists to keep a *saved* one out of reach until they say so — `read_only`
-is `--read-only`'s, and the AI data level is left as `parse_url` left it, unset — only `mcp` reads
-it, and `serve_mcp` sets it from `--ai-data` (below)
+`one_off_connection(url, read_only, stdin_is_protocol)` — `core::conn_import::read_url`, which
+is `parse_url` keeping what an unreviewed caller has to judge it on, then three refusals and
+three decisions. A `--url` is a connection nobody reviews: in the app the same string becomes a
+row with its notes beside it and a tick to withhold, and here it is dialled.
+**A URL that carried a secret is refused**, exit 2, and the secret is never repeated: argv is
+readable by every process on the machine and lands in the shell's history, the exposure the rest
+of this CLI keeps a password out of, so the message points at `--password-stdin` and
+`SCHEMAIC_PASSWORD` instead — or at `SCHEMAIC_PASSWORD` alone when
+`ConnArgs::stdin_is_protocol` is set (`mcp`'s, below), since offering a flag the command does not
+have sends the user to a parse error (`a_url_with_a_password_is_refused`, both wordings). **It
+asks `UrlReading::carried_secret`, what the text held, not whether the parsed connection kept a
+password** — the refusal used to test `conn.password`, which let through an Entra
+`ActiveDirectoryPassword` string's `Password=` (the parser clears it; `core/conn_import.md` has
+why), MySQLdb's `passwd`
+(which `apply_params` did not read) and every secret key no parser reads — libpq's
+`sslpassword`, JDBC's `trustStorePassword` — all on the command line just the same
+(`a_url_carrying_any_secret_is_refused`). **A sign-in that sends the user's own identity is
+refused** — any `auth` but `AuthMode::Password`, the message naming the host: Windows sign-in's
+NTLM exchange, or a Microsoft Entra, AWS or Google Cloud token, would go to whatever host the URL
+names, and a URL's host is nobody's promise. It is the CLI's form of the import's unticked
+`ImportNote::SignsInAs` row, and the answer it gives is to save the connection in Schemaic.
+**And so is an `ImportNote::ExternalLogin`** — an Entra method Schemaic lacks, which leaves
+`auth` a password and would go in as a SQL login of that name
+(`a_url_signing_in_as_the_user_is_refused`). **`cli_access` is `true`** — the person typed the
+connection, and the flag exists to keep a *saved* one out of reach until they say so —
+**`read_only` is the URL's or'd with `--read-only`'s**, so a `mode=ro`, a
+`target_session_attrs=read-only` or an `ApplicationIntent=ReadOnly` (`conn_import`'s
+`asks_read_only` has the list) is kept and the flag can only add one: the URL is the whole of the
+connection's configuration, and that word is the person's only statement of it
+(`a_url_asking_for_read_only_is_read_only`). The AI data level is left as `parse_url` left it,
+unset — only `mcp` reads it, and `serve_mcp` sets it from `--ai-data` (below)
 (`a_url_connection_has_cli_access_and_the_read_only_asked_for`). Every caller
 then shadows `let conn = &*conn;`, so nothing downstream knows which it got. In `connect`, **a
 `--url` connection never asks the keyring**: it was never saved, so the keyring holds nothing of
@@ -496,8 +515,8 @@ exposed-then-unexposed pair refused with the exposed one's host never dialled, a
 `-c` a usage error.
 **A `--url` is one more connection in that list, after the `-c`s**, so with any of them it is not
 the default. It becomes a `ConnArgs { url, stdin_is_protocol }` and goes through the same `select_conn`, so
-`one_off_connection`'s two rules hold here as everywhere — a password in the URL refused, exit 2,
-and `cli_access` implied. Its password is `SCHEMAIC_PASSWORD`'s alone (`connect`'s URL branch),
+`one_off_connection`'s rules hold here as everywhere — a secret in the URL, or a sign-in as the
+user, refused, exit 2, and `cli_access` implied. Its password is `SCHEMAIC_PASSWORD`'s alone (`connect`'s URL branch),
 stdin being the protocol's. **Its AI data level is `--ai-data`'s, else `AiData::SchemaOnly`** — a
 level nobody chose is the narrowest, as a saved connection's never-chosen one sends no rows
 either — set on the selected `Cow` before the duplicate check; `--ai-data` without a `--url` is

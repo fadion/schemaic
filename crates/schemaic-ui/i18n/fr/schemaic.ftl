@@ -3748,7 +3748,7 @@ import-added = { $count ->
 import-added-foreign = { $count ->
         [one] { $count } connexion ajoutée.
        *[other] { $count } connexions ajoutées.
-    } La lecture seule et le badge d'environnement ne sont pas repris d'un autre client — définissez-les dans Gérer les connexions pour tout ce qui compte.
+    } Le badge d'environnement n'est pas repris d'un autre client, et la lecture seule seulement là où son URL la demandait — définissez-les dans Gérer les connexions pour tout ce qui compte.
 conn-delete-title = Supprimer « { $name } »
 conn-delete-question = Cela supprime la connexion, son mot de passe enregistré, sa conversation IA enregistrée, son historique de requêtes et ses onglets. Cette action est irréversible.
 conn-delete-keyring-kept = Schemaic n'a pas pu joindre le trousseau du système : le mot de passe et les secrets SSH enregistrés de la connexion supprimée **y sont toujours**.

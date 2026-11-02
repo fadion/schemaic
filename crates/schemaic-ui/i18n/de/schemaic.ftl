@@ -3447,7 +3447,7 @@ import-added = { $count ->
 import-added-foreign = { $count ->
         [one] { $count } Verbindung hinzugefügt.
        *[other] { $count } Verbindungen hinzugefügt.
-    } Schreibschutz und Umgebungs-Badge werden aus einem anderen Client nicht übernommen – lege sie unter Verbindungen verwalten für alles fest, worauf es ankommt.
+    } Das Umgebungs-Badge wird aus einem anderen Client nicht übernommen, der Schreibschutz nur, wo seine URL ihn verlangt hat – lege sie unter Verbindungen verwalten für alles fest, worauf es ankommt.
 conn-delete-title = „{ $name }“ löschen
 conn-delete-question = Dies löscht die Verbindung, ihr gespeichertes Passwort, ihre gespeicherte KI-Unterhaltung, ihren Abfrageverlauf und ihre Tabs. Das lässt sich nicht rückgängig machen.
 conn-delete-keyring-kept = Schemaic konnte den Schlüsselbund des Betriebssystems nicht erreichen, daher sind das gespeicherte Passwort und die SSH-Geheimnisse der gelöschten Verbindung **noch darin**.

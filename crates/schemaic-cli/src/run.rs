@@ -1461,18 +1461,26 @@ fn select_conn<'a>(
 /// only the variable when `stdin_is_protocol` (`mcp`), which has no
 /// `--password-stdin` to offer.
 ///
+/// **A sign-in as the user is refused** — Windows sign-in, or an Entra, AWS
+/// or Google token — since it would hand their identity to whatever host the
+/// URL names, as is an Entra method Schemaic lacks, which would go in as a
+/// SQL login. The app's import leaves both rows unticked; here nobody looks.
+///
 /// **CLI access is implied** — the person typed the connection; the flag
-/// exists to keep a *saved* connection out of reach until they say so. Its
-/// read-only flag is `--read-only`'s, and its AI data level stays the
-/// default, which no CLI command but `mcp` reads.
+/// exists to keep a *saved* connection out of reach until they say so. It is
+/// read-only if the URL asked for a read-only session or `--read-only` did,
+/// and its AI data level stays the default, which no CLI command but `mcp`
+/// reads.
 fn one_off_connection(
     url: &str,
     read_only: bool,
     stdin_is_protocol: bool,
 ) -> Result<Connection, String> {
-    let mut conn = schemaic_core::conn_import::parse_url(url)
-        .map_err(|e| format!("--url: {}", e.message()))?;
-    if !conn.password.is_empty() {
+    use schemaic_core::conn_import::{ImportNote, read_url};
+    use schemaic_core::connection::AuthMode;
+    let reading = read_url(url).map_err(|e| format!("--url: {}", e.message()))?;
+    let mut conn = reading.connection;
+    if reading.carried_secret {
         let carrier = if stdin_is_protocol {
             "SCHEMAIC_PASSWORD"
         } else {
@@ -1483,8 +1491,32 @@ fn one_off_connection(
              list and your shell's history; take it out of the URL and give it with {carrier}"
         ));
     }
+    let host = conn.host.clone();
+    if conn.auth != AuthMode::Password {
+        let who = match conn.auth {
+            AuthMode::Windows => "your Windows login",
+            AuthMode::AzureCli => "your Microsoft Entra account",
+            AuthMode::AwsIam => "your AWS identity",
+            AuthMode::GcpIam => "your Google Cloud account",
+            AuthMode::Password => unreachable!(),
+        };
+        return Err(format!(
+            "--url signs in with {who}, which would hand your identity to {host}; \
+             a URL's host is nobody's promise, so save the connection in Schemaic \
+             to sign in that way"
+        ));
+    }
+    if reading.notes.contains(&ImportNote::ExternalLogin) {
+        return Err(format!(
+            "--url names a sign-in to {host} that Schemaic cannot perform, and would \
+             go in as a SQL login instead; give a SQL login's user, or save the \
+             connection in Schemaic"
+        ));
+    }
     conn.cli_access = true;
-    conn.read_only = read_only;
+    // A URL that asks for a read-only session keeps it; `--read-only`
+    // can only add one.
+    conn.read_only |= read_only;
     Ok(conn)
 }
 
@@ -3363,6 +3395,72 @@ mod tests {
         );
     }
 
+    /// **A sign-in that sends the user's own identity is refused** — Windows
+    /// sign-in's NTLM exchange or an Entra token, which would go to whatever
+    /// host the URL names. The app's import leaves the same row unticked.
+    #[test]
+    fn a_url_signing_in_as_the_user_is_refused() {
+        let url = "sqlserver://sql.attacker.example;authentication=ActiveDirectoryDefault";
+        let why = one_off_connection(url, false, false).unwrap_err();
+        assert!(why.contains("sql.attacker.example"), "{why}");
+        let ado =
+            "Server=tcp:sql.attacker.example;Database=d;Authentication=ActiveDirectoryDefault";
+        assert!(one_off_connection(ado, false, false).is_err());
+        #[cfg(windows)]
+        assert!(
+            one_off_connection(
+                "Server=tcp:h;Database=d;Integrated Security=true",
+                false,
+                false
+            )
+            .is_err()
+        );
+        // An Entra method Schemaic does not have would sign in as a SQL login
+        // with that name: refused too, though `auth` stays a password.
+        let interactive = "Server=tcp:h;Database=d;Authentication=ActiveDirectoryInteractive;User Id=me@corp.example";
+        assert!(one_off_connection(interactive, false, false).is_err());
+    }
+
+    /// **The refusal asks what the URL carried, not what survived parsing** —
+    /// an Entra password the parser clears, and the secret keys it never
+    /// reads, are passwords on the command line all the same.
+    #[test]
+    fn a_url_carrying_any_secret_is_refused() {
+        for url in [
+            "Server=tcp:h;Database=d;Authentication=ActiveDirectoryPassword;User Id=u;Password=Entra-Pw",
+            "postgresql://u@h/d?sslpassword=k3y",
+            "mysql://u@h/d?passwd=pw",
+            "jdbc:sqlserver://h;databaseName=d;trustStorePassword=ts",
+        ] {
+            let why = one_off_connection(url, false, false).unwrap_err();
+            assert!(why.contains("SCHEMAIC_PASSWORD"), "{url}: {why}");
+        }
+    }
+
+    /// **A URL asking for a read-only session gets one** — the URL is the
+    /// whole of a `--url` connection's configuration, so the word that says
+    /// "don't write" is the person's only statement of it.
+    #[test]
+    fn a_url_asking_for_read_only_is_read_only() {
+        for url in [
+            "sqlite:///srv/app.db?mode=ro",
+            "file:/srv/app.db?mode=ro",
+            "sqlite:///srv/app.db?immutable=1",
+            "postgresql://report@db/shop?options=-c%20default_transaction_read_only%3Don",
+            "postgresql://report@db/shop?target_session_attrs=read-only",
+            "Server=tcp:h;Database=d;User Id=u;ApplicationIntent=ReadOnly",
+            "sqlserver://h;databaseName=d;applicationIntent=ReadOnly",
+        ] {
+            let c = one_off_connection(url, false, false).unwrap();
+            assert!(c.read_only, "{url}");
+        }
+        assert!(
+            !one_off_connection("sqlite:///srv/app.db?mode=rw", false, false)
+                .unwrap()
+                .read_only
+        );
+    }
+
     /// **Every connection `mcp` serves knows stdin is the protocol's** — the
     /// composition that brings the wording above to `mcp --url`'s refusal.
     #[test]
@@ -3398,8 +3496,8 @@ mod tests {
         );
     }
 
-    /// The person typed it, so CLI access is theirs to give; read-only is
-    /// `--read-only`'s, and nothing else is invented.
+    /// The person typed it, so CLI access is theirs to give; `--read-only`
+    /// makes it read-only, and nothing else is invented.
     #[test]
     fn a_url_connection_has_cli_access_and_the_read_only_asked_for() {
         let c = one_off_connection("postgresql://app@pg.example:5433/shop", true, false).unwrap();

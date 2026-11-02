@@ -3742,7 +3742,7 @@ import-added = { $count ->
 import-added-foreign = { $count ->
         [one] Se ha añadido { $count } conexión.
        *[other] Se han añadido { $count } conexiones.
-    } Solo lectura y la etiqueta de entorno no se trasladan desde otro cliente: configúralas en Gestionar conexiones para todo lo que importe.
+    } La etiqueta de entorno no se traslada desde otro cliente, y solo lectura solo donde su URL lo pidió: configúralas en Gestionar conexiones para todo lo que importe.
 conn-delete-title = Eliminar «{ $name }»
 conn-delete-question = Esto elimina la conexión, su contraseña guardada, su conversación de IA guardada, su historial de consultas y sus pestañas. No se puede deshacer.
 conn-delete-keyring-kept = Schemaic no ha podido acceder al llavero del sistema, así que la contraseña guardada y los secretos SSH de la conexión eliminada **siguen en él**.

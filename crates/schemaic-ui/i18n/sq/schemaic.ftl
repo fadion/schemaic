@@ -3745,7 +3745,7 @@ import-added = { $count ->
 import-added-foreign = { $count ->
         [one] U shtua { $count } lidhje.
        *[other] U shtuan { $count } lidhje.
-    } “Vetëm për lexim” dhe etiketa e mjedisit nuk barten nga një klient tjetër — caktojini te “Menaxho lidhjet” për çdo gjë që ka rëndësi.
+    } Etiketa e mjedisit nuk bartet nga një klient tjetër, kurse “Vetëm për lexim” vetëm aty ku e kërkoi URL-ja — caktojini te “Menaxho lidhjet” për çdo gjë që ka rëndësi.
 conn-delete-title = Fshi “{ $name }”
 conn-delete-question = Kjo fshin lidhjen, fjalëkalimin e saj të ruajtur, bisedën e ruajtur me AI, historikun e kërkesave dhe skedat e saj. Nuk mund të zhbëhet.
 conn-delete-keyring-kept = Schemaic nuk mundi të arrinte keyring-un e sistemit operativ, kështu fjalëkalimi i ruajtur dhe sekretet SSH të lidhjes së fshirë **janë ende aty**.
