@@ -70,7 +70,8 @@ face and padding on its own container rather than sharing a helper — `section_
 text and this styles the box the dots live in, so a helper would have to return a view either
 way.
 **A right-click on the tree's empty space raises its own menu** — `Refresh`,
-`Users and privileges`, `Server variables` and `Create database`, all four about the *panel*
+`Users and privileges`, `Server variables`, `Performance` and `Create database`, all five about
+the *panel*
 (or the server behind it) rather than about anything in it,
 because nothing in it was clicked. It hangs off the tree's own box with no hit test of its own:
 every row raises its
@@ -84,7 +85,8 @@ out to be asserted like `overlays::create_children`, and it returns `BlankEntry`
 with a catch-all arm a third entry falls into whichever branch was written last and renders as
 a live row that does nothing. A `BlankEntry` is `{ kind, disabled }` and holds no text:
 `BlankKind::label()` draws it from the kind, out of the SCHEMA gear's own messages
-(`tree-refresh`, `tree-users`, `tree-server-variables`, `tree-new-database`), since the two
+(`tree-refresh`, `tree-users`, `tree-server-variables`, `tree-performance`,
+`tree-new-database`), since the two
 menus are two homes for the same actions. `tree-new-database` was `tree-gear-create-database`
 until both menus used it; under Create ▸ the entry is the noun alone, `tree-create-database`.
 **The early return now asks whether the engine has anything here beyond `Refresh`** —
@@ -92,7 +94,9 @@ until both menus used it; under Create ▸ the entry is the noun alone, `tree-cr
 is the rule SQLite's menu is held to, and it now passes it**: having neither a database to
 create nor an account to browse, SQLite raised **nothing at all** until
 `server_vars::supports_server_vars` gave it a real second entry — its PRAGMAs — and it now
-raises `Refresh` and `Server variables` (`blank_space_on_sqlite_offers_only_what_sqlite_has`).
+raises `Refresh`, `Server variables` and `Performance`
+(`blank_space_on_sqlite_offers_only_what_sqlite_has`). `Performance` asks no capability, so it is
+not one of the early return's questions: it is pushed on every engine the menu is raised on.
 The original point stands: a one-row menu on blank space reads as a misfire, and the gear still
 carries Refresh for anyone looking for it. Left asking only the first question, that lone
 `Refresh` would have appeared the moment a second entry arrived.
@@ -105,7 +109,10 @@ still above the write one. What moves is only which of the two reads is under th
 nothing. It is dimmed on a **down** connection and **not** on a read-only one —
 browsing accounts writes nothing, and the write actions inside the browser gate themselves —
 where `Create database` is dimmed on either. `Server variables` follows it inside group 2 and is
-gated the same way, being a read of the server too.
+gated the same way, being a read of the server too, and `Performance` follows that, as on the
+gear, gated the same again — every engine has something to show (SQLite its index health and
+its `dbstat` sizes), so it asks for a connection only, and the builder opens it through
+`perf_view::open_for_active` with the active tab's database, as the gear does.
 `blank_space_is_a_subsequence_of_the_skeleton` is
 this menu's own half of `overlays::menu_order_gate`, which cannot see a menu built in this file,
 and walks every dialect in `SqlDialect::ALL`, SQLite's menu included, placing each entry by

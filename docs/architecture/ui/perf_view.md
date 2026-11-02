@@ -13,10 +13,13 @@ SQL Server suggestion each go through the table's draft, `ddl::diff` and the DDL
 statement that would turn a missing statistics source on is shown, never run. Modelled on the
 Server variables viewer (`ui/server_vars_view.md`), and mounted in the workspace group directly
 after it; on `modal_backdrop_gate::PAINTS_A_BACKDROP`.
-**Two entry points, one door.** `GearKind::Performance` in the SCHEMA gear, directly after
-`Server variables` and before `Create database`, and the palette's `performance` command
-(*Performance*), an `instant` command. The gear row is **present whenever a connection exists and
-asks no capability** — every engine has something to show, SQLite its index health and its
+**Three entry points, one door.** `GearKind::Performance` in the SCHEMA gear and
+`BlankKind::Performance` in the tree's blank-space menu, each directly after `Server variables`
+and before `Create database` (skeleton group 2, beside `tree-server-variables` in
+`overlays::menu_order_gate::group`), and the palette's `performance` command
+(*Performance*), an `instant` command. The gear row — and the blank-space row, wherever that
+menu is raised at all — is **present whenever a connection exists and asks no capability** —
+every engine has something to show, SQLite its index health and its
 `dbstat` sizes with no statement history, which the view says — and dimmed on a **down**
 connection but not on a read-only one: it is a read, and its *Drop* and *Create index* land in the
 preview, which carries the read-only refusal. That is a departure from the row above it, which
@@ -24,8 +27,8 @@ asks `server_vars::supports_server_vars` although every engine answers `true`, s
 engine has to answer it rather than inherit a row; this one would be inherited. The palette
 command is omitted with no saved connection, beside *Server Variables* and for its reason — a row
 that closes the palette and does nothing reads as broken — and is not dimmed on a down
-connection, leaving that to the fetch. The tree's blank-space menu does not carry it. Both doors
-call `open_for_active(conn, overlay, tabs_ui.active_db)`, which resolves the active connection's
+connection, leaving that to the fetch. All three call
+`open_for_active(conn, overlay, tabs_ui.active_db)`, which resolves the active connection's
 name and dialect (a no-op with none), resets the list to Statements, the order to Total time and
 the state to `Loading` on the way in — `server_vars_view::open_for_server`'s rule, so a second
 opening never flashes the last one's list — and sets `OverlayUi::perf` to a `PerfTarget {

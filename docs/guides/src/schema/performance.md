@@ -6,7 +6,8 @@ reads. Anything it suggests you change goes through the SQL preview first.
 
 ## Opening it
 
-Choose **Performance** from the **SCHEMA** panel's gear menu, or from the command palette. It
+Choose **Performance** from the **SCHEMA** panel's gear menu, from a right-click on the tree's
+empty space, or from the command palette. It
 opens on the active connection and the database chosen in the query toolbar, both named in the
 title.
 

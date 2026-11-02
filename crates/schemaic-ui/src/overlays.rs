@@ -8774,6 +8774,7 @@ fn ",
             // Raised from the same two places as the browser, for the same
             // reason, and a read of the server like it.
             | "tree-server-variables"
+            | "tree-performance"
             | "tree-refresh"
             | "tree-collapse-all" => 2,
             // 3. Tree state — the row, not the object.

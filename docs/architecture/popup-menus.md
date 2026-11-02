@@ -194,7 +194,8 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   The SCHEMA gear put `Create database` (group 4) *above* `Users and privileges` (group 2), and the
   tree's blank-space menu did the same; the gear now runs Refresh · Collapse all · Users and
   privileges · Server variables · Performance · Create database · Show table sizes, and the
-  blank-space menu
+  blank-space menu runs Refresh · Users and privileges · Server variables · Performance · Create
+  database and
   carries its own half of
   the gate in `schema_tree::blank_space_is_a_subsequence_of_the_skeleton`, asserted over the entry
   **values** rather than over the source, since unlike the context menus those entries are data,
@@ -205,8 +206,8 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   that can disagree with the original in silence; now there is one table for every menu, and
   `every_blank_entry_label_is_its_id` holds the id to the message `BlankKind::label` actually
   draws, or the gate would be ordering one entry while the menu showed another. That is why
-  `tree-users`, `tree-server-variables` (group 2 both, the second a read of the server like the
-  first) and `tree-new-database` (group 4) are in this table at all: none is **a context-menu row
+  `tree-users`, `tree-server-variables`, `tree-performance` (group 2 all three, the second and
+  third reads of the server like the first) and `tree-new-database` (group 4) are in this table at all: none is **a context-menu row
   today**, but an unknown id fails, so a second menu cannot place an entry this one has never
   heard of. The
   vacuity guard (`arms.len() == 7`) counts arms of the builder the gate already reads, so it cannot

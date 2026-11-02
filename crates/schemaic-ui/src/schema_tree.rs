@@ -1029,6 +1029,12 @@ fn blank_space_menu(ui: &Ui) -> Vec<widgets::MenuEntry> {
             BlankKind::ServerVariables => {
                 crate::server_vars_view::open_for_active(ui.conn, ui.overlay)
             }
+            // On the query toolbar's database, as the gear's entry is.
+            BlankKind::Performance => crate::perf_view::open_for_active(
+                ui.conn,
+                ui.overlay,
+                ui.tabs_ui.active_db.get_untracked(),
+            ),
         })
         .disabled(e.disabled)
     })
@@ -1048,6 +1054,7 @@ pub(crate) enum BlankKind {
     Refresh,
     Users,
     ServerVariables,
+    Performance,
 }
 
 impl BlankKind {
@@ -1059,6 +1066,7 @@ impl BlankKind {
             BlankKind::Refresh => tr!("tree-refresh"),
             BlankKind::Users => tr!("tree-users"),
             BlankKind::ServerVariables => tr!("tree-server-variables"),
+            BlankKind::Performance => tr!("tree-performance"),
         }
     }
 
@@ -1072,6 +1080,7 @@ impl BlankKind {
             BlankKind::Refresh => "tree-refresh",
             BlankKind::Users => "tree-users",
             BlankKind::ServerVariables => "tree-server-variables",
+            BlankKind::Performance => "tree-performance",
         }
     }
 }
@@ -1174,6 +1183,13 @@ pub(crate) fn blank_space_entries(
             disabled: down,
         });
     }
+    // Group 2 after the settings, as on the gear, and gated as they are. Every
+    // engine has something to show (SQLite its index health and sizes), so it
+    // asks for a connection only — which the guard above already did.
+    out.push(BlankEntry {
+        kind: BlankKind::Performance,
+        disabled: down,
+    });
     if databases {
         out.push(BlankEntry {
             kind: BlankKind::CreateDatabase,
@@ -4973,12 +4989,13 @@ mod tests {
             BlankKind::Refresh,
             BlankKind::Users,
             BlankKind::ServerVariables,
+            BlankKind::Performance,
         ] {
             assert_eq!(kind.label(), crate::i18n::LOADER.get(kind.id()), "{kind:?}");
         }
     }
 
-    /// Four entries, and all four about the panel rather than about anything
+    /// Five entries, and all five about the panel rather than about anything
     /// in it — nothing in it was clicked.
     ///
     /// **The kinds are asserted beside the labels**, because the menu builder
@@ -4986,7 +5003,7 @@ mod tests {
     /// render one thing and do another, and a labels-only assertion is exactly
     /// what would not notice.
     #[test]
-    fn blank_space_offers_refresh_accounts_settings_and_create() {
+    fn blank_space_offers_refresh_accounts_settings_performance_and_create() {
         for d in [SqlDialect::MySql, SqlDialect::Postgres] {
             assert_eq!(
                 blank_labels(d, false),
@@ -4994,6 +5011,7 @@ mod tests {
                     "Refresh",
                     "Users and privileges",
                     "Server variables",
+                    "Performance",
                     "Create database"
                 ],
                 "{d:?}"
@@ -5008,6 +5026,7 @@ mod tests {
                     BlankKind::Refresh,
                     BlankKind::Users,
                     BlankKind::ServerVariables,
+                    BlankKind::Performance,
                     BlankKind::CreateDatabase
                 ],
                 "{d:?}"
@@ -5015,17 +5034,22 @@ mod tests {
         }
     }
 
-    /// **SQLite's menu is Refresh and its settings, and nothing that is not
-    /// there.** It has no database to create — a database is a file — and no
-    /// accounts, so for a long time it raised no menu at all, a lone Refresh
-    /// reading as a misfire. Its PRAGMAs are a second, real entry, so the menu
-    /// now earns its place by the rule it was always held to.
+    /// **SQLite's menu is Refresh, its settings and Performance, and nothing
+    /// that is not there.** It has no database to create — a database is a file
+    /// — and no accounts, so for a long time it raised no menu at all, a lone
+    /// Refresh reading as a misfire. Its PRAGMAs are a second, real entry, so
+    /// the menu now earns its place by the rule it was always held to; its index
+    /// health and `dbstat` sizes are a third.
     #[test]
     fn blank_space_on_sqlite_offers_only_what_sqlite_has() {
         for read_only in [false, true] {
             let entries = blank_space_entries(SqlDialect::Sqlite, read_only, true, false);
-            assert_eq!(labels(&entries), ["Refresh", "Server variables"]);
+            assert_eq!(
+                labels(&entries),
+                ["Refresh", "Server variables", "Performance"]
+            );
             assert!(!disabled(&entries, "Server variables"), "a read");
+            assert!(!disabled(&entries, "Performance"), "a read");
         }
     }
 
@@ -5056,6 +5080,7 @@ mod tests {
                 "Refresh",
                 "Users and privileges",
                 "Server variables",
+                "Performance",
                 "Create database"
             ]
         );
@@ -5081,6 +5106,10 @@ mod tests {
         assert!(
             !disabled(&entries, "Server variables"),
             "reading settings writes nothing"
+        );
+        assert!(
+            !disabled(&entries, "Performance"),
+            "reading statistics writes nothing"
         );
     }
 
@@ -5116,6 +5145,10 @@ mod tests {
         assert!(
             disabled(&entries, "Server variables"),
             "a down connection has no settings to read"
+        );
+        assert!(
+            disabled(&entries, "Performance"),
+            "a down connection has no statistics to read"
         );
 
         // Down *and* read-only is still one dimmed entry, not a contradiction.
