@@ -39,8 +39,16 @@ and fails on a `return Err(` whose next ten lines name none of `Some(undone)`,
 `cancelled_import(` and `with_partial_rollback(`, with a floor of three `Some(undone)`. The
 `COMMIT` exit's `Server` holds the driver's own sentence, as every other exit's does: it held
 `qerr(e).to_string()`, already prefixed, so the modal said "query failed: query failed: …".
-PostgreSQL's arm is unchanged — it still races the whole of its own `import_on` — and its
-`Cancelled` really does mean nothing was written, every PostgreSQL table being transactional.
+**PostgreSQL's arm made the same move, for a different failure.** It raced the whole of its own
+load, so a cancel landing during the `COMMIT` dropped the future while the request, already
+handed to the connection task, committed on the server — and `Cancelled`, "rolled back; nothing
+was imported", was reported over committed rows that a retry inserted again. `pg::import_on`
+now checks the token between batches and races it only against each batch's `INSERT`
+(`cancel_query`, an explicit `ROLLBACK`, `Cancelled`), so `Cancelled` always follows the
+`ROLLBACK` of a transaction known to be open; **the `COMMIT` is never raced**, a cancel arriving
+once it is sent is too late, and the import reports what it committed. Like MySQL's it looks once
+more between the last batch and the `COMMIT`, the last moment a cancel can still undo the load. Its `Cancelled` really does mean nothing was
+written, every PostgreSQL table being transactional.
 `a_cancelled_import_rolls_back_and_says_so` and
 `a_cancelled_import_on_a_non_transactional_table_says_the_rows_remain` are the live pins — what
 each of them asserts, and why it takes two, is under `tests/live/` below.

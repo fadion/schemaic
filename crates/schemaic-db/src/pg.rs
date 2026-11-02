@@ -4797,6 +4797,10 @@ async fn import_on(
         total += affected;
     }
 
+    // The last moment a cancel can still undo the load, as MySQL's asks.
+    if cancel.is_cancelled() {
+        return cancelled().await;
+    }
     client
         .batch_execute("COMMIT")
         .await
