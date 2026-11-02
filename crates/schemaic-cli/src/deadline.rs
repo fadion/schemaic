@@ -74,9 +74,19 @@ pub async fn with_deadline_unwound<F>(
 where
     F: std::future::Future,
 {
+    // The timer below cannot fire while the future holds the executor, and
+    // on the CLI's current-thread runtime SQLite's import does, inline, for
+    // the whole load: the token is cancelled from a thread of its own too.
+    let _watchdog = Watchdog::arm(token.clone(), timeout);
     tokio::pin!(fut);
     tokio::select! {
-        r = &mut fut => Deadlined::InTime(r),
+        // Finished, but after the watchdog cancelled it: late, with what it
+        // said while unwinding.
+        r = &mut fut => if token.is_cancelled() {
+            Deadlined::Late(Some(r))
+        } else {
+            Deadlined::InTime(r)
+        },
         _ = tokio::time::sleep(timeout) => {
             token.cancel();
             Deadlined::Late(tokio::time::timeout(UNWIND_GRACE, fut).await.ok())
@@ -84,9 +94,45 @@ where
     }
 }
 
+/// Cancels a token after a timeout **from a thread of its own**, unless
+/// dropped first — the deadline for a future that blocks the executor its
+/// timer would run on. Dropping it ends the thread at once.
+struct Watchdog(#[allow(dead_code)] std::sync::mpsc::Sender<()>);
+
+impl Watchdog {
+    fn arm(token: CancellationToken, timeout: Duration) -> Watchdog {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(timeout) {
+                token.cancel();
+            }
+        });
+        Watchdog(tx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A future that blocks the executor is still cancelled on time** —
+    /// SQLite's import runs inline on the CLI's current-thread runtime, so
+    /// the timer arm could not fire until the load had finished, and
+    /// `--timeout` never stopped one. The token is what the load watches.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_future_blocking_the_executor_still_sees_the_cancel() {
+        let token = CancellationToken::new();
+        let watched = token.clone();
+        let blocking = async move {
+            let start = std::time::Instant::now();
+            while !watched.is_cancelled() && start.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            watched.is_cancelled()
+        };
+        let got = with_deadline_unwound(blocking, token, Duration::from_millis(50)).await;
+        assert!(matches!(got, Deadlined::Late(Some(true))), "{got:?}");
+    }
 
     /// A read that finishes in time comes back whole, and the clock is never
     /// consulted for it.
