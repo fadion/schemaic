@@ -235,6 +235,77 @@ fn pick<'a>(endpoints: &'a [Named<'a>], args: &Value) -> Result<&'a Endpoint, St
     }
 }
 
+/// The other connection a `compare_schemas` call names, when it names one —
+/// the one call that needs two endpoints, so [`serve_on`] answers it rather
+/// than `call_tool`, which is handed one.
+fn cross_connection_source<'a>(name: &str, args: &'a Value) -> Option<&'a str> {
+    (name == McpTool::CompareSchemas.name())
+        .then(|| args.get("source_connection").and_then(Value::as_str))
+        .flatten()
+        .filter(|s| !s.is_empty())
+}
+
+/// `compare_schemas` across two served connections: each resolved by name,
+/// each held to its own levels as `call_tool` holds one (`refusal_for`), and
+/// the call logged under the target's name, as any call is under its own.
+async fn compare_across(
+    endpoints: &[Named<'_>],
+    source_name: &str,
+    name: &str,
+    args: &Value,
+) -> Value {
+    let by_name = |want: Option<&str>| match want {
+        None => Ok(&endpoints[0]),
+        Some(w) => endpoints.iter().find(|n| n.name == w).ok_or_else(|| {
+            let names: Vec<&str> = endpoints.iter().map(|n| n.name).collect();
+            format!(
+                "No connection named {w:?} on this server; it serves {}.",
+                names.join(", ")
+            )
+        }),
+    };
+    let target_name = args
+        .get("connection")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let sides = by_name(target_name).and_then(|t| by_name(Some(source_name)).map(|s| (t, s)));
+    let (text, is_error) = match sides {
+        Err(why) => (why, true),
+        Ok((t, s)) => {
+            let refused = [t, s].into_iter().find_map(|n| {
+                let e = n.endpoint;
+                refusal_for(McpTool::CompareSchemas, e.samples, e.schema, e.host)
+            });
+            match refused {
+                Some(why) => (why.to_string(), true),
+                None => {
+                    Box::pin(compare_schemas(
+                        (t.endpoint, t.name),
+                        (s.endpoint, s.name),
+                        args,
+                    ))
+                    .await
+                }
+            }
+        }
+    };
+    // Logged under the target when it was found, else the default's name.
+    let logged = sides_target(endpoints, target_name);
+    if let Some(connection) = &logged.audit_as {
+        record(logged, connection, name, args, &text, is_error);
+    }
+    json!({ "content": [ { "type": "text", "text": text } ], "isError": is_error })
+}
+
+/// The endpoint a call's log line goes under: the one it named, else the
+/// default.
+fn sides_target<'a>(endpoints: &'a [Named<'a>], named: Option<&str>) -> &'a Endpoint {
+    named
+        .and_then(|w| endpoints.iter().find(|n| n.name == w))
+        .unwrap_or(&endpoints[0])
+        .endpoint
+}
+
 /// `list_connections`' answer.
 fn list_connections(endpoints: &[Named<'_>]) -> String {
     let mut out = String::from("Connections on this server:\n");
@@ -493,6 +564,8 @@ where
                         "content": [ { "type": "text", "text": list_connections(endpoints) } ],
                         "isError": false
                     }))
+                } else if let Some(source) = cross_connection_source(&name, &args) {
+                    Some(compare_across(endpoints, source, &name, &args).await)
                 } else {
                     match pick(endpoints, &args) {
                         Ok(endpoint) => Some(call_tool(endpoint, &name, &args).await),
@@ -564,13 +637,14 @@ pub enum McpTool {
     ListSchema,
     DescribeTable,
     SearchObjects,
+    CompareSchemas,
     ProposeTableChange,
     ProposeSql,
 }
 
 impl McpTool {
     /// Every tool, in the order `tools/list` advertises them.
-    pub const ALL: [McpTool; 9] = [
+    pub const ALL: [McpTool; 10] = [
         McpTool::RunQuery,
         McpTool::Explain,
         McpTool::SampleRows,
@@ -578,6 +652,7 @@ impl McpTool {
         McpTool::ListSchema,
         McpTool::DescribeTable,
         McpTool::SearchObjects,
+        McpTool::CompareSchemas,
         McpTool::ProposeTableChange,
         McpTool::ProposeSql,
     ];
@@ -594,6 +669,7 @@ impl McpTool {
             McpTool::SearchObjects => "search_objects",
             McpTool::ProposeTableChange => "propose_table_change",
             McpTool::ProposeSql => "propose_sql",
+            McpTool::CompareSchemas => "compare_schemas",
         }
     }
 
@@ -611,6 +687,7 @@ impl McpTool {
             McpTool::SearchObjects => "mcp__schemaic__search_objects",
             McpTool::ProposeTableChange => "mcp__schemaic__propose_table_change",
             McpTool::ProposeSql => "mcp__schemaic__propose_sql",
+            McpTool::CompareSchemas => "mcp__schemaic__compare_schemas",
         }
     }
 
@@ -638,7 +715,8 @@ impl McpTool {
             | McpTool::DescribeTable
             | McpTool::SearchObjects
             | McpTool::ProposeTableChange
-            | McpTool::ProposeSql => false,
+            | McpTool::ProposeSql
+            | McpTool::CompareSchemas => false,
         }
     }
 
@@ -675,7 +753,9 @@ impl McpTool {
             | McpTool::ListSchema
             | McpTool::DescribeTable
             | McpTool::SearchObjects
-            | McpTool::ProposeTableChange => true,
+            | McpTool::ProposeTableChange
+            // Two whole catalogues, and a script naming every object in them.
+            | McpTool::CompareSchemas => true,
         }
     }
 
@@ -699,7 +779,9 @@ impl McpTool {
             | McpTool::DescribeTable
             | McpTool::SearchObjects
             | McpTool::ProposeTableChange
-            | McpTool::ProposeSql => true,
+            | McpTool::ProposeSql
+            // The script it hands back is text; nothing runs it here.
+            | McpTool::CompareSchemas => true,
         }
     }
 
@@ -724,7 +806,8 @@ impl McpTool {
             | McpTool::ListDatabases
             | McpTool::ListSchema
             | McpTool::DescribeTable
-            | McpTool::SearchObjects => false,
+            | McpTool::SearchObjects
+            | McpTool::CompareSchemas => false,
         }
     }
 
@@ -744,7 +827,7 @@ impl McpTool {
 /// for the table and column names (or to raise the setting) rather than retry.
 const NO_SCHEMA_ACCESS: &str = "Refused: the user's Schema context setting is None, so the \
      assistant is given no database structure and list_databases, list_schema, describe_table, \
-     search_objects, sample_rows and propose_table_change are unavailable. Ask the user for the table and column names you need \
+     search_objects, sample_rows, compare_schemas and propose_table_change are unavailable. Ask the user for the table and column names you need \
      — or tell them to set Schema context to a database in AI settings.";
 
 /// What the server says when a withheld tool is called anyway. It names the
@@ -967,6 +1050,41 @@ pub fn tools_list(
                     }
                 },
                 "required": ["query"]
+            }
+        },
+        {
+            "name": "compare_schemas",
+            "description": format!(
+                "Compare two {} databases' structure and get the SQL that would make one match \
+                 the other — tables, columns, indexes, keys, views, routines and triggers. \
+                 **This runs nothing**: it reads both catalogues and hands back the script, with \
+                 what in it is destructive and what it leaves out. `database` is the one the \
+                 script would change, `source_database` the one it should come to match; on a \
+                 server with several connections, `source_connection` may name another. Show \
+                 the script to the user; never present it as applied.",
+                dialect.engine_label(),
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "database": {
+                        "type": "string",
+                        "description": "The database the script would change. Defaults to the connection's active database."
+                    },
+                    "source_database": {
+                        "type": "string",
+                        "description": "The database to match. Defaults to the source connection's active database."
+                    },
+                    "source_connection": {
+                        "type": "string",
+                        "description": "On a server with several connections, the one holding source_database. Defaults to the same connection."
+                    },
+                    "tables": {
+                        "type": "array",
+                        "description": "Only these tables or views, and the triggers on them. Every difference when absent.",
+                        "items": { "type": "string" }
+                    }
+                }
             }
         },
         {
@@ -1220,6 +1338,11 @@ async fn answer(endpoint: &Endpoint, name: &str, args: &Value) -> (String, bool)
             None => ("search_objects needs a `query`.".to_string(), true),
         },
         McpTool::ProposeTableChange => propose_change(db, database, arg("database"), args).await,
+        // Two databases on this one connection; a `source_connection` naming
+        // another is resolved in `serve_on`, which sees every connection.
+        McpTool::CompareSchemas => {
+            Box::pin(compare_schemas((endpoint, ""), (endpoint, ""), args)).await
+        }
         McpTool::ProposeSql => propose_sql(
             arg("sql").unwrap_or(""),
             schemaic_core::sql::GuardPolicy {
@@ -1233,6 +1356,109 @@ async fn answer(endpoint: &Endpoint, name: &str, args: &Value) -> (String, bool)
         ),
     };
     (text, is_error)
+}
+
+/// `compare_schemas`' answer: the script that makes one database's structure
+/// match another's, and what is said about it — `schemaic compare` as a tool,
+/// through the same `cli::compare::report` over the same `core::compare`.
+///
+/// **Nothing runs.** Two catalogues are read, each under the server's
+/// deadline, and the script comes back as text: the model may show it, and
+/// the user runs it — `schemaic exec --script`, or the app — if they choose.
+///
+/// `target` is where the script would run and `source` what it should come to
+/// match: the same endpoint for two databases on one connection, two served
+/// connections otherwise ([`serve_on`] resolves the second). Both sides must
+/// be the same engine, as the CLI's are.
+async fn compare_schemas(
+    target: (&Endpoint, &str),
+    source: (&Endpoint, &str),
+    args: &Value,
+) -> (String, bool) {
+    let ((target, target_name), (source, source_name)) = (target, source);
+    let two = !std::ptr::eq(target, source);
+    let source_db = args
+        .get("source_database")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or(source.database.as_deref());
+    let (Some(target_db), Some(source_db)) =
+        (tool_database(args, target.database.as_deref()), source_db)
+    else {
+        return (
+            "compare_schemas needs a database on each side: name `database` (the one the \
+             script would change) and `source_database` (the one to match)."
+                .to_string(),
+            true,
+        );
+    };
+    if !two && target_db == source_db {
+        return (
+            format!(
+                "Both sides are {target_db}: name another `source_database`, or a \
+                 `source_connection`."
+            ),
+            true,
+        );
+    }
+    let dialect = dialect_of(&target.db);
+    if let Err(e) = schemaic_core::compare::comparable(dialect, dialect_of(&source.db)) {
+        return (e, true);
+    }
+    let tables: Vec<String> = args
+        .get("tables")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let (lt, rt) = (CancellationToken::new(), CancellationToken::new());
+    let (left, right) = tokio::join!(
+        with_deadline(target.db.fetch_schema(target_db, lt.clone()), lt),
+        with_deadline(source.db.fetch_schema(source_db, rt.clone()), rt)
+    );
+    let read = |got, db: &str| match got {
+        Some(Ok(s)) => Ok(s),
+        Some(Err(e)) => Err(format!("Error reading the schema of {db}: {e}")),
+        None => Err(format!(
+            "Reading the schema of {db} timed out ({}s) and was cancelled.",
+            QUERY_TIMEOUT.as_secs()
+        )),
+    };
+    let (left, right) = match (read(left, target_db), read(right, source_db)) {
+        (Ok(l), Ok(r)) => (l, r),
+        (Err(e), _) | (_, Err(e)) => return (e, true),
+    };
+    let cmp = schemaic_core::compare::SchemaComparison::of(&left, &right, dialect);
+    let label = |name: &str, db: &str| {
+        if two {
+            format!("{db} on {name}")
+        } else {
+            db.to_string()
+        }
+    };
+    match crate::compare::report(
+        &cmp,
+        &tables,
+        &label(target_name, target_db),
+        &label(source_name, source_db),
+    ) {
+        Err(e) => (e, true),
+        Ok(report) => {
+            let mut out = String::from("Nothing has run.\n");
+            for note in &report.notes {
+                out.push_str(note);
+                out.push('\n');
+            }
+            if let Some(script) = report.script {
+                out.push_str("\nSQL:\n");
+                out.push_str(&script);
+            }
+            (out, false)
+        }
+    }
 }
 
 /// `propose_sql`'s answer: what the write guard (`sql::run_verdict`) says of
@@ -2619,7 +2845,8 @@ mod tests {
                     "list_databases",
                     "list_schema",
                     "describe_table",
-                    "search_objects"
+                    "search_objects",
+                    "compare_schemas"
                 ],
                 "{engine:?}"
             );
@@ -2659,7 +2886,8 @@ mod tests {
                 "list_databases",
                 "list_schema",
                 "describe_table",
-                "search_objects"
+                "search_objects",
+                "compare_schemas"
             ]
         );
         let refusal = refusal_for(McpTool::RunQuery, false, true, Host::Standalone);
@@ -2936,6 +3164,87 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **`compare_schemas` reads catalogues and nothing else**: offered from
+    /// both hosts, withheld at Schema context None, and never a row tool.
+    #[test]
+    fn compare_schemas_is_a_catalogue_tool() {
+        use super::{Host, McpTool};
+        let t = McpTool::CompareSchemas;
+        assert!(t.reads_schema() && !t.reads_row_data() && t.read_only() && !t.needs_panel());
+        assert!(t.offered(false, true, Host::Standalone));
+        assert!(!t.offered(true, false, Host::Panel));
+    }
+
+    /// Its refusals come before anything is read: no database on a side, the
+    /// same database on both, and two engines — each its own sentence.
+    #[tokio::test]
+    async fn compare_schemas_refuses_before_reading() {
+        let e = unreachable(true, true, super::Host::Standalone);
+        let (none, err) =
+            super::compare_schemas((&e, "a"), (&e, "a"), &serde_json::json!({})).await;
+        assert!(err && none.contains("a database on each side"), "{none}");
+        let (same, err) = super::compare_schemas(
+            (&e, "a"),
+            (&e, "a"),
+            &serde_json::json!({ "database": "main", "source_database": "main" }),
+        )
+        .await;
+        assert!(err && same.contains("Both sides are main"), "{same}");
+        let pg = schemaic_db::Db::from_parts(
+            schemaic_db::Engine::Postgres,
+            "127.0.0.1".into(),
+            1,
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        let mut other = unreachable(true, true, super::Host::Standalone);
+        other.db = pg;
+        let (engines, err) = super::compare_schemas(
+            (&e, "a"),
+            (&other, "b"),
+            &serde_json::json!({ "database": "main", "source_database": "shop" }),
+        )
+        .await;
+        assert!(err, "{engines}");
+    }
+
+    /// Across two connections it is answered in `serve_on`: a source that is
+    /// not served is refused with the names, and a source whose own Schema
+    /// context withholds the catalogue is refused in that one's words.
+    #[tokio::test]
+    async fn compare_schemas_across_connections_holds_each_side_to_its_levels() {
+        let open = unreachable(true, true, super::Host::Standalone);
+        let blind = unreachable(true, false, super::Host::Standalone);
+        let named = [
+            super::Named {
+                name: "a",
+                endpoint: &open,
+            },
+            super::Named {
+                name: "b",
+                endpoint: &blind,
+            },
+        ];
+        let call = |args: &str| {
+            format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":\
+                 {{\"name\":\"compare_schemas\",\"arguments\":{args}}}}}\n"
+            )
+        };
+        let text = |got: &[serde_json::Value]| {
+            got[0]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let unknown = exchange_many(&named, call(r#"{"source_connection":"c"}"#).as_bytes()).await;
+        assert!(text(&unknown).contains("a, b"), "{}", text(&unknown));
+        let refused = exchange_many(&named, call(r#"{"source_connection":"b"}"#).as_bytes()).await;
+        assert!(text(&refused).starts_with("Refused:"), "{}", text(&refused));
+        assert_eq!(refused[0]["result"]["isError"], true);
     }
 
     /// A tool needing rows and the catalogue is offered only by a connection

@@ -264,7 +264,7 @@ never what is *true*. The same line runs through the built-in **MCP server**: `l
 what this session can see), and so do `search_objects` without a `database`, which searches
 that same overview, and `list_databases`, which is its names alone, while
 `list_schema {"database": …}`, `search_objects {"database": …}`,
-`describe_table`, `sample_rows`, `run_query` and `explain` answer in full — a named lookup is a fact, and half-filtering a fence `run_query`
+`describe_table`, `sample_rows`, `compare_schemas`, `run_query` and `explain` answer in full — a named lookup is a fact, and half-filtering a fence `run_query`
 walks through anyway would be theatre. The MCP subprocess is handed a **blob, not a signal**
 (`hidden` on the endpoint JSON, absent in older blobs → nothing hidden), so hiding a database
 mid-session takes effect on the next one, exactly as the system prompt beside it does. **A folder now carries a menu of its own** (`CtxKind::ObjectGroup`), reversing the

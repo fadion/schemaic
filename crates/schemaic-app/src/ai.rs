@@ -3528,7 +3528,8 @@ fn render_ai_context(
          preview the user reviews and applies themselves. Send only what should change: it is \
          a patch, and what you don't name, you don't touch. Before offering a statement that \
          writes data, call propose_sql: it says whether Schemaic would refuse it or ask the user \
-         first, and nothing runs.",
+         first, and nothing runs. To compare two databases' structure, compare_schemas returns \
+         the SQL that would make one match the other; it runs nothing either.",
         tag = schemaic_core::propose::FENCE_TAG,
     );
     // **At `None`, say that the schema was withheld — don't just omit it.**
@@ -3542,8 +3543,8 @@ fn render_ai_context(
     // `render_inline_prompt` writes for the same setting.
     let schema_section = if scope == SchemaScope::None {
         "The user has set Schema context to None, so you are given no database structure and \
-         the list_databases, list_schema, search_objects, describe_table and sample_rows tools \
-         are unavailable. Ask them \
+         the list_databases, list_schema, search_objects, describe_table, sample_rows and \
+         compare_schemas tools are unavailable. Ask them \
          for the table and \
          column names you need; they can also raise the setting in AI settings.\n"
             .to_string()

@@ -1,11 +1,12 @@
 # `cli/mcp.rs`
 
-`cli/mcp.rs` — the **MCP (stdio) server**: newline-delimited JSON-RPC on stdin/stdout, and nine
+`cli/mcp.rs` — the **MCP (stdio) server**: newline-delimited JSON-RPC on stdin/stdout, and ten
 tools, none of which writes anything. It was `app/mcp.rs` until `schemaic mcp` needed it, and it
 lives here so that the second way in is the same server rather than a copy of its gates —
-`schemaic-cli` cannot reach into `schemaic-app`, which depends on it. The nine (`run_query`,
+`schemaic-cli` cannot reach into `schemaic-app`, which depends on it. The ten (`run_query`,
 `explain`, `sample_rows`, `list_databases`, `list_schema`, `describe_table`, `search_objects`,
-`propose_table_change`, `propose_sql`, in `McpTool::ALL`'s order, which is `tools/list`'s) are described
+`compare_schemas`, `propose_table_change`, `propose_sql`, in `McpTool::ALL`'s order, which is
+`tools/list`'s) are described
 for **this** connection's engine and listed for **this** connection's access levels and **this** host:
 `tools_list(engine, reads_data, schema, host)` builds
 `run_query`'s advertised statement heads from `schemaic_core::sql::read_only_heads`, the same list
@@ -87,7 +88,7 @@ the write log, and a failed append is a line on stderr, the server's log, never 
 Smoke-tested through `schemaic mcp` over stdio under a throwaway `APPDATA`: a `describe_table`,
 a refused `run_query` with its value masked and the refusal as its error, and an unknown tool
 each got their line.
-**The nine are a type — `McpTool` — and that is what makes the advertised array and the gates one
+**The ten are a type — `McpTool` — and that is what makes the advertised array and the gates one
 set.** They used to be written out independently in five places the compiler related to nothing:
 the `json!` array in `tools_list`, a `==` in `reads_row_data`, a `matches!` in `reads_schema`,
 `call_tool`'s dispatch with its `other =>` catch-all, and `ai.rs`'s two `mcp__schemaic__*` `const`
@@ -342,6 +343,21 @@ the refusal's text. `list_connections` is answered only when there is
 more than one connection; on a one-connection server the name falls through to `pick` and
 `call_tool`'s unknown-tool reply. `host` is the first endpoint's too, which is moot while
 `serve_many`'s only caller builds every endpoint `Host::Standalone`.
+**`compare_schemas` with a `source_connection` is the one tool call `serve_on` answers itself**,
+because it is the one that needs two endpoints and `call_tool` is handed one.
+`cross_connection_source(name, args)` picks it out — that tool, a non-empty `source_connection` —
+ahead of `pick`, and `compare_across` resolves both sides by saved name: the target from
+`connection`, else the first, the source from `source_connection`, either one not served refused
+with the served names as `pick` refuses. Then it **holds each side to its own levels**, asking
+`refusal_for` of the target and then the source, so a connection whose *Schema context* is None
+cannot have its catalogue read by naming it as the other side of a comparison started at one
+that allows it — the same rule as "every call is judged by its own connection", applied to a call
+with two (`compare_schemas_across_connections_holds_each_side_to_its_levels`: an unserved source
+refused with `a, b`, and a source at *Schema context: None* refused with `Refused: …` beside a
+target that allows it). The line is `record`ed under the target's `audit_as`, or the first
+connection's when the target did not resolve (`sides_target`), and the answer wrapped as
+`call_tool` wraps one. Without a `source_connection` the call takes the ordinary route — `pick`,
+then `call_tool` — and compares two databases on the one connection.
 **The loop is `serve_on(&endpoints, reader, writer)`, and `serve`/`serve_many` only hand it stdin
 and stdout** — any `AsyncBufRead` and `AsyncWrite`, so the protocol itself is tested rather than
 only the pure pieces it calls: the tests drive it with a `&[u8]` and a `Vec<u8>`, and no request
@@ -378,10 +394,11 @@ spec tells it to walk away from, and `2025-03-26` is answered `2024-11-05`
 (`the_answer_is_the_newest_version_the_client_can_know`). The loop keeps what was agreed, and
 `tools/list` goes through `annotated`: from `2025-03-26` on — the revision that introduced
 them — every tool carries `annotations: {readOnlyHint}` from `McpTool::read_only`, an
-exhaustive match that answers `true` for all nine (`run_query` and `sample_rows` read on a
+exhaustive match that answers `true` for all ten (`run_query` and `sample_rows` read on a
 read-only session, `explain` plans without the analysing form that would run the statement,
-`search_objects` and `list_databases` read only the catalogue, `propose_table_change` and
-`propose_sql` run nothing). A `2024-11-05` session, or a `tools/list` sent before the
+`search_objects` and `list_databases` read only the catalogue, `compare_schemas` reads two
+catalogues and hands back a script nothing runs, `propose_table_change` and `propose_sql` run
+nothing). A `2024-11-05` session, or a `tools/list` sent before the
 handshake, gets the list as it always was
 (`a_2025_session_is_told_every_tool_is_read_only`).
 **`search_objects` is Find-Anywhere's question asked over this server's two reads, not a third
@@ -461,6 +478,36 @@ children used to be listed and a sub-partition was nowhere in the assistant's vi
 (`database_schema_names_sub_partitions_under_their_partition`); MySQL, which keeps no
 subpartition names, has its `SUBPARTITION BY` clause beside the key — `(partitioned by …,
 subpartitioned by …)` (`database_schema_names_a_mysql_subpartition_clause`).
+**`compare_schemas {database?, source_database?, source_connection?, tables?}` is `schemaic
+compare` as a tool, and like the CLI it runs nothing.** `database` is the one the script would
+change — the call's own, else the endpoint's default (`tool_database`) — and `source_database`
+the one it should come to match, else the *source* endpoint's default. The source is the same
+endpoint unless `source_connection` named another (`serve_on`, above), and the async
+`compare_schemas((target, name), (source, name), args)` tells the two cases apart by
+`std::ptr::eq` on the endpoints, so naming the target's own connection as the source is the
+one-connection case. It **refuses before anything is read**: a side with no database ("needs a
+database on each side"), the same database on both sides of one connection ("Both sides are …",
+pointing at another `source_database` or a `source_connection` — on one SQLite connection, whose
+only database is `main`, that is every call without a `source_connection`), and two engines
+`core::compare::comparable` will not compare (`compare_schemas_refuses_before_reading`, which pins
+the first two sentences and only that the third is an error). Then both catalogues are read
+**concurrently**, each `db.fetch_schema` under `with_deadline` with its own token, and a failure
+or a timeout on either side is the error. **There is no differ and no report here**: it is
+`SchemaComparison::of(&target, &source, dialect)`, the target's dialect, and
+`cli::compare::report` — the CLI's own, so `tables` resolves as `-t` does, an unknown name is
+the error, and the notes are the CLI's stderr lines word for word (the three-armed first line,
+`destructive: …`, `not in the script: …`, `left out: …`, `note: …`). The answer is "Nothing has
+run." over those notes, then `SQL:` and `export_script()` when the plan holds anything; each side
+is labelled by its database, with " on <connection>" only when the two are different connections
+— `run.rs`'s `side_label` rule. **A catalogue tool, and nothing more**: `reads_schema` is `true`
+(two whole catalogues, and a script naming every object in them), so *Schema context: None*
+withholds it and `NO_SCHEMA_ACCESS` names it; `reads_row_data` is `false`, so every data level
+offers it; `read_only` is `true`, the script being text; and it is not `needs_panel`, so both
+hosts list it (`compare_schemas_is_a_catalogue_tool`). Like the two arms above, its arm in
+`answer` is `Box::pin`ned. Smoke-tested by the change's author through `schemaic mcp -c scratch
+-c second` under a throwaway `APPDATA`: with `source_connection` `second` it returned `CREATE
+TABLE k` and `DROP TABLE people`, with "destructive: people — Drops the table and every row in
+it."
 `propose_table_change` is the odd one out and stays read-only like the rest: it takes a
 `core::propose::Proposal`, introspects the table, runs `propose::apply` → `ddl::diff` → `emit`,
 and hands the model back the change list in the *preview's own words* plus the SQL and anything

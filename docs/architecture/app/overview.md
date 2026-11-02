@@ -1359,12 +1359,14 @@ whether or not queries are allowed, since proposing reads the schema and that wa
 part, and the tag comes from the constant the renderer reads
 (`the_prompt_names_the_fence_tag_the_renderer_reads`). The same `propose_line` ends by telling
 the model to call `propose_sql` before offering a statement that writes data — it says whether
-Schemaic would refuse it or ask the user first, and nothing runs (`cli/mcp.rs`). Its **tools line** names the tools the
+Schemaic would refuse it or ask the user first, and nothing runs (`cli/mcp.rs`) — and then names
+`compare_schemas`, which returns the SQL making one database's structure match another's and runs
+nothing either. Its **tools line** names the tools the
 connection's `AiData` level leaves the session: `list_databases`, `list_schema`,
 `search_objects` and `describe_table` at every level, `sample_rows`, `run_query` and `explain`
 at `Full` alone; and at *Schema context: None* the withheld-schema sentence names
-`list_databases`, `list_schema`, `search_objects`, `describe_table` and `sample_rows` as
-unavailable. The harnesses' allow-lists need no such edit when a tool is added, being derived
+`list_databases`, `list_schema`, `search_objects`, `describe_table`, `sample_rows` and
+`compare_schemas` as unavailable. The harnesses' allow-lists need no such edit when a tool is added, being derived
 from `McpTool::ALL` and `offered`. The MCP server itself is `cli/mcp.rs`
 now, under `schemaic-cli` below — its tools, its gates, its deadlines, and how `ai_allowed_tools`
 is derived from them. What stays here is the blob the panel hands it: `McpEndpoint` is an alias

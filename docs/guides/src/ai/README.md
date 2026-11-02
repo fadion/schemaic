@@ -36,8 +36,8 @@ servers you've registered with them yourself, which Schemaic can't switch off.
   tables, columns, keys.
 - **All databases** sends the outline of every database on the connection. On a big server this
   can make each message large.
-- **None** sends no outline, and also takes away the schema tools, so the assistant has to ask you
-  for table and column names.
+- **None** sends no outline, and also takes away the schema tools — listing, searching,
+  describing, sampling, comparing and checking a table change — so the assistant has to ask you for table and column names.
 
 Databases you've hidden in the schema tree are left out of the outline.
 
@@ -65,6 +65,10 @@ On its own, the assistant can look things up with Schemaic's tools:
 - *Run a query* — one read-only statement, if the connection's data access allows it. Results are
   capped at 200 rows, and long values are cut short.
 - *Explain a query* — the plan, without running it, under the same data access rule.
+- *Compare two databases* — the SQL that would make one database's structure match another's, the
+  same comparison as the schema tree's **Compare with** ([Comparing schemas](../schema/compare.md)). It reads
+  structure only, so it works at every data access level, and it runs nothing: the script comes
+  back in its reply for you to run if you choose.
 - *Check a table change* — it can work out the SQL for a change it wants to suggest, without
   running anything.
 - *Check a statement* — before it offers SQL that writes data, it checks it against the same

@@ -37,6 +37,9 @@ Repeat `-c` to serve more than one connection from the same server:
   it out goes to the first `-c`.
 - The agent gets a `list_connections` tool: each connection's name, engine, default database, and
   whether it may read rows.
+- `compare_schemas` can compare across them: its `source_connection` argument names the
+  connection holding the database to match. It reads no rows, so it works whatever either
+  connection's **AI data access**.
 - `-d` sets the first connection's default database. The others use their own.
 - A connection given twice is refused.
 
@@ -54,6 +57,7 @@ Nothing the server offers writes to the database. What it can read depends on th
 | `list_schema`    | An overview of the server, or one database in full      | Always                      |
 | `describe_table` | One table's definition and foreign keys                 | Always                      |
 | `search_objects` | Tables, views and columns by part of their name         | Always                      |
+| `compare_schemas` | The SQL that would make one database's structure match another's | Always            |
 | `run_query`      | Runs one read-only statement, 200 rows at most          | **Let it read data** only   |
 | `explain`        | A read's plan, and what in it looks slow                | **Let it read data** only   |
 | `sample_rows`    | The first rows of a table                               | **Let it read data** only   |
@@ -62,6 +66,11 @@ Nothing the server offers writes to the database. What it can read depends on th
 Two tools the app's own assistant has are left out: `propose_table_change` and `propose_sql`.
 Each hands its result to the AI panel — a change to review, a statement to insert or run — and
 there's no panel on the other end.
+
+`compare_schemas` is the same comparison as [`schemaic compare`](reading.md#compare): it reads
+both databases' structure and hands back the script, with what in it is destructive and what it
+leaves out. It runs nothing. Both databases must be the same engine, and a `tables` argument
+narrows it to the tables you name.
 
 **Only what I attach**, the default, gives an outside agent no rows at all: it has no way to attach
 any. `run_query` and `explain` pass the same read-only check as

@@ -47,8 +47,7 @@ The headless release's decisions are taken; the other entries' are not. What an 
 
 They ship in this order, one release each. Releases 2 and 3 merge if 3 turns out small.
 
-1. **Headless:** `compare_schemas` and `--url` on `schemaic mcp` are what is left of it. All of it
-   is in `schemaic-cli` and shares the CLI's guards.
+1. **Headless:** `--url` on `schemaic mcp` is what is left of it.
 2. **Performance:** *Workload and performance insight* with the MCP performance tools, which share
    its backend, plus the Server Activity keyboard path.
 3. **Data and editor:** *Compare and sync table data*, the custom keymap and the two chart kinds.
@@ -139,14 +138,6 @@ The other commands take a one-off `--url` connection; `mcp` does not yet.
   `SCHEMAIC_PASSWORD` only: stdin is the protocol's.
 - **Trap:** with several connections, a `--url` one has no saved name for `list_connections` and
   the agent log; it needs one given or derived, and two must not collide.
-
-### `compare_schemas`
-
-A tool that wraps `cli/compare.rs` and returns the migration as text. It executes nothing.
-
-- **Decided:** both sides are connections this server was given, so it lands after *Several
-  connections*. It reads only the catalogue, so like `list_schema` it needs no data level. Both
-  sides are the same engine, as in the CLI.
 
 ### Performance tools
 

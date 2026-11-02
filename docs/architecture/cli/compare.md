@@ -39,4 +39,7 @@ itself or a trigger whose `table` is it) — each line being `CompareEntry::omis
 `pub` for this (under `core/compare.rs`). The comparison's own `notes()`, which are about the reading
 rather than any one object, follow as `note: …` lines whatever the scope. Both tests were
 watched fail against the old `report`. Nothing here runs anything; the script is printed for a
-person to read.
+person to read. **`report` has a second caller**: the MCP server's `compare_schemas`
+(`cli/mcp.rs`), which hands a model the same notes and the same script in one text answer —
+so a change to a note's wording here changes what the assistant is told as well as what
+`schemaic compare` prints on stderr.
