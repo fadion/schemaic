@@ -470,8 +470,9 @@ failure at the click is said in `activity_kill_error` rather than returning in s
 is the read-only refusal, per kind, in `ui::i18n::activity_read_only_refusal`'s words (core's
 `activity::read_only_refusal` is the English it is held to).
 **Opening and saving a tab's `.sql` file** is `TabsActions::open_sql_file`/`save_sql_file`/
-`save_sql_file_as`/`reload_sql_file` (Ctrl+O / Ctrl+S / Ctrl+Shift+S, bound in `NavKeys::handle`
-so they work at the workspace root and inside the editor alike, and offered as Open File / Save
+`save_sql_file_as`/`reload_sql_file` (Ctrl+O / Ctrl+S / Ctrl+Shift+S by default — the keymap's
+`open-file`, `save-file` and `save-file-as`, run by `NavKeys::run` — so they work at the
+workspace root and inside the editor alike, and offered as Open File / Save
 File / Save File As in the palette). They are split the way the results export is: the dialog
 (`floem::file_action::open_file` / `floem::action::save_as`, filtered on
 `sqlfile::SQL_EXTENSIONS`) and the tab bookkeeping run on the UI thread, while the read/write goes

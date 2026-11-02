@@ -1,10 +1,17 @@
-//! The app's keyboard shortcuts, as **one table** — and the test that keeps it
-//! honest.
+//! The app's keyboard shortcuts, in **two tables** — the rebindable commands
+//! of [`schemaic_core::keymap`], and the fixed keys of [`SHORTCUTS`] — and the
+//! test that keeps the second one honest.
 //!
-//! This list is the app's only keyboard documentation: the Shortcuts modal
-//! ([`crate::settings::help_overlay`]) renders straight from [`SHORTCUTS`], and
-//! for a binding like Ctrl+H or Ctrl+G there is no other affordance anywhere in
-//! the UI. A binding missing here is a feature nobody can find.
+//! Together they are the app's only keyboard documentation: the Shortcuts modal
+//! ([`crate::shortcuts_view::help_overlay`]) renders both, and for a binding like
+//! Ctrl+H or Ctrl+G there is no other affordance anywhere in the UI. A binding
+//! missing here is a feature nobody can find.
+//!
+//! **A command's key is the keymap's**, read through [`keymap`]: the handlers
+//! resolve a press through it ([`chord_of`], `Keymap::resolve`), and the modal,
+//! the palette ([`command_keys`]) and the menus ([`MenuKey`]) show the binding it
+//! holds. None of them spells a command's key, so a key the user moved is moved
+//! everywhere at once.
 //!
 //! It used to be a literal inside the modal, hand-maintained against `match` arms
 //! in three files, and it drifted exactly as its own comment predicted it would:
@@ -14,9 +21,8 @@
 //!
 //! # What the test does, and what it deliberately doesn't
 //!
-//! The handlers can't render *from* this table — they are `match` arms on
-//! `Key::Character` spread across several files, and rewriting them to dispatch
-//! through a table would be a far larger change than the problem warrants. So the
+//! The fixed keys' handlers can't render *from* this table — they are `match`
+//! arms on `Key::Character` spread across several files. So the
 //! guarantee is enforced from the other side: the tests below scan the files in
 //! `KEY_FILES` for the five idioms the codebase actually uses to bind a
 //! **Ctrl/Alt + letter** key, and fail when one isn't named here.
@@ -43,6 +49,7 @@
 use std::borrow::Cow;
 
 use floem::keyboard::Modifiers;
+use schemaic_core::keymap::{Chord, Command, Context, FixedKey, Key as ChordKey, Keymap};
 
 use crate::i18n::tr;
 
@@ -76,6 +83,422 @@ impl Group {
             Group::ServerActivity => tr!("shortcuts-group-server-activity"),
         }
     }
+
+    /// Where the group's keys are listened for, as the keymap names it.
+    pub(crate) fn context(self) -> Context {
+        match self {
+            Group::Global => Context::Global,
+            Group::Editor => Context::Editor,
+            Group::ResultsGrid => Context::ResultsGrid,
+            Group::SchemaTree => Context::SchemaTree,
+            Group::AiPanel => Context::AiPanel,
+            Group::Terminal => Context::Terminal,
+            Group::ErDiagram => Context::ErDiagram,
+            Group::ServerActivity => Context::ServerActivity,
+        }
+    }
+
+    /// The group a command's row is shown in.
+    pub(crate) fn of(command: Command) -> Group {
+        let context = command.context();
+        SHORTCUTS
+            .iter()
+            .map(|(g, _)| *g)
+            .find(|g| g.context() == context)
+            .unwrap_or(Group::Global)
+    }
+}
+
+/// What a command does, in the interface's language — its row in the
+/// Shortcuts modal.
+pub(crate) fn command_label(command: Command) -> String {
+    match command {
+        Command::FindAnywhere => tr!("shortcuts-find-anywhere"),
+        Command::CommandPalette => tr!("shortcuts-command-palette"),
+        Command::NewTab => tr!("shortcuts-new-tab"),
+        Command::CloseTab => tr!("shortcuts-close-tab"),
+        Command::NextTab => tr!("shortcuts-next-tab"),
+        Command::PreviousTab => tr!("shortcuts-previous-tab"),
+        Command::ReopenTab => tr!("shortcuts-reopen-tab"),
+        Command::OpenFile => tr!("shortcuts-open-file"),
+        Command::SaveFile => tr!("shortcuts-save-file"),
+        Command::SaveFileAs => tr!("shortcuts-save-file-as"),
+        Command::ToggleSchema => tr!("shortcuts-toggle-schema"),
+        Command::ToggleAi => tr!("shortcuts-toggle-ai"),
+        Command::ToggleTerminal => tr!("shortcuts-toggle-terminal"),
+        Command::FormatCode => tr!("shortcuts-format-code"),
+        Command::FormatStatement => tr!("shortcuts-format-statement"),
+        Command::MakeSingleLine => tr!("shortcuts-single-line"),
+        Command::GoToLine => tr!("shortcuts-go-to-line"),
+    }
+}
+
+// ── The keymap ───────────────────────────────────────────────────────────────
+
+thread_local! {
+    static KEYMAP: std::cell::RefCell<
+        Option<(floem::reactive::RwSignal<Keymap>, floem::reactive::Scope)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// The keymap as it stands — window-wide, in a detached scope like
+/// [`modifier_keys`]. The defaults until [`load_keymap`] has read the user's
+/// file; every handler, the modal and the palette read this one signal.
+pub(crate) fn keymap() -> floem::reactive::RwSignal<Keymap> {
+    KEYMAP.with(|cell| {
+        if cell.borrow().is_none() {
+            let scope = floem::reactive::Scope::new();
+            let sig = scope.create_rw_signal(Keymap::defaults());
+            *cell.borrow_mut() = Some((sig, scope));
+        }
+        cell.borrow().as_ref().unwrap().0
+    })
+}
+
+/// Read `keymap.json` into [`keymap`], and say what in it could not be kept —
+/// `None` when everything was. The notice is the caller's to show.
+pub fn load_keymap() -> Option<String> {
+    use floem::reactive::SignalUpdate;
+    let file = schemaic_core::persist::load_json::<schemaic_core::keymap::KeymapFile>(
+        schemaic_core::keymap::FILE,
+    );
+    let (map, problems) = Keymap::load(&file, &fixed_keys());
+    keymap().set(map);
+    if problems.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = problems.iter().map(problem_text).collect();
+    Some(format!(
+        "{}\n\n{}",
+        tr!("keymap-problems"),
+        lines.join("\n")
+    ))
+}
+
+/// The keymap's changes from the defaults, as a settings bundle carries them.
+pub fn keymap_file() -> schemaic_core::keymap::KeymapFile {
+    use floem::reactive::SignalWith;
+    keymap().with_untracked(Keymap::to_file)
+}
+
+/// What a settings bundle's keymap would make the keymap: the keymap itself,
+/// how many commands it binds differently from now, and the notice for any
+/// entry of it that could not be applied (`None` when all could).
+pub fn keymap_from_bundle(
+    file: &schemaic_core::keymap::KeymapFile,
+) -> (Keymap, usize, Option<String>) {
+    use floem::reactive::SignalWith;
+    let (map, problems) = Keymap::load(file, &fixed_keys());
+    let changes = keymap().with_untracked(|now| now.changes_from(&map));
+    let notice = (!problems.is_empty()).then(|| {
+        let lines: Vec<String> = problems.iter().map(problem_text).collect();
+        format!("{}\n\n{}", tr!("keymap-problems"), lines.join("\n"))
+    });
+    (map, changes, notice)
+}
+
+/// Make `map` the keymap and write it to `keymap.json`.
+pub fn save_keymap(map: Keymap) {
+    use floem::reactive::SignalUpdate;
+    schemaic_core::persist::save_json(schemaic_core::keymap::FILE, &map.to_file());
+    keymap().set(map);
+}
+
+/// One entry of `keymap.json` that could not be kept, as a line of the notice.
+fn problem_text(problem: &schemaic_core::keymap::Problem) -> String {
+    use schemaic_core::keymap::Problem;
+    match problem {
+        Problem::UnknownCommand(id) => tr!("keymap-problem-unknown", id = id.clone()),
+        Problem::Unreadable { command, text, .. } => tr!(
+            "keymap-problem-unreadable",
+            command = command_label(*command),
+            keys = text.clone()
+        ),
+        Problem::Refused {
+            command,
+            chord,
+            refusal,
+        } => tr!(
+            "keymap-problem-refused",
+            command = command_label(*command),
+            keys = chord_label(*chord),
+            reason = refusal_text(*refusal)
+        ),
+        Problem::Fixed {
+            command,
+            chord,
+            fixed,
+        } => tr!(
+            "keymap-problem-fixed",
+            command = command_label(*command),
+            keys = chord_label(*chord),
+            holder = fixed_rows()
+                .get(*fixed)
+                .map(|r| (r.describe)())
+                .unwrap_or_default()
+        ),
+        Problem::Conflict {
+            command,
+            chord,
+            holder,
+        } => tr!(
+            "keymap-problem-taken",
+            command = command_label(*command),
+            keys = chord_label(*chord),
+            holder = command_label(*holder)
+        ),
+    }
+}
+
+/// Why no command may have a chord, in the interface's language.
+pub(crate) fn refusal_text(refusal: schemaic_core::keymap::Refusal) -> String {
+    use schemaic_core::keymap::Refusal;
+    let primary = keys_label("Ctrl").into_owned();
+    match refusal {
+        Refusal::NeedsPrimary => tr!("keymap-refusal-needs-primary", primary = primary),
+        Refusal::NeedsModifier => tr!(
+            "keymap-refusal-needs-modifier",
+            primary = primary,
+            alt = keys_label("Alt").into_owned()
+        ),
+        Refusal::Escape => tr!("keymap-refusal-escape"),
+        Refusal::Editing => tr!("keymap-refusal-editing"),
+        Refusal::System => tr!("keymap-refusal-system"),
+    }
+}
+
+/// A chord as this platform and language read it: `Ctrl+Shift+P`, `Cmd+…` on
+/// macOS, `Strg+Umschalt+P` in German.
+pub(crate) fn chord_label(chord: Chord) -> String {
+    keys_label_on(&chord.to_string(), PRIMARY_IS_CMD, key_name).into_owned()
+}
+
+/// The key a command has now, as the screen shows it — `None` when the user
+/// cleared it.
+pub(crate) fn command_chord_label(command: Command) -> Option<String> {
+    use floem::reactive::SignalWith;
+    keymap()
+        .with_untracked(|m| m.chord(command))
+        .map(chord_label)
+}
+
+/// A fixed row of [`SHORTCUTS`], one chord of it at a time: the key the keymap
+/// may not move a command onto, and what the modal says it does.
+#[derive(Clone, Copy)]
+pub(crate) struct FixedRow {
+    pub key: FixedKey,
+    pub describe: Describe,
+}
+
+/// Every chord the fixed rows bind, each with its row's description. A row of
+/// several bindings (`Tab / Shift+Tab`, `Ctrl+1…9`) gives one entry per chord.
+pub(crate) fn fixed_rows() -> Vec<FixedRow> {
+    let mut out = Vec::new();
+    for (group, rows) in SHORTCUTS {
+        for (keys, describe) in *rows {
+            for chord in row_chords(keys) {
+                out.push(FixedRow {
+                    key: FixedKey {
+                        context: group.context(),
+                        chord,
+                    },
+                    describe: *describe,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// [`fixed_rows`]' keys alone, as the keymap's checks take them. The index of
+/// one is the index of its row.
+pub(crate) fn fixed_keys() -> Vec<FixedKey> {
+    fixed_rows().into_iter().map(|r| r.key).collect()
+}
+
+/// The chords a [`SHORTCUTS`] key string names. `Ctrl+1…9` is nine of them.
+fn row_chords(keys: &str) -> Vec<Chord> {
+    keys.split(" / ")
+        .flat_map(|binding| match binding.strip_suffix("1…9") {
+            Some(head) => ('1'..='9')
+                .filter_map(|d| Chord::parse(&format!("{head}{d}")).ok())
+                .collect(),
+            None => Chord::parse(binding).ok().into_iter().collect::<Vec<_>>(),
+        })
+        .collect()
+}
+
+/// The chord a key press is, or `None` for a lone modifier or a key no chord
+/// can name.
+pub(crate) fn chord_of(
+    key: &floem::keyboard::Key,
+    physical: &floem::keyboard::PhysicalKey,
+    mods: Modifiers,
+) -> Option<Chord> {
+    chord_from(key, physical, primary_held(mods), mods.alt(), mods.shift())
+}
+
+/// [`chord_of`] with the primary modifier already decided.
+///
+/// **A letter is read by its character and anything else by its place.** A
+/// letter follows the layout, so Ctrl+Z is where the Z is on AZERTY. A key
+/// that is not a Latin letter — a digit, `/`, `` ` ``, or a letter Shift or
+/// AltGr has changed (`!` for Shift+1, `ł` for AltGr+L) — is read by the key
+/// it sits on, as a US keyboard names it, so `Ctrl+Shift+/` is one chord
+/// whatever Shift turned the `/` into, and Ctrl+Alt+L works on Windows, which
+/// delivers Ctrl+Alt as AltGr.
+fn chord_from(
+    key: &floem::keyboard::Key,
+    physical: &floem::keyboard::PhysicalKey,
+    primary: bool,
+    alt: bool,
+    shift: bool,
+) -> Option<Chord> {
+    use floem::keyboard::{Key, NamedKey, PhysicalKey};
+    let named = |n: &NamedKey| {
+        Some(match n {
+            NamedKey::Tab => ChordKey::Tab,
+            NamedKey::Enter => ChordKey::Enter,
+            NamedKey::Space => ChordKey::Space,
+            NamedKey::Escape => ChordKey::Escape,
+            NamedKey::Backspace => ChordKey::Backspace,
+            NamedKey::Delete => ChordKey::Delete,
+            NamedKey::Insert => ChordKey::Insert,
+            NamedKey::Home => ChordKey::Home,
+            NamedKey::End => ChordKey::End,
+            NamedKey::PageUp => ChordKey::PageUp,
+            NamedKey::PageDown => ChordKey::PageDown,
+            NamedKey::ArrowUp => ChordKey::Up,
+            NamedKey::ArrowDown => ChordKey::Down,
+            NamedKey::ArrowLeft => ChordKey::Left,
+            NamedKey::ArrowRight => ChordKey::Right,
+            n => ChordKey::F(function_key(n)?),
+        })
+    };
+    let at = match physical {
+        PhysicalKey::Code(code) => us_char(*code),
+        _ => None,
+    };
+    let key = match key {
+        Key::Named(n) => named(n)?,
+        Key::Character(c) => {
+            let c = c.as_str();
+            let mut chars = c.chars();
+            match (chars.next(), chars.next()) {
+                (Some(' '), None) => ChordKey::Space,
+                (Some(ch), None) if ch.is_ascii_alphabetic() => {
+                    ChordKey::Char(ch.to_ascii_lowercase())
+                }
+                (Some(ch), _) => ChordKey::Char(at.unwrap_or(ch.to_lowercase().next()?)),
+                (None, _) => ChordKey::Char(at?),
+            }
+        }
+        // A dead key, or one the layout gives no character: its place.
+        _ => ChordKey::Char(at?),
+    };
+    Some(Chord {
+        primary,
+        alt,
+        shift,
+        key,
+    })
+}
+
+/// `F1`…`F24` as a number.
+fn function_key(n: &floem::keyboard::NamedKey) -> Option<u8> {
+    use floem::keyboard::NamedKey as N;
+    const KEYS: [N; 24] = [
+        N::F1,
+        N::F2,
+        N::F3,
+        N::F4,
+        N::F5,
+        N::F6,
+        N::F7,
+        N::F8,
+        N::F9,
+        N::F10,
+        N::F11,
+        N::F12,
+        N::F13,
+        N::F14,
+        N::F15,
+        N::F16,
+        N::F17,
+        N::F18,
+        N::F19,
+        N::F20,
+        N::F21,
+        N::F22,
+        N::F23,
+        N::F24,
+    ];
+    KEYS.iter().position(|k| k == n).map(|i| i as u8 + 1)
+}
+
+/// The character a US keyboard prints on the key at `code`, unshifted.
+fn us_char(code: floem::keyboard::KeyCode) -> Option<char> {
+    use floem::keyboard::KeyCode as K;
+    const LETTERS: [K; 26] = [
+        K::KeyA,
+        K::KeyB,
+        K::KeyC,
+        K::KeyD,
+        K::KeyE,
+        K::KeyF,
+        K::KeyG,
+        K::KeyH,
+        K::KeyI,
+        K::KeyJ,
+        K::KeyK,
+        K::KeyL,
+        K::KeyM,
+        K::KeyN,
+        K::KeyO,
+        K::KeyP,
+        K::KeyQ,
+        K::KeyR,
+        K::KeyS,
+        K::KeyT,
+        K::KeyU,
+        K::KeyV,
+        K::KeyW,
+        K::KeyX,
+        K::KeyY,
+        K::KeyZ,
+    ];
+    const DIGITS: [K; 10] = [
+        K::Digit0,
+        K::Digit1,
+        K::Digit2,
+        K::Digit3,
+        K::Digit4,
+        K::Digit5,
+        K::Digit6,
+        K::Digit7,
+        K::Digit8,
+        K::Digit9,
+    ];
+    if let Some(i) = LETTERS.iter().position(|k| *k == code) {
+        return Some((b'a' + i as u8) as char);
+    }
+    if let Some(i) = DIGITS.iter().position(|k| *k == code) {
+        return Some((b'0' + i as u8) as char);
+    }
+    Some(match code {
+        K::Backquote => '`',
+        K::Minus => '-',
+        K::Equal => '=',
+        K::BracketLeft => '[',
+        K::BracketRight => ']',
+        K::Backslash => '\\',
+        K::Semicolon => ';',
+        K::Quote => '\'',
+        K::Comma => ',',
+        K::Period => '.',
+        K::Slash => '/',
+        _ => return None,
+    })
 }
 
 /// What a row does, in the interface's language: a function rather than the
@@ -96,24 +519,7 @@ pub(crate) type ShortcutGroup = (Group, &'static [(&'static str, Describe)]);
 pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
     (
         Group::Global,
-        &[
-            ("Ctrl+P", || tr!("shortcuts-find-anywhere")),
-            ("Ctrl+Shift+P", || tr!("shortcuts-command-palette")),
-            ("Ctrl+T", || tr!("shortcuts-new-tab")),
-            ("Ctrl+W", || tr!("shortcuts-close-tab")),
-            // Split rather than "Ctrl+Tab (Shift = reverse)": the palette shows a
-            // command's own keys, and Previous Tab needs a row of its own to name.
-            ("Ctrl+Tab", || tr!("shortcuts-next-tab")),
-            ("Ctrl+Shift+Tab", || tr!("shortcuts-previous-tab")),
-            ("Ctrl+1…9", || tr!("shortcuts-jump-to-tab")),
-            ("Ctrl+Shift+T", || tr!("shortcuts-reopen-tab")),
-            ("Ctrl+O", || tr!("shortcuts-open-file")),
-            ("Ctrl+S", || tr!("shortcuts-save-file")),
-            ("Ctrl+Shift+S", || tr!("shortcuts-save-file-as")),
-            ("Ctrl+Shift+E", || tr!("shortcuts-toggle-schema")),
-            ("Ctrl+Shift+A", || tr!("shortcuts-toggle-ai")),
-            ("Ctrl+`", || tr!("shortcuts-toggle-terminal")),
-        ],
+        &[("Ctrl+1…9", || tr!("shortcuts-jump-to-tab"))],
     ),
     (
         Group::Editor,
@@ -125,7 +531,6 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
             // Ctrl+F collapses the replace row, so nothing in the UI reveals
             // Ctrl+H — this modal is its only affordance.
             ("Ctrl+H", || tr!("shortcuts-find-replace")),
-            ("Ctrl+G", || tr!("shortcuts-go-to-line")),
             ("Ctrl+Shift+\\", || tr!("shortcuts-matching-bracket")),
             ("Ctrl+/", || tr!("shortcuts-line-comment")),
             ("Ctrl+Shift+/", || tr!("shortcuts-block-comment")),
@@ -133,9 +538,6 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
             ("Ctrl+Shift+J", || tr!("shortcuts-join-lines")),
             ("Ctrl+D", || tr!("shortcuts-duplicate")),
             ("Ctrl+X", || tr!("shortcuts-cut")),
-            ("Ctrl+Alt+L", || tr!("shortcuts-format-code")),
-            ("Ctrl+Alt+Shift+L", || tr!("shortcuts-format-statement")),
-            ("Ctrl+Alt+J", || tr!("shortcuts-single-line")),
             ("Alt+↑ / Alt+↓", || tr!("shortcuts-move-line")),
             ("Alt+Enter", || tr!("shortcuts-quick-fix")),
             ("Tab / Shift+Tab", || tr!("shortcuts-indent")),
@@ -216,42 +618,32 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
 /// Showing a nearly-right binding on a row is worse than showing none — it
 /// teaches a key that does something else.
 ///
-/// The keys string must be *byte-identical* to a [`SHORTCUTS`] row, which
-/// `tests::every_command_key_is_a_real_shortcut` enforces (a `#[cfg(test)]`
-/// item, so not linkable), and the palette can therefore never advertise a
-/// binding the modal doesn't document or the app doesn't have.
-///
-/// **Each entry names its row's group**, not just the key string. The table has
-/// two `Ctrl+G` rows meaning different things — the editor's Go to Line and the
-/// grid's Go to Row — so matching on the string alone let *either* vouch for the
-/// palette's keycap: deleting the Editor row would have left the palette
-/// advertising `Ctrl+G` for "Go to Line" while the surviving row means the
-/// grid's row jump. A nearly-right keycap is worse than none, because it teaches
-/// a key that does something else.
-pub(crate) const COMMAND_KEYS: &[(&str, Group, &str)] = &[
-    ("new tab", Group::Global, "Ctrl+T"),
-    ("close tab", Group::Global, "Ctrl+W"),
-    ("open file", Group::Global, "Ctrl+O"),
-    ("save file", Group::Global, "Ctrl+S"),
-    ("save file as", Group::Global, "Ctrl+Shift+S"),
-    ("next tab", Group::Global, "Ctrl+Tab"),
-    ("previous tab", Group::Global, "Ctrl+Shift+Tab"),
-    ("format code", Group::Editor, "Ctrl+Alt+L"),
-    ("format statement", Group::Editor, "Ctrl+Alt+Shift+L"),
-    ("make single line", Group::Editor, "Ctrl+Alt+J"),
-    ("go to line", Group::Editor, "Ctrl+G"),
+/// Each palette command is mapped to the keymap's command that does the same
+/// thing, so its keycap is the key the user has bound to it now, and a command
+/// they cleared shows none.
+pub(crate) const COMMAND_KEYS: &[(&str, Command)] = &[
+    ("new tab", Command::NewTab),
+    ("close tab", Command::CloseTab),
+    ("open file", Command::OpenFile),
+    ("save file", Command::SaveFile),
+    ("save file as", Command::SaveFileAs),
+    ("next tab", Command::NextTab),
+    ("previous tab", Command::PreviousTab),
+    ("format code", Command::FormatCode),
+    ("format statement", Command::FormatStatement),
+    ("make single line", Command::MakeSingleLine),
+    ("go to line", Command::GoToLine),
 ];
 
-/// The keys to show on a palette row for the command called `name`.
-///
-/// Respelled for the platform, like every other rendered key string — see
-/// [`keys_label`]. The lookup still matches on the table's own Ctrl spelling, so
-/// the byte-identity the tests enforce between the two tables is untouched.
+/// The keys to show on a palette row for the command called `name`, respelled
+/// for the platform and language — `None` when it maps to no keymap command
+/// or the user cleared that command's key.
 pub(crate) fn command_keys(name: &str) -> Option<Cow<'static, str>> {
     COMMAND_KEYS
         .iter()
-        .find(|(n, _, _)| *n == name)
-        .map(|(_, _, k)| keys_label(k))
+        .find(|(n, _)| *n == name)
+        .and_then(|(_, c)| command_chord_label(*c))
+        .map(Cow::Owned)
 }
 
 /// A context-menu entry that does **exactly** what a key does — the menus'
@@ -263,8 +655,9 @@ pub(crate) fn command_keys(name: &str) -> Option<Cow<'static, str>> {
 /// it has one.
 ///
 /// An enum rather than a string key, so a menu cannot name an entry that is not
-/// here; `tests::every_menu_key_is_the_shortcut_row_it_names` holds each one to
-/// its `SHORTCUTS` row.
+/// here; `tests::every_menu_key_is_the_shortcut_row_it_names` holds each fixed
+/// one to its `SHORTCUTS` row. One that runs a keymap command shows that
+/// command's key as it stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuKey {
     /// The grid's cell and gutter *Copy*: the selection, as Ctrl+C copies it.
@@ -277,30 +670,47 @@ pub(crate) enum MenuKey {
     EditorFormat,
 }
 
+/// What a [`MenuKey`] shows: a fixed `SHORTCUTS` row, or a keymap command.
+enum MenuRow {
+    /// The group is what the menu-key test finds the row by.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Fixed(Group, &'static str, Describe),
+    Command(Command),
+}
+
 impl MenuKey {
-    /// The `SHORTCUTS` row this entry shows: `(group, keys, description)`.
-    fn row(self) -> (Group, &'static str, Describe) {
+    /// The row this entry shows.
+    fn row(self) -> MenuRow {
         match self {
-            MenuKey::GridCopy => (Group::ResultsGrid, "Ctrl+C", || tr!("shortcuts-copy")),
-            MenuKey::GridPaste => (Group::ResultsGrid, "Ctrl+V", || {
+            MenuKey::GridCopy => {
+                MenuRow::Fixed(Group::ResultsGrid, "Ctrl+C", || tr!("shortcuts-copy"))
+            }
+            MenuKey::GridPaste => MenuRow::Fixed(Group::ResultsGrid, "Ctrl+V", || {
                 tr!("shortcuts-paste-staged")
             }),
             MenuKey::GridDeleteRows => {
-                (Group::ResultsGrid, "Del", || tr!("shortcuts-mark-deletion"))
+                MenuRow::Fixed(Group::ResultsGrid, "Del", || tr!("shortcuts-mark-deletion"))
             }
-            MenuKey::EditorFormat => (Group::Editor, "Ctrl+Alt+L", || tr!("shortcuts-format-code")),
+            MenuKey::EditorFormat => MenuRow::Command(Command::FormatCode),
         }
     }
 
-    /// The keys as this platform reads them, for the menu's keycap.
-    pub(crate) fn keys(self) -> Cow<'static, str> {
-        keys_label(self.row().1)
+    /// The keys as this platform reads them, for the menu's keycap — `None`
+    /// for a command the user left without a key.
+    pub(crate) fn keys(self) -> Option<Cow<'static, str>> {
+        match self.row() {
+            MenuRow::Fixed(_, keys, _) => Some(keys_label(keys)),
+            MenuRow::Command(c) => command_chord_label(c).map(Cow::Owned),
+        }
     }
 
-    /// What the `SHORTCUTS` row calls the action — the menu entry's own label
+    /// What the Shortcuts modal calls the action — the menu entry's own label
     /// where the menu takes it from here, so the two say the same thing.
     pub(crate) fn label(self) -> String {
-        (self.row().2)()
+        match self.row() {
+            MenuRow::Fixed(_, _, describe) => describe(),
+            MenuRow::Command(c) => command_label(c),
+        }
     }
 }
 
@@ -353,11 +763,11 @@ fn key_name(key: &str) -> Option<String> {
 /// testable from whichever machine runs the suite. A row is bindings joined by
 /// ` / `, each a chord of keys joined by `+` — so the `/` in `Ctrl+/`, with no
 /// spaces around it, is a key and not a separator.
-fn keys_label_on(
-    keys: &'static str,
+fn keys_label_on<'a>(
+    keys: &'a str,
     primary_is_cmd: bool,
     name: impl Fn(&str) -> Option<String>,
-) -> Cow<'static, str> {
+) -> Cow<'a, str> {
     let named = keys
         .split(" / ")
         .map(|chord| {
@@ -610,9 +1020,11 @@ mod primary_key_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMAND_KEYS, Group, MenuKey, SHORTCUTS, command_keys, keys_label, keys_label_on,
-        primary_from,
+        COMMAND_KEYS, Chord, Command, Context, Group, Keymap, MenuKey, MenuRow, SHORTCUTS,
+        chord_from, command_keys, command_label, fixed_keys, keymap, keys_label, keys_label_on,
+        primary_from, row_chords,
     };
+    use floem::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
@@ -631,8 +1043,9 @@ mod tests {
     /// surface that binds it is what turns that into a failure.
     ///
     /// A file lists every group it may document into, not one — `lib.rs` is the
-    /// window root *and* the terminal panel, and the editor re-binds the global
-    /// navigation keys because it consumes every KeyDown itself. When a binding
+    /// window root *and* the terminal panel. (The global *commands* are the
+    /// keymap's now, and no file binds their letters; `Group::Global` stays on
+    /// the surfaces that may still hand-bind a window-wide key.) When a binding
     /// legitimately belongs to a group not listed here, add the group; the
     /// failure message says so.
     const KEY_FILES: &[(&str, &[Group])] = &[
@@ -695,22 +1108,24 @@ mod tests {
     use crate::source_gate::production_code;
 
     /// Every single letter bound with Ctrl or Alt in `src`, by the five idioms
-    /// the codebase actually uses:
+    /// the codebase has used:
     ///
     /// - `"x" | "X"` — the case pair, covering both `matches!(s.as_str(), …)` and
     ///   a plain `match` arm (the grid, the root, the terminal's copy/paste)
     /// - `eq_ignore_ascii_case("x")` — the editor's style
-    /// - `Some("x") =>` — `NavKeys`' match arms, requiring the `=>` so this
-    ///   doesn't match every `Some("…")` in the crate
-    /// - `ch == Some("x")` — the *same* function's shifted arms, spelled as an
-    ///   equality rather than a pattern. This one was missing, and it is where
-    ///   **both** of the app's Ctrl+Shift+letter bindings live: the gate was
-    ///   green only because `p` and `t` happen to be bound a second time in the
-    ///   unshifted arms below, so adding a third Ctrl+Shift+letter in the
-    ///   file's own established style would have needed no `SHORTCUTS` row
-    /// - `KeyCode::KeyX` — a *physical* key, which is how Ctrl+Alt+L has to be
-    ///   matched (Windows delivers Ctrl+Alt as AltGr, so the logical character
-    ///   isn't "l")
+    /// - `Some("x") =>` — a match on the lowercased character, as `NavKeys`'
+    ///   arms were, requiring the `=>` so this doesn't match every `Some("…")`
+    ///   in the crate
+    /// - `ch == Some("x")` — the same, spelled as an equality rather than a
+    ///   pattern; it is where `NavKeys`' Ctrl+Shift+letter arms lived, and it
+    ///   was once missing from this list
+    /// - `KeyCode::KeyX` — a *physical* key, which is how a Ctrl+Alt letter was
+    ///   matched before the keymap read one by its place (Windows delivers
+    ///   Ctrl+Alt as AltGr, so the logical character need not be the letter)
+    ///
+    /// The last three bind nothing in production code since those keys became
+    /// keymap commands; they stay scanned because they are the spellings a new
+    /// hand-written binding would most likely use.
     ///
     /// Anything spelled a sixth way slips through, which is the weakness this
     /// test accepts: it exists to catch the binding nobody wrote down, not to
@@ -758,8 +1173,8 @@ mod tests {
                 }
             }
         }
-        // `== Some("x")` — the equality form, which is how the shifted arms of
-        // `NavKeys::handle` are written. The `==` is what distinguishes it from
+        // `== Some("x")` — the equality form, as the shifted arms of
+        // `NavKeys::handle` were written. The `==` is what distinguishes it from
         // an ordinary `Some("…")`, exactly as the `=>` does above.
         let mut rest = src;
         while let Some(i) = rest.find("== Some(\"") {
@@ -869,7 +1284,7 @@ mod tests {
         assert!(bound_letters(r#"Some("p") => { find(); }"#).contains(&'p'));
         assert!(
             bound_letters(r#"if ch == Some("b") { bold(); }"#).contains(&'b'),
-            "the equality form, where both Ctrl+Shift+letter bindings live"
+            "the equality form, where the Ctrl+Shift+letter arms lived"
         );
         assert!(
             bound_letters("PhysicalKey::Code(KeyCode::KeyL)").contains(&'l'),
@@ -970,8 +1385,8 @@ mod tests {
     #[test]
     fn documented_reads_a_letter_only_as_a_whole_key() {
         assert!(documented('g'), "Ctrl+G");
-        assert!(documented('l'), "Ctrl+Alt+L");
-        assert!(documented('e'), "Ctrl+Shift+E");
+        assert!(documented('u'), "Ctrl+Shift+U");
+        assert!(documented('j'), "Ctrl+Shift+J");
         // The failure this spelling avoids: `Ctrl+Enter` must not make every
         // Ctrl+E binding look documented, nor `Del` vouch for Ctrl+D.
         assert!(
@@ -988,35 +1403,30 @@ mod tests {
         );
     }
 
-    /// The palette may only advertise a binding the modal documents, spelled
-    /// identically. Without this the two lists drift into disagreeing about the
-    /// same key, which is worse than either being merely incomplete.
+    /// **A palette command shows the key of the keymap command that does the
+    /// same thing.** Each palette name is its command's id with spaces, so a
+    /// mapping to the wrong command reads as a mismatch here.
     #[test]
-    fn every_command_key_is_a_real_shortcut() {
-        for (name, group, keys) in COMMAND_KEYS {
-            // The row that *means* it, not any row with the same key string:
-            // the table has two `Ctrl+G` rows for two different things.
-            let found = SHORTCUTS
-                .iter()
-                .filter(|(g, _)| g == group)
-                .any(|(_, rows)| rows.iter().any(|(k, _)| k == keys));
-            assert!(
-                found,
-                "palette command {name:?} shows {keys:?} from group {group:?}, which is \
-                 not a SHORTCUTS row there — add the row, fix the spelling to match one \
-                 exactly, or name the group the binding really comes from"
+    fn every_palette_keycap_names_the_command_of_its_name() {
+        for (name, command) in COMMAND_KEYS {
+            assert_eq!(
+                name.replace(' ', "-"),
+                command.id(),
+                "palette command {name:?} shows the key of {command:?}"
             );
         }
     }
 
     /// **A context menu may only show a key the modal documents, for the row
-    /// that means it.** Each [`MenuKey`] names its `SHORTCUTS` row by group,
-    /// key string *and* description, so a row reworded or moved fails here
-    /// rather than leaving a menu showing a key for something else.
+    /// that means it.** Each fixed [`MenuKey`] names its `SHORTCUTS` row by
+    /// group, key string *and* description, so a row reworded or moved fails
+    /// here rather than leaving a menu showing a key for something else.
     #[test]
     fn every_menu_key_is_the_shortcut_row_it_names() {
         for key in menu_keys_all() {
-            let (group, keys, what) = key.row();
+            let MenuRow::Fixed(group, keys, what) = key.row() else {
+                continue;
+            };
             let found = SHORTCUTS
                 .iter()
                 .filter(|(g, _)| *g == group)
@@ -1027,8 +1437,24 @@ mod tests {
                  SHORTCUTS row — fix the entry to name a real one",
                 what()
             );
-            assert_eq!(key.keys(), keys_label(keys));
+            assert_eq!(key.keys(), Some(keys_label(keys)));
         }
+    }
+
+    /// **A menu entry that runs a command shows that command's key as it
+    /// stands** — Format code's menu keycap follows the keymap, and is gone
+    /// when the user clears the key.
+    #[test]
+    fn a_command_menu_key_follows_the_keymap() {
+        use floem::reactive::SignalUpdate;
+        let map = keymap();
+        assert_eq!(
+            MenuKey::EditorFormat.keys().as_deref(),
+            Some(&*keys_label("Ctrl+Alt+L"))
+        );
+        map.update(|m| m.clear(Command::FormatCode));
+        assert_eq!(MenuKey::EditorFormat.keys(), None);
+        map.set(Keymap::defaults());
     }
 
     /// The format action is called the same on the shortcut sheet, the editor
@@ -1038,16 +1464,16 @@ mod tests {
     #[test]
     fn the_format_action_has_one_name_on_every_surface() {
         let label = MenuKey::EditorFormat.label();
-        let (group, keys, _) = MenuKey::EditorFormat.row();
         let palette = COMMAND_KEYS
             .iter()
-            .find(|(_, g, k)| *g == group && *k == keys)
-            .map(|(name, _, _)| *name)
+            .find(|(_, c)| *c == Command::FormatCode)
+            .map(|(name, _)| *name)
             .expect("the palette names the format command");
         assert!(
             label.eq_ignore_ascii_case(palette),
             "{label:?} / {palette:?}"
         );
+        assert_eq!(label, command_label(Command::FormatCode));
     }
 
     /// Every [`MenuKey`], spelled so that a new variant fails to compile here
@@ -1069,27 +1495,11 @@ mod tests {
         ]
     }
 
-    /// Two rows can share a key string across groups (`Ctrl+G` is Go to Line in
-    /// the editor and Go to Row in the grid), which is exactly why the check
-    /// above names the group — this pins that the ambiguity is real.
-    #[test]
-    fn a_key_string_can_mean_two_things_in_two_groups() {
-        let with_ctrl_g: Vec<Group> = SHORTCUTS
-            .iter()
-            .filter(|(_, rows)| rows.iter().any(|(k, _)| *k == "Ctrl+G"))
-            .map(|(g, _)| *g)
-            .collect();
-        assert!(
-            with_ctrl_g.len() > 1,
-            "expected Ctrl+G in more than one group, got {with_ctrl_g:?}"
-        );
-    }
-
     #[test]
     fn command_keys_looks_up_by_name_and_misses_cleanly() {
-        // Compared against `keys_label` rather than a literal: the lookup is by
-        // the table's own Ctrl spelling, but what comes back is respelled for the
-        // platform, so a literal here would assert Ctrl on a macOS run.
+        // Compared against `keys_label` rather than a literal: what comes back
+        // is respelled for the platform, so a literal here would assert Ctrl on
+        // a macOS run.
         assert_eq!(command_keys("go to line"), Some(keys_label("Ctrl+G")));
         assert_eq!(
             command_keys("previous tab"),
@@ -1104,20 +1514,224 @@ mod tests {
         assert_eq!(command_keys("Go to Line"), None);
     }
 
+    /// **The palette's keycap is the key the user bound**, not the default:
+    /// moved, it follows; cleared, it is gone.
+    #[test]
+    fn a_palette_keycap_follows_the_keymap() {
+        use floem::reactive::SignalUpdate;
+        let map = keymap();
+        map.update(|m| {
+            m.assign(Command::NewTab, Chord::parse("Ctrl+N").unwrap(), &[]);
+        });
+        assert_eq!(command_keys("new tab"), Some(keys_label("Ctrl+N")));
+        map.update(|m| m.clear(Command::NewTab));
+        assert_eq!(command_keys("new tab"), None);
+        map.set(Keymap::defaults());
+    }
+
     /// A command name is what the parser matches and what Tab completes, so a
     /// duplicate here would make one of the two entries dead.
     #[test]
     fn command_keys_names_are_unique() {
         let mut seen = BTreeSet::new();
-        for (name, _, _) in COMMAND_KEYS {
+        for (name, _) in COMMAND_KEYS {
             assert!(seen.insert(*name), "duplicate COMMAND_KEYS entry {name:?}");
         }
     }
 
+    // ── The keymap against the fixed keys ────────────────────────────────
+
+    /// **No command's default is a fixed key heard where the command is.** A
+    /// default on one would leave either the command or the fixed key dead
+    /// from the first launch — and `Keymap::load` would report it to every
+    /// user with no `keymap.json` at all.
+    #[test]
+    fn no_default_is_a_fixed_key() {
+        let (_, problems) = Keymap::load(&Default::default(), &fixed_keys());
+        assert_eq!(problems, vec![]);
+    }
+
+    /// Every chord a fixed row names reads as a chord, so none of them can be
+    /// silently missing from the keys a command may not take.
+    #[test]
+    fn every_fixed_row_reads_as_chords() {
+        for (group, rows) in SHORTCUTS {
+            for (keys, desc) in *rows {
+                let want = keys.split(" / ").count() + if keys.contains("1…9") { 8 } else { 0 };
+                assert_eq!(
+                    row_chords(keys).len(),
+                    want,
+                    "{group:?} / {keys} ({}) has a binding that does not parse",
+                    desc()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_1_to_9_is_nine_fixed_keys() {
+        let chords = row_chords("Ctrl+1…9");
+        assert_eq!(chords.len(), 9);
+        assert_eq!(chords[0], Chord::parse("Ctrl+1").unwrap());
+        assert_eq!(chords[8], Chord::parse("Ctrl+9").unwrap());
+    }
+
+    /// A global command cannot be moved onto a key the editor or the grid
+    /// answers itself — the editor's find is heard before nothing else.
+    #[test]
+    fn a_global_command_cannot_take_a_surfaces_fixed_key() {
+        use schemaic_core::keymap::Verdict;
+        let fixed = fixed_keys();
+        let map = Keymap::defaults();
+        let ctrl_f = Chord::parse("Ctrl+F").unwrap();
+        assert!(matches!(
+            map.check(Command::NewTab, ctrl_f, &fixed),
+            Verdict::Fixed(_)
+        ));
+        // F6 is the grid's toolbar key, not the editor's: Go to line may have it.
+        let f6 = Chord::parse("F6").unwrap();
+        assert_eq!(map.check(Command::GoToLine, f6, &fixed), Verdict::Free);
+    }
+
+    // ── Reading a key press ──────────────────────────────────────────────
+
+    fn press(logical: Key, code: KeyCode, primary: bool, alt: bool, shift: bool) -> Option<Chord> {
+        chord_from(&logical, &PhysicalKey::Code(code), primary, alt, shift)
+    }
+
+    fn ch(s: &str) -> Key {
+        Key::Character(s.into())
+    }
+
+    #[test]
+    fn a_letter_is_read_by_its_character_whatever_shift_did_to_it() {
+        assert_eq!(
+            press(ch("P"), KeyCode::KeyP, true, false, true),
+            Chord::parse("Ctrl+Shift+P").ok()
+        );
+        // AZERTY: the A is where the Q is, and Ctrl+A is still Ctrl+A.
+        assert_eq!(
+            press(ch("a"), KeyCode::KeyQ, true, false, false),
+            Chord::parse("Ctrl+A").ok()
+        );
+    }
+
+    /// **Ctrl+Alt+L on Windows**, which delivers Ctrl+Alt as AltGr: the
+    /// character is whatever AltGr+L types (`ł` on a Polish layout), and the
+    /// chord is still Ctrl+Alt+L — the editor's format key.
+    #[test]
+    fn a_letter_altgr_changed_is_read_by_its_place() {
+        let chord = press(ch("ł"), KeyCode::KeyL, true, true, false);
+        assert_eq!(chord, Chord::parse("Ctrl+Alt+L").ok());
+        assert_eq!(
+            Keymap::defaults().resolve(chord.unwrap(), Context::Editor),
+            Some(Command::FormatCode)
+        );
+    }
+
+    #[test]
+    fn a_shifted_symbol_is_read_by_its_place() {
+        assert_eq!(
+            press(ch("?"), KeyCode::Slash, true, false, true),
+            Chord::parse("Ctrl+Shift+/").ok()
+        );
+        assert_eq!(
+            press(ch("!"), KeyCode::Digit1, true, false, true),
+            Chord::parse("Ctrl+Shift+1").ok()
+        );
+        assert_eq!(
+            press(ch("`"), KeyCode::Backquote, true, false, false),
+            Chord::parse("Ctrl+`").ok()
+        );
+    }
+
+    /// A Cyrillic layout types `п` where the G is; Ctrl on it is Ctrl+G.
+    #[test]
+    fn a_non_latin_letter_is_read_by_its_place() {
+        assert_eq!(
+            press(ch("п"), KeyCode::KeyG, true, false, false),
+            Chord::parse("Ctrl+G").ok()
+        );
+    }
+
+    #[test]
+    fn named_and_function_keys_are_read_by_name() {
+        assert_eq!(
+            press(Key::Named(NamedKey::Tab), KeyCode::Tab, true, false, true),
+            Chord::parse("Ctrl+Shift+Tab").ok()
+        );
+        assert_eq!(
+            press(Key::Named(NamedKey::F6), KeyCode::F6, false, false, false),
+            Chord::parse("F6").ok()
+        );
+        assert_eq!(
+            press(ch(" "), KeyCode::Space, true, false, false),
+            Chord::parse("Ctrl+Space").ok()
+        );
+    }
+
+    #[test]
+    fn a_lone_modifier_is_no_chord() {
+        for n in [
+            NamedKey::Control,
+            NamedKey::Shift,
+            NamedKey::Alt,
+            NamedKey::Meta,
+        ] {
+            assert_eq!(
+                press(Key::Named(n), KeyCode::ControlLeft, true, false, false),
+                None,
+                "{n:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_keys_a_command_had_by_default_resolve_as_they_did() {
+        let map = Keymap::defaults();
+        let cases = [
+            (
+                press(ch("p"), KeyCode::KeyP, true, false, false),
+                Command::FindAnywhere,
+            ),
+            (
+                press(ch("T"), KeyCode::KeyT, true, false, true),
+                Command::ReopenTab,
+            ),
+            (
+                press(ch("E"), KeyCode::KeyE, true, false, true),
+                Command::ToggleSchema,
+            ),
+            (
+                press(ch("A"), KeyCode::KeyA, true, false, true),
+                Command::ToggleAi,
+            ),
+            (
+                press(ch("`"), KeyCode::Backquote, true, false, false),
+                Command::ToggleTerminal,
+            ),
+        ];
+        for (chord, command) in cases {
+            assert_eq!(map.resolve(chord.unwrap(), Context::Global), Some(command));
+        }
+    }
+
+    #[test]
+    fn a_chord_is_named_in_the_interface_language() {
+        assert_eq!(
+            keys_label_on(
+                &Chord::parse("Ctrl+Shift+P").unwrap().to_string(),
+                false,
+                german
+            ),
+            "Strg+Umschalt+P"
+        );
+    }
+
     /// macOS spells the primary modifier Cmd, so the table's rows are rewritten
     /// on the way to the screen rather than duplicated per platform — one table
-    /// stays the single source, and `every_command_key_is_a_real_shortcut` can
-    /// go on comparing the two tables byte for byte.
+    /// stays the single source, and a keymap file written on one platform reads
+    /// the same on the other.
     #[test]
     fn a_key_string_is_respelled_for_cmd_only_where_cmd_is_the_modifier() {
         assert_eq!(keys_label_on("Ctrl+K", true, english), "Cmd+K");

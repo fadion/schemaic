@@ -309,7 +309,8 @@ code*, writes `sqlfmt::format_statement` over the statement under the click, and
 **without a selection** — with one, *Format code* already formats just that — and only when the
 statement is not formatted yet, keyword case included. A selection stays selected over the rewritten range; a bare
 caret keeps its place among the tokens (`sqlfmt::caret_after_replace`). Each has a palette
-command (*Format Statement*, *Make Single Line*) and a key (Ctrl+Alt+Shift+L, Ctrl+Alt+J), which
+command (*Format Statement*, *Make Single Line*) and a key (Ctrl+Alt+Shift+L, Ctrl+Alt+J by
+default — the keymap's `format-statement` and `make-single-line`, rebindable), which
 act at the caret through `Tab::format_req` — an `Option<FormatReq>` naming which of the three
 formats is asked — and the same `sqlfmt` answer and `rewrite_range`. **The menu entries wear no
 keycap on purpose**: they act on the statement under the click, the key on the one at the caret,
@@ -855,9 +856,11 @@ the bar reported no matches, `n/total` collapsed and Enter did nothing, over a d
 held every occurrence: the screen read as though the replace had happened.
 **The editor's key order is one decision, `editor_key_plan`, and the view only carries it out.**
 It used to be a run of `if`s in `text_editor_keys`, each reading signals another had just set,
-so the order — which *is* the behaviour — had no test. The tab navigation (Ctrl+P/T/W/Tab/1–9)
-and the Ctrl+K verdict stay ahead of it in the closure, unchanged, and Ctrl+Space onwards after
-it. The handler builds a `KeyCtx` — the key as an `EdKey` (←, Home, End, PgUp and PgDn are one
+so the order — which *is* the behaviour — had no test. The keymap's global commands and Ctrl+1–9
+(`nav.handle`, the window root's own `NavKeys`), then the editor's own commands — Format code,
+Format statement, Make single line and Go to line, resolved in `Context::Editor` wherever the
+user has bound them — and the Ctrl+K verdict stay ahead of it in the closure, and Ctrl+Space
+onwards after it. The handler builds a `KeyCtx` — the key as an `EdKey` (←, Home, End, PgUp and PgDn are one
 `Move`), the modifiers, which bars and offers are up, the *shown* ghost's offset
 (`inline_diff::shown_ghost`, below), `lone_caret`, and whether the caret ends its line, which it
 works out only for a → with a ghost showing — applies the returned `KeyPlan`'s `dismiss` and

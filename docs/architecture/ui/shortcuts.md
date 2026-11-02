@@ -1,11 +1,12 @@
 # `ui/shortcuts.rs`
 
-`shortcuts.rs` — the app's keyboard shortcuts as **one table** (`SHORTCUTS`), which
-`settings::help_overlay` renders straight from — plus the tests that keep it honest. This list
-is the app's *only* keyboard documentation and for Ctrl+H / Ctrl+G the only affordance of any
-kind, so a binding missing from it is a feature nobody can find; it was a literal inside the
+`shortcuts.rs` — the app's keyboard shortcuts as **two tables**: the rebindable commands of
+`core/keymap.rs`, whose keys the user can move, and the fixed keys of `SHORTCUTS`, which they
+cannot — both rendered by `shortcuts_view::help_overlay` — plus the tests that keep them honest.
+This list is the app's *only* keyboard documentation and for Ctrl+H / Ctrl+G the only affordance
+of any kind, so a binding missing from it is a feature nobody can find; it was a literal inside the
 modal and drifted exactly as its own comment predicted, hiding Alt+↑/↓, Ctrl+↑/↓, Ctrl+Shift+C/V
-and Ctrl+Home/End. **The handlers can't render from the table** — they are `match` arms on
+and Ctrl+Home/End. **The fixed keys' handlers can't render from the table** — they are `match` arms on
 `Key::Character` spread across the files `KEY_FILES` names — so the guarantee runs the other
 way: the tests scan those files for the **five** idioms the codebase binds a
 **Ctrl/Alt + letter** with (the `"x" | "X"` case pair, `eq_ignore_ascii_case`, `NavKeys`'
@@ -17,8 +18,12 @@ everywhere at once, so exempting Ctrl+Z for the masked secret field's sake would
 for a real editor undo binding added later, in a different file, doing a different thing. Its
 two entries are `lib.rs`'s `z` and `y` — a masked field's undo/redo, *suppressed* rather than
 bound, because the document's history is a history of mask characters. The equality form is where **both**
-Ctrl+Shift+letter bindings live and was missed; the gate was green only because `p`/`t` are
-bound a second time in the unshifted arms. `KEY_FILES` pairs each file with the `SHORTCUTS`
+Ctrl+Shift+letter bindings lived and was missed; the gate was green only because `p`/`t` were
+bound a second time in the unshifted arms. **Three of the five idioms now match nothing in
+production code** — `Some("x") =>` and `== Some("x")` were `NavKeys`' arms and `KeyCode::KeyX`
+the editor's `format_chord`, and the keymap replaced all three, so the letters they bound are
+commands with no `SHORTCUTS` row to vouch for them. The scan still looks for them, pinned on
+synthetic input, so a fixed binding written in any of those ways is still seen. `KEY_FILES` pairs each file with the `SHORTCUTS`
 **groups** its bindings may be documented in, because a table-wide lookup let the editor's
 Ctrl+D vouch for a grid Ctrl+D — a different key doing a different thing. **It is
 hand-maintained, and it was short rather than merely short-able**: the ER diagram binds Ctrl+F,
@@ -39,33 +44,68 @@ deleted) and each idiom is pinned against synthetic input, since a scan that sil
 matching still passes a test that looks for what's missing. Only **modified letters** are
 gated: plain keys are bound in dozens of places for ordinary navigation, so gating them is all
 noise, and they're what a user tries anyway.
+**A command's key is the keymap's, and nothing here spells one.** `keymap()` is the window-wide
+`RwSignal<Keymap>` — a detached-scope `thread_local`, the `modifier_keys` shape — that every
+handler, the modal and the palette read, the defaults until `load_keymap` has read
+`keymap.json` (through `persist::load_json`) and answered the notice for whatever
+`Keymap::load` could not keep, `None` when it kept everything. Showing it is the caller's:
+`lib::load_keymap(text, open)`, which the app calls at startup **just before** its own
+`report_recoveries`, drains the recoveries itself and appends the keymap's notice to them — the
+other order would have the keymap's notice overwrite whatever the startup reads recovered, or
+be overwritten by it, in the one error-modal slot. `save_keymap` sets the signal and writes the file in one call, and
+`keymap_file`/`keymap_from_bundle` are the settings file's two halves. **The fixed keys are read
+off `SHORTCUTS` itself** — `fixed_rows`/`fixed_keys`, one entry per chord, so `Tab / Shift+Tab`
+is two and `Ctrl+1…9` nine, each in its group's `Context` (`Group::context`) — so a fixed row
+added to the table is at once a key no command can be moved onto, with no second list to
+remember. `every_fixed_row_reads_as_chords` fails on a row `Chord::parse` cannot read, which
+would otherwise fall out of that list in silence, and `no_default_is_a_fixed_key` on a command
+default the table has since claimed, which `Keymap::load` would report to every user with no
+`keymap.json` at all. **`chord_of` reads a press as a chord: an ASCII letter by its logical
+character, anything else by its physical key's US character** (`chord_from`, `us_char`). A
+letter follows the layout, so Ctrl+Z is where the Z is on AZERTY; a digit, punctuation, a letter
+Shift or AltGr has changed and a non-Latin letter are read by the key they sit on, so
+`Ctrl+Shift+/` is one chord whatever Shift made of the `/`, Ctrl on a Cyrillic `п` is Ctrl+G, and
+Ctrl+Alt+L survives Windows delivering Ctrl+Alt as AltGr (`ł` on a Polish layout) — the case the
+editor's old `format_chord` matched physically for (`a_letter_altgr_changed_is_read_by_its_place`,
+`a_shifted_symbol_is_read_by_its_place`, `a_non_latin_letter_is_read_by_its_place`). The
+dispatch is `lib::NavKeys::handle` for `Context::Global`, at the window root and inside the
+editor alike, and the editor's own key handler for `Context::Editor` (`ui/editor_pane.md`).
+`command_label`, `chord_label` and `command_chord_label` are a command's description and key as
+the screen shows them; `refusal_text` is a `Refusal` in words.
 `COMMAND_KEYS`/`command_keys` is the second consumer: the **command palette** shows a row's
 binding as a keycap at its far right, which is where someone who can't remember a key actually
 looks. Only where the command does *the same thing* the key does — a narrower set than it looks,
 since `Run` runs all statements while Ctrl+Enter runs the one under the caret, `Terminal` and
 `Ask AI` act on an argument where the keys only toggle a panel, and `Toggle Panel` names its
 panel as an argument so it has three bindings and therefore none. A nearly-right keycap is worse
-than none: it teaches a key that does something else. Each entry carries its row's **group**
-as well as the key string, which must be **byte-identical** to a `SHORTCUTS` row in that group
-(tested) — the table has two `Ctrl+G` rows meaning different things, so a string match alone
-let either vouch for the keycap; the
+than none: it teaches a key that does something else. Each entry maps a palette name to the
+keymap `Command` that does the same thing, so its keycap is the key bound *now* and a cleared
+command shows none (`a_palette_keycap_follows_the_keymap`). It used to carry a `SHORTCUTS` group
+and a key string held **byte-identical** to a row in it — the table had two `Ctrl+G` rows meaning
+different things, so a string match alone let either vouch for the keycap; with no key string
+left to drift, the check is that each palette name is its command's id with spaces
+(`every_palette_keycap_names_the_command_of_its_name`), so a mapping to the wrong command reads as
+a mismatch. The
 other half — that each name still names a live command — can only be checked against a built
 registry, so it rides `overlays::assert_names_match_labels`' `debug_assert`, without which a
 renamed command would drop its keycap in silence. The name it checks is the command's `id`, its
 English name, never the translated label, so the mapping holds in every language.
 `MenuKey` is the third: the context menus' half of `COMMAND_KEYS`, held to the same rule (which
 entries earn one is under *Popup menus*). It is an **enum rather than a string**, so a menu
-cannot name an entry that is not there, and `MenuKey::row` names its `SHORTCUTS` row by group,
-keys **and description** — stronger than `COMMAND_KEYS`' group-and-keys, so a row reworded
-under it fails the test rather than going on vouching for the keycap. `keys()` hands it out through `keys_label`, so it is
+cannot name an entry that is not there, and `MenuKey::row` answers a `MenuRow`: either a
+`SHORTCUTS` row named by group, keys **and description** — so a row reworded under it fails the
+test rather than going on vouching for the keycap — or a keymap `Command`, which is what
+`EditorFormat` is (`FormatCode`), showing whatever key that command has now. `keys()` is
+therefore an `Option`, `None` for a command the user cleared (`a_command_menu_key_follows_the_keymap`),
+and hands a fixed row's keys out through `keys_label`, so either kind is
 respelled for the platform and the language like the rest. `every_menu_key_is_the_shortcut_row_it_names` checks each
 variant, walking `menu_keys_all()`, which sits beside an exhaustive `_exhaustive` match so a
 new variant fails to compile until it is listed — a list the test walks is only as good as its
 completeness. Palette and menus draw one keycap, `widgets::keycap`.
 **A group is an identity, its heading is text, and the two are kept apart for translation.**
 `Group` is an enum (`Global`, `Editor`, `ResultsGrid`, `SchemaTree`, `AiPanel`, `Terminal`,
-`ErDiagram`, `ServerActivity`) whose `label()` is the `tr!` heading, because `KEY_FILES`, `COMMAND_KEYS` and
-`MenuKey::row` all name groups for the tests above and none of that may change with the
+`ErDiagram`, `ServerActivity`) whose `label()` is the `tr!` heading, because `KEY_FILES` and
+`MenuKey::row` name groups for the tests above and none of that may change with the
 language — a heading string would have made every one of those checks depend on the locale. A
 row's description is a `Describe = fn() -> String`, a non-capturing closure over `tr!`, so
 `SHORTCUTS` stays a `const` while each message id is still checked at compile time; the key
@@ -79,12 +119,13 @@ so a `Cmd+K` row would have documented a key that does nothing on most of the su
 Both halves therefore hang off one capability — `PRIMARY_IS_CMD =
 cfg!(target_os = "macos")`, the single `cfg!` for this concern, per *Ask the capability, never
 `cfg!(target_os = …)` at the use site* (`core::window_chrome` above). What the modal **says**
-goes through `keys_label`, called from `settings::shortcut_row` (the one choke point for every
-row the modal draws) and from `command_keys`, so the palette's keycap is respelled the same way
-— `PaletteItem::keys` is a `Cow<'static, str>` for exactly that. The tables stay Ctrl-spelled: a
-second Cmd-spelled table would drift, and `every_command_key_is_a_real_shortcut` works by
-comparing the two byte for byte, so respelling at the source would have dissolved that
-guarantee. **The interface language is the respelling's second half, applied the same way** —
+goes through `keys_label`, called from `shortcuts_view::shortcut_row` (the one choke point for
+every fixed row the modal draws) and, for a keymap chord, from `chord_label` — which the
+modal's command rows, `command_keys` and `MenuKey::keys` all take — so the palette's keycap is
+respelled the same way — `PaletteItem::keys` is a `Cow<'static, str>` for exactly that. The
+table stays Ctrl-spelled, and so does a `Chord`'s `Display`: a second Cmd-spelled table would
+drift, and `every_menu_key_is_the_shortcut_row_it_names` compares a menu's key string with its
+row byte for byte, so respelling at the source would dissolve that guarantee. **The interface language is the respelling's second half, applied the same way** —
 key by key on the way to the screen, never through a translated table, for the reason a Cmd
 table was refused. `keys_label_on(keys, primary_is_cmd, name)` splits a row into bindings on
 ` / ` and each binding into keys on `+` — so the `/` in `Ctrl+/`, with no spaces around it, is a

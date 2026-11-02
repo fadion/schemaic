@@ -65,6 +65,8 @@ mod alias_rename;
 mod settings;
 pub use settings::SettingsSection;
 mod shortcuts;
+pub use shortcuts::{keymap_file, keymap_from_bundle, save_keymap};
+mod shortcuts_view;
 mod snippet_edit;
 mod snippet_panel;
 pub use alias_rename::AliasRenameRequest;
@@ -5026,11 +5028,10 @@ pub struct TabsActions {
     pub ai_seed: AiSeedFn,
 }
 
-/// The global navigation keys — handled at BOTH the workspace root and inside the
-/// editor (which `on_event_stop`s every KeyDown, so it can't rely on bubbling).
-/// Ctrl+P Find Anywhere · Ctrl+T new tab · Ctrl+Shift+T reopen closed tab ·
-/// Ctrl+W close tab · Ctrl+Tab cycle (Shift = reverse) · Ctrl+1..9 jump to the Nth tab ·
-/// Ctrl+O open a `.sql` file · Ctrl+S save · Ctrl+Shift+S save as.
+/// The global keys — handled at BOTH the workspace root and inside the editor
+/// (which `on_event_stop`s every KeyDown, so it can't rely on bubbling): every
+/// [`Context::Global`](schemaic_core::keymap::Context::Global) command of the
+/// keymap, wherever the user has bound it, and the fixed Ctrl+1..9.
 #[derive(Clone)]
 pub(crate) struct NavKeys {
     pub tabs: RwSignal<Vec<Tab>>,
@@ -5046,72 +5047,88 @@ pub(crate) struct NavKeys {
     pub open_file: Rc<dyn Fn()>,
     pub save_file: Rc<dyn Fn(usize)>,
     pub save_file_as: Rc<dyn Fn(usize)>,
+    pub schema_visible: RwSignal<bool>,
+    pub right_panel: RwSignal<RightPanel>,
 }
 
 impl NavKeys {
-    /// Try to handle a Ctrl-modified key. Callers pass `shift`, the lowercased
-    /// character (`ch`, if the key was a Character), and whether it was the Tab
-    /// key. Returns true iff it consumed the key. (Ctrl is assumed already checked
-    /// by the caller.)
-    pub(crate) fn handle(&self, shift: bool, ch: Option<&str>, is_tab: bool) -> bool {
-        if is_tab {
-            self.cycle(shift);
+    /// Answer a key press the window answers wherever focus is. Returns true
+    /// iff it consumed the key.
+    pub(crate) fn handle(
+        &self,
+        key: &Key,
+        physical: &floem::keyboard::PhysicalKey,
+        mods: floem::keyboard::Modifiers,
+    ) -> bool {
+        use schemaic_core::keymap::{Context, Key as ChordKey};
+        let Some(chord) = shortcuts::chord_of(key, physical, mods) else {
+            return false;
+        };
+        if let Some(command) =
+            shortcuts::keymap().with_untracked(|m| m.resolve(chord, Context::Global))
+        {
+            self.run(command);
             return true;
         }
-        // Ctrl+Shift+P → command palette: Find-Anywhere pre-filled with ">".
-        if shift {
-            if ch == Some("p") {
+        // Ctrl+1..9 → jump to the 1st..9th tab (by position, not id). Fixed: a
+        // family of nine is no command to move.
+        if chord.primary
+            && !chord.shift
+            && !chord.alt
+            && let ChordKey::Char(d @ '1'..='9') = chord.key
+        {
+            self.jump(d as usize - '1' as usize);
+            return true;
+        }
+        false
+    }
+
+    /// Run a global command of the keymap. An editor command is the editor's
+    /// to run, so it does nothing here.
+    pub(crate) fn run(&self, command: schemaic_core::keymap::Command) {
+        use schemaic_core::keymap::Command as C;
+        match command {
+            // Find Anywhere; a redundant set(true) would rebuild the overlay.
+            C::FindAnywhere => {
+                if !self.find_open.get_untracked() {
+                    self.find_open.set(true);
+                }
+            }
+            // The command palette: Find-Anywhere pre-filled with ">".
+            C::CommandPalette => {
                 self.find_query.set(">".to_string());
                 if !self.find_open.get_untracked() {
                     self.find_open.set(true);
                 }
-                return true;
             }
-            // Ctrl+Shift+T → reopen the most-recently-closed tab.
-            if ch == Some("t") {
-                (self.reopen_closed)();
-                return true;
-            }
-            // Ctrl+Shift+S → Save As.
-            if ch == Some("s") {
-                (self.save_file_as)(self.active.get_untracked());
-                return true;
-            }
-            // Other Ctrl+Shift+<letter/digit> belong to the panel toggles, not us.
-            return false;
-        }
-        match ch {
-            Some("p") => {
-                // Find Anywhere; a redundant set(true) would rebuild the overlay.
-                if !self.find_open.get_untracked() {
-                    self.find_open.set(true);
+            C::NewTab => (self.add_tab)(),
+            C::CloseTab => (self.close_tab)(self.active.get_untracked()),
+            C::NextTab => self.cycle(false),
+            C::PreviousTab => self.cycle(true),
+            C::ReopenTab => (self.reopen_closed)(),
+            // Open a `.sql` file, and save the active tab to one (Save As when
+            // it hasn't got a file yet).
+            C::OpenFile => (self.open_file)(),
+            C::SaveFile => (self.save_file)(self.active.get_untracked()),
+            C::SaveFileAs => (self.save_file_as)(self.active.get_untracked()),
+            C::ToggleSchema => {
+                if schema_panel_allowed() {
+                    self.schema_visible.update(|v| *v = !*v);
                 }
-                true
             }
-            Some("t") => {
-                (self.add_tab)();
-                true
-            }
-            Some("w") => {
-                (self.close_tab)(self.active.get_untracked());
-                true
-            }
-            // Ctrl+O / Ctrl+S — open a `.sql` file, and save the active tab to
-            // one (Save As when it hasn't got a file yet).
-            Some("o") => {
-                (self.open_file)();
-                true
-            }
-            Some("s") => {
-                (self.save_file)(self.active.get_untracked());
-                true
-            }
-            // Ctrl+1..9 → jump to the 1st..9th tab (by position, not id).
-            Some(d) if d.len() == 1 && matches!(d.as_bytes()[0], b'1'..=b'9') => {
-                self.jump((d.as_bytes()[0] - b'1') as usize);
-                true
-            }
-            _ => false,
+            // AI and Terminal share the right slot, so each key shows-or-hides
+            // its own panel.
+            C::ToggleAi => self.toggle_right(RightPanel::Ai),
+            C::ToggleTerminal => self.toggle_right(RightPanel::Terminal),
+            C::FormatCode | C::FormatStatement | C::MakeSingleLine | C::GoToLine => {}
+        }
+    }
+
+    fn toggle_right(&self, which: RightPanel) {
+        if right_panel_allowed() {
+            self.right_panel.update(|p| {
+                *p = if *p == which { RightPanel::None } else { which };
+            });
         }
     }
 
@@ -5687,7 +5704,7 @@ pub enum VarsState {
 }
 
 /// The connection and database the **Performance** view is open on
-/// ([`perf_view`](crate::perf_view)), captured at open for [`VarsTarget`]'s
+/// ([`perf_view`]), captured at open for [`VarsTarget`]'s
 /// reason. `database` is where the per-database reads look (index health,
 /// sizes, PostgreSQL's extension, SQL Server's Query Store); `None` is a
 /// connection with no database chosen, which those views say.
@@ -7251,6 +7268,8 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
         open_file: ui.tab_actions.open_sql_file.clone(),
         save_file: ui.tab_actions.save_sql_file.clone(),
         save_file_as: ui.tab_actions.save_sql_file_as.clone(),
+        schema_visible,
+        right_panel,
     };
     let shell = v_stack((
         header(ui.clone(), chrome),
@@ -7516,8 +7535,8 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
         // handler and hid it. `window_key_gate` is what keeps it here.
         //
         // What this answers, in order: Escape closing an open dropdown popup, the
-        // Tab-trap backstop, `NavKeys` (Ctrl+P/Shift+P/T/W/Tab/1-9, Ctrl+O/S), and
-        // the three panel toggles Ctrl+Shift+E / Ctrl+Shift+A / Ctrl+`.
+        // Tab-trap backstop, and `NavKeys` — the keymap's global commands
+        // (tabs, files, the three panel toggles) and Ctrl+1..9.
         .on_event(EventListener::KeyDown, move |e| {
             if let Event::KeyDown(ke) = e {
                 let m = ke.modifiers;
@@ -7630,51 +7649,11 @@ pub fn workspace(ui: Ui, window: WindowId) -> impl IntoView {
                 if root_menus.any_open() {
                     return EventPropagation::Continue;
                 }
-                if crate::shortcuts::primary_held(m) {
-                    // Global nav (Ctrl+P/T/W/Tab/1-9, Cmd on macOS) — also wired inside the
-                    // editor, which stops KeyDown; here it catches every other
-                    // focus (grid, schema, nothing).
-                    let is_tab = matches!(ke.key.logical_key, Key::Named(NamedKey::Tab));
-                    let ch = match &ke.key.logical_key {
-                        Key::Character(c) => Some(c.as_str().to_ascii_lowercase()),
-                        _ => None,
-                    };
-                    if navkeys.handle(m.shift(), ch.as_deref(), is_tab) {
-                        return EventPropagation::Stop;
-                    }
-                    if let Key::Character(c) = &ke.key.logical_key {
-                        let c = c.as_str();
-                        if m.shift() && c.eq_ignore_ascii_case("e") {
-                            if schema_panel_allowed() {
-                                schema_visible.update(|v| *v = !*v);
-                            }
-                            return EventPropagation::Stop;
-                        }
-                        if m.shift() && c.eq_ignore_ascii_case("a") {
-                            if right_panel_allowed() {
-                                right_panel.update(|p| {
-                                    *p = if matches!(*p, RightPanel::Ai) {
-                                        RightPanel::None
-                                    } else {
-                                        RightPanel::Ai
-                                    };
-                                });
-                            }
-                            return EventPropagation::Stop;
-                        }
-                        if c == "`" {
-                            if right_panel_allowed() {
-                                right_panel.update(|p| {
-                                    *p = if matches!(*p, RightPanel::Terminal) {
-                                        RightPanel::None
-                                    } else {
-                                        RightPanel::Terminal
-                                    };
-                                });
-                            }
-                            return EventPropagation::Stop;
-                        }
-                    }
+                // The keymap's global commands and Ctrl+1..9 — also wired inside
+                // the editor, which stops KeyDown; here they catch every other
+                // focus (grid, schema, nothing).
+                if navkeys.handle(&ke.key.logical_key, &ke.key.physical_key, m) {
+                    return EventPropagation::Stop;
                 }
             }
             EventPropagation::Continue
@@ -8535,6 +8514,25 @@ pub fn report_recoveries(
     open.set(true);
 }
 
+/// Read `keymap.json` into the window's keymap, **and report** what the read
+/// recovered and every entry that could not be applied, as one act.
+///
+/// Called before the build's own [`report_recoveries`], so the drain here takes
+/// every recovery so far and the keymap's notice is added beside them rather
+/// than overwriting them; the later drain then finds nothing.
+pub fn load_keymap(text: RwSignal<Option<schemaic_core::model::ModalError>>, open: RwSignal<bool>) {
+    let problems = shortcuts::load_keymap();
+    report_recoveries(text, open);
+    if let Some(notice) = problems {
+        let notice = match text.get_untracked() {
+            Some(before) => format!("{}\n\n{notice}", before.text),
+            None => notice,
+        };
+        text.set(Some(schemaic_core::model::ModalError::app(notice)));
+        open.set(true);
+    }
+}
+
 /// Read `diagrams.json` **and report what that read recovered**, as one act.
 ///
 /// The ER layouts are the app's only *lazy* config load: the startup drain runs
@@ -9031,7 +9029,6 @@ fn center(ui: Ui) -> impl IntoView {
     let inline_ai_cancel = ui.ai_actions.inline_cancel.clone();
     let error_modal_open = ui.overlay.error_modal_open;
     let error_modal_text = ui.overlay.error_modal_text;
-    let schema_visible = ui.layout.schema_visible;
     let right_panel = ui.layout.right_panel;
     let ai_send = ui.ai_actions.send.clone();
     let context_menu = ui.overlay.context_menu;
@@ -9186,6 +9183,8 @@ fn center(ui: Ui) -> impl IntoView {
         open_file: ui.tab_actions.open_sql_file.clone(),
         save_file: ui.tab_actions.save_sql_file.clone(),
         save_file_as: ui.tab_actions.save_sql_file_as.clone(),
+        schema_visible: ui.layout.schema_visible,
+        right_panel: ui.layout.right_panel,
     };
 
     // Open the query-plan modal for a statement (from the editor's "Plan" menu):
@@ -9274,7 +9273,6 @@ fn center(ui: Ui) -> impl IntoView {
                     error_modal_open,
                     alias_rename: ui.overlay.alias_rename,
                     usages: ui.overlay.usages,
-                    schema_visible,
                     right_panel,
                     ai_send: ai_send.clone(),
                     context_menu,

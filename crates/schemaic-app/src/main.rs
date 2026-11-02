@@ -12561,7 +12561,12 @@ fn app_view(
                     extensions: &["json"],
                 }]);
             let text = snippets.with_untracked(|s| {
-                schemaic_core::settings_bundle::export_json(&current_ui_state(), &current_term(), s)
+                schemaic_core::settings_bundle::export_json(
+                    &current_ui_state(),
+                    &current_term(),
+                    &schemaic_ui::keymap_file(),
+                    s,
+                )
             });
             let (handle, file_error) = (handle.clone(), file_error.clone());
             floem::action::save_as(opts, move |file| {
@@ -12698,7 +12703,12 @@ fn app_view(
                                         TermCursor::from_key(&t.cursor_style).key().into();
                                 },
                             );
-                            let changed = changed + term_changed;
+                            // The keymap's, read as `keymap.json` is: an entry
+                            // it cannot apply is reported once the import runs.
+                            let keymap =
+                                bundle.keymap.as_ref().map(schemaic_ui::keymap_from_bundle);
+                            let keys_changed = keymap.as_ref().map_or(0, |(_, n, _)| *n);
+                            let changed = changed + term_changed + keys_changed;
                             // How many snippets would be added, by the merge
                             // itself over a copy.
                             let adds = snippets.with_untracked(|s| {
@@ -12718,6 +12728,7 @@ fn app_view(
                                 apply_settings.clone(),
                                 import_snippets.clone(),
                             );
+                            let file_error = file_error.clone();
                             confirm.set(Some(Confirm {
                                 title: tr!("settings-import-title"),
                                 message: settings_import_question(&shown, changed, adds),
@@ -12731,6 +12742,14 @@ fn app_view(
                                         term_cursor_blink.set(term.cursor_blink);
                                         (save_ui)(persist::Saving::Replacing);
                                         (import_snippets)(bundle.snippets.clone());
+                                        if let Some((map, n, notice)) = &keymap {
+                                            if *n > 0 {
+                                                schemaic_ui::save_keymap(map.clone());
+                                            }
+                                            if let Some(notice) = notice {
+                                                (file_error)(notice.clone());
+                                            }
+                                        }
                                     }
                                 }),
                             }));
@@ -16098,6 +16117,10 @@ fn app_view(
     // corrupt `diagrams.json` was renamed aside and reported to nobody. They
     // call `report_recoveries` too; this is the same function, not a fourth
     // spelling of it.
+    //
+    // The keymap is read first, and drains them itself, so its own notice is
+    // added to theirs rather than replacing it (`load_keymap`).
+    schemaic_ui::load_keymap(error_modal_text, error_modal_open);
     schemaic_ui::report_recoveries(error_modal_text, error_modal_open);
     // **The session write that has to happen even though nobody asked for it.**
     // Quitting the window is the one way of losing a tab that never reaches

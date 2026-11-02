@@ -107,7 +107,9 @@ anchor, rather than the window-wide one `menu_panel` applies (GitHub #21; the `o
   The cell menu's single-row *Delete row* wears none, and neither does the editor's *Ask AI*, which
   acts on the right-clicked statement where Ctrl+K takes the caret or selection — nor, for the same
   reason, *Format statement* and *Make single line*, whose keys act at the caret; the editor's
-  *Format code* wears Ctrl+Alt+L, being the same `format_editor` call — and takes its label from
+  *Format code* wears the keymap's `format-code` key (Ctrl+Alt+L by default, none once the user
+  clears it — `MenuKey::EditorFormat` is a keymap command, not a fixed row), being the same
+  `format_editor` call — and takes its label from
   the row too (`MenuKey::label`), so it is called what the shortcut sheet and the palette's
   *Format Code* call it (`the_format_action_has_one_name_on_every_surface`; it was "Format", "Format
   SQL" and "Format Code"). The builder is a no-op on

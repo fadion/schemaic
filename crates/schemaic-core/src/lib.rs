@@ -44,6 +44,7 @@ pub mod import;
 pub mod init_sql;
 pub mod intel;
 pub mod jsontree;
+pub mod keymap;
 pub mod launch;
 pub mod locale;
 pub mod model;

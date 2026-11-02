@@ -28,10 +28,15 @@
 //! file from someone else must not choose what the terminal launches. The
 //! terminal's settings type lives in a crate this one does not depend on, so
 //! both halves go through [`apply_keys`], generic over the type that reads them.
+//!
+//! **So does the keymap**, as `keymap.json` holds it ([`KeymapFile`]): only the
+//! keys the user moved. Its entries are checked by the keymap's own reader when
+//! the bundle is applied, as a hand-edited file's are.
 
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
+use crate::keymap::KeymapFile;
 use crate::persist::UiState;
 use crate::snippet::{Scope, Snippet, Source};
 
@@ -91,17 +96,26 @@ pub const TERMINAL_KEYS: &[&str] = &[
 ];
 
 /// A bundle as read: the portable settings it names (only those — any other
-/// key in the file is dropped here), the terminal's, and its snippets.
+/// key in the file is dropped here), the terminal's, the keymap's changes, and
+/// its snippets.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Bundle {
     pub settings: Map<String, Value>,
     pub terminal: Map<String, Value>,
+    /// `None` for a bundle with no keymap section — from before the keymap
+    /// travelled — which leaves the keymap as it is.
+    pub keymap: Option<KeymapFile>,
     pub snippets: Vec<Snippet>,
 }
 
-/// The bundle for `state`, the terminal's settings `terminal` and `snippets`,
-/// as the file's text.
-pub fn export_json(state: &UiState, terminal: &impl Serialize, snippets: &[Snippet]) -> String {
+/// The bundle for `state`, the terminal's settings `terminal`, the keymap's
+/// changes `keymap` and `snippets`, as the file's text.
+pub fn export_json(
+    state: &UiState,
+    terminal: &impl Serialize,
+    keymap: &KeymapFile,
+    snippets: &[Snippet],
+) -> String {
     let snippets: Vec<&Snippet> = snippets.iter().filter(|s| travels(s)).collect();
     let mut out = Map::new();
     out.insert("schemaic_settings".into(), Value::from(BUNDLE_VERSION));
@@ -109,6 +123,10 @@ pub fn export_json(state: &UiState, terminal: &impl Serialize, snippets: &[Snipp
     out.insert(
         "terminal".into(),
         Value::Object(pick(terminal, TERMINAL_KEYS)),
+    );
+    out.insert(
+        "keymap".into(),
+        serde_json::to_value(keymap).unwrap_or(Value::Null),
     );
     out.insert(
         "snippets".into(),
@@ -144,6 +162,10 @@ pub fn parse(json: &str) -> Result<Bundle, String> {
     let settings = allowed("settings", PORTABLE_KEYS);
     // A bundle from before the terminal travelled has no section: nothing to apply.
     let terminal = allowed("terminal", TERMINAL_KEYS);
+    // Its entries are the keymap reader's to check when it is applied.
+    let keymap = v
+        .get("keymap")
+        .and_then(|k| serde_json::from_value::<KeymapFile>(k.clone()).ok());
     // A snippet this build cannot read is dropped alone, not the whole file.
     let snippets = v
         .get("snippets")
@@ -157,6 +179,7 @@ pub fn parse(json: &str) -> Result<Bundle, String> {
     Ok(Bundle {
         settings,
         terminal,
+        keymap,
         snippets,
     })
 }
@@ -329,7 +352,7 @@ mod tests {
             font_size: 16,
             ..Term::default()
         };
-        let json = export_json(&UiState::default(), &term, &[]);
+        let json = export_json(&UiState::default(), &term, &KeymapFile::default(), &[]);
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["terminal"]["font_size"], 16);
         assert!(v["terminal"].get("shell").is_none());
@@ -379,6 +402,38 @@ mod tests {
         assert!(b.terminal.is_empty());
     }
 
+    fn moved_keymap() -> KeymapFile {
+        KeymapFile {
+            bindings: [
+                ("new-tab".to_string(), Some("Ctrl+N".to_string())),
+                ("close-tab".to_string(), None),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    /// **The keymap travels**, as `keymap.json` holds it: only what moved,
+    /// and a cleared command as `null`.
+    #[test]
+    fn the_keymap_travels_as_its_file_holds_it() {
+        let json = export_json(&UiState::default(), &Term::default(), &moved_keymap(), &[]);
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["keymap"]["bindings"]["new-tab"], "Ctrl+N");
+        assert!(v["keymap"]["bindings"]["close-tab"].is_null());
+        assert_eq!(parse(&json).unwrap().keymap, Some(moved_keymap()));
+    }
+
+    /// A bundle with no keymap section leaves the keymap alone — `None`, not
+    /// an empty keymap that would put every key back on its default.
+    #[test]
+    fn a_bundle_from_before_the_keymap_travelled_reads_with_none() {
+        let b = parse(r#"{"schemaic_settings": 1, "settings": {}}"#).unwrap();
+        assert_eq!(b.keymap, None);
+        let b = parse(r#"{"schemaic_settings": 1, "keymap": "nonsense"}"#).unwrap();
+        assert_eq!(b.keymap, None, "an unreadable section is no keymap");
+    }
+
     #[test]
     fn every_portable_key_is_a_field_ui_state_writes() {
         let written = serde_json::to_value(UiState::default()).unwrap();
@@ -405,7 +460,7 @@ mod tests {
             ),
             snip(3, "one server", "SELECT 3", Scope::Conn(7)),
         ];
-        let json = export_json(&state, &Term::default(), &snippets);
+        let json = export_json(&state, &Term::default(), &KeymapFile::default(), &snippets);
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["schemaic_settings"], BUNDLE_VERSION);
         let settings = v["settings"].as_object().unwrap();
@@ -431,6 +486,7 @@ mod tests {
         let json = export_json(
             &state,
             &Term::default(),
+            &KeymapFile::default(),
             &[snip(1, "a", "SELECT 1", Scope::Global)],
         );
         let b = parse(&json).unwrap();

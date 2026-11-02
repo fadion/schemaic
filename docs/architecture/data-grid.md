@@ -210,9 +210,13 @@ this bundle's.
   that owns the Global shortcuts was never asked. A Shift variant is a different key in this app;
   declined here, it reaches `grid_key`'s `_ => Continue` and falls through to the window. Alt is out
   because AltGr arrives as Ctrl+Alt on Windows and AltGr+V is a character on many European
-  layouts — it pasted. `no_global_ctrl_shift_shortcut_is_taken_by_the_grid` walks every
-  `Ctrl+Shift+<letter>` row of the `SHORTCUTS` Global group rather than a list of its own, so a
-  Global binding added later is covered the day it lands (it was seen red naming Ctrl+Shift+A);
+  layouts — it pasted. `no_global_ctrl_shift_shortcut_is_taken_by_the_grid` walks every Global
+  command of the keymap whose default is `Ctrl+Shift+<letter>` (`Command::ALL`, since those rows
+  left `SHORTCUTS` for `core/keymap.rs`) rather than a list of its own, so a Global command added
+  later is covered the day it lands (it was seen red naming Ctrl+Shift+A). It reads the defaults,
+  not what a user has bound — the grid declining every Shift and Alt chord, and its plain Ctrl
+  letters being fixed rows (F, G) or reserved editing keys (C, V, A) that no command may take, is
+  what covers those;
   `the_grids_ctrl_letters_answer_plain_ctrl_only` pins the other side. Both test the pure function,
   and the bug was at the call site, so **`every_letter_arm_in_grid_key_asks_grid_ctrl_command`**
   reads `grid_key` and fails on any `Key::Character` arm that decides its own modifiers (seen red on

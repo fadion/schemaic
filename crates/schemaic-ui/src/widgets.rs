@@ -1532,6 +1532,32 @@ pub(crate) fn in_focus_ring_with<V: IntoView + 'static>(
     tabindex: u32,
     on_dispose: impl Fn() + 'static,
 ) -> impl IntoView {
+    in_focus_ring_inner(view, ring, tabindex, on_dispose, || false)
+}
+
+/// [`in_focus_ring`] for a control that sometimes takes **every** key itself —
+/// the Shortcuts modal's row while it records a chord. While `taking_keys`
+/// answers true, the ring's Tab step and Escape blur stand down.
+///
+/// A guard rather than an earlier listener because floem runs *every* listener
+/// a view has for an event and ORs their answers (`ViewId::apply_event`), so a
+/// listener that returns `Stop` first does not keep the ring's from running.
+pub(crate) fn in_focus_ring_unless<V: IntoView + 'static>(
+    view: V,
+    ring: FocusRing,
+    tabindex: u32,
+    taking_keys: impl Fn() -> bool + 'static,
+) -> impl IntoView {
+    in_focus_ring_inner(view, ring, tabindex, || {}, taking_keys)
+}
+
+fn in_focus_ring_inner<V: IntoView + 'static>(
+    view: V,
+    ring: FocusRing,
+    tabindex: u32,
+    on_dispose: impl Fn() + 'static,
+    taking_keys: impl Fn() -> bool + 'static,
+) -> impl IntoView {
     let view = view.into_view();
     let id = view.id();
     ring.register(tabindex, id);
@@ -1550,6 +1576,9 @@ pub(crate) fn in_focus_ring_with<V: IntoView + 'static>(
             let Event::KeyDown(ke) = e else {
                 return EventPropagation::Continue;
             };
+            if taking_keys() {
+                return EventPropagation::Continue;
+            }
             if steps_ring(&ke.key.logical_key, ke.modifiers) {
                 step_ring.step_from(id, ke.modifiers.shift());
                 return EventPropagation::Stop;
@@ -3608,7 +3637,7 @@ impl MenuEntry {
     /// a submenu row's trailing slot is its chevron.
     pub(crate) fn shortcut(mut self, key: crate::shortcuts::MenuKey) -> Self {
         if let MenuEntry::Action { shortcut, .. } = &mut self {
-            *shortcut = Some(key.keys());
+            *shortcut = key.keys();
         }
         self
     }
@@ -9424,7 +9453,7 @@ mod menu_placement_tests {
         let plain = menu_panel_width(&[MenuEntry::action("Format", || {})]);
         let keyed =
             menu_panel_width(&[MenuEntry::action("Format", || {}).shortcut(MenuKey::EditorFormat)]);
-        let cap = keycap_width(&MenuKey::EditorFormat.keys());
+        let cap = keycap_width(&MenuKey::EditorFormat.keys().expect("a default key"));
         assert!(cap > 0.0);
         assert!(
             keyed >= plain + cap,
@@ -9441,7 +9470,7 @@ mod menu_placement_tests {
         let MenuEntry::Action { shortcut, .. } = e else {
             panic!("an action");
         };
-        assert_eq!(shortcut, Some(MenuKey::GridCopy.keys()));
+        assert_eq!(shortcut, MenuKey::GridCopy.keys());
         let sub = MenuEntry::sub("More", vec![]).shortcut(MenuKey::GridCopy);
         assert!(matches!(sub, MenuEntry::Sub { .. }));
     }

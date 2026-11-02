@@ -636,21 +636,6 @@ pub enum FormatReq {
     SingleLine,
 }
 
-/// The format request a Ctrl+Alt chord asks for, by its *physical* key: L
-/// formats the code (DataGrip's key), Shift+L the statement at the caret, and
-/// J makes it single line — Ctrl+Shift+J's join, taken to the whole statement.
-/// Physical because Windows delivers Ctrl+Alt as AltGr, so the logical
-/// character need not be the letter.
-fn format_chord(shift: bool, key: floem::keyboard::KeyCode) -> Option<FormatReq> {
-    use floem::keyboard::KeyCode;
-    match (shift, key) {
-        (false, KeyCode::KeyL) => Some(FormatReq::Code),
-        (true, KeyCode::KeyL) => Some(FormatReq::Statement),
-        (false, KeyCode::KeyJ) => Some(FormatReq::SingleLine),
-        _ => None,
-    }
-}
-
 /// One level of Format's indentation, from the editor's tab-width and
 /// soft-tabs settings.
 fn indent_unit() -> String {
@@ -3269,7 +3254,6 @@ pub(crate) struct QueryPaneParams {
     pub alias_rename: RwSignal<Option<crate::AliasRenameRequest>>,
     /// Raises *Find usages*' list ([`crate::OverlayUi::usages`]).
     pub usages: RwSignal<Option<crate::UsagesRequest>>,
-    pub schema_visible: RwSignal<bool>,
     pub right_panel: RwSignal<RightPanel>,
     pub ai_send: Rc<dyn Fn(String)>,
     pub context_menu: RwSignal<Option<CtxMenu>>,
@@ -3368,7 +3352,6 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         error_modal_open,
         alias_rename,
         usages,
-        schema_visible,
         right_panel,
         ai_send,
         context_menu,
@@ -3758,18 +3741,42 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
         if guard.get_untracked().is_some() {
             guard.set(None);
         }
-        // Global navigation (Ctrl+P/T/W/Tab/1-9). Handled here because the editor
-        // `on_event_stop`s KeyDown, so the workspace-root handler never sees it
-        // while the editor is focused. Checked before completion so Ctrl+Tab cycles
-        // tabs rather than being eaten as a completion-accept Tab.
-        if primary_held(mods) {
-            let is_tab = matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Tab), _));
-            let ch = match &kp.key {
-                KeyInput::Keyboard(Key::Character(c), _) => Some(c.as_str().to_ascii_lowercase()),
-                _ => None,
-            };
-            if nav.handle(mods.shift(), ch.as_deref(), is_tab) {
+        // The keymap's global commands and Ctrl+1..9. Handled here because the
+        // editor `on_event_stop`s KeyDown, so the workspace-root handler never
+        // sees them while the editor is focused. Checked before completion so
+        // Ctrl+Tab cycles tabs rather than being eaten as a completion-accept
+        // Tab. Then the editor's own commands — Format code and its siblings,
+        // Go to line — wherever the user has bound them.
+        if let KeyInput::Keyboard(key, physical) = &kp.key {
+            if nav.handle(key, physical, mods) {
                 return CommandExecuted::Yes;
+            }
+            use schemaic_core::keymap::{Command as KeyCommand, Context};
+            let command = crate::shortcuts::chord_of(key, physical, mods).and_then(|chord| {
+                crate::shortcuts::keymap().with_untracked(|m| m.resolve(chord, Context::Editor))
+            });
+            match command {
+                // Through `format_req`, the palette's and the menu's path, so
+                // the three cannot disagree about what each one does.
+                Some(KeyCommand::FormatCode) => {
+                    format_req.set(Some(FormatReq::Code));
+                    return CommandExecuted::Yes;
+                }
+                Some(KeyCommand::FormatStatement) => {
+                    format_req.set(Some(FormatReq::Statement));
+                    return CommandExecuted::Yes;
+                }
+                Some(KeyCommand::MakeSingleLine) => {
+                    format_req.set(Some(FormatReq::SingleLine));
+                    return CommandExecuted::Yes;
+                }
+                // Open the Go-to-line popup (autofocuses on mount). An effect
+                // closes the find bar so the two never overlap at the top-right.
+                Some(KeyCommand::GoToLine) => {
+                    goto_open.set(true);
+                    return CommandExecuted::Yes;
+                }
+                _ => {}
             }
         }
         // Enter accepts / Escape rejects the Ctrl+K bar from the editor. Which
@@ -4211,19 +4218,6 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             cmdk.open.set(true);
             return CommandExecuted::Yes;
         }
-        // Ctrl+Alt+L — reformat SQL (DataGrip's shortcut); Ctrl+Alt+Shift+L the
-        // statement at the caret, Ctrl+Alt+J make it single line
-        // (`format_chord`). Through `format_req`, the palette's and the menu's
-        // path, so the three cannot disagree about what each one does.
-        if primary_held(mods) && mods.alt() {
-            use floem::keyboard::PhysicalKey;
-            if let KeyInput::Keyboard(_, PhysicalKey::Code(code)) = &kp.key
-                && let Some(req) = format_chord(mods.shift(), *code)
-            {
-                format_req.set(Some(req));
-                return CommandExecuted::Yes;
-            }
-        }
         // Ctrl+Shift+\ — jump to the matching bracket (VS Code's key), or the
         // `BEGIN`/`CASE`/`END` partner of the word under the caret, matched
         // physically: Shift turns the `\` into `|` on a US layout.
@@ -4487,12 +4481,6 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 find_open.set(true);
                 return CommandExecuted::Yes;
             }
-            if c.eq_ignore_ascii_case("g") {
-                // Open the Go-to-line popup (autofocuses on mount). An effect closes
-                // the find bar so the two never overlap at the top-right.
-                goto_open.set(true);
-                return CommandExecuted::Yes;
-            }
             if c.eq_ignore_ascii_case("h") {
                 // Open the find bar with the replace row expanded.
                 find_replace_visible.set(true);
@@ -4532,44 +4520,6 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 }
             });
             return CommandExecuted::Yes;
-        }
-        // Panel toggles (also handled at the workspace root for non-editor
-        // focus). Ctrl+Shift+E = Schema, Ctrl+Shift+A = AI, Ctrl+` = Terminal.
-        // AI/Terminal share the right slot, so each key shows-or-hides its panel.
-        if primary_held(mods)
-            && let KeyInput::Keyboard(Key::Character(c), _) = &kp.key
-        {
-            let c = c.as_str();
-            if mods.shift() && c.eq_ignore_ascii_case("e") {
-                if crate::schema_panel_allowed() {
-                    schema_visible.update(|v| *v = !*v);
-                }
-                return CommandExecuted::Yes;
-            }
-            if mods.shift() && c.eq_ignore_ascii_case("a") {
-                if crate::right_panel_allowed() {
-                    right_panel.update(|p| {
-                        *p = if matches!(*p, RightPanel::Ai) {
-                            RightPanel::None
-                        } else {
-                            RightPanel::Ai
-                        };
-                    });
-                }
-                return CommandExecuted::Yes;
-            }
-            if c == "`" {
-                if crate::right_panel_allowed() {
-                    right_panel.update(|p| {
-                        *p = if matches!(*p, RightPanel::Terminal) {
-                            RightPanel::None
-                        } else {
-                            RightPanel::Terminal
-                        };
-                    });
-                }
-                return CommandExecuted::Yes;
-            }
         }
         if primary_held(mods)
             && matches!(kp.key, KeyInput::Keyboard(Key::Named(NamedKey::Enter), _))
@@ -9261,36 +9211,6 @@ mod looks_focused_tests {
     #[test]
     fn focus_elsewhere_without_its_menu_looks_inert() {
         assert!(!looks_focused(false, false));
-    }
-}
-
-#[cfg(test)]
-mod format_chord_tests {
-    use super::{FormatReq, format_chord};
-    use floem::keyboard::KeyCode;
-
-    /// Ctrl+Alt+L formats the code, Shift added narrows it to the statement,
-    /// and Ctrl+Alt+J makes the statement single line.
-    #[test]
-    fn each_format_chord_asks_for_its_own_request() {
-        assert_eq!(format_chord(false, KeyCode::KeyL), Some(FormatReq::Code));
-        assert_eq!(
-            format_chord(true, KeyCode::KeyL),
-            Some(FormatReq::Statement)
-        );
-        assert_eq!(
-            format_chord(false, KeyCode::KeyJ),
-            Some(FormatReq::SingleLine)
-        );
-    }
-
-    /// Shift+J is no chord here, and nor is any other letter: the key types as
-    /// it would have.
-    #[test]
-    fn other_chords_ask_for_nothing() {
-        assert_eq!(format_chord(true, KeyCode::KeyJ), None);
-        assert_eq!(format_chord(false, KeyCode::KeyK), None);
-        assert_eq!(format_chord(true, KeyCode::Slash), None);
     }
 }
 

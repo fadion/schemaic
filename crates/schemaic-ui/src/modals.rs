@@ -22,7 +22,8 @@ use crate::erd_view::erd_overlay;
 use crate::monitor_view::monitor_overlay;
 use crate::overlays::{confirm_overlay, error_modal_overlay, find_overlay, tx_prompt_overlay};
 use crate::plan_view::plan_overlay;
-use crate::settings::{help_overlay, settings_overlay};
+use crate::settings::settings_overlay;
+use crate::shortcuts_view::help_overlay;
 use crate::{
     BlobUi, DdlUi, DumpUi, ImportUi, LayoutUi, OverlayUi, ScriptUi, Ui, account_editor,
     database_editor, ddl_preview, event_editor, import_view, object_editor, properties,
@@ -780,6 +781,9 @@ mod modal_backdrop_gate {
         // `workspace_modals_up`'s `vars_open.get().is_some()` arm.
         "server_vars_view.rs",
         "settings.rs",
+        // The Shortcuts modal, beside Settings in the layer's settings group,
+        // raised by `settings_modals_up`'s `help_open` arm.
+        "shortcuts_view.rs",
         // In the layer's DDL group, raised by `ddl_modals_up`'s
         // `snippet_edit.get().is_some()` arm.
         "snippet_edit.rs",

@@ -1,11 +1,80 @@
 # Keyboard shortcuts
 
 Every shortcut below is also listed in the app: click the question-mark icon in the top bar, just left of
-the settings gear (its tooltip says **Keyboard shortcuts**). The list there is the same as this
-one, grouped the same way.
+the settings gear (its tooltip says **Keyboard shortcuts**). The list there is grouped the same
+way as this one, but shows your own keys where you've [changed them](#changing-a-shortcut) — this
+page lists the defaults. Type in its search box to filter the rows by what they do or by their
+keys: `ctrl+t` and `ctrlt` both find <kbd>Ctrl</kbd>+<kbd>T</kbd>.
 
 On macOS, read <kbd>Cmd</kbd> for <kbd>Ctrl</kbd> — and <kbd>Ctrl</kbd> keeps working too. In an
 interface language other than English, the app writes the key names as your keyboard does.
+
+## Changing a shortcut
+
+You can move these commands to other keys: everything in the *Global* table except
+<kbd>Ctrl</kbd>+<kbd>1</kbd>…<kbd>9</kbd>, and, in the *Editor* table, Format code, Format
+statement, Make single line and Go to line. Every other key is fixed; its row has no menu.
+
+1. In the **Shortcuts** window, right-click the command's row and choose **Assign**. Double-clicking
+   the row, or pressing <kbd>Enter</kbd> on it, does the same.
+2. Press the new key combination. <kbd>Esc</kbd> cancels.
+
+The change takes effect and is saved at once. The command palette and the editor's menu show the
+new key too.
+
+The same menu has **Clear**, which leaves the command with no key (its row then says **Not set**),
+and **Reset to default**. From the keyboard, <kbd>Tab</kbd> moves between the command rows and
+<kbd>Shift</kbd>+<kbd>F10</kbd> or the menu key opens a row's menu.
+
+### When a key is taken
+
+If another command already has the key, the row asks whether to take it: **Replace** gives it to
+this command and leaves the other one with no key; **Cancel** keeps things as they were.
+<kbd>Enter</kbd> and <kbd>Esc</kbd> answer too. **Reset to default** asks the same way if its
+default has since gone to another command.
+
+A key the editor uses can still mean something else in the results grid — <kbd>Ctrl</kbd>+<kbd>G</kbd>
+is *Go to line* in one and *Go to row* in the other. A Global command, though, is heard
+everywhere, so it can't take a fixed key from any part of the app.
+
+### Keys you can't use
+
+A key that's fixed, or reserved, is refused with the reason under the row, and the row keeps
+listening for another:
+
+- A letter, digit or <kbd>Tab</kbd> needs <kbd>Ctrl</kbd> (<kbd>Cmd</kbd> on macOS), or it would
+  type.
+- <kbd>Enter</kbd>, <kbd>Space</kbd>, the arrows and the other named keys need <kbd>Ctrl</kbd> or
+  <kbd>Alt</kbd>. Function keys need nothing.
+- <kbd>Esc</kbd> is never a command's key.
+- <kbd>Ctrl</kbd> with <kbd>C</kbd>, <kbd>V</kbd>, <kbd>X</kbd>, <kbd>A</kbd>, <kbd>Z</kbd> or
+  <kbd>Y</kbd>, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd>, and <kbd>Ctrl</kbd> with an arrow,
+  <kbd>Home</kbd>, <kbd>End</kbd>, <kbd>Backspace</kbd> or <kbd>Del</kbd> are kept for editing
+  text.
+- <kbd>Alt</kbd>+<kbd>F4</kbd> belongs to the desktop.
+
+### Where your keys are kept
+
+Your changes are saved in `keymap.json`, in `%APPDATA%\schemaic` on Windows and
+`~/.config/schemaic` elsewhere. It holds only what you changed; a cleared command is `null`:
+
+```json
+{ "bindings": { "new-tab": "Ctrl+N", "close-tab": null } }
+```
+
+You can edit it by hand while the app is closed. Write <kbd>Ctrl</kbd> even on macOS — it means
+<kbd>Cmd</kbd> there. The commands are `find-anywhere`, `command-palette`, `new-tab`, `close-tab`,
+`next-tab`, `previous-tab`, `reopen-tab`, `open-file`, `save-file`, `save-file-as`,
+`toggle-schema`, `toggle-ai`, `toggle-terminal`, `format-code`, `format-statement`,
+`make-single-line` and `go-to-line`.
+
+If something in the file can't be applied, Schemaic lists it in a notice at startup and that
+command keeps its default — or, where two commands end up with the same key, one of them is left
+with none, and the notice says which.
+
+Settings › **General** › **Settings file** carries your shortcuts along with your other
+preferences. Importing a file counts the shortcuts it changes in its question, and **Yes** makes
+its shortcuts yours: a command it leaves at its default goes back to its default here too.
 
 ## The command palette
 

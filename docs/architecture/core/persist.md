@@ -338,6 +338,12 @@ reach it through one door now**: `schemaic_ui::load_diagram_layouts(text, open)`
 `diagrams.json` and calls `report_recoveries` in that order, as a single act, so on the save side
 the notice is queued before the caller's `save_json` can overwrite the recovered nothing. Each of
 the three used to make both calls itself and carry its own copy of the comment saying why.
+**`keymap.json` is a startup read with a door of its own**, because it has a notice of its own
+besides any recovery: `schemaic_ui::load_keymap(text, open)` reads it, drains the recoveries
+itself and then appends the entries `Keymap::load` could not keep, and the app calls it just
+before the startup `report_recoveries`, which then finds the queue empty. The two share the one
+error-modal slot, and `report_recoveries` *sets* it, so in the other order whichever notice came
+second would have replaced the first.
 **That changed what can be checked, which is the part worth keeping.** The rule was
 **positional** — "is this load inside `app_view`'s build?" is not a question a scan can answer —
 so `app_tests::every_lazy_config_load_reports_what_it_recovered` was a *count* instead: the lazy

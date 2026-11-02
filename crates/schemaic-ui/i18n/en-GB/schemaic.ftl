@@ -292,6 +292,36 @@ shortcuts-recall-prompt = Recall previous / next prompt
 shortcuts-copy-paste = Copy / paste
 shortcuts-find-in-diagram = Find in the diagram
 
+## Shortcuts modal › changing a command's key (`shortcuts.rs`, `settings.rs`)
+
+keymap-hint = Right-click a command, or double-click it, to change its key. Keys without a menu are fixed.
+keymap-search = Search shortcuts
+keymap-no-match = No shortcut matches.
+keymap-assign = Assign
+keymap-clear = Clear
+keymap-reset = Reset to default
+keymap-unset = Not set
+keymap-press = Press the new key combination. Esc cancels.
+keymap-taken = { $keys } is already used by { $holder }.
+keymap-replace = Replace
+keymap-cancel = Cancel
+keymap-fixed = { $keys } is used by { $holder }, which can't be changed.
+keymap-refused = { $keys } can't be used. { $reason }
+keymap-refusal-needs-primary = A letter, a digit or Tab needs { $primary }, or it would type.
+keymap-refusal-needs-modifier = This key needs { $primary } or { $alt }.
+keymap-refusal-escape = Esc closes and cancels everywhere, so it is never a command's key.
+keymap-refusal-editing = Every text field uses it for editing.
+keymap-refusal-system = The desktop uses it.
+
+## Startup notice about keymap.json
+
+keymap-problems = Some of the shortcut changes in keymap.json could not be applied:
+keymap-problem-unknown = • “{ $id }” is no command this version knows.
+keymap-problem-unreadable = • { $command }: “{ $keys }” is not a key combination, so it keeps its default.
+keymap-problem-refused = • { $command }: { $keys } can't be used, so it keeps its default. { $reason }
+keymap-problem-fixed = • { $command }: { $keys } is used by { $holder }, which can't be changed, so it keeps its default.
+keymap-problem-taken = • { $command }: { $keys } is already used by { $holder }, so { $command } has no key.
+
 ## Key names in shortcut labels — a keyboard's own legends, so a language
 ## whose keyboards print another word uses it (German: Strg, Umschalt, Entf).
 ## Keys written the same everywhere (letters, arrows, Tab, Esc, F6) and macOS's

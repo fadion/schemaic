@@ -5,8 +5,8 @@ file, to take to another machine or hand to a colleague, and read back. Pure ove
 values — the app gathers the current `UiState` and snippets, picks the file and applies what
 comes back (Settings → General's *Settings file* row and the palette's *Export Settings* /
 *Import Settings*; the app's two trips are described under `settings.rs`'s `bundle_row`).
-`export_json(state, terminal, snippets)` writes the envelope
-`{schemaic_settings, settings, terminal, snippets}`, pretty-printed, at `BUNDLE_VERSION` (1) —
+`export_json(state, terminal, keymap, snippets)` writes the envelope
+`{schemaic_settings, settings, terminal, keymap, snippets}`, pretty-printed, at `BUNDLE_VERSION` (1) —
 `terminal` is any `Serialize`, because the terminal's settings type is
 `schemaic_term::TerminalSettings` and this crate does not depend on that one, so the app passes
 its own and the tests a mirror of its shape. `parse` reads it back BOM-tolerant, refuses a file
@@ -62,6 +62,15 @@ written before the terminal travelled has no `terminal` section and reads as an 
 `BUNDLE_VERSION` stayed 1 (`a_bundle_from_before_the_terminal_travelled_reads_with_none`), and in
 the other direction `parse` only ever looks up the sections it knows, so a build from before
 reads a newer file's `terminal` as nothing rather than refusing the file.
+**The keymap travels as `keymap.json` holds it** — a `core::keymap::KeymapFile`, only the
+commands the user moved, a cleared one as `null` (`the_keymap_travels_as_its_file_holds_it`).
+This module does not check its entries: they are the keymap reader's, `Keymap::load`, when the
+app applies the bundle, exactly as a hand-edited `keymap.json`'s are, so an unknown command or a
+refused chord in someone else's file is reported rather than half-applied. `Bundle::keymap` is
+an `Option`, and **`None` is not an empty keymap**: a bundle from before the keymap travelled,
+or one whose section does not read, leaves the user's keys alone, where an empty `KeymapFile`
+would put every key back on its default (`a_bundle_from_before_the_keymap_travelled_reads_with_none`).
+`BUNDLE_VERSION` stayed 1 for this as for the terminal.
 **A bundle never lowers a guard**: `confirm_writes` is taken only when it turns confirmation
 *on*, so a file from someone else cannot quietly remove the question before a write
 (`a_bundle_can_turn_confirmation_on_but_never_off`).

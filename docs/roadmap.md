@@ -48,7 +48,7 @@ settle before work starts, and the traps are the ones known today.
 They ship in this order, one release each. The headless and performance releases before them
 have landed.
 
-1. **Data and editor:** *Compare and sync table data*, the custom keymap and the two chart kinds.
+1. **Data and editor:** *Compare and sync table data* and the two chart kinds.
 2. **DuckDB**, alone. A new engine answers every capability predicate and needs its own read-only
    allowlist, so it gets a release with nothing else in it.
 
@@ -59,14 +59,6 @@ have landed.
 Each of these is a one-session change.
 
 - **Charts:** add scatter and stacked bar.
-
-### Custom keymap
-
-The shortcuts can't be rebound. Add a keymap file, plus a settings page for it, that rebinds
-palette commands. Conflicts are reported, not resolved silently.
-
-- **Trap:** Floem's focus and Tab handling (`floem-gotchas.md`). Some bindings are consumed before
-  a keymap would ever see them.
 
 ### DuckDB as a fifth engine
 

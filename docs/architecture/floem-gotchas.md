@@ -1327,7 +1327,11 @@
   `keyboard_nav` on the way); ←/→ walk it, Tab does too, Enter/Space activates. `widgets::in_strip_button`
   is `in_ring_button` plus those two keys, and its `leave` must **defer** its focus request —
   `in_focus_ring`'s own Escape arm runs too (floem folds every KeyDown listener) and queues a
-  `ClearFocus` in the same pass, so only a request landing in a later tick wins. **And it carries
+  `ClearFocus` in the same pass, so only a request landing in a later tick wins. Registering a
+  listener *before* `in_focus_ring`'s does not stop it either: a view that must take every key
+  for a while goes through `widgets::in_focus_ring_unless`, whose guard stands the ring's Tab and
+  Escape arms down — the Shortcuts modal's key capture, the case that first assumed order would
+  do it (`ui/shortcuts_view.md`). **And it carries
   the panel's own bindings**, through a `keys` closure it consults for modified keys only
   (`widgets::strip_defers`): the panel is a *sibling* of the strip, floem carries an unconsumed
   `KeyDown` to neither an ancestor nor a sibling, so `Ctrl+Enter` on the ✓ did nothing under a
@@ -1951,12 +1955,14 @@
   invisible in review, because the line that "applies" the format looks exactly like the line that
   would work if the sync went both ways. It also meant two formatters, so the palette could drift
   from Ctrl+Alt+L; `format_req` (`Some(FormatReq::Code)`) reaches the same
-  `editor_pane::format_editor`. The keys now come the same way: the key handler asks
-  `editor_pane::format_chord` (Ctrl+Alt+L, Ctrl+Alt+Shift+L, Ctrl+Alt+J, matched by *physical* key
-  because Windows delivers Ctrl+Alt as AltGr) and sets `format_req` rather than formatting itself.
-  When it called `format_editor` directly, its Ctrl+Alt+L arm did not exclude Shift, so
-  Ctrl+Alt+Shift+L — now *Format statement* — formatted the whole document
-  (`each_format_chord_asks_for_its_own_request`, `other_chords_ask_for_nothing`).
+  `editor_pane::format_editor`. The keys now come the same way: the key handler resolves the
+  press in the keymap's `Context::Editor` (`core/keymap.rs`; Ctrl+Alt+L, Ctrl+Alt+Shift+L and
+  Ctrl+Alt+J by default, read through `shortcuts::chord_of`, which takes a letter AltGr changed
+  by its physical key because Windows delivers Ctrl+Alt as AltGr) and sets `format_req` rather
+  than formatting itself. When it called `format_editor` directly, its Ctrl+Alt+L arm did not
+  exclude Shift, so Ctrl+Alt+Shift+L — now *Format statement* — formatted the whole document; a
+  `Chord` carries `shift` and `resolve` matches it exactly, so the two are two chords. The
+  `format_chord` function and its two tests went with the keymap.
   That function writes `sqlfmt::format_range`'s text, not `format_sql`'s — the `sqlfmt.rs` entry
   has the `fromt` splice that cost — and returns without touching the caret when `edit_untyped`
   refuses, where under the Ctrl+K preview's freeze it used to move the caret anyway. A formatted

@@ -9,7 +9,8 @@ next launch; its signal is `LayoutUi::ui_language`, persisted and mirrored by no
 and, after it, *Show CPU and RAM in the status bar*, a `focusable_toggle_row` at tabindex 340 over
 `LayoutUi::show_resources`, on by default; off hides `footer`'s two segments *and* stops the
 sampling behind them, which is `start_resource_monitor`'s half, under `core/ui-state-models.md`'s
-`resource.rs`) and the Shortcuts reference, **and the
+`resource.rs`) — the Shortcuts reference was here too until the keymap moved it to
+`shortcuts_view.rs`, and the passages below about it now describe that file — **and the
 four shared controls every modal's form is
 built from**: `focusable_toggle`/`focusable_toggle_row` (the switch — Space is ours, Enter is
 floem's), `focusable_dropdown` and the picker-agnostic **`in_ring_picker`** under it — the box
@@ -211,13 +212,21 @@ added. The terminal half runs beside it as `apply_keys(TERMINAL_KEYS, …)` agai
 `current_term()`, its `normalise` the terminal picker's own reading — `ui::term_font_offered`
 (the size if `TERM_FONT_SIZES` holds it, else 13, so a size no row of the picker selects is
 refused) and `TermCursor::from_key(..).key()` — and its change count is added to the settings
-count, so the confirmation's *N settings* covers both halves. Nothing to change at all is said through `file_error` (*Nothing to import: …*) rather
+count, so the confirmation's *N settings* covers both halves. The keymap is a third,
+`ui::keymap_from_bundle(&bundle.keymap)`: `Keymap::load` of the bundle's entries over the
+defaults, with the same fixed keys `keymap.json` is read against, its `changes_from` the keymap
+now added to the count — and since it is the bundle's keymap that is built, not the bundle's
+entries laid over the user's, a command they moved that the bundle does not name goes back to
+its default, and is counted as a change. A bundle with no `keymap` section leaves it alone.
+Nothing to change at all is said through `file_error` (*Nothing to import: …*) rather
 than asked about; otherwise the shared `Confirm` — *Import settings*, "{path} changes
 N settings and adds M snippets. The settings it changes replace your current values; the
 snippets are added beside yours.", one catalogue message with both counts as plurals
 (`settings-import-question`, through `settings_import_question`) — and only on yes
 `apply_settings` sets each portable signal, the four terminal signals are set from the
-`apply_keys` answer, `save_ui(Replacing)` runs, and `SnippetStore::import` merges the snippets.
+`apply_keys` answer, `save_ui(Replacing)` runs, `SnippetStore::import` merges the snippets, and
+the keymap is saved (`save_keymap`) when it changes anything, any entry of it that could not be
+applied then reported through `file_error` — after the yes, not in the question.
 Nothing writes `terminal.json` here: the terminal's own save effect, subscribed to those four
 signals, does — through `shell_to_persist`, so the shell it writes is this machine's. **`apply_settings` goes through startup's own
 conversions and clamps** (`UiThemeKind`/`EditorThemeKind`/`UiScale::from_key`,
@@ -440,7 +449,7 @@ an auto-detected path is long and has no spaces (Codex resolves to
 page's `SECTION_PAGE_W` now, through `section_page`'s own `width_full` — cosmic-text's default `Wrap::WordOrGlyph` falls back to glyph-level breaks, which is what a path
 wants anyway.
 **The Shortcuts modal's body scrolls under a cap, and it is the last of the three that did.** It
-is `autohide(scroll(body))` under `max_height(widgets::modal_body_h(560.0))`, against a modal
+is `autohide(scroll(body))` under `max_height(widgets::modal_body_h(520.0))`, against a modal
 taller than the screen losing its *bottom* rows with no affordance saying they exist. The cap is
 a `modal_body_h` rather than a constant precisely so it shrinks with a small window instead of
 being right at one size only. The AI modal joined that shape last — its eight groups at 25px
@@ -459,8 +468,8 @@ it: labels, hints, placeholders, section names and the Settings and Shortcuts ti
 are `tr!` over `settings-*`/`shortcuts-*` messages (`ui/i18n.rs`), with German beside them, and
 English output was compared message by message against the literals they replaced. The
 Shortcuts modal's headings and rows are `shortcuts.rs`'s, converted after it (below), which is
-why `shortcut_group` takes a `shortcuts::Group` and renders `group.label()` and `shortcut_row`
-takes an owned description. `TermCursor::label` is `lib.rs`'s and came with that file; the
+why `shortcut_group` — `shortcuts_view.rs`'s now — takes a `shortcuts::Group` and renders
+`group.label()` and `shortcut_row` takes an owned description. `TermCursor::label` is `lib.rs`'s and came with that file; the
 Agent CLI dropdown's *Disabled* is `agent_label`'s (above); the *Statement timeout* dropdown's
 `statement_timeout_label` is `i18n::statement_timeout`'s, the renderer the app's timed-out
 message quotes too (*The string catalogue*); and the three option lists core's `sqlfmt` types

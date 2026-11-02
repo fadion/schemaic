@@ -14049,7 +14049,7 @@ mod guarded_entry_tests {
         let MenuEntry::Action { shortcut, .. } = &entries[0] else {
             panic!("an action");
         };
-        assert_eq!(shortcut.as_deref(), Some(&*MenuKey::GridCopy.keys()));
+        assert_eq!(shortcut, &MenuKey::GridCopy.keys());
         let MenuEntry::Sub { children, .. } = &entries[1] else {
             panic!("a submenu");
         };
@@ -14059,7 +14059,7 @@ mod guarded_entry_tests {
         else {
             panic!("an action");
         };
-        assert_eq!(shortcut.as_deref(), Some(&*MenuKey::GridPaste.keys()));
+        assert_eq!(shortcut, &MenuKey::GridPaste.keys());
         assert!(*disabled);
     }
 
@@ -15243,30 +15243,31 @@ mod tests {
     /// **A global Ctrl+Shift shortcut is not the grid's Ctrl+letter.** With
     /// the grid focused, Ctrl+Shift+A selected every cell — the grid's Ctrl+A
     /// arm took it and the AI panel toggle never ran. Checked against the
-    /// Shortcuts table itself, so a Ctrl+Shift binding added there later is
+    /// keymap's global defaults, so a Ctrl+Shift command added there later is
     /// covered on the day it is added.
     #[test]
     fn no_global_ctrl_shift_shortcut_is_taken_by_the_grid() {
-        let global = crate::shortcuts::SHORTCUTS
-            .iter()
-            .find(|(g, _)| *g == crate::shortcuts::Group::Global)
-            .expect("a Global group")
-            .1;
+        use schemaic_core::keymap::{Command, Context, Key};
         let mut checked = 0;
-        for (keys, what) in global {
-            let Some(letter) = keys.strip_prefix("Ctrl+Shift+") else {
+        for &command in Command::ALL {
+            let chord = command.default_chord();
+            let Key::Char(letter) = chord.key else {
                 continue;
             };
-            if letter.chars().count() != 1 {
+            if command.context() != Context::Global
+                || !chord.primary
+                || !chord.shift
+                || chord.alt
+                || !letter.is_ascii_alphabetic()
+            {
                 continue;
             }
             checked += 1;
-            for key in [letter.to_lowercase(), letter.to_uppercase()] {
+            for key in [letter.to_ascii_lowercase(), letter.to_ascii_uppercase()] {
                 assert_eq!(
-                    grid_ctrl_command(&key, mods(true, true, false)),
+                    grid_ctrl_command(&key.to_string(), mods(true, true, false)),
                     None,
-                    "{keys} ({}) is swallowed by the grid",
-                    what()
+                    "{chord} ({command:?}) is swallowed by the grid",
                 );
             }
         }

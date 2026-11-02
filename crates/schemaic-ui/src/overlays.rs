@@ -4133,12 +4133,12 @@ impl Command {
 /// commands too: typing all of `verlauf leeren` would otherwise resolve to the
 /// argument-command `verlauf` with the argument `leeren`.
 ///
-/// And the half of the keycap mapping that no static test can reach:
-/// `shortcuts::COMMAND_KEYS` is checked against `SHORTCUTS` in that module, but
-/// only a built registry can say whether its *names* still name anything. A
-/// renamed command would otherwise drop its keycap in silence.
+/// And the half of the keycap mapping that no static test can reach: only a
+/// built registry can say whether `shortcuts::COMMAND_KEYS`' *names* still
+/// name anything. A renamed command would otherwise drop its keycap in
+/// silence.
 fn assert_names_match_labels(cmds: &[Command]) {
-    for (name, _, keys) in crate::shortcuts::COMMAND_KEYS {
+    for (name, keys) in crate::shortcuts::COMMAND_KEYS {
         debug_assert!(
             cmds.iter().any(|c| c.id == *name),
             "shortcuts::COMMAND_KEYS maps {name:?} to {keys:?}, but no palette \
