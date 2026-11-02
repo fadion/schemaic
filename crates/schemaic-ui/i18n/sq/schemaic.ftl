@@ -339,6 +339,8 @@ palette-switch-connection = Ndërro lidhjen
 palette-switch-connection-hint = <lidhja>
 palette-server-variables = Variablat e serverit
 palette-server-variables-hint = cilësimet e lidhjes aktive
+palette-performance = Performanca
+palette-performance-hint = urdhrat më të ngadaltë, gjendja e indeksëve dhe tabelat më të mëdha
 palette-enter-number = Jepni një numër
 palette-nothing-found = Nuk u gjet asgjë
 
@@ -422,6 +424,7 @@ tree-drop-foreign-key = Fshi çelësin e jashtëm
 tree-ai-explain = Shpjegim me AI
 tree-users = Përdoruesit dhe privilegjet
 tree-server-variables = Variablat e serverit
+tree-performance = Performanca
 tree-new-database = Krijo bazë të dhënash
 tree-show-table-sizes = Shfaq madhësitë e tabelave
 
@@ -2807,6 +2810,65 @@ server-vars-count = { $count ->
 }
 server-vars-count-filtered = { $shown } nga { $count } cilësime
 server-vars-refresh = Rifresko
+
+## Performance view (perf_view.rs)
+
+perf-title = Performanca — { $connection }
+perf-title-database = Performanca — { $connection } · { $database }
+perf-view-statements = Urdhrat
+perf-view-indexes = Indeksët
+perf-view-sizes = Madhësitë
+perf-order-total = Koha totale
+perf-order-mean = Koha mesatare
+perf-order-calls = Thirrjet
+perf-loading = Po lexohen statistikat e serverit…
+perf-no-database = Zgjidhni më parë një bazë të dhënash në shiritin e veglave të kërkesave — indeksët dhe madhësitë i përkasin një baze të vetme.
+perf-refresh = Rifresko
+perf-copy = Kopjo
+perf-copy-statement = Kopjo urdhrin
+# The statement sources, when off. Each must read as core's
+# `workload::Unavailable::reason` does in English.
+perf-src-not-supported = Ky motor nuk mban statistika për urdhrat.
+perf-src-pgss-not-installed = pg_stat_statements nuk është i instaluar në këtë bazë të dhënash.
+perf-src-pgss-not-loaded = pg_stat_statements është i instaluar por jo i ngarkuar: duhet të jetë i listuar në shared_preload_libraries, gjë që kërkon rinisjen e serverit.
+perf-src-ps-off = performance_schema është joaktiv në këtë server. Është një opsion nisjeje, ndaj aktivizimi i tij kërkon rinisje.
+perf-src-digest-off = performance_schema është aktiv, por konsumatori i tij statements_digest është joaktiv.
+perf-src-qs-off = Query Store është joaktiv për këtë bazë të dhënash.
+perf-src-qs-error = Query Store është në gjendje gabimi për këtë bazë të dhënash.
+perf-src-no-permission = Ky login nuk lejohet të lexojë statistikat e urdhrave: { $error }
+perf-src-enable = Për ta aktivizuar, ekzekutoni këtë në një skedë kërkese:
+perf-statements-none = Burimi i statistikave është aktiv por nuk ka regjistruar ende urdhra.
+perf-since = Numëruar që nga { $since }.
+# A statement's figures, joined by middle dots under its text.
+perf-total = { $time } gjithsej
+perf-mean = { $time } mesatarisht
+perf-sub-ms = { $ms }ms
+perf-calls = { $n ->
+    [one] { $shown } thirrje
+   *[other] { $shown } thirrje
+}
+perf-rows = { $n ->
+    [one] { $shown } rresht
+   *[other] { $shown } rreshta
+}
+perf-indexes-none = Nuk u gjet asnjë indeks i dyfishtë, i tepërt ose i papërdorur.
+perf-problem-unused = Nuk është lexuar që nga rivendosja e fundit e numëruesve
+perf-problem-duplicate = Dyfishon { $of }
+perf-problem-redundant = Mbuluar nga { $by }, çelësi i të cilit fillon si ky
+perf-usage-note = Numërimet e përdorimit fillojnë nga e para kur serveri rinis ose statistikat e tij rivendosen, ndaj një indeks që përdoret vetëm nga një punë mujore mund të duket i papërdorur. Kontrolloni para se të fshini një të tillë.
+perf-usage-uncounted = Ky server nuk raporton numërime përdorimi të indeksëve, ndaj asnjë indeks nuk mund të quhet i papërdorur — shfaqen vetëm të dyfishtat dhe prefiksët.
+perf-drop-index = Fshi
+perf-create-index = Krijo indeks
+perf-missing-title = Indeksët që mungojnë, të regjistruar nga optimizuesi që nga rinisja e fundit
+perf-missing-none = Asnjë i regjistruar.
+perf-missing-detail = { $uses } përdorime · { $impact }% përmirësim i vlerësuar
+perf-missing-note = Secili është një vlerësim i optimizuesit. Krahasojeni me indeksët më sipër para se ta krijoni.
+perf-sizes-none = Kjo bazë të dhënash nuk raportoi madhësi tabelash.
+perf-sizes-tables = Tabelat më të mëdha
+perf-sizes-indexes = Indeksët më të mëdhenj
+perf-sizes-no-index-sizes = Ky motor raporton madhësitë e indeksëve për tabelë, jo për indeks.
+perf-sizes-no-indexes = Kjo bazë të dhënash nuk ka indeksë për t'u matur.
+perf-rows-estimate = ~{ $shown } rreshta
 
 ## Edit snippet modal (snippet_edit.rs)
 

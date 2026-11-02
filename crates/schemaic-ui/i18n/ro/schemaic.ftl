@@ -343,6 +343,8 @@ palette-switch-connection = Schimbă conexiunea
 palette-switch-connection-hint = <conexiune>
 palette-server-variables = Variabile server
 palette-server-variables-hint = setările conexiunii active
+palette-performance = Performanță
+palette-performance-hint = cele mai lente instrucțiuni, starea indexurilor și cele mai mari tabele
 palette-enter-number = Introdu un număr
 palette-nothing-found = Nu s-a găsit nimic
 
@@ -427,6 +429,7 @@ tree-drop-foreign-key = Elimină cheia străină
 tree-ai-explain = Explicație AI
 tree-users = Utilizatori și privilegii
 tree-server-variables = Variabile server
+tree-performance = Performanță
 tree-new-database = Creează bază de date
 tree-show-table-sizes = Arată dimensiunile tabelelor
 
@@ -2904,6 +2907,67 @@ server-vars-count = { $count ->
 }
 server-vars-count-filtered = Setări: { $shown } din { $count }
 server-vars-refresh = Reîmprospătează
+
+## Performance view (perf_view.rs)
+
+perf-title = Performanță — { $connection }
+perf-title-database = Performanță — { $connection } · { $database }
+perf-view-statements = Instrucțiuni
+perf-view-indexes = Indexuri
+perf-view-sizes = Dimensiuni
+perf-order-total = Timp total
+perf-order-mean = Timp mediu
+perf-order-calls = Apeluri
+perf-loading = Se citesc statisticile serverului…
+perf-no-database = Alege mai întâi o bază de date în bara de instrumente a interogărilor — indexurile și dimensiunile aparțin unei singure baze de date.
+perf-refresh = Reîmprospătează
+perf-copy = Copiază
+perf-copy-statement = Copiază instrucțiunea
+# The statement sources, when off. Each must read as core's
+# `workload::Unavailable::reason` does in English.
+perf-src-not-supported = Acest motor nu păstrează statistici despre instrucțiuni.
+perf-src-pgss-not-installed = pg_stat_statements nu este instalat în această bază de date.
+perf-src-pgss-not-loaded = pg_stat_statements este instalat, dar nu este încărcat: trebuie să fie listat în shared_preload_libraries, ceea ce necesită repornirea serverului.
+perf-src-ps-off = performance_schema este dezactivat pe acest server. Este o opțiune de pornire, deci activarea lui necesită o repornire.
+perf-src-digest-off = performance_schema este activ, dar consumatorul său statements_digest este dezactivat.
+perf-src-qs-off = Query Store este dezactivat pentru această bază de date.
+perf-src-qs-error = Query Store este în stare de eroare pentru această bază de date.
+perf-src-no-permission = Acest login nu are voie să citească statisticile instrucțiunilor: { $error }
+perf-src-enable = Pentru a-l activa, rulează aceasta într-o filă de interogare:
+perf-statements-none = Sursa de statistici este activă, dar nu a înregistrat încă nicio instrucțiune.
+perf-since = Numărat din { $since }.
+# A statement's figures, joined by middle dots under its text.
+perf-total = { $time } în total
+perf-mean = { $time } în medie
+perf-sub-ms = { $ms }ms
+perf-calls = { $n ->
+    [one] { $shown } apel
+    [few] { $shown } apeluri
+   *[other] { $shown } de apeluri
+}
+perf-rows = { $n ->
+    [one] { $shown } rând
+    [few] { $shown } rânduri
+   *[other] { $shown } de rânduri
+}
+perf-indexes-none = Nu s-a găsit niciun index duplicat, redundant sau neutilizat.
+perf-problem-unused = Necitit de la ultima resetare a contoarelor
+perf-problem-duplicate = Duplică { $of }
+perf-problem-redundant = Acoperit de { $by }, a cărui cheie începe ca a acestuia
+perf-usage-note = Contoarele de utilizare reîncep când serverul repornește sau statisticile lui sunt resetate, deci un index folosit doar de o sarcină lunară poate părea neutilizat. Verifică înainte de a elimina unul.
+perf-usage-uncounted = Acest server nu raportează contoare de utilizare a indexurilor, deci niciun index nu poate fi numit neutilizat — sunt afișate doar duplicatele și prefixele.
+perf-drop-index = Elimină
+perf-create-index = Creează index
+perf-missing-title = Indexuri lipsă înregistrate de optimizator de la ultima repornire
+perf-missing-none = Niciunul înregistrat.
+perf-missing-detail = { $uses } utilizări · { $impact }% îmbunătățire estimată
+perf-missing-note = Fiecare este o estimare a optimizatorului. Verifică-o față de indexurile de mai sus înainte de a o crea.
+perf-sizes-none = Această bază de date nu a raportat dimensiuni de tabele.
+perf-sizes-tables = Cele mai mari tabele
+perf-sizes-indexes = Cele mai mari indexuri
+perf-sizes-no-index-sizes = Acest motor raportează dimensiunile indexurilor pe tabel, nu pe index.
+perf-sizes-no-indexes = Această bază de date nu are indexuri de măsurat.
+perf-rows-estimate = ~{ $shown } rânduri
 
 ## Edit snippet modal (snippet_edit.rs)
 

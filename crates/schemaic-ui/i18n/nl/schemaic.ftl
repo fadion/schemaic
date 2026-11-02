@@ -339,6 +339,8 @@ palette-switch-connection = Verbinding wisselen
 palette-switch-connection-hint = <verbinding>
 palette-server-variables = Servervariabelen
 palette-server-variables-hint = de instellingen van de actieve verbinding
+palette-performance = Prestaties
+palette-performance-hint = de traagste instructies, de toestand van indexen en de grootste tabellen
 palette-enter-number = Voer een getal in
 palette-nothing-found = Niets gevonden
 
@@ -422,6 +424,7 @@ tree-drop-foreign-key = Refererende sleutel verwijderen
 tree-ai-explain = AI-uitleg
 tree-users = Gebruikers en bevoegdheden
 tree-server-variables = Servervariabelen
+tree-performance = Prestaties
 tree-new-database = Database maken
 tree-show-table-sizes = Tabelgroottes tonen
 
@@ -2807,6 +2810,65 @@ server-vars-count = { $count ->
 }
 server-vars-count-filtered = { $shown } van { $count } instellingen
 server-vars-refresh = Vernieuwen
+
+## Performance view (perf_view.rs)
+
+perf-title = Prestaties — { $connection }
+perf-title-database = Prestaties — { $connection } · { $database }
+perf-view-statements = Instructies
+perf-view-indexes = Indexen
+perf-view-sizes = Groottes
+perf-order-total = Totale tijd
+perf-order-mean = Gemiddelde tijd
+perf-order-calls = Aanroepen
+perf-loading = De statistieken van de server lezen…
+perf-no-database = Kies eerst een database in de querywerkbalk — indexen en groottes horen bij één database.
+perf-refresh = Vernieuwen
+perf-copy = Kopiëren
+perf-copy-statement = Instructie kopiëren
+# The statement sources, when off. Each must read as core's
+# `workload::Unavailable::reason` does in English.
+perf-src-not-supported = Deze engine houdt geen instructiestatistieken bij.
+perf-src-pgss-not-installed = pg_stat_statements is niet geïnstalleerd in deze database.
+perf-src-pgss-not-loaded = pg_stat_statements is geïnstalleerd maar niet geladen: het moet in shared_preload_libraries staan, wat een herstart van de server vereist.
+perf-src-ps-off = performance_schema staat uit op deze server. Het is een opstartoptie, dus inschakelen vereist een herstart.
+perf-src-digest-off = performance_schema staat aan, maar de statements_digest-consumer is uitgeschakeld.
+perf-src-qs-off = Query Store staat uit voor deze database.
+perf-src-qs-error = Query Store verkeert in een foutstatus voor deze database.
+perf-src-no-permission = Deze login mag de instructiestatistieken niet lezen: { $error }
+perf-src-enable = Voer dit uit in een querytabblad om het in te schakelen:
+perf-statements-none = De statistiekenbron staat aan, maar heeft nog geen instructies geregistreerd.
+perf-since = Geteld sinds { $since }.
+# A statement's figures, joined by middle dots under its text.
+perf-total = { $time } totaal
+perf-mean = { $time } gemiddeld
+perf-sub-ms = { $ms }ms
+perf-calls = { $n ->
+    [one] { $shown } aanroep
+   *[other] { $shown } aanroepen
+}
+perf-rows = { $n ->
+    [one] { $shown } rij
+   *[other] { $shown } rijen
+}
+perf-indexes-none = Geen dubbele, overbodige of ongebruikte indexen gevonden.
+perf-problem-unused = Niet gelezen sinds de tellers voor het laatst zijn gereset
+perf-problem-duplicate = Dubbel van { $of }
+perf-problem-redundant = Gedekt door { $by }, waarvan de sleutel met deze begint
+perf-usage-note = Gebruikstellingen beginnen opnieuw wanneer de server herstart of de statistieken worden gereset, dus een index die alleen door een maandelijkse taak wordt gebruikt kan ongebruikt lijken. Controleer dit voordat je er een verwijdert.
+perf-usage-uncounted = Deze server rapporteert geen indexgebruikstellingen, dus geen enkele index kan ongebruikt worden genoemd — alleen dubbele indexen en prefixen worden getoond.
+perf-drop-index = Verwijderen
+perf-create-index = Index maken
+perf-missing-title = Ontbrekende indexen die de optimizer sinds de laatste herstart heeft vastgelegd
+perf-missing-none = Geen vastgelegd.
+perf-missing-detail = { $uses } keer gebruikt · { $impact }% geschatte verbetering
+perf-missing-note = Elk is een schatting van de optimizer. Vergelijk het met de indexen hierboven voordat je het maakt.
+perf-sizes-none = Deze database heeft geen tabelgroottes gerapporteerd.
+perf-sizes-tables = Grootste tabellen
+perf-sizes-indexes = Grootste indexen
+perf-sizes-no-index-sizes = Deze engine rapporteert indexgroottes per tabel, niet per index.
+perf-sizes-no-indexes = Deze database heeft geen indexen om te meten.
+perf-rows-estimate = ~{ $shown } rijen
 
 ## Edit snippet modal (snippet_edit.rs)
 

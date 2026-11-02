@@ -339,6 +339,8 @@ palette-switch-connection = Changer de connexion
 palette-switch-connection-hint = <connexion>
 palette-server-variables = Variables du serveur
 palette-server-variables-hint = les paramètres de la connexion active
+palette-performance = Performances
+palette-performance-hint = les instructions les plus lentes, l'état des index et les plus grandes tables
 palette-enter-number = Saisissez un nombre
 palette-nothing-found = Aucun résultat
 
@@ -422,6 +424,7 @@ tree-drop-foreign-key = Supprimer la clé étrangère
 tree-ai-explain = Explication par l'IA
 tree-users = Utilisateurs et privilèges
 tree-server-variables = Variables du serveur
+tree-performance = Performances
 tree-new-database = Créer une base de données
 tree-show-table-sizes = Afficher la taille des tables
 
@@ -2810,6 +2813,65 @@ server-vars-count = { $count ->
 }
 server-vars-count-filtered = { $shown } paramètres sur { $count }
 server-vars-refresh = Actualiser
+
+## Performance view (perf_view.rs)
+
+perf-title = Performances — { $connection }
+perf-title-database = Performances — { $connection } · { $database }
+perf-view-statements = Instructions
+perf-view-indexes = Index
+perf-view-sizes = Tailles
+perf-order-total = Temps total
+perf-order-mean = Temps moyen
+perf-order-calls = Appels
+perf-loading = Lecture des statistiques du serveur…
+perf-no-database = Choisissez d'abord une base de données dans la barre d'outils des requêtes : les index et les tailles sont ceux d'une seule base.
+perf-refresh = Actualiser
+perf-copy = Copier
+perf-copy-statement = Copier l'instruction
+# The statement sources, when off. Each must read as core's
+# `workload::Unavailable::reason` does in English.
+perf-src-not-supported = Ce moteur ne conserve aucune statistique sur les instructions.
+perf-src-pgss-not-installed = pg_stat_statements n'est pas installé dans cette base de données.
+perf-src-pgss-not-loaded = pg_stat_statements est installé mais pas chargé : il doit figurer dans shared_preload_libraries, ce qui demande un redémarrage du serveur.
+perf-src-ps-off = performance_schema est désactivé sur ce serveur. C'est une option de démarrage : l'activer demande donc un redémarrage.
+perf-src-digest-off = performance_schema est activé, mais son consommateur statements_digest est désactivé.
+perf-src-qs-off = Query Store est désactivé pour cette base de données.
+perf-src-qs-error = Query Store est en état d'erreur pour cette base de données.
+perf-src-no-permission = Ce compte n'est pas autorisé à lire les statistiques sur les instructions : { $error }
+perf-src-enable = Pour l'activer, exécutez ceci dans un onglet de requête :
+perf-statements-none = La source de statistiques est activée mais n'a encore enregistré aucune instruction.
+perf-since = Comptabilisé depuis { $since }.
+# A statement's figures, joined by middle dots under its text.
+perf-total = { $time } au total
+perf-mean = { $time } en moyenne
+perf-sub-ms = { $ms } ms
+perf-calls = { $n ->
+    [one] { $shown } appel
+   *[other] { $shown } appels
+}
+perf-rows = { $n ->
+    [one] { $shown } ligne
+   *[other] { $shown } lignes
+}
+perf-indexes-none = Aucun index en double, redondant ou inutilisé n'a été trouvé.
+perf-problem-unused = Non lu depuis la dernière réinitialisation des compteurs
+perf-problem-duplicate = Double { $of }
+perf-problem-redundant = Couvert par { $by }, dont la clé commence comme celle-ci
+perf-usage-note = Les compteurs d'utilisation repartent de zéro quand le serveur redémarre ou que ses statistiques sont réinitialisées : un index utilisé uniquement par une tâche mensuelle peut donc sembler inutilisé. Vérifiez avant d'en supprimer un.
+perf-usage-uncounted = Ce serveur ne fournit aucun compteur d'utilisation des index, donc aucun index ne peut être déclaré inutilisé — seuls les doublons et les préfixes sont affichés.
+perf-drop-index = Supprimer
+perf-create-index = Créer un index
+perf-missing-title = Index manquants enregistrés par l'optimiseur depuis le dernier redémarrage
+perf-missing-none = Aucun enregistré.
+perf-missing-detail = { $uses } utilisations · { $impact }% d'amélioration estimée
+perf-missing-note = Chacun est une estimation de l'optimiseur. Comparez-le aux index ci-dessus avant de le créer.
+perf-sizes-none = Cette base de données n'a signalé aucune taille de table.
+perf-sizes-tables = Plus grandes tables
+perf-sizes-indexes = Plus grands index
+perf-sizes-no-index-sizes = Ce moteur signale les tailles d'index par table, pas par index.
+perf-sizes-no-indexes = Cette base de données n'a aucun index dont mesurer la taille.
+perf-rows-estimate = ~{ $shown } lignes
 
 ## Edit snippet modal (snippet_edit.rs)
 

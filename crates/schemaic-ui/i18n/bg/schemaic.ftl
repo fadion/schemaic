@@ -339,6 +339,8 @@ palette-switch-connection = Смяна на връзката
 palette-switch-connection-hint = <връзка>
 palette-server-variables = Сървърни променливи
 palette-server-variables-hint = настройките на активната връзка
+palette-performance = Производителност
+palette-performance-hint = най-бавните изрази, състоянието на индексите и най-големите таблици
 palette-enter-number = Въведете число
 palette-nothing-found = Нищо не е намерено
 
@@ -422,6 +424,7 @@ tree-drop-foreign-key = Премахване на външния ключ
 tree-ai-explain = Обяснение от ИИ
 tree-users = Потребители и привилегии
 tree-server-variables = Сървърни променливи
+tree-performance = Производителност
 tree-new-database = Създаване на база данни
 tree-show-table-sizes = Показване на размерите на таблиците
 
@@ -2807,6 +2810,65 @@ server-vars-count = { $count ->
 }
 server-vars-count-filtered = { $shown } от { $count } настройки
 server-vars-refresh = Опресняване
+
+## Performance view (perf_view.rs)
+
+perf-title = Производителност — { $connection }
+perf-title-database = Производителност — { $connection } · { $database }
+perf-view-statements = Изрази
+perf-view-indexes = Индекси
+perf-view-sizes = Размери
+perf-order-total = Общо време
+perf-order-mean = Средно време
+perf-order-calls = Извиквания
+perf-loading = Четене на статистиката на сървъра…
+perf-no-database = Първо изберете база данни от лентата с инструменти за заявки — индексите и размерите са на една база данни.
+perf-refresh = Опресняване
+perf-copy = Копиране
+perf-copy-statement = Копиране на израза
+# The statement sources, when off. Each must read as core's
+# `workload::Unavailable::reason` does in English.
+perf-src-not-supported = Тази система не поддържа статистика за изразите.
+perf-src-pgss-not-installed = pg_stat_statements не е инсталиран в тази база данни.
+perf-src-pgss-not-loaded = pg_stat_statements е инсталиран, но не е зареден: трябва да бъде изброен в shared_preload_libraries, което изисква рестартиране на сървъра.
+perf-src-ps-off = performance_schema е изключена на този сървър. Това е опция при стартиране, така че включването ѝ изисква рестартиране.
+perf-src-digest-off = performance_schema е включена, но нейният консуматор statements_digest е изключен.
+perf-src-qs-off = Query Store е изключен за тази база данни.
+perf-src-qs-error = Query Store е в състояние на грешка за тази база данни.
+perf-src-no-permission = Този вход няма право да чете статистиката за изразите: { $error }
+perf-src-enable = За да го включите, изпълнете това в раздел за заявки:
+perf-statements-none = Източникът на статистика е включен, но още не е записал нито един израз.
+perf-since = Отчетено от { $since }.
+# A statement's figures, joined by middle dots under its text.
+perf-total = { $time } общо
+perf-mean = { $time } средно
+perf-sub-ms = { $ms } мс
+perf-calls = { $n ->
+    [one] { $shown } извикване
+   *[other] { $shown } извиквания
+}
+perf-rows = { $n ->
+    [one] { $shown } ред
+   *[other] { $shown } реда
+}
+perf-indexes-none = Не са намерени дублиращи се, излишни или неизползвани индекси.
+perf-problem-unused = Не е четен, откакто броячите са нулирани за последно
+perf-problem-duplicate = Дублира { $of }
+perf-problem-redundant = Покрит от { $by }, чийто ключ започва като този
+perf-usage-note = Броячите на използване започват отначало, когато сървърът се рестартира или статистиката му се нулира, така че индекс, ползван само от месечна задача, може да изглежда неизползван. Проверете, преди да премахнете такъв.
+perf-usage-uncounted = Този сървър не отчита броячи на използване на индексите, така че никой индекс не може да се определи като неизползван — показват се само дубликатите и префиксите.
+perf-drop-index = Премахване
+perf-create-index = Създаване на индекс
+perf-missing-title = Липсващи индекси, записани от оптимизатора от последното рестартиране
+perf-missing-none = Няма записани.
+perf-missing-detail = { $uses } използвания · { $impact }% очаквано подобрение
+perf-missing-note = Всеки е оценка на оптимизатора. Сравнете го с индексите по-горе, преди да го създадете.
+perf-sizes-none = Тази база данни не съобщи размери на таблици.
+perf-sizes-tables = Най-големи таблици
+perf-sizes-indexes = Най-големи индекси
+perf-sizes-no-index-sizes = Тази система съобщава размерите на индексите по таблица, а не по индекс.
+perf-sizes-no-indexes = Тази база данни няма индекси, чийто размер да се покаже.
+perf-rows-estimate = ~{ $shown } реда
 
 ## Edit snippet modal (snippet_edit.rs)
 

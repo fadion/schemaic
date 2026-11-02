@@ -331,6 +331,8 @@ palette-switch-connection = Verbindung wechseln
 palette-switch-connection-hint = <Verbindung>
 palette-server-variables = Servervariablen
 palette-server-variables-hint = die Einstellungen der aktiven Verbindung
+palette-performance = Performance
+palette-performance-hint = die langsamsten Anweisungen, der Zustand der Indizes und die größten Tabellen
 palette-enter-number = Eine Zahl eingeben
 palette-nothing-found = Nichts gefunden
 
@@ -413,6 +415,7 @@ tree-drop-foreign-key = Fremdschlüssel löschen
 tree-ai-explain = Mit KI erklären
 tree-users = Benutzer und Rechte
 tree-server-variables = Servervariablen
+tree-performance = Performance
 tree-new-database = Datenbank erstellen
 tree-show-table-sizes = Tabellengrößen anzeigen
 
@@ -2680,6 +2683,63 @@ server-vars-count = { $count ->
 }
 server-vars-count-filtered = { $shown } von { $count } Einstellungen
 server-vars-refresh = Aktualisieren
+
+perf-title = Performance — { $connection }
+perf-title-database = Performance — { $connection } · { $database }
+perf-view-statements = Anweisungen
+perf-view-indexes = Indizes
+perf-view-sizes = Größen
+perf-order-total = Gesamtzeit
+perf-order-mean = Mittlere Zeit
+perf-order-calls = Aufrufe
+perf-loading = Statistiken des Servers werden gelesen…
+perf-no-database = Wähle zuerst in der Abfrage-Symbolleiste eine Datenbank — Indizes und Größen gehören zu einer einzelnen Datenbank.
+perf-refresh = Aktualisieren
+perf-copy = Kopieren
+perf-copy-statement = Anweisung kopieren
+# The statement sources, when off. Each must read as core's
+# `workload::Unavailable::reason` does in English.
+perf-src-not-supported = Diese Engine führt keine Anweisungsstatistik.
+perf-src-pgss-not-installed = pg_stat_statements ist in dieser Datenbank nicht installiert.
+perf-src-pgss-not-loaded = pg_stat_statements ist installiert, aber nicht geladen: Es muss in shared_preload_libraries aufgeführt sein, was einen Neustart des Servers erfordert.
+perf-src-ps-off = performance_schema ist auf diesem Server ausgeschaltet. Das ist eine Startoption, daher erfordert das Einschalten einen Neustart.
+perf-src-digest-off = performance_schema ist eingeschaltet, aber der Consumer statements_digest ist deaktiviert.
+perf-src-qs-off = Query Store ist für diese Datenbank ausgeschaltet.
+perf-src-qs-error = Query Store befindet sich für diese Datenbank in einem Fehlerzustand.
+perf-src-no-permission = Dieses Login darf die Anweisungsstatistik nicht lesen: { $error }
+perf-src-enable = Führe zum Einschalten Folgendes in einem Abfrage-Tab aus:
+perf-statements-none = Die Statistikquelle ist eingeschaltet, hat aber noch keine Anweisungen erfasst.
+perf-since = Gezählt seit { $since }.
+# A statement's figures, joined by middle dots under its text.
+perf-total = { $time } gesamt
+perf-mean = { $time } im Mittel
+perf-sub-ms = { $ms } ms
+perf-calls = { $n ->
+    [one] { $shown } Aufruf
+   *[other] { $shown } Aufrufe
+}
+perf-rows = { $n ->
+    [one] { $shown } Zeile
+   *[other] { $shown } Zeilen
+}
+perf-indexes-none = Keine doppelten, redundanten oder ungenutzten Indizes gefunden.
+perf-problem-unused = Nicht gelesen seit dem letzten Zurücksetzen der Zähler
+perf-problem-duplicate = Doppelt zu { $of }
+perf-problem-redundant = Abgedeckt von { $by }, dessen Schlüssel mit diesem beginnt
+perf-usage-note = Die Nutzungszähler beginnen von vorn, wenn der Server neu startet oder seine Statistik zurückgesetzt wird, daher kann ein Index, den nur ein monatlicher Job nutzt, ungenutzt aussehen. Prüfe das, bevor du einen löschst.
+perf-usage-uncounted = Dieser Server meldet keine Index-Nutzungszähler, daher lässt sich kein Index als ungenutzt bezeichnen — es werden nur Duplikate und Präfixe gezeigt.
+perf-drop-index = Löschen
+perf-create-index = Index erstellen
+perf-missing-title = Fehlende Indizes, die der Optimierer seit dem letzten Neustart erfasst hat
+perf-missing-none = Keine erfasst.
+perf-missing-detail = { $uses } Verwendungen · { $impact }% geschätzte Verbesserung
+perf-missing-note = Jeder ist die Schätzung eines Optimierers. Gleiche ihn mit den Indizes oben ab, bevor du ihn erstellst.
+perf-sizes-none = Diese Datenbank hat keine Tabellengrößen gemeldet.
+perf-sizes-tables = Größte Tabellen
+perf-sizes-indexes = Größte Indizes
+perf-sizes-no-index-sizes = Diese Engine meldet Indexgrößen pro Tabelle, nicht pro Index.
+perf-sizes-no-indexes = Diese Datenbank hat keine Indizes, deren Größe sich zeigen ließe.
+perf-rows-estimate = ~{ $shown } Zeilen
 snippet-edit-title = Snippet bearbeiten — { $name }
 snippet-edit-name = Name
 snippet-edit-name-placeholder = Name des Snippets
