@@ -1196,7 +1196,7 @@ pub(crate) async fn run_script(
     use schemaic_core::script::ExecEnd;
     let client = match connect_to(db, database).await {
         Ok(c) => c,
-        Err(e) => return (ExecEnd::Connect(e.to_string()), 0),
+        Err(e) => return (e.script_connect_end(), 0),
     };
     // **No lock bound is set here, and that is the change.** This used to apply
     // `DDL_LOCK_WAIT_SECS`, a constant documented for the Apply modal — a short
@@ -4699,31 +4699,40 @@ pub(crate) async fn import_rows(
     cancel: CancellationToken,
 ) -> Result<u64, DbError> {
     let client = connect_to(db, target.database).await?;
-    let token = client.cancel_token();
-    tokio::select! {
-        r = import_on(&client, &target, rows) => r,
-        _ = cancel.cancelled() => {
-            cancel_query(db, &token).await;
-            // Explicit, like every other exit in `import_on` — the drop would
-            // abort the transaction too, but it leaves it open until the
-            // connection actually goes away, holding its locks meanwhile.
-            //
-            // No `Rollback::note()` here and none is owed: PostgreSQL has no
-            // non-transactional table, so `Cancelled` really does mean nothing
-            // was written. Its MySQL counterpart cannot say that (see
-            // `Db::import_rows`), and the divergence is the engines', not a
-            // difference in care between the two paths.
-            let _ = client.batch_execute("ROLLBACK").await;
-            Err(DbError::Cancelled)
-        }
-    }
+    import_on(db, &client, &target, rows, &cancel).await
 }
 
+/// [`import_rows`] on an open connection.
+///
+/// **The cancel is raced against an `INSERT` only, never the `COMMIT`.** The
+/// whole load used to race it, so a cancel landing during the `COMMIT`
+/// dropped the future while the request, already handed to the connection
+/// task, committed on the server — and `Cancelled` ("rolled back; nothing was
+/// imported") was reported over committed rows, which a retry inserted again.
+/// Checked between batches and raced only where the transaction is known to
+/// be open, `Cancelled` now always follows a `ROLLBACK` of an open
+/// transaction; a cancel arriving once the `COMMIT` is sent is too late, and
+/// the import reports what it committed. The MySQL path made the same move.
 async fn import_on(
+    db: &Db,
     client: &Client,
     target: &crate::ImportTarget<'_>,
     rows: crate::RowSource<'_>,
+    cancel: &CancellationToken,
 ) -> Result<u64, DbError> {
+    // Explicit, like every other exit here — the drop would abort the
+    // transaction too, but it leaves it open until the connection actually
+    // goes away, holding its locks meanwhile.
+    //
+    // No `Rollback::note()` here and none is owed: PostgreSQL has no
+    // non-transactional table, so `Cancelled` really does mean nothing was
+    // written. Its MySQL counterpart cannot say that (see `Db::import_rows`),
+    // and the divergence is the engines', not a difference in care.
+    let cancelled = || async {
+        let _ = client.batch_execute("ROLLBACK").await;
+        Err(DbError::Cancelled)
+    };
+    let token = client.cancel_token();
     // `db_err`, not `to_string()`: the driver's own Display for a server error is
     // the literal text "db error" — a duplicate-key import has to say so.
     client
@@ -4738,6 +4747,9 @@ async fn import_on(
     // shape is one decision and is taken in one place.
     let mut held: Option<Vec<schemaic_core::model::Value>> = None;
     loop {
+        if cancel.is_cancelled() {
+            return cancelled().await;
+        }
         // Postgres leaves the transaction aborted after any error, so every exit
         // path below rolls back explicitly rather than relying on the drop.
         let batch = match crate::next_batch_off_executor(rows, &mut held) {
@@ -4756,7 +4768,14 @@ async fn import_on(
                 return Err(e);
             }
         };
-        let affected = match client.execute(sql.as_str(), &[]).await {
+        let executed = tokio::select! {
+            r = client.execute(sql.as_str(), &[]) => r,
+            _ = cancel.cancelled() => {
+                cancel_query(db, &token).await;
+                return cancelled().await;
+            }
+        };
+        let affected = match executed {
             Ok(n) => n,
             Err(e) => {
                 let _ = client.batch_execute("ROLLBACK").await;
