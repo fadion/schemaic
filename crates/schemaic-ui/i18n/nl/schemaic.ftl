@@ -259,7 +259,6 @@ shortcuts-find-in-diagram = Zoeken in het diagram
 
 ## Sneltoetsen › de toets van een opdracht wijzigen
 
-keymap-hint = Klik met rechts of dubbelklik op een opdracht om de toets te wijzigen. Toetsen zonder menu liggen vast.
 keymap-search = Sneltoetsen zoeken
 keymap-no-match = Geen sneltoets komt overeen.
 keymap-assign = Toewijzen

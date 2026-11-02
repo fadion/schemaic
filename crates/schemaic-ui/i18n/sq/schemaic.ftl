@@ -259,7 +259,6 @@ shortcuts-find-in-diagram = Gjej në diagram
 
 ## Shkurtoret › ndryshimi i tastit të një komande
 
-keymap-hint = Klikoni me të djathtën ose dyklikoni një komandë për t'i ndryshuar tastin. Tastet pa menu janë të fiksuara.
 keymap-search = Kërkoni shkurtore
 keymap-no-match = Asnjë shkurtore nuk përputhet.
 keymap-assign = Cakto

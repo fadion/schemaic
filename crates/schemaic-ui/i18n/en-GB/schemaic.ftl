@@ -294,7 +294,6 @@ shortcuts-find-in-diagram = Find in the diagram
 
 ## Shortcuts modal › changing a command's key (`shortcuts.rs`, `settings.rs`)
 
-keymap-hint = Right-click a command, or double-click it, to change its key. Keys without a menu are fixed.
 keymap-search = Search shortcuts
 keymap-no-match = No shortcut matches.
 keymap-assign = Assign

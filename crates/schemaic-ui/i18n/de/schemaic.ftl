@@ -259,7 +259,6 @@ shortcuts-find-in-diagram = Im Diagramm suchen
 
 ## Tastenkürzel › die Taste eines Befehls ändern
 
-keymap-hint = Klicke mit rechts auf einen Befehl oder doppelklicke ihn, um seine Taste zu ändern. Tasten ohne Menü sind fest.
 keymap-search = Tastenkürzel durchsuchen
 keymap-no-match = Kein Tastenkürzel passt.
 keymap-assign = Zuweisen

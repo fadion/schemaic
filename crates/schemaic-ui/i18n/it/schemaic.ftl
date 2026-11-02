@@ -259,7 +259,6 @@ shortcuts-find-in-diagram = Trova nel diagramma
 
 ## Scorciatoie › cambiare il tasto di un comando
 
-keymap-hint = Fai clic destro o doppio clic su un comando per cambiarne il tasto. I tasti senza menu sono fissi.
 keymap-search = Cerca scorciatoie
 keymap-no-match = Nessuna scorciatoia corrisponde.
 keymap-assign = Assegna

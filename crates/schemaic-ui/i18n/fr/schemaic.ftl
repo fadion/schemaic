@@ -259,7 +259,6 @@ shortcuts-find-in-diagram = Rechercher dans le diagramme
 
 ## Raccourcis › changer la touche d'une commande
 
-keymap-hint = Faites un clic droit ou un double-clic sur une commande pour changer sa touche. Les touches sans menu sont fixes.
 keymap-search = Rechercher un raccourci
 keymap-no-match = Aucun raccourci ne correspond.
 keymap-assign = Attribuer

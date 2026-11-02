@@ -263,7 +263,6 @@ shortcuts-find-in-diagram = Caută în diagramă
 
 ## Scurtături › schimbarea tastei unei comenzi
 
-keymap-hint = Fă clic dreapta sau dublu clic pe o comandă pentru a-i schimba tasta. Tastele fără meniu sunt fixe.
 keymap-search = Caută scurtături
 keymap-no-match = Nicio scurtătură nu se potrivește.
 keymap-assign = Atribuie

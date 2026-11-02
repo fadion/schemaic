@@ -259,7 +259,6 @@ shortcuts-find-in-diagram = Buscar en el diagrama
 
 ## Atajos › cambiar la tecla de un comando
 
-keymap-hint = Haz clic derecho o doble clic en un comando para cambiar su tecla. Las teclas sin menú son fijas.
 keymap-search = Buscar atajos
 keymap-no-match = Ningún atajo coincide.
 keymap-assign = Asignar
