@@ -540,6 +540,15 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
             ("Ctrl+D", || tr!("shortcuts-duplicate")),
             ("Ctrl+X", || tr!("shortcuts-cut")),
             ("Alt+↑ / Alt+↓", || tr!("shortcuts-move-line")),
+            // floem's own bindings (`keypress::add_default_*`). Listed so they
+            // are fixed keys: the editor answers a Global command before its
+            // own keys, so a command moved onto one would silently take it.
+            ("Alt+Shift+↑ / Alt+Shift+↓", || {
+                tr!("shortcuts-copy-line")
+            }),
+            ("Ctrl+Alt+↑ / Ctrl+Alt+↓", || {
+                tr!("shortcuts-add-cursor")
+            }),
             ("Alt+Enter", || tr!("shortcuts-quick-fix")),
             ("Tab / Shift+Tab", || tr!("shortcuts-indent")),
             ("Tab / Ctrl+→", || tr!("shortcuts-take-prediction")),

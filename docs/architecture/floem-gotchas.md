@@ -1231,6 +1231,13 @@
 - **A key event goes to the focused view and, if consumed, to *nobody* else.** The dispatch is
   `directed` — no bubbling to ancestors, and with focus on nothing only the root view's own
   listeners run.
+  **So the focused view decides which Global commands run**, and since they became rebindable a
+  view that stops a key it gives no meaning to takes it from whatever command the user put there:
+  the results grid stopped Ctrl+PgDn and Alt+← and the schema tree Ctrl/Alt with Enter and the
+  arrows, so a command on one never reached `NavKeys::handle` at the root. Both now decline the
+  modified forms they do not advertise (`grid::grid_nav` in `data-grid.md`, `ui/schema_tree.md`);
+  a new surface that takes keys owes the same, and the terminal is the stated exception — it hands
+  the shell every key it can encode, by design.
   **So a `KeyDown`/`KeyUp` listener on a container around the focused view hears nothing** — not
   even the keys the focused view leaves alone, which go past it to the root (`window_handle.rs`
   `event()`: `unconditional_view_event` on the focus, then `main_view.apply_event`). The SQL

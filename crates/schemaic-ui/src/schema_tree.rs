@@ -1443,7 +1443,11 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
                 Key::Named(NamedKey::ContextMenu) => true,
                 // …and the shifted-F10 spelling every platform accepts, for the
                 // keyboards that don't.
-                Key::Named(NamedKey::F10) => ke.modifiers.shift(),
+                // Shift alone: Ctrl+Shift+F10 is a chord a command may have.
+                Key::Named(NamedKey::F10) => {
+                    ke.modifiers.shift()
+                        && !(ke.modifiers.control() || ke.modifiers.alt() || ke.modifiers.meta())
+                }
                 _ => false,
             };
             if menu_key {
@@ -1487,6 +1491,15 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             // matched by rebuilding their exact nav key from the schema rather than
             // parsing it — identifiers may contain ':' and, now, a '.' that a
             // schema-qualified key also uses.
+            //
+            // **Enter and the arrows only without Ctrl or Alt**: the tree gives
+            // those forms no meaning, and a Global command may be bound to one
+            // (Ctrl+Enter, Alt+←) — the window's handler hears only what the
+            // tree lets through.
+            let m = ke.modifiers;
+            if m.control() || m.alt() || m.meta() {
+                return EventPropagation::Continue;
+            }
             if matches!(ke.key.logical_key, Key::Named(NamedKey::Enter)) {
                 if let Some(sel) = nav.selected.get_untracked() {
                     'find: for node in db_nodes.get_untracked() {

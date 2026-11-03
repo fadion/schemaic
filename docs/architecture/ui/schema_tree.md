@@ -13,6 +13,14 @@ about that field before it came off**, in opposite directions: the struct's own 
 `BUDGET`'s said it was carried "for `table_colors` alone" (true of half of `table_node`). It
 was reached in three functions for six things, one of them an `active_conn` the struct already
 had a field for. Nothing checks a comment; the field list is checked by the compiler.
+**The tree's `KeyDown` answers Enter and the arrows only without Ctrl, Alt or Meta.** After its
+Shift+F10 / Menu-key arm, any press carrying one of those returns `Continue`: the tree gives those
+forms no meaning, and since commands became rebindable a Global command may sit on one (Alt+←,
+Ctrl+Enter) — the window root's `NavKeys::handle` hears only what the focused tree lets through.
+The F10 arm is held to the same rule, **Shift alone**, since Ctrl+Shift+F10 is a chord a command
+may have; the Menu key takes whatever modifiers come with it.
+It is the schema tree's half of the grid's `grid_nav` (`data-grid.md`); no test pins it, the
+decision living in the view.
 **Every word the panel writes itself comes from the catalogue** (`tree-*`):
 the `SCHEMA` title, in the loading dots too; the two header tooltips; the search placeholder,
 through `FieldCfg::placeholder_of`; *Loading*, *No tables*, `failed_row`'s *Failed to connect*

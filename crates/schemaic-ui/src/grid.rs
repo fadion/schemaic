@@ -2153,6 +2153,40 @@ fn grid_ctrl_command(key: &str, m: floem::keyboard::Modifiers) -> Option<GridCtr
     }
 }
 
+/// The move a navigation key makes in the grid, or `None` when the key is not
+/// one the grid moves on.
+///
+/// **Only the modifiers that mean something here.** Shift extends the
+/// selection, and Ctrl turns Home/End into the first/last cell; Alt means
+/// nothing, and neither does Ctrl on a page key. Those used to move the cell
+/// anyway and stop the press, and since commands became rebindable that
+/// swallowed a Global command put on Ctrl+PgDn or Alt+← while the grid had
+/// focus — the window's handler only hears what the grid lets through. Ctrl
+/// with an arrow still moves: no command may take it (`Refusal::Editing`).
+fn grid_nav(key: &floem::keyboard::Key, m: floem::keyboard::Modifiers) -> Option<Nav> {
+    use floem::keyboard::{Key, NamedKey};
+    let ctrl = m.control() || m.meta();
+    let Key::Named(named) = key else {
+        return None;
+    };
+    if m.alt() {
+        return None;
+    }
+    Some(match named {
+        NamedKey::ArrowDown => Nav::Down,
+        NamedKey::ArrowUp => Nav::Up,
+        NamedKey::ArrowRight => Nav::Right,
+        NamedKey::ArrowLeft => Nav::Left,
+        NamedKey::Home if ctrl => Nav::First,
+        NamedKey::Home => Nav::RowStart,
+        NamedKey::End if ctrl => Nav::Last,
+        NamedKey::End => Nav::RowEnd,
+        NamedKey::PageDown if !ctrl => Nav::PageDown,
+        NamedKey::PageUp if !ctrl => Nav::PageUp,
+        _ => return None,
+    })
+}
+
 /// Hide column `ci`, if it may be — a wrapper over `ColLayout::hide`, which
 /// decides what goes with it (the freeze, and the selection's corners) and is
 /// where that is tested. Each signal is written only when it changed.
@@ -5696,8 +5730,12 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                     // it enters at the first control, or resumes where the strip was
                     // last left. It also arms `keyboard_nav`, so the ring it lands on
                     // is visible.
+                    //
+                    // Plain F6 only: a modified F6 is no binding of the grid's,
+                    // and a Global command may have been put on one.
                     if let Event::KeyDown(ke) = e
                         && ke.key.logical_key == Key::Named(NamedKey::F6)
+                        && ke.modifiers.is_empty()
                         && let Some(from) = gs.focus_id.get_untracked()
                     {
                         strip_entry.step_from(from, false);
@@ -8821,35 +8859,19 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
     // With no cell selected yet, the first navigation keypress selects the
     // origin (0,0) instead of moving off it — otherwise Arrow-Down would skip
     // row 0 (and Arrow-Right column 0) on the very first press (§7.4).
-    let is_nav = matches!(
-        &ke.key.logical_key,
-        Key::Named(
-            NamedKey::ArrowDown
-                | NamedKey::ArrowUp
-                | NamedKey::ArrowRight
-                | NamedKey::ArrowLeft
-                | NamedKey::Home
-                | NamedKey::End
-                | NamedKey::PageDown
-                | NamedKey::PageUp
-        )
-    );
+    let nav = grid_nav(&ke.key.logical_key, m);
     // The first and last columns *drawn*: a selection corner on a hidden column
     // would be an active cell nobody can see.
     let (first_c, last_c) = gs.layout_untracked().edges(ncols);
-    if active_opt.is_none() && is_nav {
-        set_active(gs, 0, first_c, shift);
+    if let Some(nav) = nav {
+        if active_opt.is_none() {
+            set_active(gs, 0, first_c, shift);
+        } else {
+            go(nav);
+        }
         return EventPropagation::Stop;
     }
     match &ke.key.logical_key {
-        Key::Named(NamedKey::ArrowDown) => go(Nav::Down),
-        Key::Named(NamedKey::ArrowUp) => go(Nav::Up),
-        Key::Named(NamedKey::ArrowRight) => go(Nav::Right),
-        Key::Named(NamedKey::ArrowLeft) => go(Nav::Left),
-        Key::Named(NamedKey::Home) => go(if ctrl { Nav::First } else { Nav::RowStart }),
-        Key::Named(NamedKey::End) => go(if ctrl { Nav::Last } else { Nav::RowEnd }),
-        Key::Named(NamedKey::PageDown) => go(Nav::PageDown),
-        Key::Named(NamedKey::PageUp) => go(Nav::PageUp),
         Key::Named(NamedKey::Escape) => {
             // Esc closes the find bar or the goto popup first (so either closes
             // from anywhere in the grid, not only when its input is focused), then
@@ -8867,7 +8889,10 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
                 gs.anchor.set(None);
             }
         }
-        Key::Named(NamedKey::Enter) if ctrl => commit_grid(gs),
+        // Ctrl alone: Ctrl+Shift+Enter or Ctrl+Alt+Enter is no binding of the
+        // grid's, and committing on a chord a Global command was moved to
+        // would write the staged edits by surprise.
+        Key::Named(NamedKey::Enter) if ctrl && !m.shift() && !m.alt() => commit_grid(gs),
         // **`m.is_empty()`, because this handler is not only the grid's.** The
         // results strip hands `grid_key` *every* modified key it declines
         // (`widgets::strip_defers` is `!mods.is_empty()` minus three), so with
@@ -15238,6 +15263,44 @@ mod tests {
         m.set(Modifiers::SHIFT, shift);
         m.set(Modifiers::ALT, alt);
         m
+    }
+
+    #[test]
+    fn the_grid_moves_on_the_navigation_keys_with_shift_and_ctrl_where_it_means_something() {
+        use floem::keyboard::{Key, NamedKey};
+        let at = |k: NamedKey, ctrl, shift, alt| grid_nav(&Key::Named(k), mods(ctrl, shift, alt));
+        assert_eq!(
+            at(NamedKey::ArrowDown, false, false, false),
+            Some(Nav::Down)
+        );
+        assert_eq!(at(NamedKey::ArrowDown, false, true, false), Some(Nav::Down));
+        assert_eq!(at(NamedKey::Home, false, false, false), Some(Nav::RowStart));
+        assert_eq!(at(NamedKey::Home, true, true, false), Some(Nav::First));
+        assert_eq!(at(NamedKey::End, true, false, false), Some(Nav::Last));
+        assert_eq!(
+            at(NamedKey::PageDown, false, true, false),
+            Some(Nav::PageDown)
+        );
+    }
+
+    #[test]
+    fn a_navigation_key_the_grid_gives_no_meaning_reaches_the_window() {
+        // A Global command may be rebound to these, and the window only hears
+        // a key the focused grid lets through.
+        use floem::keyboard::{Key, NamedKey};
+        let at = |k: NamedKey, ctrl, shift, alt| grid_nav(&Key::Named(k), mods(ctrl, shift, alt));
+        assert_eq!(at(NamedKey::PageDown, true, false, false), None);
+        assert_eq!(at(NamedKey::PageUp, true, true, false), None);
+        for k in [
+            NamedKey::ArrowLeft,
+            NamedKey::ArrowRight,
+            NamedKey::Home,
+            NamedKey::End,
+            NamedKey::PageUp,
+        ] {
+            assert_eq!(at(k, false, false, true), None, "Alt+{k:?}");
+            assert_eq!(at(k, true, false, true), None, "Ctrl+Alt+{k:?}");
+        }
     }
 
     /// **A global Ctrl+Shift shortcut is not the grid's Ctrl+letter.** With

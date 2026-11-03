@@ -224,6 +224,22 @@ this bundle's.
   first, because that is a form `shortcuts`' `bound_letters` reads and this is the grid's one binding
   site for them — folded, the documentation gate saw no grid letters at all (checked: a probe
   `"q" | "Q"` arm fails `every_bound_letter_is_documented` naming `grid.rs`).
+- **The navigation keys take only the modifiers that mean something here**, the same rule for the
+  arrows, Home, End and the page keys. One pure `grid_nav(key, modifiers) -> Option<Nav>` answers
+  both of `grid_key`'s uses — the first press that selects the origin and every move after it —
+  and says `None` for Alt with any of them and for Ctrl with PgUp/PgDn, which then reach the
+  `_ => Continue` like a declined letter. Shift still extends, Ctrl still turns Home/End into the
+  first/last cell, and **Ctrl with an arrow still moves**, because no command may take it
+  (`Refusal::Editing`). The arms used to match the key whatever the modifiers and stop the press,
+  harmless while the Global keys were fixed letters and wrong once they were rebindable: Next tab
+  moved to Ctrl+PgDn, which the keymap reports `Free`, paged the grid rather than changing tab, and
+  Alt+←/→, Alt+Home/End and Ctrl+PgUp went the same way, because the window's `NavKeys::handle` is
+  the only place a Global command runs outside the editor and it hears only what the grid lets
+  through. `the_grid_moves_on_the_navigation_keys_with_shift_and_ctrl_where_it_means_something` and
+  `a_navigation_key_the_grid_gives_no_meaning_reaches_the_window` pin both sides of the pure
+  function; nothing reads `grid_key` to prove it calls it, as the Ctrl-letter gate does. The grid
+  body's **F6** arm is plain F6 only for the same reason — it matched F6 with any modifiers, so
+  Shift+F6 or Ctrl+F6 entered the toolbar strip whatever command was on it.
 - **Paste (Ctrl+V / the cell menu) stages, it does not write.** Every pasted cell goes through the
   same `GridState::stage`/`stage_new` a typed edit does, so it lands as ordinary green edits and
   the write-back plan, the one-row safety net and Commit/Discard all apply unchanged — a paste is
@@ -1604,9 +1620,12 @@ this bundle's.
       ArrowLeft/ArrowRight/Escape) — so with the keyboard on a toolbar button **Ctrl+Delete staged a
       row deletion**, and Shift+Enter opened the in-cell editor. Neither is a binding the strip
       advertises, and before the strip began forwarding neither reached the grid at all. The
-      plain-Enter arm carries the same guard (the arm above it claims Ctrl), and
-      `the_staging_key_arms_refuse_a_modified_press` reads `grid_key`'s own span for both — a source
-      gate because the handler needs a `GridState`.
+      plain-Enter arm carries the same guard, and the commit arm above it claims **Ctrl alone** —
+      Ctrl+Shift+Enter and Ctrl+Alt+Enter are no binding of the grid's, and committing on a chord
+      a Global command was moved to would write the staged edits by surprise.
+      `the_staging_key_arms_refuse_a_modified_press` reads `grid_key`'s own span for Del and Enter
+      — a source gate because the handler needs a `GridState` — and not for the commit arm, which
+      no test pins.
   Inserts/deletes change membership/order → those commits **full-re-run** the query (pure-UPDATE
   splices in place). A NOT-NULL-no-default omission or duplicate-key clone fails the transaction and
   surfaces the error — nothing half-applied.

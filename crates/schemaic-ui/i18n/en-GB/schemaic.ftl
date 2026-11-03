@@ -268,6 +268,8 @@ shortcuts-format-code = Format code
 shortcuts-format-statement = Format statement
 shortcuts-single-line = Make single line
 shortcuts-move-line = Move line up / down
+shortcuts-copy-line = Copy line up / down
+shortcuts-add-cursor = Add a cursor above / below
 shortcuts-quick-fix = Apply the quick fix under the caret
 shortcuts-indent = Indent / outdent
 # Its keys are "Tab / Ctrl+→": the first half is Tab (or →), the second Ctrl+→.

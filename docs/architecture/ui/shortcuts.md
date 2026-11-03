@@ -60,7 +60,14 @@ added to the table is at once a key no command can be moved onto, with no second
 remember. `every_fixed_row_reads_as_chords` fails on a row `Chord::parse` cannot read, which
 would otherwise fall out of that list in silence, and `no_default_is_a_fixed_key` on a command
 default the table has since claimed, which `Keymap::load` would report to every user with no
-`keymap.json` at all. **`chord_of` reads a press as a chord: an ASCII letter by its logical
+`keymap.json` at all. **A row is therefore also how a key the app does not bind itself is
+protected.** The Editor group lists two of floem's own editor bindings (`keypress::add_default_*`)
+— `Alt+Shift+↑ / Alt+Shift+↓`, copy the line up or down, and `Ctrl+Alt+↑ / Ctrl+Alt+↓`, add a
+cursor above or below — because the editor answers a Global command before its own keys, so a
+command moved onto one took it from the editor in silence; listed, they are fixed keys no command
+can be moved onto. **Ctrl+PgUp/PgDn, floem's scroll, is deliberately not listed**: it is the
+conventional tab-cycling key, and there the user's choice should win in the editor too (the
+change's author's call). **`chord_of` reads a press as a chord: an ASCII letter by its logical
 character, anything else by its physical key's US character** (`chord_from`, `us_char`). A
 letter follows the layout, so Ctrl+Z is where the Z is on AZERTY; a digit, punctuation, a letter
 Shift or AltGr has changed and a non-Latin letter are read by the key they sit on, so

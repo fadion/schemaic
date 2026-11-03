@@ -28,6 +28,16 @@ Ctrl+G (Go to line) and the grid's Ctrl+G (Go to row) mean two things — and wh
 command cannot take the editor's fixed Ctrl+F while Go to line may take the grid's F6
 (`a_fixed_key_is_refused_where_it_is_heard_and_free_elsewhere`;
 `a_global_command_cannot_take_a_surfaces_fixed_key` over the real fixed list, in `shortcuts.rs`).
+**"Heard whatever has focus" is a promise the surfaces keep, not this module**: the window root's
+`NavKeys::handle` hears only what the focused view lets through, so a surface must decline every
+chord it gives no meaning to. The results grid used to move on an arrow, Home, End or a page key
+whatever the modifiers and stop the press, so Next tab rebound to Ctrl+PgDn — `Free` here — ran in
+the editor and paged the grid instead; `grid::grid_nav` and the schema tree now let those forms
+through (`data-grid.md`, `ui/schema_tree.md`). The other direction is the fixed list's: the editor
+answers a Global command *before* its own keys, so an editor binding the table does not list is
+one a command silently takes, which is why floem's own Alt+Shift+↑/↓ and Ctrl+Alt+↑/↓ are rows of
+`SHORTCUTS` now (`ui/shortcuts.md`). The terminal is the stated exception, by design: it hands the
+shell every key it can encode, so no Global command runs while it has focus.
 **A `Chord` is `{ primary, alt, shift, key }`, written in the Shortcuts table's own spelling** —
 `Ctrl+Alt+Shift+L`, the modifiers always in that order whatever order they were read in — so a
 written chord goes through the modal's respeller (`Ctrl` → `Cmd`, `Del` → `Entf`) unchanged.

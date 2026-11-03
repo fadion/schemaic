@@ -132,6 +132,8 @@ Find anywhere (<kbd>Ctrl</kbd>+<kbd>P</kbd>) does the same.
 | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd> | Format statement |
 | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>J</kbd> | Make single line |
 | <kbd>Alt</kbd>+<kbd>↑</kbd> / <kbd>Alt</kbd>+<kbd>↓</kbd> | Move line up / down |
+| <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>↓</kbd> | Copy line up / down |
+| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>↑</kbd> / <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>↓</kbd> | Add a cursor above / below |
 | <kbd>Alt</kbd>+<kbd>Enter</kbd> | Apply the quick fix under the caret |
 | <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | Indent / outdent |
 | <kbd>Tab</kbd> / <kbd>Ctrl</kbd>+<kbd>→</kbd> | Take the inline prediction (→ too, at a line's end) / its next word |
