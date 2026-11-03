@@ -230,9 +230,18 @@ snapshot lookup), `a_server_process_lock_is_neither_offered_nor_confirmed`,
 **The panel's keyboard cursor is a `RowKey`, an identity and never a position.** The list is
 rebuilt and re-sorted on every poll, so an index that pointed at session 41 before a poll points
 at whoever sorted into that slot after it — and the action the cursor exists for is a kill. A
-session row is its id (`RowKey::of_session`); a lock row is everything the row shows — session,
-object, kind, mode and `granted` (`RowKey::of_lock`) — since one session can hold several locks
-and each row's menu is enabled by its own (`LockInfo::offers`). `step_cursor` moves it by a
+session row is its id (`RowKey::of_session`); a lock row is session, object, kind, mode and
+`granted` — since one session can hold several locks and each row's menu is enabled by its own
+(`LockInfo::offers`) — **and `nth`, which of the rows showing those it is**. Two rows can: InnoDB
+reports the supremum record of a range lock once per page, and SQL Server repeats a wait once per
+waiting task of a parallel request, the rows differing only in `blocked_by`. With one key for both
+the cursor could never step past the pair — `step_cursor` finds a key at its first occurrence, so
+Down from the pair's first row produced the same key again and the cursor stayed put. So the
+keys are built for a whole list at once, `RowKey::of_locks` over the rows drawn, in order, each
+row counting the earlier ones that show what it does; there is no per-row constructor, because a
+lock alone cannot know its `nth`. The count is ordinal, so across a poll the cursor stays on the
+*n*th such row rather than on one particular task
+(`the_cursor_steps_past_two_lock_rows_that_show_the_same_thing`). `step_cursor` moves it by a
 `CursorStep` (`Down`/`Up`/`First`/`Last`) over the keys of the rows drawn now, stopping at
 either end rather than wrapping. A cursor whose row has gone — killed, finished, filtered out —
 is no cursor: Down and First start at the top, Up and Last at the bottom, as they would from

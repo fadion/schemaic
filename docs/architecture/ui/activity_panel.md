@@ -37,7 +37,12 @@ whoever sorted into that slot and the action the cursor exists for is a kill. Th
 menu key both read the rows through `drawn_sessions`/`drawn_locks`, the one definition the
 builders draw from too, so the cursor cannot land on a row the search or `RENDER_CAP` left off
 screen; and the menu key asks `live_cursor` first, so a cursor whose session has gone opens
-nothing rather than the menu of the row now in its place. The menu is the same
+nothing rather than the menu of the row now in its place. A lock row's key comes from
+`RowKey::of_locks` over the drawn rows, in `locks_list` and `ListKeys::rows` alike, and
+`ListKeys::menu` finds the lock by **zipping the drawn rows with those keys**, not by searching
+the list for a lock with the key's content: two rows can show the same lock (`core/activity.md`),
+and a content search answers the first of them for either, so the three must build the keys the
+same way from the same rows. The menu is the same
 `row_menu`/`lock_menu` the right-click builds (`ListKeys::menu`), so the two routes cannot offer
 different entries for one row, opened **at the row** — `PopupAnchor::BelowBox` on the window box
 the cursor row publishes from `on_move`/`on_resize` in `with_cursor` — because the pointer may be

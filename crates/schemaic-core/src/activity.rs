@@ -456,9 +456,13 @@ pub fn render_slice<T>(rows: &[T]) -> (&[T], usize) {
 /// **An identity, never a position.** The list is rebuilt and re-sorted on every
 /// poll, so an index that pointed at session 41 before a poll points at whoever
 /// sorted into that slot after it — and the action the cursor exists for is a
-/// kill. A session is its id. A lock is everything its row shows, since one
-/// session can hold several and each row's menu is enabled by its own lock
-/// ([`LockInfo::offers`]).
+/// kill. A session is its id. A lock is its session, object, kind, mode and
+/// grant, since one session can hold several and each row's menu is enabled by
+/// its own lock ([`LockInfo::offers`]) — **and which of the rows showing those
+/// it is**
+/// (`nth`): two rows can show the same thing (InnoDB's supremum record on
+/// each page of a range lock, a SQL Server wait repeated per waiting task),
+/// and with one key for both the cursor could never step past the pair.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RowKey {
     Session(i64),
@@ -468,6 +472,7 @@ pub enum RowKey {
         kind: String,
         mode: String,
         granted: bool,
+        nth: usize,
     },
 }
 
@@ -476,14 +481,29 @@ impl RowKey {
         RowKey::Session(s.id)
     }
 
-    pub fn of_lock(l: &LockInfo) -> Self {
-        RowKey::Lock {
-            session: l.session,
-            object: l.object.clone(),
-            kind: l.kind.clone(),
-            mode: l.mode.clone(),
-            granted: l.granted,
-        }
+    /// The keys of the lock rows drawn, in order: a row that shows what an
+    /// earlier one does is its next occurrence.
+    pub fn of_locks<'a>(locks: impl IntoIterator<Item = &'a LockInfo>) -> Vec<Self> {
+        let mut seen: std::collections::HashMap<(i64, &str, &str, &str, bool), usize> =
+            std::collections::HashMap::new();
+        locks
+            .into_iter()
+            .map(|l| {
+                let count = seen
+                    .entry((l.session, &l.object, &l.kind, &l.mode, l.granted))
+                    .or_insert(0);
+                let nth = *count;
+                *count += 1;
+                RowKey::Lock {
+                    session: l.session,
+                    object: l.object.clone(),
+                    kind: l.kind.clone(),
+                    mode: l.mode.clone(),
+                    granted: l.granted,
+                    nth,
+                }
+            })
+            .collect()
     }
 }
 
@@ -625,14 +645,44 @@ mod cursor_tests {
             blocked_by: vec![],
             killable: true,
         };
-        let a = RowKey::of_lock(&lock("t1", true));
-        let b = RowKey::of_lock(&lock("t2", true));
-        let c = RowKey::of_lock(&lock("t1", false));
+        let keys = RowKey::of_locks(&[lock("t1", true), lock("t2", true), lock("t1", false)]);
+        let [a, b, c] = [keys[0].clone(), keys[1].clone(), keys[2].clone()];
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_ne!(a, RowKey::Session(5));
         let rows = vec![a.clone(), b.clone()];
         assert_eq!(step_cursor(&rows, Some(&a), CursorStep::Down), Some(b));
+    }
+
+    #[test]
+    fn the_cursor_steps_past_two_lock_rows_that_show_the_same_thing() {
+        // InnoDB's supremum records of a range lock, or a SQL Server wait
+        // repeated once per waiting task: two rows, one of everything shown.
+        let lock = |object: &str, blocked_by: Vec<i64>| LockInfo {
+            session: 5,
+            object: object.into(),
+            kind: "RECORD".into(),
+            mode: "X".into(),
+            granted: true,
+            blocked_by,
+            killable: true,
+        };
+        let locks = [
+            lock("a", vec![]),
+            lock("supremum", vec![7]),
+            lock("supremum", vec![8]),
+            lock("c", vec![]),
+        ];
+        let rows = RowKey::of_locks(&locks);
+        assert_ne!(rows[1], rows[2]);
+        let second = step_cursor(&rows, Some(&rows[1]), CursorStep::Down);
+        assert_eq!(second.as_ref(), Some(&rows[2]));
+        let past = step_cursor(&rows, second.as_ref(), CursorStep::Down);
+        assert_eq!(past.as_ref(), Some(&rows[3]));
+        assert_eq!(
+            step_cursor(&rows, Some(&rows[2]), CursorStep::Up).as_ref(),
+            Some(&rows[1])
+        );
     }
 }
 

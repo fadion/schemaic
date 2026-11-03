@@ -246,7 +246,7 @@ impl ListKeys {
                 crate::LocksState::Loaded(list) => {
                     let waits = tr!("activity-lock-waits-for");
                     let (rows, _) = drawn_locks(list, &q, &waits);
-                    rows.into_iter().map(RowKey::of_lock).collect()
+                    RowKey::of_locks(rows)
                 }
                 _ => Vec::new(),
             });
@@ -274,12 +274,18 @@ impl ListKeys {
                     .map(|s| row_menu(s, self.kill.clone(), read_only, dialect)),
                 _ => None,
             }),
+            // Found among the rows drawn, by the key each was drawn with: two
+            // rows can show the same lock (`RowKey`'s `nth`).
             RowKey::Lock { .. } => self.locks.with_untracked(|lk| match lk {
-                crate::LocksState::Loaded(list) => list
-                    .locks
-                    .iter()
-                    .find(|l| RowKey::of_lock(l) == *key)
-                    .map(|l| lock_menu(l, self.kill.clone(), read_only, dialect)),
+                crate::LocksState::Loaded(list) => {
+                    let waits = tr!("activity-lock-waits-for");
+                    let (rows, _) = drawn_locks(list, &self.search.get_untracked(), &waits);
+                    let keys = RowKey::of_locks(rows.iter().copied());
+                    rows.iter()
+                        .zip(&keys)
+                        .find(|(_, k)| *k == key)
+                        .map(|(l, _)| lock_menu(l, self.kill.clone(), read_only, dialect))
+                }
                 _ => None,
             }),
         }
@@ -1375,13 +1381,15 @@ fn locks_list(
             theme::text_muted,
         );
     }
+    let keys = RowKey::of_locks(rows.iter().copied());
     let mut items: Vec<floem::AnyView> = rows
         .iter()
-        .map(|l| {
+        .zip(keys)
+        .map(|(l, key)| {
             with_cursor(
                 lock_row(l, kill.clone(), overlay, menus, read_only, dialect),
                 nav,
-                RowKey::of_lock(l),
+                key,
             )
         })
         .collect();
