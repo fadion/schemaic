@@ -2864,6 +2864,7 @@ perf-src-ps-off = performance_schema staat uit op deze server. Het is een opstar
 perf-src-digest-off = performance_schema staat aan, maar de statements_digest-consumer is uitgeschakeld.
 perf-src-qs-off = Query Store staat uit voor deze database.
 perf-src-qs-error = Query Store verkeert in een foutstatus voor deze database.
+perf-src-qs-missing = Deze server heeft geen Query Store; dat kwam met SQL Server 2016.
 perf-src-no-permission = Deze login mag de instructiestatistieken niet lezen: { $error }
 perf-src-enable = Voer dit uit in een querytabblad om het in te schakelen:
 perf-statements-none = De statistiekenbron staat aan, maar heeft nog geen instructies geregistreerd.

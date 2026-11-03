@@ -28,13 +28,14 @@ names which source is missing: `NotSupported` (SQLite, which keeps no statement 
 `ExtensionNotInstalled` and `ExtensionNotLoaded` (PostgreSQL's `pg_stat_statements`, absent, or
 present but not in `shared_preload_libraries` and so collecting nothing), `PerformanceSchemaOff`
 and `DigestConsumerOff` (MySQL and MariaDB, where it is off by default on MariaDB), `QueryStoreOff`
-and `QueryStoreError` (SQL Server, opt-in per database), and `NoPermission` carrying the engine's
+and `QueryStoreError` (SQL Server, opt-in per database), `QueryStoreMissing` (SQL Server 2014 and
+earlier, which predate Query Store), and `NoPermission` carrying the engine's
 own words. `reason()` is the English; `enable_sql()` is the statement that turns the source on
 **only where one statement does** — `CREATE EXTENSION pg_stat_statements;`, the
 `setup_consumers` `UPDATE`, `ALTER DATABASE CURRENT SET QUERY_STORE = ON;` — and `None` where it
 takes a configuration change and a restart, or a grant only an administrator can make
 (`only_a_one_statement_fix_offers_its_statement`). It is shown for the user to run; nothing in
-Schemaic runs it. Three classifiers keep each engine's read from deciding this inline.
+Schemaic runs it. Four classifiers keep each engine's read from deciding this inline.
 `classify_pg_statements_error` turns an error naming `shared_preload_libraries` into
 `ExtensionNotLoaded` and a permission denial into `NoPermission`, and leaves anything else an
 error (`pg_errors_are_classified_only_when_they_mean_the_source_is_off`).
@@ -43,7 +44,22 @@ error (`pg_errors_are_classified_only_when_they_mean_the_source_is_off`).
 read (`mysql_digests_need_the_schema_and_the_consumer`). `query_store_availability` reads
 `actual_state_desc`: `READ_ONLY` is readable, since it still holds the history it gathered, and
 no row at all is a database where Query Store was never configured, so off
-(`query_store_is_readable_read_only_and_off_without_a_row`). The capabilities are
+(`query_store_is_readable_read_only_and_off_without_a_row`). `classify_query_store_error` reads
+the error that state read gives a server older than Query Store, which came with 2016 and so has
+no `sys.database_query_store_options`: *Invalid object name* naming that view is
+`QueryStoreMissing`, with no `enable_sql`, since no statement adds Query Store to a server that
+lacks it; an invalid object name naming anything else, or any other error, stays one
+(`a_server_older_than_query_store_says_so_rather_than_failing`). Before it, such a server answered
+an error — exit 1 from `schemaic statements`, `isError` from the MCP tool, a red error in the view
+— where every other absent source is said. **One more decision is the extension's, not the
+server's**: `pg_statements_has_exec_columns(extversion)` says whether `pg_stat_statements` names
+its timings `total_exec_time`/`mean_exec_time` — from the extension's 1.8 on — or 1.7's
+`total_time`/`mean_time`, and a version it cannot read is taken as a current one. The rename
+shipped with PostgreSQL 13, which is why the server's `server_version_num` was asked first and
+why that was wrong: a cluster brought up by `pg_upgrade` keeps the extension objects it had until
+someone runs `ALTER EXTENSION … UPDATE`, so a 16 server with extension 1.7 failed with *column
+s.total_exec_time does not exist* rather than listing
+(`the_statement_columns_follow_the_extensions_version_not_the_servers`). The capabilities are
 `supports_statement_stats`, false on SQLite alone, and `supports_missing_index_hints`, true on SQL
 Server alone — PostgreSQL and MySQL record nothing of the kind, and inferring one from the
 statement list would be guessing.

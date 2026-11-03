@@ -2867,6 +2867,7 @@ perf-src-ps-off = performance_schema è disattivato su questo server. È un'opzi
 perf-src-digest-off = performance_schema è attivo, ma il suo consumer statements_digest è disattivato.
 perf-src-qs-off = Query Store è disattivato per questo database.
 perf-src-qs-error = Query Store è in stato di errore per questo database.
+perf-src-qs-missing = Questo server non ha Query Store, arrivato con SQL Server 2016.
 perf-src-no-permission = Questo login non può leggere le statistiche sulle istruzioni: { $error }
 perf-src-enable = Per attivarlo, esegui questo in una scheda di query:
 perf-statements-none = La fonte delle statistiche è attiva ma non ha ancora registrato istruzioni.

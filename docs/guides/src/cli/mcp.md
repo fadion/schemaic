@@ -137,7 +137,7 @@ view.
   |---|---|---|
   | PostgreSQL | the `pg_stat_statements` extension | Run `CREATE EXTENSION pg_stat_statements;` in the database. The library also has to be in `shared_preload_libraries`, which takes a restart. |
   | MySQL/MariaDB | `performance_schema`'s statement digests | `performance_schema` is a startup option, so turning it on takes a restart. If it's on but the digest consumer isn't, run `UPDATE performance_schema.setup_consumers SET ENABLED = 'YES' WHERE NAME = 'statements_digest';` |
-  | SQL Server | the database's Query Store, one per database | Run `ALTER DATABASE CURRENT SET QUERY_STORE = ON;` in that database. |
+  | SQL Server | the database's Query Store, one per database | Run `ALTER DATABASE CURRENT SET QUERY_STORE = ON;` in that database. Query Store came with SQL Server 2016, so on 2014 and earlier there is nothing to turn on, and the agent is told so. |
 
   When the source is off, the agent is told which and, where one statement does it, the statement
   to pass on. It never runs it.

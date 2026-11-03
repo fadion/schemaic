@@ -131,6 +131,8 @@ pub enum Unavailable {
     QueryStoreOff,
     /// SQL Server: Query Store is in its `ERROR` state.
     QueryStoreError,
+    /// SQL Server: the server predates Query Store (2014 or earlier).
+    QueryStoreMissing,
     /// The source is there but this login may not read it — the engine's own
     /// words.
     NoPermission(String),
@@ -162,6 +164,9 @@ impl Unavailable {
             Unavailable::QueryStoreError => {
                 "Query Store is in an error state for this database.".into()
             }
+            Unavailable::QueryStoreMissing => {
+                "This server has no Query Store, which came with SQL Server 2016.".into()
+            }
             Unavailable::NoPermission(e) => {
                 format!("This login may not read the statement statistics: {e}")
             }
@@ -184,6 +189,7 @@ impl Unavailable {
             | Unavailable::ExtensionNotLoaded
             | Unavailable::PerformanceSchemaOff
             | Unavailable::QueryStoreError
+            | Unavailable::QueryStoreMissing
             | Unavailable::NoPermission(_) => None,
         }
     }
@@ -215,6 +221,23 @@ pub fn classify_pg_statements_error(message: &str) -> Option<Unavailable> {
     }
 }
 
+/// Does `pg_stat_statements` at extension version `extversion` (as
+/// `pg_extension` has it) name its timings `total_exec_time`/`mean_exec_time`?
+///
+/// **The extension's version, not the server's.** The rename came with the
+/// extension's 1.8, which ships with PostgreSQL 13 — but a cluster upgraded
+/// with `pg_upgrade` keeps the extension objects it had until someone runs
+/// `ALTER EXTENSION … UPDATE`, so a 16 server can still have 1.7's
+/// `total_time`. A version this cannot read is taken as a current one.
+pub fn pg_statements_has_exec_columns(extversion: &str) -> bool {
+    let mut parts = extversion.trim().split('.').map(str::parse::<u32>);
+    match (parts.next(), parts.next()) {
+        (Some(Ok(major)), Some(Ok(minor))) => (major, minor) >= (1, 8),
+        (Some(Ok(major)), None) => major >= 2,
+        _ => true,
+    }
+}
+
 /// MySQL's digest source, from `@@performance_schema` and the
 /// `statements_digest` consumer's `ENABLED` (`None` when the row could not be
 /// read). `None` back means the source is readable.
@@ -240,6 +263,16 @@ pub fn query_store_availability(actual_state: Option<&str>) -> Option<Unavailabl
         Some(s) if s == "ERROR" => Some(Unavailable::QueryStoreError),
         _ => Some(Unavailable::QueryStoreOff),
     }
+}
+
+/// SQL Server's refusal to read Query Store's state, classified: a server
+/// from before Query Store (it came with 2016) has no
+/// `sys.database_query_store_options`, which is an absent source to say, not
+/// a failure to retry. Anything else stays an error (`None`).
+pub fn classify_query_store_error(message: &str) -> Option<Unavailable> {
+    let m = message.to_ascii_lowercase();
+    (m.contains("invalid object name") && m.contains("database_query_store_options"))
+        .then_some(Unavailable::QueryStoreMissing)
 }
 
 // ── Index health ────────────────────────────────────────────────────────────
@@ -855,6 +888,19 @@ mod tests {
     }
 
     #[test]
+    fn the_statement_columns_follow_the_extensions_version_not_the_servers() {
+        // A cluster pg_upgraded to 16 whose extension was never updated keeps
+        // 1.7's `total_time`.
+        assert!(!pg_statements_has_exec_columns("1.7"));
+        assert!(!pg_statements_has_exec_columns("1.4"));
+        assert!(pg_statements_has_exec_columns("1.8"));
+        assert!(pg_statements_has_exec_columns("1.10"));
+        assert!(pg_statements_has_exec_columns("2.0"));
+        // A spelling nobody has shipped reads as the current one.
+        assert!(pg_statements_has_exec_columns("devel"));
+    }
+
+    #[test]
     fn mysql_digests_need_the_schema_and_the_consumer() {
         assert_eq!(
             mysql_digest_availability(false, Some(true)),
@@ -867,6 +913,21 @@ mod tests {
         assert_eq!(mysql_digest_availability(true, Some(true)), None);
         // An unreadable consumer row is not a disabled one: try the read.
         assert_eq!(mysql_digest_availability(true, None), None);
+    }
+
+    #[test]
+    fn a_server_older_than_query_store_says_so_rather_than_failing() {
+        // SQL Server 2014 and earlier have no `sys.database_query_store_options`.
+        assert_eq!(
+            classify_query_store_error("Invalid object name 'sys.database_query_store_options'."),
+            Some(Unavailable::QueryStoreMissing)
+        );
+        assert_eq!(
+            classify_query_store_error("Invalid object name 'dbo.orders'."),
+            None
+        );
+        assert_eq!(classify_query_store_error("Login timeout expired"), None);
+        assert_eq!(Unavailable::QueryStoreMissing.enable_sql(), None);
     }
 
     #[test]

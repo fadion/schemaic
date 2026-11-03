@@ -2864,6 +2864,7 @@ perf-src-ps-off = performance_schema е изключена на този сър�
 perf-src-digest-off = performance_schema е включена, но нейният консуматор statements_digest е изключен.
 perf-src-qs-off = Query Store е изключен за тази база данни.
 perf-src-qs-error = Query Store е в състояние на грешка за тази база данни.
+perf-src-qs-missing = Този сървър няма Query Store, който се появи със SQL Server 2016.
 perf-src-no-permission = Този вход няма право да чете статистиката за изразите: { $error }
 perf-src-enable = За да го включите, изпълнете това в раздел за заявки:
 perf-statements-none = Източникът на статистика е включен, но още не е записал нито един израз.

@@ -2100,7 +2100,9 @@ fn pg_statements_sql(
 
 /// The PostgreSQL half of [`Db::fetch_top_statements`]: the extension's
 /// presence in `database` first, so its absence is said rather than read as a
-/// quiet server, then the version for the column names, then the list.
+/// quiet server, with its version for the column names
+/// ([`schemaic_core::workload::pg_statements_has_exec_columns`]), then the
+/// list.
 pub(crate) async fn fetch_top_statements(
     db: &Db,
     database: Option<&str>,
@@ -2111,7 +2113,7 @@ pub(crate) async fn fetch_top_statements(
     let client = connect_catalogue(db, database).await?;
     let ext = query_all(
         &client,
-        "SELECT n.nspname FROM pg_catalog.pg_extension e \
+        "SELECT n.nspname, e.extversion FROM pg_catalog.pg_extension e \
          JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace \
          WHERE e.extname = 'pg_stat_statements'",
     )
@@ -2121,12 +2123,13 @@ pub(crate) async fn fetch_top_statements(
             Unavailable::ExtensionNotInstalled,
         ));
     };
-    let version = query_all(&client, "SELECT current_setting('server_version_num')")
-        .await?
-        .first()
-        .and_then(|r| num(r, 0))
-        .unwrap_or(0);
-    let sql = pg_statements_sql(&ns, version >= 130_000, order, limit);
+    let extversion = ext.first().and_then(|r| opt(r, 1)).unwrap_or_default();
+    let sql = pg_statements_sql(
+        &ns,
+        wl::pg_statements_has_exec_columns(&extversion),
+        order,
+        limit,
+    );
     let rows = match query_all(&client, &sql).await {
         Ok(rows) => rows,
         Err(DbError::Query(msg)) => {
@@ -5200,7 +5203,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_statements_query_names_the_columns_of_the_servers_version() {
+    fn the_statements_query_names_the_columns_it_is_told_the_extension_has() {
         use schemaic_core::workload::StatementOrder;
         let new = pg_statements_sql("public", true, StatementOrder::Mean, 20);
         assert!(new.contains("s.total_exec_time::float8"), "{new}");

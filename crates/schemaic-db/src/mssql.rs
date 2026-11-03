@@ -3618,6 +3618,9 @@ pub(crate) async fn fetch_top_statements(
     .await
     {
         Ok(rows) => rows.first().and_then(|r| r.first().cloned().flatten()),
+        Err(DbError::Query(msg)) if wl::classify_query_store_error(&msg).is_some() => {
+            return Ok(StatementReport::Unavailable(Unavailable::QueryStoreMissing));
+        }
         Err(e) => return refused(e),
     };
     if let Some(u) = wl::query_store_availability(state.as_deref()) {

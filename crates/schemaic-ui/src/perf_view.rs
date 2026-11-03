@@ -406,6 +406,7 @@ fn unavailable(u: &Unavailable) -> AnyView {
         Unavailable::DigestConsumerOff => tr!("perf-src-digest-off"),
         Unavailable::QueryStoreOff => tr!("perf-src-qs-off"),
         Unavailable::QueryStoreError => tr!("perf-src-qs-error"),
+        Unavailable::QueryStoreMissing => tr!("perf-src-qs-missing"),
         Unavailable::NoPermission(e) => tr!("perf-src-no-permission", error = e.clone()),
     };
     let mut rows = vec![message(icons::CIRCLE_QUESTION, theme::text_faint, reason)];
@@ -936,6 +937,7 @@ mod tests {
             (Unavailable::DigestConsumerOff, tr!("perf-src-digest-off")),
             (Unavailable::QueryStoreOff, tr!("perf-src-qs-off")),
             (Unavailable::QueryStoreError, tr!("perf-src-qs-error")),
+            (Unavailable::QueryStoreMissing, tr!("perf-src-qs-missing")),
         ] {
             assert_eq!(key, u.reason(), "{u:?}");
         }

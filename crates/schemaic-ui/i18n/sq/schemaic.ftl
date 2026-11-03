@@ -2864,6 +2864,7 @@ perf-src-ps-off = performance_schema është joaktiv në këtë server. Është 
 perf-src-digest-off = performance_schema është aktiv, por konsumatori i tij statements_digest është joaktiv.
 perf-src-qs-off = Query Store është joaktiv për këtë bazë të dhënash.
 perf-src-qs-error = Query Store është në gjendje gabimi për këtë bazë të dhënash.
+perf-src-qs-missing = Ky server nuk ka Query Store, që erdhi me SQL Server 2016.
 perf-src-no-permission = Ky login nuk lejohet të lexojë statistikat e urdhrave: { $error }
 perf-src-enable = Për ta aktivizuar, ekzekutoni këtë në një skedë kërkese:
 perf-statements-none = Burimi i statistikave është aktiv por nuk ka regjistruar ende urdhra.

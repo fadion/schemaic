@@ -3366,6 +3366,7 @@ perf-src-ps-off = performance_schema is off on this server. It is a startup opti
 perf-src-digest-off = performance_schema is on, but its statements_digest consumer is disabled.
 perf-src-qs-off = Query Store is off for this database.
 perf-src-qs-error = Query Store is in an error state for this database.
+perf-src-qs-missing = This server has no Query Store, which came with SQL Server 2016.
 perf-src-no-permission = This login may not read the statement statistics: { $error }
 perf-src-enable = To turn it on, run this in a query tab:
 perf-statements-none = The statistics source is on but has recorded no statements yet.

@@ -1572,12 +1572,17 @@ server. Neither is on `every_reachability_path_is_bounded_by_a_timeout`'s list, 
 timer calling them. **An absent source is `Ok(StatementReport::Unavailable(…))`, not an error**;
 failing to reach the server stays one.
 PostgreSQL's (`pg::fetch_top_statements`) asks `pg_extension` joined to `pg_namespace` where
-`pg_stat_statements` was created — no row is `ExtensionNotInstalled` — and reads the view **from
-that schema, quoted through `export::ident_sql`**, because the catalogue connection's
-`search_path` leads with `pg_catalog`, not with wherever `CREATE EXTENSION` put it
-(`the_statements_view_is_read_from_the_extensions_schema_quoted`). `server_version_num` ≥ 130000
-picks the `*_exec_time` columns PostgreSQL 13 renamed from `total_time`/`mean_time`
-(`the_statements_query_names_the_columns_of_the_servers_version`). The view holds every
+`pg_stat_statements` was created, and at which `extversion` — no row is `ExtensionNotInstalled` —
+and reads the view **from that schema, quoted through `export::ident_sql`**, because the
+catalogue connection's `search_path` leads with `pg_catalog`, not with wherever `CREATE EXTENSION`
+put it (`the_statements_view_is_read_from_the_extensions_schema_quoted`). **The extension's
+version, not the server's, picks the timing columns** (`workload::pg_statements_has_exec_columns`):
+`total_exec_time`/`mean_exec_time` from 1.8 on, `total_time`/`mean_time` before. It read
+`server_version_num` ≥ 130000 once, and a `pg_upgrade`d 16 cluster still on extension 1.7 failed
+with *column s.total_exec_time does not exist* instead of listing
+(`the_statements_query_names_the_columns_it_is_told_the_extension_has`); verified live by the
+change's author on PostgreSQL 16.14, where `CREATE EXTENSION pg_stat_statements VERSION '1.7'`
+gives a view with `total_time` and `ALTER EXTENSION … UPDATE TO '1.8'` renames it. The view holds every
 database's statements, so each row's database is `dbid` joined to `pg_database`; the text is
 `left(query, 8192)`, a statement being shown and not run. A failed read goes through
 `classify_pg_statements_error`, so not-preloaded and permission-denied become `Unavailable` and
@@ -1596,7 +1601,9 @@ and is filtered out (`the_digest_query_ranks_by_the_asked_timer_and_skips_the_ov
 Error 1142 or 1044 on the consumer or the digest read is `NoPermission`, and `since` is
 `MIN(FIRST_SEEN)`, best effort. SQL Server's (`mssql::fetch_top_statements`, `query_store_sql`)
 reads `sys.database_query_store_options.actual_state_desc` first, through
-`query_store_availability`, then sums Query Store **per query text** across its plans and
+`query_store_availability` — and a server with no such view, 2014 or earlier, is
+`QueryStoreMissing` through `classify_query_store_error` rather than an error (not verified
+against a real 2014 server; none was available) — then sums Query Store **per query text** across its plans and
 intervals: `avg_duration × count_executions` summed is the total and that over the executions
 the mean, microseconds to milliseconds, **in floats throughout**, because `bigint` arithmetic over
 a busy server's lifetime overflows. A refusal `is_permission_refusal` recognises (a missing `VIEW
