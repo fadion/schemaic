@@ -22,7 +22,7 @@
 
 use crate::intel::SqlDialect;
 use crate::schema::{IndexColumn, IndexInfo, TableInfo};
-use crate::stats::SchemaStats;
+use crate::stats::{IndexStats, SchemaStats};
 
 /// How many statements a fetch returns by default. Enough to see the shape of
 /// a workload; a list of five hundred digests is a list nobody reads.
@@ -324,10 +324,13 @@ fn same_index(a: &IndexInfo, b: &IndexInfo) -> bool {
 ///
 /// A unique `narrow` is never covered: its uniqueness is a constraint on
 /// fewer columns, which the wider index does not enforce. Neither is one with
-/// included columns, which the wider key may not carry.
+/// included columns, which the wider key may not carry, nor a clustered one
+/// ([`is_clustered`]), which is the table's own row order rather than a lookup
+/// structure beside it.
 fn covers(wide: &IndexInfo, narrow: &IndexInfo) -> bool {
     !narrow.unique
         && !narrow.is_primary()
+        && !is_clustered(narrow)
         && narrow.include.is_empty()
         && narrow.predicate.is_none()
         && wide.predicate.is_none()
@@ -341,24 +344,43 @@ fn covers(wide: &IndexInfo, narrow: &IndexInfo) -> bool {
             .all(|(x, y)| same_key_column(x, y))
 }
 
-/// Of two identical indexes, the one to keep: the primary key, then a unique
-/// one or one backing a constraint (dropping those changes what the table
-/// accepts), then one backing a foreign key, then the first by name.
-fn keeper_rank(ix: &IndexInfo) -> (u8, &str) {
+/// Is `ix` the table's clustered index (SQL Server's `CLUSTERED`)? It is the
+/// table itself, in key order: dropping it leaves a heap and rebuilds every
+/// other index, so it is never reported, and it is the one kept of a pair.
+fn is_clustered(ix: &IndexInfo) -> bool {
+    ix.clustered == Some(true)
+}
+
+/// Of two identical indexes, the one to keep: the primary key, then the
+/// clustered one, then a unique one or one backing a constraint (dropping
+/// those changes what the table accepts), then one backing a foreign key, then
+/// one something reads over one that would itself be reported unused
+/// (`idle`), then the first by name.
+fn keeper_rank<'a>(ix: &'a IndexInfo, idle: &dyn Fn(&str) -> bool) -> (u8, bool, &'a str) {
     let rank = if ix.is_primary() {
         0
-    } else if ix.unique || ix.constraint.is_some() {
+    } else if is_clustered(ix) {
         1
-    } else if ix.foreign {
+    } else if ix.unique || ix.constraint.is_some() {
         2
-    } else {
+    } else if ix.foreign {
         3
+    } else {
+        4
     };
-    (rank, ix.name.as_str())
+    (rank, idle(&ix.name), ix.name.as_str())
 }
 
 /// The duplicate and redundant indexes of one table.
-fn table_overlaps(t: &TableInfo) -> Vec<(String, IndexProblem)> {
+///
+/// `idle` says whether an index would be reported unused on its own count.
+/// **Usage decides which of a pair is named.** Choosing by name alone kept an
+/// unread twin and reported the read one, and named an unread wider index as a
+/// read prefix's stand-in — two findings that, both followed, dropped every
+/// index on the column. So the read one is kept; a read prefix is not called
+/// redundant beside an unread wider index (that one is the unused finding);
+/// and [`index_health`] never reports unused an index a finding here names.
+fn table_overlaps(t: &TableInfo, idle: &dyn Fn(&str) -> bool) -> Vec<(String, IndexProblem)> {
     let ixs: Vec<&IndexInfo> = t.indexes.iter().filter(|ix| comparable(ix)).collect();
     let mut out: Vec<(String, IndexProblem)> = Vec::new();
     let mut reported = std::collections::HashSet::new();
@@ -372,9 +394,12 @@ fn table_overlaps(t: &TableInfo) -> Vec<(String, IndexProblem)> {
         if group.len() < 2 {
             continue;
         }
-        group.sort_by(|x, y| keeper_rank(x).cmp(&keeper_rank(y)));
+        group.sort_by(|x, y| keeper_rank(x, idle).cmp(&keeper_rank(y, idle)));
         let keep = group[0].name.clone();
         for dup in &group[1..] {
+            if is_clustered(dup) {
+                continue;
+            }
             // A unique index identical to a kept one still enforces nothing
             // the kept one doesn't — unless the kept one is not unique, in
             // which case dropping the unique one loosens the table.
@@ -388,8 +413,9 @@ fn table_overlaps(t: &TableInfo) -> Vec<(String, IndexProblem)> {
             ));
         }
     }
-    // Then prefixes, for an index not already reported as a duplicate. The
-    // shortest wider index is named — the closest stand-in.
+    // Then prefixes, for an index not already reported as a duplicate. A read
+    // wider index is named over an unread one, then the shortest — the
+    // closest stand-in.
     for narrow in &ixs {
         if reported.contains(&narrow.name) {
             continue;
@@ -397,8 +423,10 @@ fn table_overlaps(t: &TableInfo) -> Vec<(String, IndexProblem)> {
         let by = ixs
             .iter()
             .filter(|w| w.name != narrow.name && !reported.contains(&w.name) && covers(w, narrow))
-            .min_by_key(|w| (w.columns.len(), w.name.as_str()));
-        if let Some(by) = by {
+            .min_by_key(|w| (idle(&w.name), w.columns.len(), w.name.as_str()));
+        // Only an unread stand-in covers a read prefix: the advice is then to
+        // drop the stand-in, which the unused pass gives.
+        if let Some(by) = by.filter(|by| !idle(&by.name) || idle(&narrow.name)) {
             reported.insert(narrow.name.clone());
             out.push((
                 narrow.name.clone(),
@@ -429,10 +457,22 @@ pub fn index_health(tables: &[TableInfo], stats: &SchemaStats) -> Vec<IndexFindi
             .and_then(|t| t.indexes.iter().find(|i| i.name == index))
             .and_then(|i| i.bytes)
     };
+    // Would `ix` be reported unused on its own count? Not a key or a unique
+    // index (`is_unused`), not one backing a foreign key, not the clustered one.
+    let idle = |def: Option<&TableInfo>, ix: &IndexStats| {
+        let info = def.and_then(|t| t.indexes.iter().find(|i| i.name == ix.name));
+        ix.is_unused() && !info.is_some_and(|i| i.foreign || is_clustered(i))
+    };
     let mut unused = Vec::new();
     let mut overlaps = Vec::new();
     for t in tables.iter().filter(|t| !t.is_view) {
-        for (index, problem) in table_overlaps(t) {
+        let counts = stats.get(t.schema.as_deref(), &t.name);
+        let idle_here = |name: &str| {
+            counts
+                .and_then(|c| c.indexes.iter().find(|i| i.name == name))
+                .is_some_and(|i| idle(Some(t), i))
+        };
+        for (index, problem) in table_overlaps(t, &idle_here) {
             overlaps.push(IndexFinding {
                 schema: t.schema.clone(),
                 table: t.name.clone(),
@@ -449,20 +489,22 @@ pub fn index_health(tables: &[TableInfo], stats: &SchemaStats) -> Vec<IndexFindi
         if def.is_some_and(|t| t.is_view) {
             continue;
         }
-        for ix in ts.indexes.iter().filter(|i| i.is_unused()) {
+        for ix in ts.indexes.iter().filter(|i| idle(def, i)) {
             // **Once per index.** A duplicate that is also unread is reported
             // as the duplicate: that finding holds whatever the counters say,
-            // and two rows for one index read as two problems.
-            let overlapping = overlaps
-                .iter()
-                .any(|f| f.index == ix.name && f.table == ts.table && f.schema == ts.schema);
+            // and two rows for one index read as two problems. **And never the
+            // stand-in** a finding names: dropping both is no index at all.
+            let overlapping = overlaps.iter().any(|f| {
+                f.table == ts.table
+                    && f.schema == ts.schema
+                    && (f.index == ix.name
+                        || match &f.problem {
+                            IndexProblem::Duplicate { of } => *of == ix.name,
+                            IndexProblem::Redundant { by } => *by == ix.name,
+                            IndexProblem::Unused => false,
+                        })
+            });
             if overlapping {
-                continue;
-            }
-            let backs_fk = def
-                .and_then(|t| t.indexes.iter().find(|i| i.name == ix.name))
-                .is_some_and(|i| i.foreign);
-            if backs_fk {
                 continue;
             }
             unused.push(IndexFinding {
@@ -1029,6 +1071,115 @@ mod tests {
         assert_eq!(
             problems(&f),
             vec![("ix_a2", &IndexProblem::Duplicate { of: "ix_a".into() })]
+        );
+    }
+
+    fn clustered(name: &str, cols: &[&str]) -> IndexInfo {
+        IndexInfo {
+            clustered: Some(true),
+            ..ix(name, cols)
+        }
+    }
+
+    #[test]
+    fn a_clustered_index_is_never_reported_unused() {
+        // Dropping it leaves the table a heap and rebuilds every other index.
+        let defs = vec![table("audit", vec![clustered("cx_audit", &["created_at"])])];
+        let stats = SchemaStats::new(vec![tstat("audit", vec![istat("cx_audit", Some(0), None)])]);
+        assert_eq!(problems(&index_health(&defs, &stats)), vec![]);
+    }
+
+    #[test]
+    fn a_clustered_index_is_not_covered_by_a_wider_nonclustered_one() {
+        let defs = vec![table(
+            "audit",
+            vec![
+                clustered("cx_audit", &["created_at"]),
+                ix("ix_created_who", &["created_at", "who"]),
+            ],
+        )];
+        let f = index_health(&defs, &SchemaStats::default());
+        assert_eq!(problems(&f), vec![]);
+    }
+
+    #[test]
+    fn of_a_clustered_and_a_nonclustered_twin_the_clustered_one_is_kept() {
+        // `IX_…` sorts before `cx_…` byte-wise, which used to decide it.
+        let defs = vec![table(
+            "audit",
+            vec![
+                clustered("cx_audit", &["created_at"]),
+                ix("IX_audit_created", &["created_at"]),
+            ],
+        )];
+        let f = index_health(&defs, &SchemaStats::default());
+        assert_eq!(
+            problems(&f),
+            vec![(
+                "IX_audit_created",
+                &IndexProblem::Duplicate {
+                    of: "cx_audit".into()
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn a_read_index_is_not_called_redundant_beside_an_unread_wider_one() {
+        // The advice is to drop the wide one nothing reads, not the one the
+        // queries use — and never both.
+        let defs = vec![table(
+            "t",
+            vec![ix("ix_a", &["a"]), ix("ix_ab", &["a", "b"])],
+        )];
+        let stats = SchemaStats::new(vec![tstat(
+            "t",
+            vec![istat("ix_a", Some(40), None), istat("ix_ab", Some(0), None)],
+        )]);
+        let f = index_health(&defs, &stats);
+        assert_eq!(problems(&f), vec![("ix_ab", &IndexProblem::Unused)]);
+    }
+
+    #[test]
+    fn of_twins_the_read_one_is_kept_whatever_their_names() {
+        let defs = vec![table("t", vec![ix("ix_a", &["a"]), ix("ix_a2", &["a"])])];
+        let stats = SchemaStats::new(vec![tstat(
+            "t",
+            vec![istat("ix_a", Some(0), None), istat("ix_a2", Some(9), None)],
+        )]);
+        let f = index_health(&defs, &stats);
+        assert_eq!(
+            problems(&f),
+            vec![("ix_a", &IndexProblem::Duplicate { of: "ix_a2".into() })]
+        );
+    }
+
+    #[test]
+    fn the_index_a_finding_names_as_its_stand_in_is_not_reported_unused() {
+        // Neither twin is read: one goes as the duplicate, the other stays.
+        let defs = vec![table("t", vec![ix("ix_a", &["a"]), ix("ix_a2", &["a"])])];
+        let stats = SchemaStats::new(vec![tstat(
+            "t",
+            vec![istat("ix_a", Some(0), None), istat("ix_a2", Some(0), None)],
+        )]);
+        let f = index_health(&defs, &stats);
+        assert_eq!(
+            problems(&f),
+            vec![("ix_a2", &IndexProblem::Duplicate { of: "ix_a".into() })]
+        );
+        // Likewise a prefix and the unread index that covers it.
+        let defs = vec![table(
+            "t",
+            vec![ix("ix_a", &["a"]), ix("ix_ab", &["a", "b"])],
+        )];
+        let stats = SchemaStats::new(vec![tstat(
+            "t",
+            vec![istat("ix_a", Some(0), None), istat("ix_ab", Some(0), None)],
+        )]);
+        let f = index_health(&defs, &stats);
+        assert_eq!(
+            problems(&f),
+            vec![("ix_a", &IndexProblem::Redundant { by: "ix_ab".into() })]
         );
     }
 

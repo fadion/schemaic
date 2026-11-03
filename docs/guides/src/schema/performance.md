@@ -39,6 +39,17 @@ Usage counts start again when the server restarts or its statistics are reset, s
 only by a monthly job can look unused. Check before dropping one. If the server keeps no usage
 counts, the view says so and lists only duplicates and prefixes.
 
+Where two indexes overlap, the one listed is the one you could drop:
+
+- Of two identical indexes, the primary key, a clustered, unique or foreign-key index is kept
+  over a plain one, and otherwise the one queries read.
+- An index queries read is never called redundant beside a wider one nothing reads. The wider one
+  is listed as unused instead.
+- An index a finding names as the one to keep is never listed as unused itself, so dropping
+  everything listed never takes both of a pair.
+
+On SQL Server the clustered index is never listed: it is the table itself, in key order.
+
 On SQL Server a second list, **Missing indexes the optimiser recorded since the last restart**,
 shows the indexes the optimiser wished it had, with how often and how much it expected to gain.
 Each is one estimate: check it against the indexes above it before creating one.

@@ -50,26 +50,52 @@ statement list would be guessing.
 **Index health adds no catalogue read of its own.** `index_health(tables, stats)` sweeps the
 `SchemaStats` that `Db::fetch_table_stats` already returns and the index definitions
 `fetch_schema` already holds, and reports each `IndexFinding` with one `IndexProblem`. `Unused` is
-`IndexStats::is_unused` — a *counted* zero, never a primary key or a unique index — with two
+`IndexStats::is_unused` — a *counted* zero, never a primary key or a unique index — with four
 exclusions. An unused index **backing a foreign key** is left out, because MySQL requires one and
 refuses to drop it while the key stands, so naming it is advice the server will refuse
-(`an_unused_index_backing_a_foreign_key_is_left_alone`). And an index already reported as a
+(`an_unused_index_backing_a_foreign_key_is_left_alone`). **A clustered index**
+(`IndexInfo::clustered == Some(true)`, SQL Server's `CLUSTERED`, through `is_clustered`) is never
+reported at all — not unused, not a duplicate, not redundant — because it is the table itself in
+key order: dropping it leaves a heap and rebuilds every other index, and SQL Server counts its
+seeks like any other index's, so a table that is only ever written had its clustered index
+reported unused, with the Performance view's *Drop index* on the row
+(`a_clustered_index_is_never_reported_unused`). An index already reported as a
 duplicate or a prefix is **reported once, as the overlap**: that finding holds whatever the
 counters say, and two rows for one index read as two problems
-(`an_unread_duplicate_is_reported_once_as_the_duplicate`). `Duplicate { of }` is the same key
+(`an_unread_duplicate_is_reported_once_as_the_duplicate`). And **the index a finding names as its
+`of` or `by` is never reported unused**: the two rows were each sound alone and, both followed,
+dropped every index on the column
+(`the_index_a_finding_names_as_its_stand_in_is_not_reported_unused`). **Usage decides which of a
+pair is named**, which is what keeps that last exclusion from hiding the right advice:
+`table_overlaps` takes an `idle` predicate — would this index be reported unused on its own count,
+`is_unused` and neither backing a foreign key nor clustered — and asks it below wherever it chooses
+between two indexes. `Duplicate { of }` is the same key
 compared `IndexColumn` by `IndexColumn` — so a prefix length, a direction, an expression or a
 collation is a difference — with the same predicate, the same method (`btree` named and unnamed
 being one, since PostgreSQL names the default MySQL leaves unset), the same `INCLUDE` set in any
 order and the same `using`. Of a group, the one kept is ranked by `keeper_rank`: the primary key,
-then a unique or constraint-backed index (dropping either changes what the table accepts), then
-one backing a foreign key, then the first by name; and **a unique index is never reported against
+then the clustered index, then a unique or constraint-backed index (dropping either changes what
+the table accepts), then one backing a foreign key, then **one something reads over an idle one**,
+then the first by name. The name alone decided it before the clustered and read ranks were there,
+and both went wrong the same way: `IX_audit_created` sorts before `cx_audit` byte-wise, so a
+nonclustered twin was kept and the clustered index reported as its duplicate
+(`of_a_clustered_and_a_nonclustered_twin_the_clustered_one_is_kept`), and of twins `ix_a` (unread)
+and `ix_a2` (read) the read one was reported and the unread one then reported unused
+(`of_twins_the_read_one_is_kept_whatever_their_names`). **A unique index is never reported against
 a plain twin**, since dropping it would loosen the table
 (`a_unique_index_is_never_reported_against_a_plain_twin`). `Redundant { by }` is a strict
 leading prefix of a wider index, both plain B-trees over every row — no predicate, the default
-method — and the narrow one neither unique, a primary key nor carrying `INCLUDE` columns: the
-wider index enforces no uniqueness on fewer columns and may not carry what was included. It names
-the **shortest** wider index, the closest stand-in
-(`a_leading_prefix_is_covered_by_the_shortest_wider_index`). Three kinds of index are never
+method — and the narrow one neither unique, a primary key, clustered nor carrying `INCLUDE`
+columns: the wider index enforces no uniqueness on fewer columns and may not carry what was
+included, and a nonclustered index does not serve every lookup the table's own row order does
+(`a_clustered_index_is_not_covered_by_a_wider_nonclustered_one`). It names a **read** wider index
+over an idle one, then the **shortest**, the closest stand-in
+(`a_leading_prefix_is_covered_by_the_shortest_wider_index`) — and **a read prefix is not called
+redundant when the only stand-in is idle**: the advice there is to drop the wide index nothing
+reads, which the unused finding gives, where `ix_a` (read) beside `ix_ab` (unread) used to come out
+as `ix_ab` unused *and* `ix_a` redundant by `ix_ab`
+(`a_read_index_is_not_called_redundant_beside_an_unread_wider_one`). With neither read, the prefix
+is still the redundant one and its stand-in stays. Three kinds of index are never
 compared at all (`comparable`): one read only in part (`IndexInfo::lossy` — an operator class or
 a `NULLS` ordering it could not see may be the whole difference, `a_lossy_index_is_never_compared`),
 SQL Server's XML and spatial kinds, and a partition's inherited copy of its parent's index, which
