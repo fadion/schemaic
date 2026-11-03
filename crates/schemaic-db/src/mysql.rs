@@ -889,8 +889,9 @@ pub(crate) async fn fetch_table_stats(db: &Db, database: &str) -> Result<SchemaS
 /// driver hands a `DECIMAL` back as bytes.
 ///
 /// The text is capped at 8 KiB **in bytes** (`CONVERT … USING binary`), as
-/// `MY_PROCESSLIST_SQL` caps its own, so a multi-byte character can't make
-/// the cut land mid-sequence. The row with a NULL digest is the server's
+/// `MY_PROCESSLIST_SQL` caps its own, so a statement in a multi-byte script
+/// can't triple the size; a cut that lands mid-character comes back as the
+/// replacement character rather than as invalid UTF-8. The row with a NULL digest is the server's
 /// overflow bucket — statements that arrived after the digest table filled —
 /// and is no statement at all.
 fn my_statements_sql(order: schemaic_core::workload::StatementOrder, limit: usize) -> String {

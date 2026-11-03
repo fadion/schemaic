@@ -277,15 +277,14 @@ csv = "1"
 # never to deduplicate a duplicate *downwards*.
 rust_xlsxwriter = { version = "0.99", features = ["constant_memory"] }
 calamine = "0.38"
-# **Tests only, and for one fixture that cannot be written any other way.** An
-# `.xlsx` is a zip, and the case an Excel import gets silently wrong is a
-# worksheet whose `<dimension ref>` under-declares its own extent — which
-# `rust_xlsxwriter` will never emit, because it always writes a correct one. So
-# the fixture is a real workbook re-zipped with that one attribute restated, and
-# that needs a zip reader and writer. Already in the graph as calamine's own
-# dependency, so it is a `[dev-dependencies]` line and not a new crate for the
-# licence census to weigh; pinned to the major calamine resolves (9), since
-# core's central-directory check reads the same untrusted archive calamine does.
+# **A runtime dependency of core**: before calamine inflates an `.xlsx` (a zip),
+# `import::inflated_refusal` reads the archive's central directory to size what
+# it would inflate to. The tests also use it to re-zip a real workbook with its
+# `<dimension ref>` under-declaring its own extent — the case an Excel import
+# gets silently wrong, which `rust_xlsxwriter` will never emit. Already in the
+# graph as calamine's own dependency, so it is no new crate for the licence
+# census to weigh; pinned to the major calamine resolves (9), since core reads
+# the same untrusted archive calamine does.
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # Profiling build: release-grade optimization (so we measure real perf, not a slow

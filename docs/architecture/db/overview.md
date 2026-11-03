@@ -1595,7 +1595,8 @@ then ranked by `SUM_TIMER_WAIT`, `AVG_TIMER_WAIT` or `COUNT_STAR`, its picosecon
 to milliseconds. **Every figure comes back `CAST … AS CHAR` and is parsed here**, because MariaDB
 has no `CAST … AS DOUBLE` before 10.4 and the driver hands a `DECIMAL` back as bytes. The text is
 capped at 8 KiB **in bytes** (`CONVERT … USING binary`), as `MY_PROCESSLIST_SQL` caps its own, so
-a multi-byte character cannot make the cut land mid-sequence; the row with a NULL `DIGEST_TEXT` —
+a statement in a multi-byte script cannot triple the size — a cut that lands mid-character comes
+back as the replacement character, not as invalid UTF-8; the row with a NULL `DIGEST_TEXT` —
 the overflow bucket for statements that arrived after the digest table filled — is no statement
 and is filtered out (`the_digest_query_ranks_by_the_asked_timer_and_skips_the_overflow_row`).
 Error 1142 or 1044 on the consumer or the digest read is `NoPermission`, and `since` is
