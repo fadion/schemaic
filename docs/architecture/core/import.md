@@ -351,11 +351,14 @@ directly: one call site, so a format that needs a warning cannot be given one no
 All three answer a `MemoryWarning` — `Json` or `Xlsx`, each the file size and the estimate —
 rather than the sentence, whose English is `message` and whose interface words are the view's.
 **The reader is `calamine`, and an imported `.xlsx` is the first untrusted XML this app has ever
-parsed** — a ZIP of it, from wherever the user got the file. `calamine` depends on quick-xml
-**0.41**, the version that fixes `RUSTSEC-2026-0194`/`0195`, and that is now the only quick-xml
-in the tree: `cargo tree -i quick-xml` returns exactly one, 0.41.0, under calamine — and under
-`schemaic-core` itself, which now asks the same version directly to read SQL Server's plan
-documents (`core::plan`), which arrive from the server rather than with the build. There were
+parsed** — a ZIP of it, from wherever the user got the file. It is held at **0.38**, the
+release that fixes `RUSTSEC-2026-0436`: its CFB/OLE2 parser, which opens an `.xls` or `.xlsb`,
+panicked on a short directory chunk and let a self-referential DIFAT chain drive a
+multi-gigabyte allocation from a 512-byte file. `calamine` depends on quick-xml **0.42**, past
+the 0.41 that fixes `RUSTSEC-2026-0194`/`0195`, and so does `schemaic-core` itself, which asks
+the same version directly to read SQL Server's plan documents (`core::plan`), which arrive from
+the server rather than with the build. A second, 0.41, sits under `wayland-scanner` (below);
+both are on the fixed line. There were
 two for a while, the second a vulnerable 0.39 whose **only** consumer was `wayland-scanner`, a
 Linux-only build-time proc macro over Wayland's vendored protocol XML — not usvg/resvg, which
 parses SVG with roxmltree and never depended on either version, an attribution `deny.toml` had
@@ -364,8 +367,7 @@ still at 0.43 while 0.39 disappeared. That XML shipped with the build rather tha
 a user, so `deny.toml` ignored the two advisories on that reachability argument, on the stated
 condition that the ignores go once the duplicate did.
 `wayland-scanner` 0.31.11 moved to quick-xml 0.41 and took the last 0.39 with it, so they are
-gone (they had begun emitting `advisory-not-detected`) and `RUSTSEC-2023-0071` — `rsa`'s Marvin
-timing sidechannel, via russh — is the only ignore left. **The argument outlives the
+gone (they had begun emitting `advisory-not-detected`). **The argument outlives the
 duplicate**: if a second quick-xml ever comes back it must not be deduplicated *downwards*,
 which would put the untrusted parser back on the vulnerable code, and `deny.toml` carries that
 warning in prose where the ignores used to be.

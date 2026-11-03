@@ -54,9 +54,10 @@ unmaintained = "workspace"
 # and a vulnerable 0.39 under `wayland-scanner`, a Linux-only build-time proc
 # macro over Wayland's vendored protocol XML. The old entry said to check the
 # version was >= 0.41 before removing them, and `wayland-scanner` 0.31.11 moved
-# to 0.41: `cargo tree -i quick-xml` now shows exactly one, 0.41.0, under
-# calamine. If a duplicate ever comes back, do not dedupe it *downwards* — that
-# would put the untrusted parser back on the vulnerable code.
+# to 0.41. calamine 0.38 has since moved to 0.42, so the tree holds two again,
+# both fixed: 0.42 under calamine and core's plan reader, 0.41 under
+# `wayland-scanner`. Do not dedupe a duplicate *downwards* — that would put the
+# untrusted parser back on whatever the older one carries.
 ignore = [
     # `rsa` "Marvin Attack" timing sidechannel (RSA key recovery). Pulled by russh
     # for RSA SSH key/host support. No patched `rsa` release exists yet. The attack
@@ -72,11 +73,11 @@ ignore = [
     # either (checked again for -0429, now that `schemaic import` opens an
     # `.xlsx` with nobody at the keyboard: calamine and core read entries only). calamine (an imported `.xlsx`) and core's `import`/`export` open an
     # archive in memory and read entries by name; rust_xlsxwriter only writes;
-    # velopack never extracts through `zip`. Not fixable by an upgrade yet:
-    # calamine 0.36.1, the newest, requires `zip` ^8.6, so moving our own
-    # requirement to 9 would add a second `zip` and leave 8 in the lock. Remove
-    # these when calamine moves to 9 — then bump the workspace `zip` with it — or
-    # sooner if anything here starts extracting an archive to disk.
+    # velopack never extracts through `zip`. calamine 0.38 moved to `zip` 9 and
+    # the workspace `zip` moved with it, so both readers of an imported `.xlsx`
+    # are on the fixed line; 8 stays in the lock only under rust_xlsxwriter
+    # (which writes) and velopack. Remove these when both of those move to 9,
+    # or sooner if anything here starts extracting an archive to disk.
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",

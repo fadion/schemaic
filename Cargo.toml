@@ -262,18 +262,21 @@ csv = "1"
 # every other format. It is the one place in `schemaic-core` whose tests touch
 # the filesystem; `export::export_xlsx_chunks` states why.
 #
-# `calamine` reads. Note the quick-xml it pulls is **0.41**, the version that
-# fixes RUSTSEC-2026-0194/0195 — which matters here and nowhere else in the
-# tree: an imported `.xlsx` is the first untrusted XML this app has ever parsed.
-# The tree carried a vulnerable 0.39 alongside it for a while, reached only by
-# `wayland-scanner`'s build-time proc macro over Wayland's own vendored protocol
-# XML, and `deny.toml` ignored the two advisories on that reachability argument.
-# `wayland-scanner` 0.31.11 moved to 0.41 and took the last 0.39 with it, so
-# `cargo tree -i quick-xml` now returns exactly one version and the ignores are
-# gone — see `deny.toml`, which keeps the standing warning never to deduplicate
-# a future duplicate *downwards*.
+# `calamine` reads, at **0.38** — the release that fixes RUSTSEC-2026-0436, a
+# panic and an unbounded allocation in its CFB/OLE2 parser on a crafted `.xls`
+# or `.xlsb`, which is exactly what an import opens. Note the quick-xml it pulls
+# is **0.42**, past the 0.41 that fixes RUSTSEC-2026-0194/0195 — which matters
+# here and nowhere else in the tree: an imported `.xlsx` is the first untrusted
+# XML this app has ever parsed. The tree carried a vulnerable 0.39 alongside it
+# for a while, reached only by `wayland-scanner`'s build-time proc macro over
+# Wayland's own vendored protocol XML, and `deny.toml` ignored the two
+# advisories on that reachability argument. `wayland-scanner` 0.31.11 moved to
+# 0.41 and took the last 0.39 with it, so the ignores are gone. It still sits
+# on 0.41 while calamine is on 0.42, so `cargo tree --target all -i quick-xml`
+# shows two again — both fixed — and `deny.toml` keeps the standing warning
+# never to deduplicate a duplicate *downwards*.
 rust_xlsxwriter = { version = "0.99", features = ["constant_memory"] }
-calamine = "0.36"
+calamine = "0.38"
 # **Tests only, and for one fixture that cannot be written any other way.** An
 # `.xlsx` is a zip, and the case an Excel import gets silently wrong is a
 # worksheet whose `<dimension ref>` under-declares its own extent — which
@@ -281,8 +284,9 @@ calamine = "0.36"
 # the fixture is a real workbook re-zipped with that one attribute restated, and
 # that needs a zip reader and writer. Already in the graph as calamine's own
 # dependency, so it is a `[dev-dependencies]` line and not a new crate for the
-# licence census to weigh; pinned to the same major the graph already resolves.
-zip = { version = "8", default-features = false, features = ["deflate"] }
+# licence census to weigh; pinned to the major calamine resolves (9), since
+# core's central-directory check reads the same untrusted archive calamine does.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # Profiling build: release-grade optimization (so we measure real perf, not a slow
 # debug build) but with full debug symbols so a sampling profiler (samply, etc.) can

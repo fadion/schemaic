@@ -5460,11 +5460,11 @@ mod tests {
         let mut zin = zip::ZipArchive::new(Cursor::new(xlsx)).expect("a workbook is a zip");
         let mut out = Vec::new();
         let mut zout = zip::ZipWriter::new(Cursor::new(&mut out));
-        let opts: zip::write::FileOptions<'_, ()> =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
         for i in 0..zin.len() {
             let mut f = zin.by_index(i).expect("an entry");
-            let entry = f.name().to_string();
+            let entry = f.name().expect("an entry name").to_string();
             let mut bytes = Vec::new();
             f.read_to_end(&mut bytes).expect("entry bytes");
             zout.start_file(entry, opts).expect("start");
@@ -5488,12 +5488,12 @@ mod tests {
         let mut zin = zip::ZipArchive::new(Cursor::new(xlsx)).expect("a workbook is a zip");
         let mut out = Vec::new();
         let mut zout = zip::ZipWriter::new(Cursor::new(&mut out));
-        let opts: zip::write::FileOptions<'_, ()> =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
         let mut patched = false;
         for i in 0..zin.len() {
             let mut f = zin.by_index(i).expect("an entry");
-            let name = f.name().to_string();
+            let name = f.name().expect("an entry name").to_string();
             let mut bytes = Vec::new();
             f.read_to_end(&mut bytes).expect("entry bytes");
             if name.starts_with("xl/worksheets/") && name.ends_with(".xml") {
@@ -5531,12 +5531,12 @@ mod tests {
         let mut zin = zip::ZipArchive::new(Cursor::new(xlsx)).expect("a workbook is a zip");
         let mut out = Vec::new();
         let mut zout = zip::ZipWriter::new(Cursor::new(&mut out));
-        let opts: zip::write::FileOptions<'_, ()> =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
         let mut patched = false;
         for i in 0..zin.len() {
             let mut f = zin.by_index(i).expect("an entry");
-            let name = f.name().to_string();
+            let name = f.name().expect("an entry name").to_string();
             let mut bytes = Vec::new();
             f.read_to_end(&mut bytes).expect("entry bytes");
             if name.starts_with("xl/worksheets/") && name.ends_with(".xml") {

@@ -795,7 +795,7 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, UnreadPlan> {
         e.attributes()
             .flatten()
             .map(|a| {
-                let key = String::from_utf8_lossy(a.key.local_name().as_ref()).into_owned();
+                let key = a.key.local_name().as_ref().to_owned();
                 let value = a
                     .normalized_value(XmlVersion::Implicit1_0)
                     .map(|v| v.into_owned())
@@ -828,7 +828,7 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, UnreadPlan> {
                 if path.last().is_some_and(|p| p == b"Statements") {
                     stack.pop();
                 }
-                match e.local_name().as_ref() {
+                match e.local_name().as_ref().as_bytes() {
                     b"RelOp" => {
                         if let Some(top) = stack.last_mut() {
                             top.ops.pop();
@@ -862,7 +862,7 @@ fn parse_showplan(doc: &str) -> Result<Vec<MsStatement>, UnreadPlan> {
             _ => continue,
         };
         let name = e.local_name();
-        let name = std::str::from_utf8(name.as_ref()).unwrap_or("");
+        let name: &str = name.as_ref();
         let a = attrs(e);
         let attr = |k: &str| a.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         if !seen_root {

@@ -41,9 +41,10 @@ stringprep = "0.1.5"
 unicode-normalization = "0.1.25"
 # SQL Server's query plan is an XML document (`SET SHOWPLAN_XML` / `STATISTICS
 # XML`), which `plan` walks into the plan table. The crate and version calamine
-# already puts in the graph — the 0.41 that fixes RUSTSEC-2026-0194/0195, which
-# matters here too, since the document comes from the server.
-quick-xml = "0.41"
+# already puts in the graph — 0.42, past the 0.41 that fixes
+# RUSTSEC-2026-0194/0195, which matters here too, since the document comes from
+# the server.
+quick-xml = "0.42"
 
 [lints]
 workspace = true
