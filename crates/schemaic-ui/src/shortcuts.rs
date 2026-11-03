@@ -264,6 +264,7 @@ pub(crate) fn refusal_text(refusal: schemaic_core::keymap::Refusal) -> String {
         Refusal::Escape => tr!("keymap-refusal-escape"),
         Refusal::Editing => tr!("keymap-refusal-editing"),
         Refusal::System => tr!("keymap-refusal-system"),
+        Refusal::AltGr => tr!("keymap-refusal-altgr"),
     }
 }
 

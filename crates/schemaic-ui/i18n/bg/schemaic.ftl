@@ -276,6 +276,7 @@ keymap-refusal-needs-modifier = Този клавиш изисква { $primary 
 keymap-refusal-escape = Esc затваря и отказва навсякъде, затова никога не е клавиш на команда.
 keymap-refusal-editing = Всяко текстово поле го използва за редактиране.
 keymap-refusal-system = Използва се от работния плот.
+keymap-refusal-altgr = Тук Ctrl+Alt е AltGr, с който много клавиатурни подредби въвеждат знаци като @ или €.
 
 ## Известие при стартиране за keymap.json
 

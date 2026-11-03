@@ -276,6 +276,7 @@ keymap-refusal-needs-modifier = Ky tast ka nevojë për { $primary } ose { $alt 
 keymap-refusal-escape = Esc mbyll dhe anulon kudo, prandaj nuk është kurrë tasti i një komande.
 keymap-refusal-editing = Çdo fushë teksti e përdor për redaktim.
 keymap-refusal-system = E përdor desktopi.
+keymap-refusal-altgr = Këtu Ctrl+Alt është AltGr, që në shumë paraqitje tastiere shkruan shenja si @ ose €.
 
 ## Njoftim në nisje për keymap.json
 

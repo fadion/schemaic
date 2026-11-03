@@ -276,6 +276,7 @@ keymap-refusal-needs-modifier = Diese Taste braucht { $primary } oder { $alt }.
 keymap-refusal-escape = Esc schließt und bricht überall ab und ist deshalb nie die Taste eines Befehls.
 keymap-refusal-editing = Jedes Textfeld nutzt sie zum Bearbeiten.
 keymap-refusal-system = Der Desktop nutzt sie.
+keymap-refusal-altgr = Strg+Alt ist hier AltGr, das auf vielen Tastaturbelegungen Zeichen wie @ oder € schreibt.
 
 ## Hinweis beim Start zu keymap.json
 

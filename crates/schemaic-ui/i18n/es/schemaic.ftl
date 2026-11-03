@@ -276,6 +276,7 @@ keymap-refusal-needs-modifier = Esta tecla necesita { $primary } o { $alt }.
 keymap-refusal-escape = Esc cierra y cancela en todas partes, así que nunca es la tecla de un comando.
 keymap-refusal-editing = Todos los campos de texto la usan para editar.
 keymap-refusal-system = La usa el escritorio.
+keymap-refusal-altgr = Aquí Ctrl+Alt es AltGr, que escribe caracteres como @ o € en muchas distribuciones de teclado.
 
 ## Aviso al iniciar sobre keymap.json
 

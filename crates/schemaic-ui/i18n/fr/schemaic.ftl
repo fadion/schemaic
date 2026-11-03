@@ -276,6 +276,7 @@ keymap-refusal-needs-modifier = Cette touche demande { $primary } ou { $alt }.
 keymap-refusal-escape = Échap ferme et annule partout : ce n'est jamais la touche d'une commande.
 keymap-refusal-editing = Tous les champs de texte s'en servent pour l'édition.
 keymap-refusal-system = Le bureau s'en sert.
+keymap-refusal-altgr = Ici, Ctrl+Alt est AltGr, qui tape des caractères comme @ ou € sur de nombreuses dispositions de clavier.
 
 ## Avis au démarrage sur keymap.json
 

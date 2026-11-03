@@ -276,6 +276,7 @@ keymap-refusal-needs-modifier = Deze toets heeft { $primary } of { $alt } nodig.
 keymap-refusal-escape = Esc sluit en annuleert overal, dus is nooit de toets van een opdracht.
 keymap-refusal-editing = Elk tekstveld gebruikt hem om te bewerken.
 keymap-refusal-system = Het bureaublad gebruikt hem.
+keymap-refusal-altgr = Ctrl+Alt is hier AltGr, waarmee veel toetsenbordindelingen tekens als @ of € typen.
 
 ## Melding bij het starten over keymap.json
 

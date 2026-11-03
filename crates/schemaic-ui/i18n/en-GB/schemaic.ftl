@@ -311,6 +311,7 @@ keymap-refusal-needs-modifier = This key needs { $primary } or { $alt }.
 keymap-refusal-escape = Esc closes and cancels everywhere, so it is never a command's key.
 keymap-refusal-editing = Every text field uses it for editing.
 keymap-refusal-system = The desktop uses it.
+keymap-refusal-altgr = Ctrl+Alt is AltGr here, which types characters such as @ or € on many keyboard layouts.
 
 ## Startup notice about keymap.json
 

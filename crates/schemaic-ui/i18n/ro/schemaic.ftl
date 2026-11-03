@@ -280,6 +280,7 @@ keymap-refusal-needs-modifier = Tasta aceasta are nevoie de { $primary } sau { $
 keymap-refusal-escape = Esc închide și anulează peste tot, deci nu este niciodată tasta unei comenzi.
 keymap-refusal-editing = Fiecare câmp de text o folosește pentru editare.
 keymap-refusal-system = O folosește desktopul.
+keymap-refusal-altgr = Aici Ctrl+Alt este AltGr, care scrie caractere precum @ sau € pe multe aranjamente de tastatură.
 
 ## Notificare la pornire despre keymap.json
 

@@ -52,6 +52,12 @@ listening for another:
   <kbd>Home</kbd>, <kbd>End</kbd>, <kbd>Backspace</kbd> or <kbd>Del</kbd> are kept for editing
   text.
 - <kbd>Alt</kbd>+<kbd>F4</kbd> belongs to the desktop.
+- On Windows, <kbd>Ctrl</kbd>+<kbd>Alt</kbd> (with or without <kbd>Shift</kbd>) and a letter,
+  digit or symbol: <kbd>Ctrl</kbd>+<kbd>Alt</kbd> is AltGr there, which types characters such as
+  `@` or `€` on many layouts. The defaults already on one — Format code, Format statement and
+  Make single line — keep them.
+- On macOS, <kbd>Option</kbd> with an arrow, <kbd>Backspace</kbd> or <kbd>Del</kbd> moves or
+  deletes by word in every text field.
 
 ### Where your keys are kept
 
@@ -70,7 +76,9 @@ You can edit it by hand while the app is closed. Write <kbd>Ctrl</kbd> even on m
 
 If something in the file can't be applied, Schemaic lists it in a notice at startup and that
 command keeps its default — or, where two commands end up with the same key, one of them is left
-with none, and the notice says which.
+with none, and the notice says which. The entry stays in the file, so the notice comes back at
+every start until you fix it by hand or assign, clear or reset that command in the
+**Shortcuts** window.
 
 Settings › **General** › **Settings file** carries your shortcuts along with your other
 preferences. Importing a file counts the shortcuts it changes in its question, and **Yes** makes

@@ -309,7 +309,19 @@ impl Chord {
     /// text field answers (Ctrl+C/V/X/A/Z/Y, Ctrl with an arrow, Home, End,
     /// Backspace or Delete) are reserved, since a command on one would take it
     /// from every field in the app.
+    ///
+    /// Two more depend on the platform ([`Platform`]). Where AltGr arrives as
+    /// Ctrl+Alt, Ctrl+Alt with a character is refused — the editor would run
+    /// the command instead of typing the `@` — except a default's own chord,
+    /// which has always been there. On macOS, Option with an arrow, Backspace
+    /// or Delete is a text field's word movement, so it is reserved as an
+    /// editing key.
     pub fn refusal(self) -> Option<Refusal> {
+        self.refusal_on(Platform::CURRENT)
+    }
+
+    /// [`refusal`](Chord::refusal) on `platform`.
+    pub fn refusal_on(self, platform: Platform) -> Option<Refusal> {
         let any = self.primary || self.alt;
         match self.key {
             Key::Escape => return Some(Refusal::Escape),
@@ -339,8 +351,23 @@ impl Chord {
         if self.primary && !self.alt && editing {
             return Some(Refusal::Editing);
         }
+        let word_editing = matches!(
+            self.key,
+            Key::Up | Key::Down | Key::Left | Key::Right | Key::Backspace | Key::Delete
+        );
+        if platform.option_edits_text && self.alt && !self.primary && word_editing {
+            return Some(Refusal::Editing);
+        }
         if self.alt && !self.primary && self.key == Key::F(4) {
             return Some(Refusal::System);
+        }
+        if platform.altgr_is_ctrl_alt
+            && self.primary
+            && self.alt
+            && matches!(self.key, Key::Char(_))
+            && !Command::ALL.iter().any(|c| c.default_chord() == self)
+        {
+            return Some(Refusal::AltGr);
         }
         None
     }
@@ -359,6 +386,29 @@ pub enum Refusal {
     Editing,
     /// A key the desktop owns (Alt+F4).
     System,
+    /// Ctrl+Alt with a character, where that is how AltGr arrives: on many
+    /// layouts it types `@`, `{` or `€`.
+    AltGr,
+}
+
+/// What the desktop does with the modifiers, as far as it decides which
+/// chords a command may take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Platform {
+    /// AltGr is reported as Ctrl+Alt (Windows), so Ctrl+Alt with a character
+    /// is how a layout types `@` or `{`.
+    pub altgr_is_ctrl_alt: bool,
+    /// Option with an arrow, Backspace or Delete moves or deletes by word in
+    /// every text field (macOS).
+    pub option_edits_text: bool,
+}
+
+impl Platform {
+    /// The platform this build runs on.
+    pub const CURRENT: Platform = Platform {
+        altgr_is_ctrl_alt: cfg!(windows),
+        option_edits_text: cfg!(target_os = "macos"),
+    };
 }
 
 fn parse_key(part: &str) -> Option<Key> {
@@ -501,7 +551,10 @@ pub struct Keymap {
     bindings: BTreeMap<Command, Option<Chord>>,
     /// Entries of the file this build could not keep, carried back out on
     /// save so a newer build's commands, or a typo the user means to fix, are
-    /// not lost by a save from this one.
+    /// not lost by a save from this one. A known command's entry leaves once
+    /// the user gives that command a key ([`assign`](Keymap::assign),
+    /// [`clear`](Keymap::clear), [`reset`](Keymap::reset)): what they said
+    /// since replaces what the file said.
     kept: BTreeMap<String, Option<String>>,
 }
 
@@ -592,6 +645,11 @@ impl Keymap {
                             chord: c,
                             holder,
                         });
+                        // The loser's text goes back out on save, as every
+                        // other entry that could not be applied does.
+                        if let Some(text) = file.bindings.get(command.id()) {
+                            map.kept.insert(command.id().to_string(), text.clone());
+                        }
                         false
                     }
                     None => true,
@@ -621,10 +679,15 @@ impl Keymap {
     }
 
     /// The file that reproduces this keymap: every command off its default,
-    /// and whatever the loaded file held that this build could not keep.
+    /// and whatever the loaded file held that this build could not keep. A
+    /// kept entry of a known command stands for that command: it is only
+    /// still kept while the user has not given the command a key since.
     pub fn to_file(&self) -> KeymapFile {
         let mut bindings = self.kept.clone();
         for &command in Command::ALL {
+            if self.kept.contains_key(command.id()) {
+                continue;
+            }
             let chord = self.chord(command);
             if chord != Some(command.default_chord()) {
                 bindings.insert(command.id().to_string(), chord.map(|c| c.to_string()));
@@ -695,19 +758,29 @@ impl Keymap {
     pub fn assign(&mut self, command: Command, chord: Chord, fixed: &[FixedKey]) -> bool {
         match self.check(command, chord, fixed) {
             Verdict::Refused(_) | Verdict::Fixed(_) => return false,
-            Verdict::Unchanged => return true,
+            Verdict::Unchanged => {
+                self.set(command, Some(chord));
+                return true;
+            }
             Verdict::Taken(_) | Verdict::Free => {}
         }
         while let Some(holder) = self.holder(chord, command.context()) {
-            self.bindings.insert(holder, None);
+            self.set(holder, None);
         }
-        self.bindings.insert(command, Some(chord));
+        self.set(command, Some(chord));
         true
     }
 
     /// Leave `command` with no key.
     pub fn clear(&mut self, command: Command) {
-        self.bindings.insert(command, None);
+        self.set(command, None);
+    }
+
+    /// Bind `command` as the user has now said, dropping whatever the file
+    /// held for it that could not be applied.
+    fn set(&mut self, command: Command, chord: Option<Chord>) {
+        self.kept.remove(command.id());
+        self.bindings.insert(command, chord);
     }
 
     /// What [`reset`](Keymap::reset) would find in the default's way: a
@@ -834,7 +907,58 @@ mod tests {
         // Option+E is how macOS types an accent.
         assert_eq!(chord("Alt+E").refusal(), Some(Refusal::NeedsPrimary));
         assert_eq!(chord("Ctrl+P").refusal(), None);
-        assert_eq!(chord("Ctrl+Alt+P").refusal(), None);
+        assert_eq!(chord("Ctrl+Alt+P").refusal_on(MAC), None);
+        assert_eq!(chord("Ctrl+Alt+P").refusal_on(LINUX), None);
+    }
+
+    const WINDOWS: Platform = Platform {
+        altgr_is_ctrl_alt: true,
+        option_edits_text: false,
+    };
+    const MAC: Platform = Platform {
+        altgr_is_ctrl_alt: false,
+        option_edits_text: true,
+    };
+    const LINUX: Platform = Platform {
+        altgr_is_ctrl_alt: false,
+        option_edits_text: false,
+    };
+
+    #[test]
+    fn where_altgr_arrives_as_ctrl_alt_a_character_with_both_would_type() {
+        // AltGr+Q is `@` on a German keyboard, AltGr+E `€`, AltGr+7 `{`.
+        for s in ["Ctrl+Alt+Q", "Ctrl+Alt+E", "Ctrl+Alt+7", "Ctrl+Alt+Shift+Q"] {
+            assert_eq!(chord(s).refusal_on(WINDOWS), Some(Refusal::AltGr), "{s}");
+            assert_eq!(chord(s).refusal_on(LINUX), None, "{s}");
+        }
+        // A named or function key types nothing, whatever the modifiers.
+        assert_eq!(chord("Ctrl+Alt+PgDn").refusal_on(WINDOWS), None);
+        assert_eq!(chord("Ctrl+Alt+F2").refusal_on(WINDOWS), None);
+    }
+
+    #[test]
+    fn the_defaults_on_ctrl_alt_stay_usable_where_altgr_is_ctrl_alt() {
+        for s in ["Ctrl+Alt+L", "Ctrl+Alt+Shift+L", "Ctrl+Alt+J"] {
+            assert_eq!(chord(s).refusal_on(WINDOWS), None, "{s}");
+        }
+    }
+
+    #[test]
+    fn on_macos_option_with_an_arrow_or_a_delete_key_edits_text() {
+        for s in [
+            "Alt+←",
+            "Alt+→",
+            "Alt+↑",
+            "Alt+↓",
+            "Alt+Shift+←",
+            "Alt+Backspace",
+            "Alt+Del",
+        ] {
+            assert_eq!(chord(s).refusal_on(MAC), Some(Refusal::Editing), "{s}");
+            assert_eq!(chord(s).refusal_on(WINDOWS), None, "{s}");
+        }
+        assert_eq!(chord("Alt+Enter").refusal_on(MAC), None);
+        assert_eq!(chord("Alt+Home").refusal_on(MAC), None);
     }
 
     #[test]
@@ -878,7 +1002,7 @@ mod tests {
             assert_eq!(chord(s).refusal(), Some(Refusal::Editing), "{s}");
         }
         // With Alt as well they are no field's keys, and shifted only redo is.
-        assert_eq!(chord("Ctrl+Alt+C").refusal(), None);
+        assert_eq!(chord("Ctrl+Alt+C").refusal_on(LINUX), None);
         assert_eq!(chord("Ctrl+Shift+A").refusal(), None);
         assert_eq!(chord("Ctrl+Shift+C").refusal(), None);
         assert_eq!(chord("Alt+F4").refusal(), Some(Refusal::System));
@@ -1120,7 +1244,7 @@ mod tests {
         let mut map = Keymap::defaults();
         map.assign(Command::NewTab, chord("Ctrl+P"), &[]);
         map.clear(Command::SaveFileAs);
-        map.assign(Command::GoToLine, chord("Ctrl+Alt+G"), &[]);
+        map.assign(Command::GoToLine, chord("Ctrl+Shift+G"), &[]);
         let (read, problems) = Keymap::load(&map.to_file(), &[]);
         assert_eq!(problems, vec![]);
         assert_eq!(read, map);
@@ -1174,6 +1298,42 @@ mod tests {
         assert!(map.is_default(Command::CloseTab));
         assert!(map.is_default(Command::OpenFile));
         // …and goes back out on save, for the user (or a later build) to fix.
+        assert_eq!(map.to_file(), f);
+    }
+
+    #[test]
+    fn a_kept_entry_leaves_the_file_once_the_user_sets_that_commands_key() {
+        let f = file(&[("open-file", Some("Ctrl+Banana"))]);
+        let chosen = chord("Ctrl+Shift+O");
+        // Assign then Reset: the command is back on its default.
+        let (mut map, _) = Keymap::load(&f, &[]);
+        assert!(map.assign(Command::OpenFile, chosen, &[]));
+        assert!(map.reset(Command::OpenFile, &[]));
+        assert_eq!(map.to_file(), KeymapFile::default());
+        // Clear then Reset.
+        let (mut map, _) = Keymap::load(&f, &[]);
+        map.clear(Command::OpenFile);
+        assert!(map.reset(Command::OpenFile, &[]));
+        assert_eq!(map.to_file(), KeymapFile::default());
+        // Giving the command the key it already runs on says so too.
+        let (mut map, _) = Keymap::load(&f, &[]);
+        assert!(map.assign(Command::OpenFile, chord("Ctrl+O"), &[]));
+        assert_eq!(map.to_file(), KeymapFile::default());
+        // A command whose key another assignment takes has been given an
+        // answer too: no key, written as null.
+        let (mut map, _) = Keymap::load(&f, &[]);
+        assert!(map.assign(Command::NewTab, chord("Ctrl+O"), &[]));
+        assert_eq!(
+            map.to_file(),
+            file(&[("new-tab", Some("Ctrl+O")), ("open-file", None)])
+        );
+    }
+
+    #[test]
+    fn a_file_entry_that_loses_a_conflict_is_kept_in_the_file() {
+        let f = file(&[("new-tab", Some("Ctrl+N")), ("close-tab", Some("Ctrl+N"))]);
+        let (map, _) = Keymap::load(&f, &[]);
+        assert_eq!(map.chord(Command::CloseTab), None);
         assert_eq!(map.to_file(), f);
     }
 

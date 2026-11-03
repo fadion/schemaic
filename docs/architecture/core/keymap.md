@@ -48,17 +48,49 @@ Ctrl+Shift+Z, and Ctrl, shifted or not, with an arrow, Home, End, Backspace or D
 only Ctrl+Shift+Z is a field's — Ctrl+Shift+A is the AI panel's default — and with Alt as well
 none of them is. Alt+F4 is the desktop's. Every default passes
 (`every_default_is_a_chord_a_command_may_have`, `the_editing_keys_every_field_answers_are_reserved`).
+**Two refusals depend on the platform**, so `refusal` is `refusal_on(Platform::CURRENT)` and
+`Platform { altgr_is_ctrl_alt, option_edits_text }` is the capability, set from `cfg!(windows)`
+and `cfg!(target_os = "macos")` in that one constant and passed in everywhere else, so both
+platforms are tested from whichever runs the suite. **Where AltGr arrives as Ctrl+Alt** (Windows),
+Ctrl+Alt — shifted or not — with a character is `Refusal::AltGr`: the capture reads AltGr+Q as
+Ctrl+Alt+Q (`chord_from`, by the key's place), so a command put there took the German layout's
+`@` from the SQL editor, which answers a Global command before it types, and `{ [ ] } \ €` went
+the same way; a settings bundle exported on a US machine could deliver one with no key pressed
+(`where_altgr_arrives_as_ctrl_alt_a_character_with_both_would_type`). **The defaults' own Ctrl+Alt
+chords are exempt** — Ctrl+Alt+L, Ctrl+Alt+Shift+L, Ctrl+Alt+J, by asking whether the chord is
+any command's default rather than by a list — because they were there before rebinding was, and
+Polish already loses `ł` to Format code on that accepted footing
+(`the_defaults_on_ctrl_alt_stay_usable_where_altgr_is_ctrl_alt`). A named or function key types
+nothing, so Ctrl+Alt+PgDn stays free. **On macOS, Option** (Alt without the primary modifier)
+with an arrow, Backspace or Delete is `Refusal::Editing`: it is every text field's word movement
+and deletion there, floem's macOS keymap binds it so, and it is the platform's counterpart of the
+Ctrl+← that is already refused elsewhere
+(`on_macos_option_with_an_arrow_or_a_delete_key_edits_text`). Option+Home and Option+Enter are not
+editing keys and stay free.
 **`keymap.json` (`FILE`; `KeymapFile { bindings }`) holds only what the user changed**, by command
 id, so a command they never touched follows its default and a default changed in a later release
 still reaches them. A cleared command is `null`, which is a different thing from absent
 (`the_file_holds_only_what_moved_and_a_cleared_command_as_null`); a command moved back to its
-default leaves the file, and an untouched keymap writes an empty one.
+default leaves the file, and an untouched keymap writes an empty one — **including a command
+whose loaded entry could not be applied**, which is the half that once failed (below).
 **`Keymap::load(file, fixed)` reports every entry it cannot apply — and keeps it.** An unknown id,
 an unreadable chord, a refused one and one on a fixed key each become a `Problem`, and that
 command runs the session on its default; the entry itself is held in `Keymap`'s private `kept` and
 goes back out on the next save, so a newer build's command, or a typo the user means to fix, is
 not erased by a save from this one
-(`every_entry_that_cannot_be_kept_is_reported_and_kept_in_the_file`). **What the file names wins
+(`every_entry_that_cannot_be_kept_is_reported_and_kept_in_the_file`). So does a file entry that
+**loses a conflict** below: it used to be left out of `kept`, so the next save wrote the loser as
+`null` and the user's text was gone, the command cleared from then on and never reported again
+(`a_file_entry_that_loses_a_conflict_is_kept_in_the_file`). `to_file` writes a known command's
+kept text **in place of** its binding. **A known command's kept entry lasts only until the user
+gives that command a key**: `assign` (the `Unchanged` case included — choosing the key it already
+runs on is an answer too), `clear`, `reset`, and a holder whose key an `assign` takes, all go
+through the private `set`, which drops it. Before that, `to_file` overwrote a kept entry only
+while its command was off the default, so `Ctrl+Banana` for Open SQL file survived *Assign* and
+came back on *Reset to default*, and the startup notice with it — and with Reset disabled on a
+command already on its default, the modal's only way out was Clear, a restart, then Reset
+(`a_kept_entry_leaves_the_file_once_the_user_sets_that_commands_key`). An unknown id is no
+command to set, so it stays for as long as the file does. **What the file names wins
 over a default**: a file moving New tab to Ctrl+P takes Ctrl+P from Find anywhere, reported as a
 `Conflict`, rather than leaving New tab unbound
 (`what_the_file_names_wins_over_a_default_and_the_loss_is_reported`); between two entries of the
