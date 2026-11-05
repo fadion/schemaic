@@ -234,9 +234,80 @@ pub fn fold(h: Health, e: Evidence) -> Health {
     }
 }
 
+/// Should the evidence that has just landed reload a schema tree whose last load
+/// **failed**? `before` is the verdict the evidence is folded over.
+///
+/// The case it exists for: a load that fails at launch — the server not up yet,
+/// a tunnel still coming up, a keychain dialog nobody had answered — clears the
+/// tree, and nothing loaded it again. The health poll recovered on its own and
+/// the header cleared "Disconnected", over a tree that stayed empty until the
+/// user found Refresh.
+///
+/// **Only a check, and only one that changes the verdict to Connected.** A
+/// listing *is* the load, and an edit starts its own. A check that finds the
+/// connection already Connected says nothing new — and reloading on it would
+/// loop against a load that fails on something the ping does not need (a
+/// privilege, a catalogue the account cannot read): fail, check, reload, fail,
+/// every poll. A real recovery is a change of verdict, so that is the trigger.
+pub fn reloads_failed_tree(before: ConnStatus, e: Evidence, tree_failed: bool) -> bool {
+    tree_failed && e == Evidence::Checked(true) && before != ConnStatus::Connected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The recovery the poll found reloads the tree it left empty, from either
+    /// verdict short of Connected.
+    #[test]
+    fn a_check_that_recovers_the_connection_reloads_a_failed_tree() {
+        for before in [ConnStatus::Disconnected, ConnStatus::Unknown] {
+            assert!(
+                reloads_failed_tree(before, Evidence::Checked(true), true),
+                "{before:?} → Connected left the failed tree empty"
+            );
+        }
+    }
+
+    /// No failed load, nothing to reload: the tree a recovery finds is fine.
+    #[test]
+    fn a_recovery_leaves_a_tree_that_loaded_alone() {
+        assert!(!reloads_failed_tree(
+            ConnStatus::Disconnected,
+            Evidence::Checked(true),
+            false
+        ));
+    }
+
+    /// A check that finds the connection already Connected is not a recovery —
+    /// reloading on it would retry a load that fails on a privilege the ping
+    /// does not need, at every poll.
+    #[test]
+    fn a_check_that_changes_nothing_does_not_retry_a_failed_load() {
+        assert!(!reloads_failed_tree(
+            ConnStatus::Connected,
+            Evidence::Checked(true),
+            true
+        ));
+    }
+
+    /// A failed check, a listing and an edit are never the trigger: the first
+    /// is no recovery, the second is the load itself, the third starts its own.
+    #[test]
+    fn only_a_passing_check_reloads() {
+        for e in [Evidence::Checked(false), Evidence::Listed, Evidence::Edited] {
+            for before in [
+                ConnStatus::Disconnected,
+                ConnStatus::Unknown,
+                ConnStatus::Connected,
+            ] {
+                assert!(
+                    !reloads_failed_tree(before, e, true),
+                    "{e:?} from {before:?}"
+                );
+            }
+        }
+    }
 
     /// A ctx that pings: focused, idle, direct, healthy.
     fn ready() -> TickCtx {

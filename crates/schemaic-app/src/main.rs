@@ -3334,6 +3334,13 @@ fn app_view(
     // `ModalError`, which decides what the modal offers about it.
     let error_modal_text: RwSignal<Option<ModalError>> = RwSignal::new(None);
     let conn_status = RwSignal::new(ConnStatus::Unknown);
+    // The connection whose last schema load **failed and cleared the tree**, if
+    // any — set by the load's error arm, cleared by a load that installs — and
+    // the trigger `note_health` bumps when a check recovers that connection, so
+    // the tree is loaded again rather than left empty under a header that has
+    // stopped saying Disconnected (`health::reloads_failed_tree`).
+    let tree_failed_for: RwSignal<Option<u64>> = RwSignal::new(None);
+    let reload_failed_tree = RwSignal::new(0_u64);
     // Consecutive failed health checks of the active connection, folded by every
     // check (polled or manual) and cleared by a successful schema load. Drives
     // the health poll's backoff so a server that's been down for a while isn't
@@ -9501,6 +9508,10 @@ fn app_view(
             status: conn_status.get_untracked(),
             failures: health_failures.get_untracked(),
         };
+        let tree_failed = tree_failed_for.get_untracked() == Some(active_conn.get_untracked());
+        if health::reloads_failed_tree(h.status, e, tree_failed) {
+            reload_failed_tree.update(|n| *n += 1);
+        }
         let (h, generation) = note_evidence(h, health_gen.get_untracked(), e);
         conn_status.set(h.status);
         health_failures.set(h.failures);
@@ -10054,6 +10065,8 @@ fn app_view(
                         if landing != LoadLanding::Install {
                             return;
                         }
+                        // The tree is this load's now, whatever failed before it.
+                        tree_failed_for.set(None);
                         // **The listing is a check that passed** — a sign-in with
                         // the settings as they now stand, and a query after it.
                         // After the landing guard, so only the load the user is
@@ -10221,6 +10234,9 @@ fn app_view(
                             // still leaves its signals in the surviving scope; that
                             // one needs a scope per node and is not this fix.
                             (clear_schema_tree_cb)();
+                            // …and remember it, so the check that next finds the
+                            // server answering loads it again.
+                            tree_failed_for.set(Some(conn_send.id));
                         }
                     }
                 }
@@ -10305,6 +10321,28 @@ fn app_view(
     };
 
     *refresh_after_run.borrow_mut() = Some(refresh_db.clone());
+
+    // A check that recovered the connection a failed load left with an empty
+    // tree loads it again — `note_health` bumps the trigger, and only on a
+    // change of verdict (`health::reloads_failed_tree`), so a load that keeps
+    // failing on something the ping does not need is not retried every poll.
+    // Here rather than in `note_health` because `load_schema` is built after it.
+    {
+        let load_schema = load_schema.clone();
+        create_effect(move |prev: Option<u64>| {
+            let n = reload_failed_tree.get();
+            if prev.is_some_and(|p| p != n)
+                && let Some(conn) = connections.with_untracked(|cs| {
+                    cs.iter()
+                        .find(|c| c.id == active_conn.get_untracked())
+                        .cloned()
+                })
+            {
+                load_schema(conn);
+            }
+            n
+        });
+    }
 
     // Full refresh of the active connection (SCHEMA settings → Refresh): re-lists
     // databases and reloads every schema, and re-checks reachability.

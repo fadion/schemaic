@@ -41,3 +41,20 @@ connection id only a generation bump stops its failure landing over the new sett
 started *after* a load is newer news than the load, so a failure it brings back must still
 land rather than be masked by the listing. Only a load that passes `load_landing` speaks, and a
 *failed* load is no evidence — a listing can fail on a privilege a ping does not need.
+**But a failed load is owed a retry, and `reloads_failed_tree(before, e, tree_failed)` says when
+— only on a check that passes *and* moves the verdict to `Connected`.** A load that failed at
+launch — the server not up yet, the tunnel still coming up, a keychain dialog nobody had
+answered — cleared the tree, and nothing loaded it again: the poll recovered on its own and the
+header dropped "Disconnected" over a tree that stayed empty until the user found Refresh. A
+listing cannot be the trigger, being the load itself, nor an edit, which starts its own; and a
+passing check that finds the connection already `Connected` must not be either, for the same
+reason a failed load is no evidence — a load that fails on a privilege or a catalogue the ping
+does not need would be retried at every poll, fail, check, reload, fail. A real recovery is a
+change of verdict, so `before` is the verdict the evidence is folded *over*, and `note_health`
+asks before it folds. The app's half: `load_schema`'s error arm records `tree_failed_for` (the
+connection id) in the same `LoadLanding::Install` branch that clears the tree, a load that
+installs clears it, and `note_health` compares it with `active_conn` and bumps
+`reload_failed_tree`; the reload itself is an effect on that trigger, declared after
+`load_schema` because `note_health` is built before it, and it skips its first run. Pinned by
+`a_check_that_recovers_the_connection_reloads_a_failed_tree`,
+`a_check_that_changes_nothing_does_not_retry_a_failed_load` and `only_a_passing_check_reloads`.
