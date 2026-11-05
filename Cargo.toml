@@ -365,7 +365,13 @@ debug = "line-tables-only"
 # turned off for this one crate rather than worked around at the call site:
 # Floem's own monitor queries reach the same enumeration. Remove this once Floem
 # moves to an `objc2` whose bindings carry the right encoding.
-[profile.dev.package."objc2@0.4.1"]
+#
+# **Keyed on `0.4`, not `0.4.1`, and not on the bare name.** A spec naming one
+# patch release stops matching at the next `cargo update`, and cargo says so
+# only as a warning, so the panic would come back looking like a new bug. The
+# bare name would also switch the check off in the `objc2` 0.5 and 0.6 that
+# other crates bring in, whose bindings it has no complaint about.
+[profile.dev.package."objc2@0.4"]
 debug-assertions = false
 
 # **Floem 0.2.0, vendored and patched** — see `vendor/floem/PATCHES.md` for
