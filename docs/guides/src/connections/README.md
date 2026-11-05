@@ -61,7 +61,10 @@ checking on its own while the window has focus, and checks again when you come b
 While the connection is down the schema tree stays on screen, dimmed: it's the schema as last
 loaded, and you can still scroll, expand and right-click it. It goes back to normal once the server
 answers. If the tree couldn't load at all, say because the server wasn't up when you opened
-Schemaic, it loads by itself when the connection comes back — no need for **Refresh**.
+Schemaic, it loads by itself when the connection comes back — no need for **Refresh**. Over an SSH
+tunnel it does this by retrying the load while the window has focus and no query is running: after
+about 10 seconds, then less often, down to every couple of minutes. It doesn't retry a load you
+stopped yourself, such as by declining a keychain prompt; use **Refresh** then.
 
 ## Telling connections apart
 

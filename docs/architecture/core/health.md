@@ -52,9 +52,38 @@ reason a failed load is no evidence — a load that fails on a privilege or a ca
 does not need would be retried at every poll, fail, check, reload, fail. A real recovery is a
 change of verdict, so `before` is the verdict the evidence is folded *over*, and `note_health`
 asks before it folds. The app's half: `load_schema`'s error arm records `tree_failed_for` (the
-connection id) in the same `LoadLanding::Install` branch that clears the tree, a load that
+connection id, and whether the failure was one of reaching the server — below) in the same `LoadLanding::Install` branch that clears the tree, a load that
 installs clears it, and `note_health` compares it with `active_conn` and bumps
 `reload_failed_tree`; the reload itself is an effect on that trigger, declared after
 `load_schema` because `note_health` is built before it, and it skips its first run. Pinned by
 `a_check_that_recovers_the_connection_reloads_a_failed_tree`,
 `a_check_that_changes_nothing_does_not_retry_a_failed_load` and `only_a_passing_check_reloads`.
+**For an SSH connection that check could never come, so the poll reloads instead.** A load
+caches its tunnel only when it succeeds — the one a failed load opened closes with it — and
+`check_conn_then` returns without pinging while no tunnel is cached, `load_schema` being the only
+thing that opens one. So a tunnelled connection whose load failed had nothing to ping through, no
+check could pass, `reloads_failed_tree` never fired, and the tree stayed empty for good. `tick`
+now answers `reload: true` on the tunnel-pending path — still `skip: Some(TunnelPending)`, still
+no ping — when `TickCtx::tree_failed` is set and the window is focused and idle, the two gates a
+ping has; the poll then bumps the same `reload_failed_tree` trigger a recovering check does, the
+load being both the retry and the thing that opens the tunnel. **`tree_failed` is narrower than
+"the tree failed"**: it holds only when the last load failed on *reaching* the server —
+`main.rs`'s `unreached`, `DbError::modal_source() == ErrorSource::Server`, read off the error
+before it becomes text and carried as the `bool` beside `ConnectResult`'s `LoadFailure`, which is
+the second half of `tree_failed_for`'s `(u64, bool)`. A refusal of the app's own — a keychain read
+the user declined, init SQL the guard refused — is not something a retry changes, and the poll
+would only ask about it again. `note_health`'s reload still reads the connection id alone. The
+retries back off on their own count, `reload_failures`, apart from `failures`, which counts
+checks: every installing load's failure increments it — or starts it again at 1 when the failure
+is another connection's, whose count says nothing about this one — and an installing success
+resets it, and
+`next` is `backoff` over the *tunnelled* interval capped at `max_backoff` — 30 s, 60 s, then the
+120 s ceiling with the default `HealthCfg` — because each retry is an SSH handshake against a host
+that may be down for hours, where the plain tunnel-pending skip re-arms at the base interval since
+it costs nothing. The load that set `tree_failed` is itself counted, so the first retry comes on
+the next plain tick and the 30 s step is not reached from the app today. Pinned by
+`a_tunnel_that_never_opened_is_reopened_by_reloading`,
+`reopening_a_tunnel_backs_off_on_the_reloads_that_failed`,
+`a_tunnel_is_only_reopened_for_a_failed_tree_in_a_focused_idle_window` and
+`a_failed_tree_over_an_open_tunnel_is_left_to_the_check`, the last because with the tunnel up the
+ping can reach the server and the check's own reload is the right one.

@@ -102,15 +102,24 @@ use schemaic_core::monitor::{Snapshot, TickAction, diff_snapshots};
 use schemaic_core::window_place;
 
 /// Outcome of a background connect + schema-load task: `(tunnel port, tunnel
-/// handle, databases listed)` on success, or which step failed and why.
+/// handle, databases listed)` on success, or which step failed and why — and
+/// whether that failure was one of **reaching** the server
+/// (`ErrorSource::Server`), the only kind the health poll retries on its own
+/// (`TickCtx::tree_failed`). Read off the `DbError` before it becomes text.
 type ConnectResult = Result<
     (
         Option<u16>,
         Option<schemaic_db::ssh::TunnelHandle>,
         Vec<schemaic_core::schema::ListedDatabase>,
     ),
-    schemaic_core::connection::LoadFailure,
+    (schemaic_core::connection::LoadFailure, bool),
 >;
+
+/// Did `e` fail to reach the server, rather than being refused by the app
+/// itself? See [`ConnectResult`].
+fn unreached(e: &DbError) -> bool {
+    e.modal_source() == schemaic_core::model::ErrorSource::Server
+}
 /// Self-rescheduling cursor-blink tick — holds an `Rc` to itself so it can re-arm.
 type BlinkTick = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 /// An action declared before the closure that performs it exists, filled in once
@@ -3335,12 +3344,16 @@ fn app_view(
     let error_modal_text: RwSignal<Option<ModalError>> = RwSignal::new(None);
     let conn_status = RwSignal::new(ConnStatus::Unknown);
     // The connection whose last schema load **failed and cleared the tree**, if
-    // any — set by the load's error arm, cleared by a load that installs — and
-    // the trigger `note_health` bumps when a check recovers that connection, so
-    // the tree is loaded again rather than left empty under a header that has
-    // stopped saying Disconnected (`health::reloads_failed_tree`).
-    let tree_failed_for: RwSignal<Option<u64>> = RwSignal::new(None);
+    // any, and whether it failed on reaching the server — set by the load's
+    // error arm, cleared by a load that installs — and the trigger `note_health`
+    // bumps when a check recovers that connection, so the tree is loaded again
+    // rather than left empty under a header that has stopped saying
+    // Disconnected (`health::reloads_failed_tree`). The health poll bumps it
+    // too, for a tunnelled connection whose tunnel went with the failed load
+    // (`Tick::reload`), and `reload_failures` is that retry's backoff.
+    let tree_failed_for: RwSignal<Option<(u64, bool)>> = RwSignal::new(None);
     let reload_failed_tree = RwSignal::new(0_u64);
+    let reload_failures = RwSignal::new(0_u32);
     // Consecutive failed health checks of the active connection, folded by every
     // check (polled or manual) and cleared by a successful schema load. Drives
     // the health poll's backoff so a server that's been down for a while isn't
@@ -9508,7 +9521,9 @@ fn app_view(
             status: conn_status.get_untracked(),
             failures: health_failures.get_untracked(),
         };
-        let tree_failed = tree_failed_for.get_untracked() == Some(active_conn.get_untracked());
+        let tree_failed = tree_failed_for
+            .get_untracked()
+            .is_some_and(|(id, _)| id == active_conn.get_untracked());
         if health::reloads_failed_tree(h.status, e, tree_failed) {
             reload_failed_tree.update(|n| *n += 1);
         }
@@ -10067,6 +10082,7 @@ fn app_view(
                         }
                         // The tree is this load's now, whatever failed before it.
                         tree_failed_for.set(None);
+                        reload_failures.set(0);
                         // **The listing is a check that passed** — a sign-in with
                         // the settings as they now stand, and a query after it.
                         // After the landing guard, so only the load the user is
@@ -10209,8 +10225,14 @@ fn app_view(
                             (start_fetch_cb)(&nodes[i], db.clone());
                         }
                     }
-                    Err(e) => {
+                    Err((e, unreached)) => {
                         tracing::error!("schema load failed: {e:?}");
+                        // `unreached`: only a failure to *reach* the server is
+                        // one the poll may retry by itself
+                        // (`TickCtx::tree_failed`). A refusal of the app's own —
+                        // a keychain read the user declined — would only be
+                        // asked again.
+                        //
                         // **Recorded whatever the landing**: a load the user has
                         // moved on from still left *this* connection without a
                         // tunnel, and its next operation is owed the reason. Only
@@ -10235,8 +10257,16 @@ fn app_view(
                             // one needs a scope per node and is not this fix.
                             (clear_schema_tree_cb)();
                             // …and remember it, so the check that next finds the
-                            // server answering loads it again.
-                            tree_failed_for.set(Some(conn_send.id));
+                            // server answering loads it again — or, where the
+                            // tunnel the load opens is gone with it, the poll.
+                            // The count is this connection's: another one's failures
+                            // say nothing about how long to wait on this one.
+                            let same = tree_failed_for
+                                .get_untracked()
+                                .is_some_and(|(id, _)| id == conn_send.id);
+                            tree_failed_for.set(Some((conn_send.id, unreached)));
+                            reload_failures
+                                .update(|n| *n = if same { n.saturating_add(1) } else { 1 });
                         }
                     }
                 }
@@ -10267,10 +10297,13 @@ fn app_view(
                             match opened {
                                 Ok(h) => (Some(h.port()), Some(h)),
                                 Err(e) => {
-                                    send(Err(LoadFailure::Tunnel {
-                                        text: e.to_string(),
-                                        shown: db_error_shown(&e),
-                                    }));
+                                    send(Err((
+                                        LoadFailure::Tunnel {
+                                            text: e.to_string(),
+                                            shown: db_error_shown(&e),
+                                        },
+                                        unreached(&e),
+                                    )));
                                     return;
                                 }
                             }
@@ -10283,10 +10316,13 @@ fn app_view(
                 match db.list_databases().await {
                     Ok(listed) => send(Ok((tunnel_port, new_handle, listed))),
                     // The tunnel this load opened, if any, closes here with it.
-                    Err(e) => send(Err(LoadFailure::Server {
-                        text: e.to_string(),
-                        shown: db_error_shown(&e),
-                    })),
+                    Err(e) => send(Err((
+                        LoadFailure::Server {
+                            text: e.to_string(),
+                            shown: db_error_shown(&e),
+                        },
+                        unreached(&e),
+                    ))),
                 }
             });
         })
@@ -14673,10 +14709,17 @@ fn app_view(
                 focused,
                 tunnelled: ssh,
                 tunnel_pending: ssh && !tunnels.borrow().contains_key(&id),
+                tree_failed: tree_failed_for.try_get_untracked()? == Some((id, true)),
+                reload_failures: reload_failures.try_get_untracked()?,
             };
             let tick = health::tick(health::HealthCfg::default(), ctx);
             if tick.ping() {
                 check_conn();
+            }
+            // The load is what opens the tunnel, so it is the retry — through
+            // the same trigger a recovering check bumps.
+            if tick.reload {
+                reload_failed_tree.try_update(|n| *n += 1)?;
             }
             Some(tick.next)
         })
