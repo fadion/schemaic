@@ -198,6 +198,15 @@ pub fn modal_backdrop() -> Color {
     Color::rgb8(0, 0, 0).multiply_alpha(0.5)
 }
 
+/// The veil over the schema tree while its connection is **Disconnected**: the
+/// side panel's own colour at half strength, so every row fades toward the
+/// panel rather than toward black — the tree reads as the schema as last
+/// loaded, not as a live one, in either theme. A veil because Floem 0.2 has no
+/// opacity to dim a subtree with.
+pub fn stale_veil() -> Color {
+    bg_panel().multiply_alpha(0.5)
+}
+
 /// Soft drop shadow under floating tooltips (translucent black — theme-independent,
 /// reads as a shadow on both light and dark chrome).
 pub fn tooltip_shadow() -> Color {

@@ -54,7 +54,14 @@ From the keyboard, open the command palette (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<k
 Connections with a **Folder** are listed under it, in the switcher and in **Manage connections**
 alike. Hover over a connection whose name or address is cut short to see it in full.
 
-If a connection drops, the header says **Disconnected**, with a **Retry** button.
+If a connection drops, the header says **Disconnected**, with a **Retry** button. Schemaic keeps
+checking on its own while the window has focus, and checks again when you come back to it;
+**Retry** checks now.
+
+While the connection is down the schema tree stays on screen, dimmed: it's the schema as last
+loaded, and you can still scroll, expand and right-click it. It goes back to normal once the server
+answers. If the tree couldn't load at all, say because the server wasn't up when you opened
+Schemaic, it loads by itself when the connection comes back — no need for **Refresh**.
 
 ## Telling connections apart
 

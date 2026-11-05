@@ -50,6 +50,21 @@ connection into a database that admits one, and the tree reopens with each node 
 was, so reading on expansion would have the reload after `SET SINGLE_USER` take the slot on
 nobody's say-so — the one thing the state exists to prevent. Like `failed_row` and `info_row` it
 swallows a secondary click, a status row being a row.
+**While the connection is `Disconnected` the tree is veiled, never hidden.** It is the schema as
+last loaded — names still worth browsing and writing against — so `schema_panel` wraps the tree
+(after `nav.tree_id` is taken from it, and handing the wrapper the tree's old flex-grow sizing)
+in `stack((tree, veil))`, the veil an absolute `inset(0)` `empty()` painted `theme::stale_veil()`
+— `bg_panel()` at half alpha, so the rows fade toward the panel in either theme — only while
+`conn_status.get().is_down()`. Hiding the tree was the alternative weighed and refused: it
+flashed the tree away on every blip and cost its expansion and scroll; leaving it as it was read
+as live under a header saying *Disconnected*. A veil because Floem 0.2 has no opacity to dim a
+subtree with (*Floem 0.2 gotchas*). **Its `pointer_events(|| false)` is load-bearing** — the
+absolute-overlay hazard there, the size badge's lesson again — and is what keeps scrolling,
+expanding and the context menus working under it. `Unknown` is not dimmed, being also every
+startup (`ConnStatus::is_down` says why), and the veil lifts on the check that finds the server
+again; that is the whole of what recovery does to a tree that had loaded — only a *failed* load
+is reloaded (`reloads_failed_tree`, under `core/health.rs`). No test reaches it; the decision
+lives in the view.
 **The panel's title is the only place a long catalogue read can be reported.**
 `SchemaState::begin_refresh` deliberately leaves an already-loaded database's rows on screen
 through a refresh, and the per-database `Loading` row only ever appears for a *first* load — the
