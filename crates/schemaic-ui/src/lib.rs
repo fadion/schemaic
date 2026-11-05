@@ -8031,9 +8031,19 @@ fn header(ui: Ui, chrome: window_chrome::WindowChrome) -> impl IntoView {
     // can hold that alignment once something else stands to its left. The logo
     // inherits the inset, the switcher follows a 12px gap after it, and the
     // column below now lines up with the mark instead.
+    //
+    // **No mark on macOS** (`Chrome::header_shows_mark`): the traffic lights
+    // stand at that corner, and the switcher takes the mark's place — flush at
+    // the leading inset, since the gap it kept was the mark's, not the lights'.
+    let shows_mark = chrome.shows_mark();
     let left = h_stack((
-        logo,
-        container(conn_trigger).style(|s| s.margin_left(theme::scaled(12.0))),
+        if shows_mark {
+            logo.into_any()
+        } else {
+            empty().into_any()
+        },
+        container(conn_trigger)
+            .style(move |s| s.margin_left(if shows_mark { theme::scaled(12.0) } else { 0.0 })),
         badge,
         disconnected_notice(conn_status, ui.conn_actions.recheck_conn.clone()),
     ))

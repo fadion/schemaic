@@ -415,6 +415,21 @@ fn main() -> std::process::ExitCode {
         // against the installed `.desktop` file for the taskbar icon. Floem 0.2
         // has no such setter upstream — `vendor/floem/PATCHES.md`.
         .app_id(schemaic_core::APP_ID);
+    // macOS: the traffic lights, centred on the header's visible bar (above its
+    // bottom rule) at the interface scale saved last time. winit takes the
+    // offset only here, so a scale changed mid-session re-centres them at the
+    // next launch — `Chrome::traffic_lights_offset`. Read on its own rather than
+    // waiting for `ui_state` further down: that load is inside the window's
+    // view, which is too late to shape the window. Only where the OS draws the
+    // controls: elsewhere there is nothing to place, and no reason to read the
+    // file twice.
+    if !chrome.draws_own_controls() {
+        let scale = UiScale::from_key(&persist::load_ui_state().ui_scale);
+        let bar_h = schemaic_ui::theme::header_h_at(scale) - schemaic_ui::theme::HEADER_BORDER;
+        if let Some(offset) = chrome.traffic_lights_offset(bar_h) {
+            config = config.with_mac_os_config(move |c| c.traffic_lights_offset(offset));
+        }
+    }
     if let Some(icon) = app_icon() {
         config = config.window_icon(icon);
     }
