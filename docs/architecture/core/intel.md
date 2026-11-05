@@ -945,7 +945,8 @@ sorted for a binary search and `pub` for the live oracle alone. **Two different 
 `MARIADB_ONLY` and the list is right for both**: most are MariaDB's own, but `DES_ENCRYPT`,
 `DES_DECRYPT`, `ENCODE`, `ENCRYPT` and `OLD_PASSWORD` are functions MySQL *removed* in 8.0 and
 MariaDB kept — the question the list answers is "can the server in front of me call it", and for
-MySQL 8.4 the answer is no either way. `MYSQL_ONLY` is short *because* the catalog was
+MySQL 8.4 the answer is no either way. (MariaDB 13 has since dropped the `DES_*` pair too; see
+the version axis below.) `MYSQL_ONLY` is short *because* the catalog was
 transcribed from MariaDB's manual: the asymmetry is a property of how this file was written, not
 of the two servers.
 **Only the offer narrows; the checker goes on trusting the catalog whole**, which is the
@@ -964,8 +965,8 @@ the property — the popup not offering the name is, and `CatalogIndex`'s precom
 lists sit between the two. It asks with a *proper prefix* of each name, since `rank`'s dedup
 drops a candidate equal to what is already typed.
 **The spatial families are the largest thing this catalog has been missing, and the reason
-nobody saw them is a claim about `SQL_FUNCTIONS` that was false.** `FUNCTIONS` holds **463**
-entries now: 83 `ST_*` names callable on MySQL 8.4 and MariaDB 10.11 alike, and 73 MariaDB-only
+nobody saw them is a claim about `SQL_FUNCTIONS` that was false.** `FUNCTIONS` carries them
+now: 83 `ST_*` names callable on MySQL 8.4 and MariaDB 10.11 alike, and 73 MariaDB-only
 spellings — the 69 unprefixed OGC-v1 synonyms MariaDB kept and MySQL 8 removed, plus
 `ST_BOUNDARY`, `ST_ISRING`, `ST_POINTONSURFACE` and `ST_RELATE`. Until they landed `ST_Length`
 squiggled under correct SQL on the engine this app was built for first.
@@ -976,6 +977,25 @@ native function 'st_area'"* while the view does not list it — so the whole OGC
 that gap with every test in `live::mariadb_catalog` green. Anywhere the union of the two server
 views is described as what the server has, that is the false claim; the third oracle is the
 parser.
+**The catalog spans MariaDB *versions* as well as the two engines, and the flavour lists cannot
+say so.** `MARIADB_ONLY` and `MYSQL_ONLY` answer which *engine* has a name; nothing in
+`ServerFlavour` knows which version of it is in front of the tab. Two blocks at the tail of
+`FUNCTIONS` belong to a version: **MariaDB 11**, the names 11.8's `SQL_FUNCTIONS` reports and
+10.11's does not (`FORMAT_BYTES`, `UUID_V7`, the `VEC_*` family …), which squiggled under correct
+SQL on the newer server until they were added; and **MariaDB 13**, four found on a local
+Homebrew 13.0.2 — `MONTHS_BETWEEN`, `TO_NUMBER`, `TRUNC` and the aggregate `ST_COLLECT`, their
+arity measured by calling them at zero to three arguments and their behaviour by executing them.
+**`TRUNC` is the date form only**: `TRUNC(12.345, 1)` is `NULL` there, so its summary does not
+promise Oracle's numeric one. The first three are `MARIADB_ONLY`, MySQL 8.4 lacking them;
+`ST_COLLECT` is not, since MySQL has had it since 8.0.24. **The axis runs both ways**: 13.0.2's
+parser has dropped `DES_ENCRYPT`/`DES_DECRYPT` (`ERROR 1305`, while its `mysql.help_topic` still
+documents them), and the catalog keeps them because 11.x still calls them. The trade is the cheap
+direction on both sides — a 10.11 or 11.x tab is offered newer names it cannot call, and a 13.x
+tab the two `DES_*` — one extra row in a popup, against a squiggle under correct SQL for whoever
+is on the other version; narrowing it would need a version in `ServerFlavour`, which nothing else
+wants. The live tier's `NEWER_THAN_BASELINE` and `REMOVED_SINCE_BASELINE` are what excuse each
+on a server it does not fit, described with the rest of `live::mariadb_catalog` in
+`db/live-tests.md`.
 **`DEPRECATED_ALIASES` is the MySQL family's answer to `pg_builtins::is_suggested`, and it is
 the question `MARIADB_ONLY` could not be asked.** Those two lists say which *server* has a name;
 nothing said whether a name the server has is worth *suggesting*, and across 309 entries the
@@ -1007,7 +1027,7 @@ the distance is what produced this class in the first place.
 turning the PostgreSQL checker on is what forced it.** Both of the checker's loops used to walk
 the slice, mapping it to an upper-cased `String` per entry, twice over, per candidate word, per
 statement, on the editor's 120 ms debounce — affordable against MySQL's catalog (309 entries
-then, 463 now) and not
+then, 482 as of the MariaDB 13 block) and not
 against `PG_FUNCTIONS`' 2,706 — while the completion path walked the same slice undebounced. The
 index is a *rearrangement* of that slice and nothing else: nothing added, nothing filtered, so
 every answer is the answer the walk gave and only the cost differs. `lower` is every name

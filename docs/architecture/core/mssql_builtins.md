@@ -49,7 +49,8 @@ squiggles correct SQL for the user who has turned it on. `VECTOR_SEARCH` is docu
 Microsoft but is not in 17.0 CU9's parser even then, so it is not listed. **The trade is the
 cheap direction**: a tab on 2022 is offered these 25 and cannot call them, since nothing tells
 the catalog which version is in front of the tab — the same trade `intel::FUNCTIONS`'s MariaDB 11
-block makes against a 10.11 server (`live::mariadb_catalog`'s `NEWER_THAN_BASELINE`). The
+and MariaDB 13 blocks make against an older MariaDB (`live::mariadb_catalog`'s
+`NEWER_THAN_BASELINE`). The
 checker, trusting the catalog whole, likewise stays silent on 2022 over a 2025 name it cannot
 run; the server's own error is what the user sees there. Rowset functions (`OPENJSON`,
 `STRING_SPLIT`, `GENERATE_SERIES`, `OPENROWSET` …) are listed too — they are called, in `FROM` —

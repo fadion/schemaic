@@ -103,8 +103,8 @@ const NOT_CALLABLE: &[&str] = &["schemas"];
 /// **Excused only where the endpoint really lacks them.** The tests below drop
 /// a name from this list the moment the server in front of them reports it, so
 /// the excuse cannot outlive the versions it was written for —
-/// [`the_newer_names_are_reported_by_some_maria_db`] is what fails if the tier
-/// ever stops seeing a server new enough to have any of them.
+/// [`the_newer_names_are_a_version_boundary_and_not_a_dumping_ground`] is what
+/// keeps the list from drifting.
 ///
 /// A tab on 10.11 *is* offered these fifteen and cannot call them. That is the
 /// cheap direction and the same trade `intel::is_offered_builtin` already makes
@@ -127,7 +127,31 @@ const NEWER_THAN_BASELINE: &[&str] = &[
     "vec_distance_euclidean",
     "vec_fromtext",
     "vec_totext",
+    // MariaDB 13 — in 13.0.2's `SQL_FUNCTIONS`, absent from the 11.x CI leg.
+    "months_between",
+    "st_collect",
+    "to_number",
+    "trunc",
 ];
+
+/// Builtins **a newer MariaDB has removed**, which the catalog carries because
+/// an older server still has them — [`NEWER_THAN_BASELINE`]'s other direction.
+///
+/// The version axis runs both ways and that list only named one of them.
+/// `DES_ENCRYPT`/`DES_DECRYPT`, deprecated since 10.10, are gone from 13.0.2's
+/// parser (`ERROR 1305`, while `mysql.help_topic` on the same server still
+/// documents them) and callable on the 11.x CI leg. Without this list the 13.x
+/// leg reads them as invented names and the 11.x leg would read their removal
+/// from the catalog as two squiggles under correct SQL; both servers are right.
+///
+/// **The same trade, the same excuse rule.** A tab on 13.x is offered these
+/// and cannot call them — one extra row in a popup, against a squiggle under
+/// correct SQL for everyone on an older server — and narrowing it would need a
+/// version in `ServerFlavour`, as [`NEWER_THAN_BASELINE`] says. Each test
+/// excuses a name only where *this* endpoint lacks it, and
+/// [`the_removed_names_are_a_version_boundary_and_not_a_dumping_ground`] holds
+/// that every name here really is "no such function" wherever it is missing.
+const REMOVED_SINCE_BASELINE: &[&str] = &["des_decrypt", "des_encrypt"];
 
 /// Builtins MySQL 8 has and MariaDB 10.11 does not, so neither server view
 /// reports them and [`over_listing`] must account for them by hand.
@@ -279,8 +303,9 @@ async fn over_listing() {
         .filter(|n| !mysql_only().contains(n))
         // …and not a name this server is simply too old for. Keyed on what
         // *this* endpoint reports, so a newer one stops excusing it — see
-        // `NEWER_THAN_BASELINE`.
-        .filter(|n| !NEWER_THAN_BASELINE.contains(&n.as_str()))
+        // `NEWER_THAN_BASELINE` — or one it is too *new* for, which
+        // `REMOVED_SINCE_BASELINE` names.
+        .filter(|n| !is_version_bound(n))
         .cloned()
         .collect();
 
@@ -359,13 +384,13 @@ async fn over_listing() {
         .iter()
         .filter(|n| !known.contains(*n) && mysql_only().contains(n))
         .collect();
-    // The fourth part: names this endpoint is too old for. Zero on a server new
-    // enough to report them all, which is why the assertion below counts it
-    // rather than assuming it.
+    // The fourth part: names this endpoint is too old or too new for. Zero on
+    // a server that matches the catalog's every version, which is why the
+    // assertion below counts it rather than assuming it.
     let by_version: Vec<&String> = ours
         .iter()
         .filter(|n| !known.contains(*n) && !mysql_only().contains(n))
-        .filter(|n| NEWER_THAN_BASELINE.contains(&n.as_str()))
+        .filter(|n| is_version_bound(n))
         .collect();
     let by_parser = unreported.len();
     let not_in_functions = ours.iter().filter(|n| !functions.contains(*n)).count();
@@ -499,15 +524,20 @@ async fn the_newer_names_are_a_version_boundary_and_not_a_dumping_ground() {
         missing.len()
     );
 
-    // What this server actually reports of them — nothing on 10.11, all of them
-    // on 11.8.
+    // What this server actually reports of them — none on 10.11, the 11.x ones
+    // on 11.8, all of them on 13.0.2.
     let reported = server_names(FUNCTION_ORACLE, 200).await;
     let here: Vec<String> = NEWER_THAN_BASELINE
         .iter()
         .filter(|n| reported.contains(**n))
         .map(|n| (*n).to_string())
         .collect();
-    let uncallable = names_this_server_cannot_call(&here).await;
+    // "Never heard of", not `is_not_callable`: `1064` is the inconclusive
+    // answer `each_server_is_only_credited_with_the_builtins_it_really_has`
+    // explains, and `ST_COLLECT` gives it — an aggregate, so `(1,2)` is not its
+    // syntax while `ST_COLLECT(g)` runs. Reading it as "uncallable" condemned a
+    // name the server reports and executes.
+    let uncallable = names_the_server_has_never_heard_of(&here).await;
     assert!(
         uncallable.is_empty(),
         "{} reports {:?} in `SQL_FUNCTIONS` and will not call them, so they are \
@@ -516,6 +546,61 @@ async fn the_newer_names_are_a_version_boundary_and_not_a_dumping_ground() {
         MARIADB.endpoint(),
         uncallable
     );
+}
+
+/// **The removal excuse is spent where it is claimed**, as
+/// [`the_newer_names_are_a_version_boundary_and_not_a_dumping_ground`] spends
+/// [`NEWER_THAN_BASELINE`]'s.
+///
+/// A name on [`REMOVED_SINCE_BASELINE`] the catalog does not carry excuses
+/// nothing. And a name this endpoint does not report must be one its parser has
+/// **never heard of** (`1305`/`1630`): a `1064` or an arity error would mean the
+/// name is still here in some form, and the excuse would be hiding that.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_removed_names_are_a_version_boundary_and_not_a_dumping_ground() {
+    if !MARIADB.enabled() {
+        endpoint::note_skipped(&MARIADB);
+        return;
+    }
+    let ours = catalog_names();
+    let missing: Vec<&&str> = REMOVED_SINCE_BASELINE
+        .iter()
+        .filter(|n| !ours.contains(**n))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "`REMOVED_SINCE_BASELINE` names {} function(s) `intel::FUNCTIONS` does \
+         not carry, so they excuse nothing and the list has drifted: {missing:?}",
+        missing.len()
+    );
+
+    // Nothing on 11.x, both on 13.0.2.
+    let reported = server_names(FUNCTION_ORACLE, 200).await;
+    let gone: Vec<String> = REMOVED_SINCE_BASELINE
+        .iter()
+        .filter(|n| !reported.contains(**n))
+        .map(|n| (*n).to_string())
+        .collect();
+    let never_heard_of = names_the_server_has_never_heard_of(&gone).await;
+    let still_here: Vec<&String> = gone
+        .iter()
+        .filter(|n| !never_heard_of.contains(n))
+        .collect();
+    assert!(
+        still_here.is_empty(),
+        "{} does not report {still_here:?} in `SQL_FUNCTIONS` and yet its parser \
+         knows them, so `REMOVED_SINCE_BASELINE` is not describing a removal",
+        MARIADB.endpoint()
+    );
+}
+
+/// Is `name` (lower-case) a builtin one MariaDB version has and another lacks —
+/// on [`NEWER_THAN_BASELINE`] or [`REMOVED_SINCE_BASELINE`]?
+///
+/// One predicate for the three places that excuse a version, so the two lists
+/// cannot be honoured in one test and forgotten in the next.
+fn is_version_bound(name: &str) -> bool {
+    NEWER_THAN_BASELINE.contains(&name) || REMOVED_SINCE_BASELINE.contains(&name)
 }
 
 /// Every name in [`MYSQL_ONLY`] really is in the catalog, so the allowance
@@ -714,11 +799,12 @@ async fn each_server_is_only_credited_with_the_builtins_it_really_has() {
         let absent: HashSet<&str> = absent.into_iter().collect();
 
         // A name the *engine* has and this *version* does not is excused here
-        // and nowhere else — see `NEWER_THAN_BASELINE`, which also records why
-        // over-offering is the direction to accept.
+        // and nowhere else, whether this version is too old for it
+        // (`NEWER_THAN_BASELINE`, which also records why over-offering is the
+        // direction to accept) or too new (`REMOVED_SINCE_BASELINE`).
         let unlisted: Vec<&&str> = absent
             .difference(&expected)
-            .filter(|n| !NEWER_THAN_BASELINE.contains(&n.to_ascii_lowercase().as_str()))
+            .filter(|n| !is_version_bound(&n.to_ascii_lowercase()))
             .collect();
         assert!(
             unlisted.is_empty(),

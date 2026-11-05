@@ -441,8 +441,8 @@ tested (they share `history.rs`'s shape; a new one belongs here, not in the UI):
   closing `'` the literal lacked (`a_column_s_enum_members_are_offered_in_its_string`,
   `an_enum_member_is_written_as_a_literal_and_closes_its_quote`).
   **`add` asks `worth_offering` before it builds anything, which is `add_col`'s shape adopted
-  for `add_col`'s reason.** A PostgreSQL tab offers 863 builtins where a MySQL 8 one offers 341
-  (`FUNCTIONS`' 463 less `MARIADB_ONLY`, which contains every `DEPRECATED_ALIASES` name), and
+  for `add_col`'s reason.** A PostgreSQL tab offers 863 builtins where a MySQL 8 one offers 345
+  (`FUNCTIONS`' 482 less `MARIADB_ONLY`, which contains every `DEPRECATED_ALIASES` name), and
   every one of them was paying a `to_ascii_lowercase`, a `HashSet<String>` insert and an eagerly
   allocated `String` for its signature before the ranking below could drop it — on a path that
   is deliberately undebounced (`exec_after(Duration::ZERO)`, one tick per keystroke). `detail`
