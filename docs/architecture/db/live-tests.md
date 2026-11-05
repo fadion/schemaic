@@ -912,6 +912,23 @@ the paragraph below covers. A wrong password is asserted to be
 carries `'`, `\` and `*` on purpose — the first two are `ddl_string`'s job (and MySQL's
 `NO_BACKSLASH_ESCAPES` is where that went wrong) and the third is the character the account
 editor's mask is written in.
+**A refused login says why when the reason is the server's account set rather than the code.**
+The three password-login tests — `a_created_account_can_log_in_with_the_password_it_was_given`,
+`a_reset_password_replaces_the_one_the_account_had` and
+`a_salted_password_logs_in_on_create_and_on_reset` — log in through
+`ScratchAccount::log_in_or_say_why`. On an engine whose accounts have hosts
+(`users::accounts_have_hosts`) an **anonymous account** — `''@'localhost'`, which Homebrew's
+MariaDB and `mariadb-install-db` without `--skip-test-db` both create — outranks `'name'@'%'` for
+a client the server sees as `localhost`, because MySQL matches the most specific host before the
+user; so a scratch account at the default `%` is refused with the password it was given, and
+"Access denied" reads exactly like the mangled credential these tests exist to catch. Measured on
+Homebrew's MariaDB 13.0.2: all three failed that way. So on a refusal of an account at `%`, the
+failure names the server's anonymous accounts at the **loopback** hosts (`localhost`, `127.0.0.1`,
+`::1`) and the `DROP USER` that removes them, and only *counts* any others — those are the
+machine's own host names, which do not belong in test output or CI logs. **It is a failure, not a skip, and it never drops them itself**: a
+skip would quietly remove the only tests that write a credential to a server from every machine
+that has those accounts, and dropping them is a change to somebody's server this tier has no
+business making.
 **`a_reset_password_replaces_the_one_the_account_had` is the repair, and it is here because which
 engine spells it which way is a claim only a server settles.** `ALTER USER … IDENTIFIED BY` and
 `ALTER ROLE … PASSWORD` are two statements for one act, and MySQL's `ALTER ROLE` is about roles
