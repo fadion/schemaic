@@ -9,21 +9,6 @@ the architecture document (`architecture.md` and `architecture/`), an instructio
 work belongs in `AGENTS.md`. When a phase here lands, its facts move into the architecture files in
 the same change and the phase is deleted from this file rather than ticked off.
 
-The macOS entry below came out of the first hands-on run on a Mac, as did quitting when the last
-window closes and reading connection secrets when a connection is first used, both of which have
-landed (`docs/architecture/core/secrets.md`). It is meant to ship with them, and with whatever the
-next macOS round turns up, as one release.
-
-## macOS: check the CLI through its PATH symlink against the keychain
-
-On macOS the CLI is the app's own binary, so the keychain sees the same app that stored the secrets
-(`docs/architecture/cli/overview.md`). That was reasoned, not observed, and nobody has run it on a
-Mac. Check it in the same macOS round as the lazy secret reads. After *Always allow* in the GUI,
-run `schemaic query` through the `~/.local/bin` symlink Settings installs, and it must not prompt.
-If it prompts per item, `--password-stdin` is the workaround, and the PATH entry should point at
-the real binary inside the bundle instead of the symlink. This is a code-signature question,
-independent of reading secrets lazily.
-
 ## Test against the hosted services
 
 Every engine has been tested only against a self-hosted server. Each service below gets a free tier.

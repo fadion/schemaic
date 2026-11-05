@@ -11,7 +11,13 @@ floem**, which is what splitting `schemaic-conn` out of `schemaic-app` was for. 
 platform. On Linux and macOS the `schemaic` binary takes an argv branch into `run::main` before it
 builds a window, the shape `--mcp-serve` already had, so the CLI *is* the app's own executable —
 deliberately so on macOS, where the keychain binds an item's ACL to the creating application and a
-second binary would prompt for every password the GUI had stored. On Windows the app is
+second binary would prompt for every password the GUI had stored. That was observed on macOS
+26.7.2 with a debug build: once the GUI had read a MariaDB password and been given *Always allow*,
+`schemaic query` through the `~/.local/bin` link Settings installs answered three runs in about a
+second each with no dialog, where before the grant every run raised one. The grant follows the
+binary, not the path — each rebuild was asked again at the next GUI launch — and whether an update
+of the unsigned release `.app` keeps it was not checked (`core/secrets.md` records an update that
+asked again). On Windows the app is
 `windows_subsystem = "windows"` and therefore has no console to print to, so a second,
 console-subsystem binary is built from this crate and shipped beside it as `schemaic.com`:
 `PATHEXT` is `.COM;.EXE;…`, so a bare `schemaic` at a prompt resolves to the CLI while shortcuts,
