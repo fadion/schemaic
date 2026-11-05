@@ -190,20 +190,51 @@ fn edit_settings(create: bool, edit: impl Fn(&str) -> Option<SettingsEdit>) -> b
     let Some(path) = settings_path() else {
         return false;
     };
-    let Some(current) = settings_to_edit(create, std::fs::read_to_string(&path).ok()) else {
-        return false;
-    };
-    match edit(&current) {
-        // Declined: the document is not a JSON object, and losing the user's
-        // file is worse than losing this session's database tools.
-        None => false,
-        Some(SettingsEdit::Unchanged) => true,
-        Some(SettingsEdit::Write(next)) => {
+    match settings_plan(create, std::fs::read_to_string(&path).ok(), edit) {
+        SettingsPlan::Holds => true,
+        SettingsPlan::Declined => false,
+        SettingsPlan::Write(next) => {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
             persist::write_file_atomic(&path, next.as_bytes()).is_ok()
         }
+    }
+}
+
+/// What [`edit_settings`] does with the file, decided without touching it.
+#[derive(Debug, PartialEq, Eq)]
+enum SettingsPlan {
+    /// The file already says what it was asked to say; nothing is written.
+    Holds,
+    /// The edit was refused, and the caller must hear that it did not take.
+    Declined,
+    /// Write this document.
+    Write(String),
+}
+
+/// The decision behind [`edit_settings`], with the file's contents as an
+/// argument — `existing` is `None` when it could not be read — so the
+/// composition of [`settings_to_edit`] with the edit is what a test reaches,
+/// rather than each half alone.
+fn settings_plan(
+    create: bool,
+    existing: Option<String>,
+    edit: impl Fn(&str) -> Option<SettingsEdit>,
+) -> SettingsPlan {
+    let Some(current) = settings_to_edit(create, existing) else {
+        // Only a withdraw from a file that is not there: no file grants
+        // nothing, which is what a withdraw asks the file to say. Reading this
+        // as a failure logged a "still granted" error at every launch for
+        // everyone without Antigravity.
+        return SettingsPlan::Holds;
+    };
+    match edit(&current) {
+        // Declined: the document is not a JSON object, and losing the user's
+        // file is worse than losing this session's database tools.
+        None => SettingsPlan::Declined,
+        Some(SettingsEdit::Unchanged) => SettingsPlan::Holds,
+        Some(SettingsEdit::Write(next)) => SettingsPlan::Write(next),
     }
 }
 
@@ -814,6 +845,42 @@ mod tests {
             Some(doc.clone())
         );
         assert_eq!(settings_to_edit(true, Some(doc.clone())), Some(doc));
+    }
+
+    /// **A withdraw from a file that is not there has succeeded, not failed.**
+    /// The startup sweep withdraws at every launch whether or not a session
+    /// crashed, and for everyone without Antigravity the file is absent:
+    /// [`settings_to_edit`] rightly declines to make a document, and
+    /// `edit_settings` read that refusal as a withdraw that did not take — so
+    /// every such launch logged an `ERROR` saying Schemaic's tool rules were
+    /// "still granted" in a file that does not exist. Asked through the same
+    /// composition the caller runs, which is where the bug was.
+    #[test]
+    fn withdrawing_from_a_missing_settings_file_holds_rather_than_fails() {
+        let all = crate::ai::ai_allowed_tools(true, true);
+        let rules = antigravity_allow_rules(&all);
+        // The sweep's call: withdraw, no file.
+        assert_eq!(
+            settings_plan(false, None, |cur| antigravity_settings_without_rules(
+                cur, &rules
+            )),
+            SettingsPlan::Holds
+        );
+        // A withdraw the surgery refuses still fails — the one the log is for.
+        assert_eq!(
+            settings_plan(false, Some("[1, 2]".into()), |cur| {
+                antigravity_settings_without_rules(cur, &rules)
+            }),
+            SettingsPlan::Declined
+        );
+        // And a withdraw from a file holding our rules writes them out.
+        let granted = format!(r#"{{"permissions":{{"allow":["{}"]}}}}"#, rules[0]);
+        let SettingsPlan::Write(left) = settings_plan(false, Some(granted), |cur| {
+            antigravity_settings_without_rules(cur, &rules)
+        }) else {
+            panic!("our rule must be withdrawn from a file that has it");
+        };
+        assert!(!left.contains(&rules[0]), "{left}");
     }
 
     #[test]
