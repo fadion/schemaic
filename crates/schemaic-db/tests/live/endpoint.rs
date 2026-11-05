@@ -460,6 +460,12 @@ impl Target {
         self.var("USER", self.default_user)
     }
 
+    /// That account's password — for a test that has to hand it over some way
+    /// other than [`Self::base_db`] does, as a `PasswordSource` read late.
+    pub fn password(&self) -> String {
+        self.var("PASSWORD", "schemaic")
+    }
+
     /// Every type case this server answers for.
     pub fn type_cases(&self) -> impl Iterator<Item = &'static TypeCase> {
         self.types.iter().chain(self.extra_types)

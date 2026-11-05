@@ -866,6 +866,24 @@ impl Db {
             .map_err(|e| DbError::Connect(e.to_string()))?
     }
 
+    /// This handle with its [`PasswordSource`] already read, for a method about
+    /// to draw a deadline: **the clock is the server's, not the keychain's.**
+    ///
+    /// Every [`PING_TIMEOUT`]-bounded method draws its bound around `open`, and
+    /// `open` is where the password is read — so on macOS, where that read
+    /// waits on a keychain dialog until the user answers it, a dialog left open
+    /// five seconds failed the schema load with "timed out" and had the health
+    /// check say "Disconnected" about a server that was up. Read first, then
+    /// start the clock. A handle with no source is returned as it is.
+    pub(crate) async fn with_password_read(&self) -> Result<Db, DbError> {
+        let mut db = self.clone();
+        if db.pass_source.is_some() {
+            db.pass = self.password().await?;
+            db.pass_source = None;
+        }
+        Ok(db)
+    }
+
     /// Attach the server's own `host:port` to a handle built by
     /// [`Self::from_parts`] from a tunnelled endpoint — the endpoint handoff's
     /// half of what [`Self::connect`] sets, so the MCP subprocess signs a cloud
@@ -1473,11 +1491,13 @@ impl Db {
         // under a modal still showing the last snapshot with no error.
         //
         // The deadline is over the whole dispatch, the shape the two activity
-        // methods took, so it covers the engine arms as well as the connect.
+        // methods took, so it covers the engine arms as well as the connect —
+        // but not the password read (`with_password_read`).
+        let this = &self.with_password_read().await?;
         let fetch = async {
-            match self.engine {
+            match this.engine {
                 Engine::Postgres => {
-                    return pg::fetch_table(self, database, schema, table, order_by, limit, cancel)
+                    return pg::fetch_table(this, database, schema, table, order_by, limit, cancel)
                         .await;
                 }
                 Engine::Sqlite => {
@@ -1489,15 +1509,15 @@ impl Db {
                         order_by_clause(order_by, ident_sqlite),
                         limit
                     );
-                    return self
+                    return this
                         .fetch_query_enforced(None, &sql, limit, cancel, Enforce::Generated)
                         .await;
                 }
                 Engine::MySql => {
-                    mysql::fetch_table(self, database, schema, table, order_by, limit, cancel).await
+                    mysql::fetch_table(this, database, schema, table, order_by, limit, cancel).await
                 }
                 Engine::MsSql => {
-                    mssql::fetch_table(self, database, schema, table, order_by, limit, cancel).await
+                    mssql::fetch_table(this, database, schema, table, order_by, limit, cancel).await
                 }
             }
         };
@@ -1972,19 +1992,21 @@ impl Db {
     /// `timeout` so a dead host/tunnel can't hang the caller. `Ok(())` means the
     /// server answered. [`PING_TIMEOUT`] is the app's answer for `timeout`.
     pub async fn ping(&self, timeout: std::time::Duration) -> Result<(), DbError> {
-        match self.engine {
-            Engine::Postgres => return pg::ping(self, timeout).await,
+        // The password first, so `timeout` times the server — `with_password_read`.
+        let this = &self.with_password_read().await?;
+        match this.engine {
+            Engine::Postgres => return pg::ping(this, timeout).await,
             Engine::Sqlite => {
                 // The timeout still applies: a file on a disconnected network
                 // share can block in `open` for as long as the OS lets it.
-                return match tokio::time::timeout(timeout, sqlite::ping(self)).await {
+                return match tokio::time::timeout(timeout, sqlite::ping(this)).await {
                     Ok(r) => r,
                     Err(_) => Err(DbError::ConnectFailed(ConnectFailure::TimedOut)),
                 };
             }
             // Bounded inside, like its two neighbours — see `mysql::ping`.
-            Engine::MySql => mysql::ping(self, timeout).await,
-            Engine::MsSql => mssql::ping(self, timeout).await,
+            Engine::MySql => mysql::ping(this, timeout).await,
+            Engine::MsSql => mssql::ping(this, timeout).await,
         }
     }
 
@@ -1997,15 +2019,20 @@ impl Db {
     /// gives up at the same five seconds and says "Disconnected". They have to
     /// agree, or the tree sits empty under a header that has already explained
     /// why and the user has nothing to do but wait out the OS.
+    ///
+    /// **The bound times the server, not the password read** — read first
+    /// ([`Self::with_password_read`]), or a keychain dialog the user has not
+    /// answered yet spends it.
     pub async fn fetch_databases(&self) -> Result<Vec<String>, DbError> {
-        match self.engine {
+        let this = &self.with_password_read().await?;
+        match this.engine {
             // Both already bounded inside, and PostgreSQL's needs to be bounded
             // *around* the sequence rather than per attempt: `connect_maintenance`
             // tries three candidate databases in turn.
-            Engine::Postgres => pg::fetch_databases(self).await,
-            Engine::Sqlite => sqlite::fetch_databases(self).await,
-            Engine::MySql => mysql::fetch_databases(self).await,
-            Engine::MsSql => mssql::fetch_databases(self).await,
+            Engine::Postgres => pg::fetch_databases(this).await,
+            Engine::Sqlite => sqlite::fetch_databases(this).await,
+            Engine::MySql => mysql::fetch_databases(this).await,
+            Engine::MsSql => mssql::fetch_databases(this).await,
         }
     }
 
@@ -2017,9 +2044,11 @@ impl Db {
         &self,
     ) -> Result<Vec<schemaic_core::schema::ListedDatabase>, DbError> {
         use schemaic_core::schema::ListedDatabase;
-        match self.engine {
-            Engine::MsSql => mssql::list_databases(self).await,
-            _ => Ok(self
+        // Read before SQL Server's arm draws its bound — `with_password_read`.
+        let this = &self.with_password_read().await?;
+        match this.engine {
+            Engine::MsSql => mssql::list_databases(this).await,
+            _ => Ok(this
                 .fetch_databases()
                 .await?
                 .into_iter()
@@ -2238,11 +2267,13 @@ impl Db {
         if !activity::supports_activity(self.engine.dialect()) {
             return Err(DbError::Query(NO_SESSIONS_MSG.to_string()));
         }
+        // The bound times the server, not the password read.
+        let this = &self.with_password_read().await?;
         let poll = async {
-            match self.engine {
-                Engine::Postgres => pg::fetch_sessions(self).await,
-                Engine::MySql => mysql::fetch_sessions(self).await,
-                Engine::MsSql => mssql::fetch_sessions(self).await,
+            match this.engine {
+                Engine::Postgres => pg::fetch_sessions(this).await,
+                Engine::MySql => mysql::fetch_sessions(this).await,
+                Engine::MsSql => mssql::fetch_sessions(this).await,
                 // Unreachable — `supports_activity` above is the gate.
                 Engine::Sqlite => Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
             }
@@ -2267,11 +2298,13 @@ impl Db {
         if !activity::supports_activity(self.engine.dialect()) {
             return Err(DbError::Query(NO_SESSIONS_MSG.to_string()));
         }
+        // The bound times the server, not the password read.
+        let this = &self.with_password_read().await?;
         let poll = async {
-            match self.engine {
-                Engine::Postgres => pg::fetch_locks(self).await,
-                Engine::MySql => mysql::fetch_locks(self).await,
-                Engine::MsSql => mssql::fetch_locks(self).await,
+            match this.engine {
+                Engine::Postgres => pg::fetch_locks(this).await,
+                Engine::MySql => mysql::fetch_locks(this).await,
+                Engine::MsSql => mssql::fetch_locks(this).await,
                 // Unreachable — `supports_activity` above is the gate.
                 Engine::Sqlite => Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
             }
@@ -2316,11 +2349,13 @@ impl Db {
         }
         let limit = wl::statement_limit(Some(limit));
         let database = database.or(self.database());
+        // The bound times the server, not the password read.
+        let this = &self.with_password_read().await?;
         let read = async {
-            match self.engine {
-                Engine::Postgres => pg::fetch_top_statements(self, database, order, limit).await,
-                Engine::MySql => mysql::fetch_top_statements(self, order, limit).await,
-                Engine::MsSql => mssql::fetch_top_statements(self, database, order, limit).await,
+            match this.engine {
+                Engine::Postgres => pg::fetch_top_statements(this, database, order, limit).await,
+                Engine::MySql => mysql::fetch_top_statements(this, order, limit).await,
+                Engine::MsSql => mssql::fetch_top_statements(this, database, order, limit).await,
                 // Unreachable — `supports_statement_stats` above is the gate.
                 Engine::Sqlite => Ok(StatementReport::Unavailable(Unavailable::NotSupported)),
             }
@@ -2349,9 +2384,11 @@ impl Db {
         }
         let limit = wl::statement_limit(Some(limit));
         let database = database.or(self.database());
+        // The bound times the server, not the password read.
+        let this = &self.with_password_read().await?;
         let read = async {
-            match self.engine {
-                Engine::MsSql => mssql::fetch_missing_indexes(self, database, limit).await,
+            match this.engine {
+                Engine::MsSql => mssql::fetch_missing_indexes(this, database, limit).await,
                 // Unreachable — `supports_missing_index_hints` above is the gate.
                 Engine::Postgres | Engine::MySql | Engine::Sqlite => Ok(Vec::new()),
             }
@@ -2391,12 +2428,14 @@ impl Db {
         if kind == server_vars::VarKind::Status && !server_vars::supports_status(dialect) {
             return Err(DbError::QueryFailed(QueryFailure::NoStatusList));
         }
+        // The bound times the server, not the password read.
+        let this = &self.with_password_read().await?;
         let fetch = async {
-            match self.engine {
-                Engine::MySql => mysql::fetch_server_vars(self, kind).await,
-                Engine::Postgres => pg::fetch_server_vars(self).await,
-                Engine::MsSql => mssql::fetch_server_vars(self).await,
-                Engine::Sqlite => sqlite::fetch_server_vars(self).await,
+            match this.engine {
+                Engine::MySql => mysql::fetch_server_vars(this, kind).await,
+                Engine::Postgres => pg::fetch_server_vars(this).await,
+                Engine::MsSql => mssql::fetch_server_vars(this).await,
+                Engine::Sqlite => sqlite::fetch_server_vars(this).await,
             }
         };
         tokio::time::timeout(PING_TIMEOUT, fetch)
@@ -2432,11 +2471,13 @@ impl Db {
         if !activity::supports_kill(self.engine.dialect()) {
             return Err(DbError::Query(NO_SESSIONS_MSG.to_string()));
         }
+        // The bound times the server, not the password read.
+        let this = &self.with_password_read().await?;
         let kill = async {
-            match self.engine {
-                Engine::Postgres => pg::kill_session(self, id, kind).await,
-                Engine::MySql => mysql::kill_session(self, id, kind).await,
-                Engine::MsSql => mssql::kill_session(self, id, kind).await,
+            match this.engine {
+                Engine::Postgres => pg::kill_session(this, id, kind).await,
+                Engine::MySql => mysql::kill_session(this, id, kind).await,
+                Engine::MsSql => mssql::kill_session(this, id, kind).await,
                 // Unreachable — `supports_kill` above is the gate.
                 Engine::Sqlite => Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
             }

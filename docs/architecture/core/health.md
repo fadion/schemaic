@@ -4,7 +4,8 @@
 ping-or-skip + the delay until the next tick (exponential `backoff` on consecutive failures,
 longer interval for SSH-tunnelled connections, skip while the window is unfocused / a query is
 already in flight / the tunnel isn't up). The app owns only the timer, `Db::ping` and the
-landing guard: a ping is up to five seconds of waiting, so `main.rs`'s `check_landing` stamps
+landing guard: a ping is up to five seconds of waiting on the server — after the keyring read,
+which is not on that clock (`db/overview.md`) — so `main.rs`'s `check_landing` stamps
 each check with `(connection id, generation)` and a check that lands after a switch — or after
 a newer check of the same connection — **writes** nothing: not `ConnStatus`, not the failure
 count `health::record` folds. Without it, leaving a dead connection for a healthy one repainted

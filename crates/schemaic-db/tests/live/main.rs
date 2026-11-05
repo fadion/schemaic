@@ -99,6 +99,7 @@ live_suite!(
     ],
     suite: [
         a_ping_reaches_the_server,
+        a_slow_password_read_is_not_charged_to_the_servers_deadline,
         server_variables_list_the_servers_settings,
         a_seeded_table_round_trips_through_a_query,
         introspection_finds_the_seeded_table,
