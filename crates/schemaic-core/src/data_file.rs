@@ -376,4 +376,15 @@ mod tests {
         assert_eq!(select_sql("sales"), "SELECT * FROM sales");
         assert_eq!(select_sql("Sales 2026"), "SELECT * FROM \"Sales 2026\"");
     }
+
+    /// **A file's stem can be a word DuckDB will not take as a bare name**
+    /// though it reserves nothing: `semi.csv` opened a tab whose
+    /// `SELECT * FROM semi` was a parser error (`SEMI JOIN`). `map` is a
+    /// keyword DuckDB still takes as a table name.
+    #[test]
+    fn a_stem_duckdb_reads_as_a_join_keyword_is_quoted() {
+        assert_eq!(select_sql("semi"), "SELECT * FROM \"semi\"");
+        assert_eq!(select_sql("left"), "SELECT * FROM \"left\"");
+        assert_eq!(select_sql("map"), "SELECT * FROM map");
+    }
 }

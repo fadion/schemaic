@@ -39,6 +39,8 @@
 //!
 //! [`DUCKDB_RESERVED`] is `duckdb_keywords()`'s `reserved` category,
 //! upper-cased: the words DuckDB refuses as a bare name.
+//! [`DUCKDB_TYPE_FUNCTION`] is its `type_function` category less the words
+//! also in `column_name`: refused as a bare name too, though not reserved.
 //!
 //! `db::duckdb`'s `the_builtin_catalogue_is_the_linked_engines` rebuilds both
 //! from the engine and compares, so a version bump that changes either fails a
@@ -3694,4 +3696,45 @@ pub const DUCKDB_RESERVED: &[&str] = &[
     "WHERE",
     "WINDOW",
     "WITH",
+];
+
+/// The words DuckDB will not take as a bare table or column name though it
+/// does not reserve them, upper-case, in order: its `type_function` keywords
+/// that are not also `column_name` ones. These are PostgreSQL's
+/// `type_func_name_keyword`s — the join family, `LIKE`, `IS` — and DuckDB's
+/// own `ANTI`, `SEMI`, `ASOF` and `POSITIONAL`. Each is a parser error as
+/// `SELECT * FROM semi` and as a column, and an alias only after `AS`
+/// (measured on 2.0.0); the six words in both categories (`MAP`, `STRUCT`,
+/// `COLUMNS` …) bind as names, so they are left out.
+pub const DUCKDB_TYPE_FUNCTION: &[&str] = &[
+    "ANTI",
+    "ASOF",
+    "AT",
+    "AUTHORIZATION",
+    "BINARY",
+    "BY",
+    "COLLATION",
+    "CONCURRENTLY",
+    "CROSS",
+    "FREEZE",
+    "FULL",
+    "GLOB",
+    "ILIKE",
+    "INNER",
+    "IS",
+    "ISNULL",
+    "JOIN",
+    "LEFT",
+    "LIKE",
+    "NATURAL",
+    "NOTNULL",
+    "OUTER",
+    "OVERLAPS",
+    "POSITIONAL",
+    "RIGHT",
+    "SEMI",
+    "SIMILAR",
+    "TABLESAMPLE",
+    "UNPACK",
+    "VERBOSE",
 ];

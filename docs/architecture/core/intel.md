@@ -1501,7 +1501,10 @@ those lists deliberately lean towards missing one. `must_quote_ident` asks wheth
 bare **identifier**, a table or column name, which is the question a quoter has: miss a word
 there and the SQL emitted does not parse. On MySQL and PostgreSQL the two coincide, so
 `alias_ok_but_unquotable` is empty for both — a reserved word is reserved everywhere and one
-list answers both. (SQL Server's holds the six documented words its parser accepts, above.) SQLite is where they come apart, because its parser falls back to treating
+list answers both. (SQL Server's holds the six documented words its parser accepts, above;
+DuckDB's is `DUCKDB_TYPE_FUNCTION`, the thirty `type_function` keywords — `SEMI`, `JOIN`,
+`LIKE` — that are no reserved word yet no bare name either, which `SELECT * FROM semi` for a
+`semi.csv` view found — `duckdb_builtins.rs`'s entry has the measurement.) SQLite is where they come apart, because its parser falls back to treating
 most of its ~147 keywords as identifiers wherever the grammar allows one: `CAST`, `IF` and
 `RAISE` are refused as a bare name yet are perfectly good `AS` aliases. Until the two were
 split, `export::ident_if_needed` and `filter::needs_quoting` were asking the **alias** set, so

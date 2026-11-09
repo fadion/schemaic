@@ -10905,10 +10905,16 @@ const NON_RESERVED_KEYWORDS: &[&str] = &[
 /// questions come apart — see [`must_quote_ident`] — and SQL Server, whose
 /// documented list holds six words its parser accepts as names (see
 /// [`MSSQL_RESERVED`]); bracketing one costs nothing, and a later version may
-/// start refusing it.
+/// start refusing it. And DuckDB, whose grammar is PostgreSQL's but whose
+/// keyword list sorts the `type_function` words apart from the reserved ones
+/// ([`crate::duckdb_builtins::DUCKDB_TYPE_FUNCTION`]).
 fn alias_ok_but_unquotable(dialect: SqlDialect) -> &'static [&'static str] {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::DuckDb => &[],
+        SqlDialect::MySql | SqlDialect::Postgres => &[],
+        // `SEMI`, `JOIN`, `LIKE` …: not reserved, so the typo checker and
+        // the alias rules leave them be, but a parser error as a bare table
+        // or column name — `SELECT * FROM semi` was, for `semi.csv`.
+        SqlDialect::DuckDb => crate::duckdb_builtins::DUCKDB_TYPE_FUNCTION,
         SqlDialect::MsSql => &[
             "DISK",
             "DUMP",

@@ -4276,6 +4276,40 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(schemaic_core::duckdb_builtins::DUCKDB_RESERVED, words);
+        let words: Vec<String> = c
+            .prepare(
+                "SELECT upper(keyword_name) FROM duckdb_keywords() \
+                 WHERE keyword_category = 'type_function' AND keyword_name NOT IN \
+                 (SELECT keyword_name FROM duckdb_keywords() \
+                  WHERE keyword_category = 'column_name') ORDER BY 1",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(schemaic_core::duckdb_builtins::DUCKDB_TYPE_FUNCTION, words);
+    }
+
+    /// **Every word the quoter holds unnameable is one DuckDB refuses bare,
+    /// and the quoted spelling binds** — a view named for each, read back
+    /// through `ident_if_needed`.
+    #[test]
+    fn a_type_function_keyword_is_quoted_and_then_names_a_view() {
+        use schemaic_core::export::ident_if_needed;
+        let db = mem("typefunc");
+        let (_i, c) = connect(&db).unwrap();
+        for w in schemaic_core::duckdb_builtins::DUCKDB_TYPE_FUNCTION {
+            let w = w.to_ascii_lowercase();
+            assert!(
+                c.execute_batch(&format!("CREATE VIEW {w} AS SELECT 1 AS x"))
+                    .is_err(),
+                "{w} is taken bare"
+            );
+            let q = ident_if_needed(&w, SqlDialect::DuckDb);
+            c.execute_batch(&format!("CREATE VIEW {q} AS SELECT 1 AS x; DROP VIEW {q}"))
+                .unwrap_or_else(|e| panic!("{q}: {e}"));
+        }
     }
 
     /// A dump of every table in `db`, as the app's writer writes it.
