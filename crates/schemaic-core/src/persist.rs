@@ -809,11 +809,40 @@ impl SavedTabsFile {
     /// `active` is re-pointed at the survivor nearest the one that was active, so
     /// the index cannot outrun the shortened list.
     pub fn unsaved_files_only(&self) -> SavedTabsFile {
+        self.keep(|t| t.path.is_some() && t.file_dirty)
+    }
+
+    /// The tabs a save writes: all but a **data session's query tabs**
+    /// (`Connection::is_data_session`).
+    ///
+    /// The session's connection is never saved (`Connection::to_save`), so a
+    /// quit that kept its tab handed it at the next launch to whichever saved
+    /// connection was active (`Connection::rebind_tab`) — a MariaDB tab
+    /// selecting from a view in a `memory` database no server has. Closing a
+    /// session drops its tabs; a quit now ends it the same way. A **file**
+    /// tab is kept: its text is the file's, and a dirty one is held nowhere
+    /// else, so it is rebound like any tab whose connection went.
+    ///
+    /// A tab on a connection `connections` does not hold is no session's and
+    /// is kept, for the restore's own rule.
+    pub fn without_session_queries(&self, connections: &[Connection]) -> SavedTabsFile {
+        let session = |id: u64| {
+            connections
+                .iter()
+                .any(|c| c.id == id && c.is_data_session())
+        };
+        self.keep(|t| t.path.is_some() || !session(t.conn_id))
+    }
+
+    /// The tabs `keep` answers yes for, with `active` re-pointed at the
+    /// survivor nearest the one that was active, so the index cannot outrun
+    /// the shortened list.
+    fn keep(&self, keep: impl Fn(&SavedTab) -> bool) -> SavedTabsFile {
         let kept: Vec<usize> = self
             .tabs
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.path.is_some() && t.file_dirty)
+            .filter(|(_, t)| keep(t))
             .map(|(i, _)| i)
             .collect();
         let active = kept
@@ -4370,6 +4399,57 @@ mod tests {
         assert_eq!(at(0), 0, "itself");
         assert_eq!(at(1), 1, "the query tab is gone; the next survivor");
         assert_eq!(at(2), 1, "itself, renumbered");
+    }
+
+    /// **A data session's query tab ends with the session.** Its connection
+    /// is never saved, so a quit that kept the tab handed it, at the next
+    /// launch, to whichever saved connection was active — a MariaDB tab
+    /// selecting from a view in a `memory` database that no server has. A
+    /// file tab is kept: its text is the file's, and dirty it is held
+    /// nowhere else.
+    #[test]
+    fn a_data_sessions_query_tabs_are_not_saved() {
+        use crate::connection::Connection;
+        let conns = vec![
+            Connection {
+                file: r"C:\data\shop.duckdb".into(),
+                ..Connection::data_session(1, "shop".into(), String::new(), None)
+            },
+            Connection::data_session(9, "sales.csv".into(), "memory:session-1".into(), None),
+        ];
+        let on = |conn_id: u64, tab: super::SavedTab| super::SavedTab { conn_id, ..tab };
+        let file = super::SavedTabsFile {
+            tabs: vec![
+                on(1, saved(None, false, "select 1")),
+                on(9, saved(None, false, "SELECT * FROM sales")),
+                on(9, saved(Some("/sql/a.sql"), true, "a")),
+                on(9, saved(Some("/sql/b.sql"), false, "b")),
+                on(1, saved(None, false, "select 2")),
+            ],
+            active: 1,
+        };
+        let kept = file.without_session_queries(&conns);
+        let queries: Vec<&str> = kept.tabs.iter().map(|t| t.query.as_str()).collect();
+        assert_eq!(queries, ["select 1", "a", "b", "select 2"]);
+        assert_eq!(kept.active, 1, "the next survivor after the dropped tab");
+        let none = super::SavedTabsFile {
+            tabs: vec![on(9, saved(None, false, "q"))],
+            active: 0,
+        }
+        .without_session_queries(&conns);
+        assert!(none.tabs.is_empty());
+        assert_eq!(none.active, 0);
+    }
+
+    /// A tab on a connection the list does not hold is no session's — it is
+    /// left for the restore's own rule (`Connection::rebind_tab`).
+    #[test]
+    fn a_tab_on_an_unknown_connection_is_not_a_sessions() {
+        let file = super::SavedTabsFile {
+            tabs: vec![saved(None, false, "q")],
+            active: 0,
+        };
+        assert_eq!(file.without_session_queries(&[]).tabs.len(), 1);
     }
 
     /// A closed tab is a saved tab beside its label — the same flat keys

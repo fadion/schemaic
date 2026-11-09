@@ -514,8 +514,16 @@ made in it goes, the data files are only read) rather than about a password it n
 **A session is never written**: `persist_conns` writes `Connection::to_save` and `active_to_save`,
 and the connections export filters through `to_save` before `is_untouched_new`. The high-water
 mark still counts a session's id, so no later connection takes the id its chat or history was kept
-under. Across a restart a session's tabs are rebound like a deleted connection's
-(`Connection::rebind_tab`, under `ui/lib.rs`).
+under. **Nor are its query tabs**: `session_snapshot` ends in
+`SavedTabsFile::without_session_queries`, so the debounced save and the quit's flush both drop
+them. A quit used to keep them, and at the next launch `Connection::rebind_tab` (under
+`ui/lib.rs`) handed each to the startup-active saved connection — a MariaDB tab selecting from a
+view in a `memory` database with source `["memory", …]`. Closing the session through the
+connection list already dropped them; a quit now ends it the same way
+(`a_data_sessions_query_tabs_are_not_saved`). A **file** tab on a session is kept — its text is
+the file's, and a dirty one is held nowhere else — and is rebound like a deleted connection's
+tab; so is a tab whose id the list does not hold at all, which is no session's and is left to
+`rebind_tab`'s rule (`a_tab_on_an_unknown_connection_is_not_a_sessions`).
 **Closing a modified file tab asks too, and `guard_close` is where both close questions live.**
 It has `GuardTxFn`'s signature (aliased `GuardCloseFn`) and wraps `guard_tx`, so it drops into
 every path that already took one — `close_tab` (×, middle-click, Ctrl+W) and `close_tabs_seq`,

@@ -9340,6 +9340,9 @@ fn app_view(
                         .collect(),
                 }
             })
+            // A data session's query tabs end with it, as its connection does
+            // (`SavedTabsFile::without_session_queries`).
+            .without_session_queries(&connections.get_untracked())
         });
 
     // **Write the session now, because the window is going.** Quitting is the one

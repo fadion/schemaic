@@ -41,7 +41,8 @@ left out, and `active_to_save` the active id it writes — `None` when that id n
 startup falls back as for any id that names nothing (`startup_active_id`) — because a session's
 data is in this process alone and after a restart it would be a connection to nothing
 (`a_save_leaves_the_data_sessions_out`). The app's save and its connection export both write
-through `to_save` (under `app/main.rs`). **A `memory:` path typed into the connection form** is
+through `to_save` (under `app/main.rs`), and the session save drops a session's query tabs by
+the same question (`persist::SavedTabsFile::without_session_queries`). **A `memory:` path typed into the connection form** is
 not refused at Save — it answers `is_data_session` like a session's, so it is never written, and
 connecting is refused in the closed-session words (`DuckDbSessionClosed`), or, should it name a
 session this process holds, reaches that session's database — but the form says so as it is typed:
