@@ -2126,7 +2126,7 @@ connections-type = Type
 connections-init-sql = Init SQL
 # PRAGMA and SET are SQL keywords.
 connections-init-sql-pragma-hint = Optional. PRAGMA settings run on every connection Schemaic opens.
-connections-init-sql-set-hint = Optional. SET statements run on every connection Schemaic opens — a search path, a time zone, a role.
+connections-init-sql-set-hint = Optional. SET statements run on every connection Schemaic opens.
 # Why the init SQL would be refused (core's init_sql::InitRefusal; a test
 # holds the English equal). $statement is the refused statement's preview;
 # $why one of the connections-init-* reasons below. $name and $scope are

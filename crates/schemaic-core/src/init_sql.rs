@@ -1,6 +1,8 @@
 //! **A connection's init SQL** — the session settings a saved connection runs
 //! on every connection Schemaic opens for it (`Connection::init_sql`): a
-//! `search_path`, a time zone, a role.
+//! time zone, a search path or a role on PostgreSQL, a thread count on DuckDB
+//! — what each engine takes is its own list, below, and [`example`] is the
+//! one the form shows.
 //!
 //! **It is user SQL that runs with nobody confirming it**, on every operation
 //! (one connection per operation: a run, a listing, a ping, a `KILL`), so it
@@ -372,6 +374,19 @@ pub fn settings_are_pragmas(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Sqlite => true,
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb => false,
+    }
+}
+
+/// A setting the connection form shows as the init SQL field's placeholder —
+/// one [`check`] accepts on `dialect`, so the example is never the first thing
+/// the field refuses. It was PostgreSQL's search path for every engine.
+pub fn example(dialect: SqlDialect) -> &'static str {
+    match dialect {
+        SqlDialect::Postgres => "SET search_path TO app, public",
+        SqlDialect::MySql => "SET time_zone = '+00:00'",
+        SqlDialect::MsSql => "SET LANGUAGE british",
+        SqlDialect::Sqlite => "PRAGMA foreign_keys = ON",
+        SqlDialect::DuckDb => "SET threads = 4",
     }
 }
 
@@ -770,6 +785,18 @@ mod tests {
             2
         );
         assert_eq!(check("PRAGMA foreign_keys = ON", LITE).unwrap().len(), 1);
+    }
+
+    /// **The form's example is one the form itself accepts**, on each engine.
+    /// It was PostgreSQL's `SET search_path TO app, public` for all five —
+    /// refused as typed on MySQL, SQL Server and SQLite.
+    #[test]
+    fn each_engines_example_passes_its_own_check() {
+        for d in SqlDialect::ALL {
+            let sql = example(d);
+            assert!(!sql.is_empty(), "{d:?}");
+            assert_eq!(check(sql, d).map(|s| s.len()), Ok(1), "{d:?}: {sql}");
+        }
     }
 
     /// DuckDB's init takes its resource and resolution settings, and never one

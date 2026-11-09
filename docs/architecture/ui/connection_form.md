@@ -77,11 +77,14 @@ id. It is deliberately not a pointer or a keyboard stop — it names a group, it
 **The *Init SQL* field is `Connection::init_sql`'s write surface**, last in Database after the
 engine block, at tabindex 85 — after the engine's own fields (to 80), before the tunnel's 90.
 It is a multi-line mono `edit_field` coloured for the engine picked, `min_rows` 2, with the
-placeholder `SET search_path TO app, public`, and it sits in a `dyn_container` keyed on the
+placeholder `init_sql::example(dialect)` — one setting `check` accepts on that engine, since the
+placeholder was PostgreSQL's `SET search_path TO app, public` on all five and refused as typed on
+MySQL, SQL Server and SQLite — and it sits in a `dyn_container` keyed on the
 dialect read off `draft.db_type`, because an `edit_field`'s colouring is fixed when it is built
 — so changing the engine rebuilds it. **Under it is what `init_sql::check` makes of the text as
 typed**: the refusal in `theme::error`, worded by `init_refusal_text`, or else a hint — both
-`widgets::form_hint_style`, the refusal recoloured — *"Optional. SET statements run on every connection Schemaic opens — a search path, a time zone, a role."*, and
+`widgets::form_hint_style`, the refusal recoloured — *"Optional. SET statements run on every connection Schemaic opens."* (it used to go on to name a
+search path, a time zone and a role), and
 on SQLite the `PRAGMA` sentence. The connect refuses the same text, and this line is the only
 place the user hears that before a connect fails; Save does not check it. `DraftSignals::init_sql`
 is threaded through create, load (and so `blank`) and `to_connection`, and the Test result's
@@ -130,7 +133,9 @@ menu's Duplicate and Delete carry the connection id themselves, and selecting up
 merely *opening* the menu ran `draft.load` over every field the user had typed, with no undo and
 no copy in the keyring. For an *Open data file* session (`Connection::is_data_session`) the menu
 is a single red *Close session*: no copy of a session reaches its data, and removing it closes it —
-the app's delete path, whose confirm asks in the session's words. What answers "which connection is this menu
+the app's delete path, whose confirm asks in the session's words. The footer's Delete button
+reads *Close session* for one too (`connections-close-session`); it said Delete over a confirm
+already worded for closing. The choice is made in the view, so no test holds it. What answers "which connection is this menu
 about" instead is the shared open-menu rule (`widgets::row_menu_mark`, *Popup menus*), keyed off
 a `menu_row: RwSignal<Option<u64>>` created in the modal's **stable scope** beside `save_flash`
 and `test_flash` and for the same reason — the clearing effect outlives the open/close

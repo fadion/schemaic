@@ -2183,7 +2183,9 @@ fn conn_form(
                         mono: true,
                         sql: Some(dialect),
                         min_rows: 2,
-                        placeholder: "SET search_path TO app, public",
+                        // One the field accepts on this engine — it was
+                        // PostgreSQL's search path on all five.
+                        placeholder: schemaic_core::init_sql::example(dialect),
                         focus: Some((init_ring.clone(), 85)),
                         ..Default::default()
                     },
@@ -2376,8 +2378,17 @@ fn conn_form(
         move |id| match id {
             Some(cid) => {
                 let del = del.clone();
+                // An Open data file session is closed, not deleted — the
+                // row's menu says so, and the confirm this opens already
+                // speaks of closing; the button said Delete over both.
+                let session = connections
+                    .with_untracked(|cs| cs.iter().any(|c| c.id == cid && c.is_data_session()));
                 action_button_icon(
-                    tr!("connections-delete"),
+                    if session {
+                        tr!("connections-close-session")
+                    } else {
+                        tr!("connections-delete")
+                    },
                     icons::TRASH_2,
                     ActionKind::Danger,
                     true,

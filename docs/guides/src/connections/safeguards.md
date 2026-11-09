@@ -51,15 +51,22 @@ pick. **Same as the app** follows the timeout in **Settings** › **Query**.
 
 ## Init SQL
 
-**Init SQL**, in the **Database** section, holds settings to apply every time Schemaic connects — a
-search path, a time zone, a role:
+**Init SQL**, in the **Database** section, holds session settings to apply every time Schemaic
+connects. On PostgreSQL that might be a search path and a time zone:
 
 ```sql
 SET search_path TO app, public;
 SET TIME ZONE 'Europe/London';
 ```
 
-On SQLite it takes `PRAGMA` settings instead.
+Each engine has its own settings, so what the box takes depends on the engine:
+
+| Engine        | For example                  |
+|---------------|------------------------------|
+| MySQL/MariaDB | `SET time_zone = '+00:00'`   |
+| SQL Server    | `SET LANGUAGE british`       |
+| SQLite        | `PRAGMA foreign_keys = ON`   |
+| DuckDB        | `SET threads = 4`            |
 
 It only accepts session settings Schemaic knows are safe. It refuses anything that isn't a `SET`
 (or a `PRAGMA` on SQLite), anything that changes the server rather than the session, and the few

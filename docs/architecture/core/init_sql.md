@@ -19,6 +19,12 @@ capability `settings_are_pragmas`, which the form's hint asks too, never an engi
 **`USE` is refused with every other non-`SET`**, because it would move each operation off the
 database it asked for — the tab's, the tree node's — and an `INSERT` would be a write on every
 ping.
+`example(dialect)` is the form's placeholder for the field: one setting `check` accepts on that
+engine — `SET time_zone = '+00:00'` on MySQL, `SET LANGUAGE british` on SQL Server, `PRAGMA
+foreign_keys = ON` on SQLite, `SET threads = 4` on DuckDB, PostgreSQL's search path on its own.
+That search path was the placeholder on all five, so the example the field offered was refused as
+typed on MySQL, SQL Server and SQLite; `each_engines_example_passes_its_own_check` runs each
+through `check`.
 **The lists name what may be set, not what may not.** The gate was `SET` plus a `DENIED` list
 of the words a guard rests on, and every setting nobody had thought of went through. `SET
 ANSI_DEFAULTS ON` turns `IMPLICIT_TRANSACTIONS` on, so on SQL Server every auto-commit write
