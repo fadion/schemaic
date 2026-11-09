@@ -99,6 +99,14 @@ default. It arrives as `generated: Some(expr)` with `default: None`, which is wh
 keep it read-only, as on every engine — `table_facts`, provenance's own column read, makes the same
 join for the same reason. **Macros are DuckDB's user functions and arrive as `RoutineInfo`** — one per name,
 an overload being the same macro to `DROP MACRO`, a table macro's `returns` reading `TABLE`.
+`body` is `duckdb_functions().macro_definition`, the expression or query alone, and a later
+overload is folded into it as `…, (a, b) AS expr` — the form one `CREATE MACRO` declares them all
+in — so `RoutineInfo::create_sql`'s DuckDB arm (`duckdb_create_sql`) writes the whole macro back
+as `CREATE MACRO s.m(args) AS [TABLE] …` (`a_macros_ddl_replays_as_the_same_macro`, which replays
+each one into a fresh database and calls every overload). Until that arm existed DuckDB fell on
+MySQL's emitter, and *Copy DDL* on a macro wrote `CREATE FUNCTION … NOT DETERMINISTIC`. **A
+parameter's default is not carried**: the catalogue lists `b := 2` as `b` (measured on 2.0), so
+the text declares the parameter without it.
 `main` is always among the namespaces (`schema::DUCKDB_DEFAULT_SCHEMA`, `default_namespace`), and
 names compare ignoring case (`names_ignore_case`). Table sizes are `duckdb_tables()`'
 `estimated_size` rows and nothing on disk, DuckDB keeping no per-table figure; the Server

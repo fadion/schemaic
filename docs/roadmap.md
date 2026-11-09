@@ -85,17 +85,19 @@ DuckDB.
     a table outside `main` may be printed unqualified by `duckdb_tables().sql` — measure it.
     Write the dump → `run_script` round trip in `db::duckdb`'s tests (the live `mssql.rs`
     `dump_file`/`restore_file` are the shape).
-  - **Macro DDL is MySQL's today**, a phase 1 bug: `RoutineInfo::create_sql` sends DuckDB to
-    `mysql_create_sql`, so *Copy DDL* on a macro writes `CREATE FUNCTION … NOT DETERMINISTIC`;
-    it wants `CREATE MACRO s.m(args) AS expr` or `AS TABLE query` (`returns == "TABLE"`). The
-    dump's *other objects* use the same text.
+    Measured already: `duckdb_tables/views/indexes().sql` are schema-qualified; a sequence's
+    `sql` restates the current counter (`START 9` after two `nextval`s from 5 by 2) but **drops its
+    schema**; comments are in none of them; `DROP MACRO [TABLE] IF EXISTS` and `DROP FUNCTION IF
+    EXISTS` both drop a macro.
   - **Manual tabs** (`Session` for DuckDB, then `tx::supports_manual_mode`; `BEGIN TRANSACTION
     READ ONLY` is the read-only session). There is **no SQLite pinned session to copy** —
     `Session::open_enforced` refuses SQLite too — so this is a new `Backend` holding a blocking
     connection (and its `Arc<Instance>`) across awaits, each call on the blocking pool, Stop
     through the interrupt handle. `commit_writes`/`refetch_rows`/`fetch_blob` in `session.rs`
-    need DuckDB arms, and the write nests in `SAVEPOINT` (`TxScope::Savepoint`) — measure whether
-    DuckDB has savepoints before relying on them.
+    need DuckDB arms, and the write nests in `SAVEPOINT` (`TxScope::Savepoint`) — which **DuckDB
+    does not have** (2.0: a parser error), so a failed grid commit inside a Manual transaction
+    cannot be undone alone: decide with the user whether it aborts the whole transaction (as a
+    failed statement already does there) or the commit is refused inside one.
   - **The table designer and the view and macro editors.** `ddl::duckdb_supports` refuses every
     change today. **Trap:** `schema.rs`'s and `ddl.rs`'s DDL emitters branch on
     `dialect == Postgres` in many places, so DuckDB falls onto the MySQL shape wherever a `pg`

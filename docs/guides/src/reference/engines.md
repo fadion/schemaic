@@ -86,7 +86,9 @@ A DuckDB connection is a database file on this machine, like SQLite's; see
 
 - running statements and scripts, including `.sql` files;
 - the schema tree — schemas, tables and views with their columns, keys and indexes, sequences, and
-  macros — and each object's DDL, which is DuckDB's own stored `CREATE` statement;
+  macros — and each object's DDL, which is DuckDB's own stored `CREATE` statement. A macro's is
+  rebuilt from the catalogue, every overload included, but DuckDB doesn't keep a parameter's
+  default there, so `CREATE MACRO m(a, b := 2)` comes back as `m(a, b)`;
 - editing results in the grid, for a result read from one table with a primary key — see
   [Editing data](../results-grid/editing.md#what-can-be-edited);
 - **Import** into a table, from CSV, JSON or Excel, in one transaction — see

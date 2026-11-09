@@ -1492,15 +1492,26 @@ fn read_schema(conn: &DuckConn) -> Result<DbSchema, DbError> {
     while let Some(r) = rows.next().map_err(query_err)? {
         let schema: String = r.get(0).map_err(query_err)?;
         let name: String = r.get(1).map_err(query_err)?;
-        // One entry per name: an overload is the same macro to `DROP MACRO`.
-        if routines
-            .iter()
-            .any(|x| x.name == name && x.schema.as_deref() == Some(schema.as_str()))
-        {
-            continue;
-        }
         let kind: String = r.get(2).map_err(query_err)?;
         let params = strings(r.get(3).map_err(query_err)?);
+        // **One entry per name**: an overload is the same macro to `DROP
+        // MACRO`, and one `CREATE MACRO` declares them all —
+        // `m(a) AS a, (a, b) AS a + b`. So a later overload is folded into the
+        // first entry's body in exactly that form, and `create_sql` writes the
+        // whole statement back (`a_macros_ddl_replays_as_the_same_macro`).
+        if let Some(first) = routines
+            .iter_mut()
+            .find(|x| x.name == name && x.schema.as_deref() == Some(schema.as_str()))
+        {
+            let def: String = r
+                .get::<_, Option<String>>(4)
+                .map_err(query_err)?
+                .unwrap_or_default();
+            let table = if kind == "table_macro" { "TABLE " } else { "" };
+            let first = Arc::make_mut(first);
+            first.body = format!("{}, ({}) AS {table}{}", first.body, params.join(", "), def);
+            continue;
+        }
         routines.push(Arc::new(RoutineInfo {
             name,
             schema: Some(schema),
@@ -3051,6 +3062,42 @@ mod tests {
             r, 63,
             "rowids survived the compaction — re-measure the key decision"
         );
+    }
+
+    /// **A macro's DDL replays as the same macro**, overloads included — the
+    /// text *Copy DDL* gives. Each read macro's `create_sql` is run into a
+    /// fresh database and every overload is called there. (A parameter's
+    /// default is not in the catalogue and is not carried; measured on 2.0,
+    /// `duckdb_functions()` lists `b := 2` as `b`.)
+    #[test]
+    fn a_macros_ddl_replays_as_the_same_macro() {
+        let db = mem("macro-ddl");
+        seed(
+            &db,
+            "CREATE SCHEMA other;
+             CREATE MACRO other.add(a, b) AS a + b;
+             CREATE MACRO other.nums(n) AS TABLE SELECT * FROM range(n);
+             CREATE MACRO ov(a) AS a * 10, (a, b) AS a * 10 + b;",
+        );
+        let rt = rt();
+        let s = rt
+            .block_on(fetch_schema(&db, CancellationToken::new()))
+            .unwrap();
+        assert_eq!(s.routines.len(), 3, "one entry per name");
+        let copy = mem("macro-ddl-copy");
+        seed(&copy, "CREATE SCHEMA other");
+        for r in &s.routines {
+            seed(&copy, &r.create_sql(D, false));
+        }
+        let (_i, c) = connect(&copy).unwrap();
+        let got: (i64, i64, i64, i64) = c
+            .query_row(
+                "SELECT other.add(2, 3), (SELECT count(*) FROM other.nums(4)), ov(1), ov(1, 2)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(got, (5, 4, 10, 12));
     }
 
     #[test]

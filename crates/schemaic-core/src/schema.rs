@@ -4180,12 +4180,10 @@ impl RoutineInfo {
             // SQLite has no stored routines at all; it never reaches here
             // (`supports_routine_editing` is false for it), and MySQL's shape is
             // the closer of the two if it somehow does.
-            // DuckDB's routines are macros, which nothing edits yet
-            // (`supports_routine_editing`, roadmap DuckDB phase 2); a
-            // macro's `CREATE` is read from the catalogue verbatim.
-            crate::intel::SqlDialect::MySql
-            | crate::intel::SqlDialect::Sqlite
-            | crate::intel::SqlDialect::DuckDb => self.mysql_create_sql(dialect, replace),
+            crate::intel::SqlDialect::MySql | crate::intel::SqlDialect::Sqlite => {
+                self.mysql_create_sql(dialect, replace)
+            }
+            crate::intel::SqlDialect::DuckDb => self.duckdb_create_sql(replace),
             // SQL Server's is rebuilt from the parts `mssql` read the stored
             // text into; `replace` is `CREATE OR ALTER`.
             crate::intel::SqlDialect::MsSql => self.tsql_create_sql(replace),
@@ -4296,6 +4294,33 @@ impl RoutineInfo {
             Ok(v) if (v - 1000.0).abs() < f64::EPSILON => None,
             _ => Some(format!("ROWS {raw}")),
         }
+    }
+
+    /// [`Self::create_sql`] for DuckDB, whose routines are **macros**:
+    /// `CREATE [OR REPLACE] MACRO s.m(args) AS expr`, or `AS TABLE query` for
+    /// a table macro (`returns` reads `TABLE`, as `db::duckdb` reads one).
+    /// `body` is `duckdb_functions().macro_definition` — the expression or the
+    /// query, with no `CREATE` around it, so the statement is rebuilt here.
+    /// A macro's later overloads arrive folded into `body` as
+    /// `…, (a, b) AS expr` (`db::duckdb`), the form one `CREATE MACRO`
+    /// declares them in, so they come back with it. A parameter's default is
+    /// not in the catalogue and is not restated.
+    /// It was `mysql_create_sql`'s `CREATE FUNCTION … NOT DETERMINISTIC` until
+    /// this arm existed, which DuckDB refuses — *Copy DDL* on a macro wrote it.
+    fn duckdb_create_sql(&self, replace: bool) -> String {
+        let d = crate::intel::SqlDialect::DuckDb;
+        format!(
+            "CREATE {}MACRO {}({}) AS {}{}",
+            if replace { "OR REPLACE " } else { "" },
+            qualified_ident(&self.name, self.schema.as_deref(), d),
+            self.arguments.trim(),
+            if self.returns.trim().eq_ignore_ascii_case("TABLE") {
+                "TABLE "
+            } else {
+                ""
+            },
+            self.body.trim()
+        )
     }
 
     fn pg_create_sql(&self, replace: bool) -> String {
@@ -8489,6 +8514,41 @@ mod xml_parent_tests {
         assert_eq!(secondary("USING XML INDEX [p FOR PATH").xml_parent(), None);
         assert_eq!(secondary("FOR ([a] = N'/a')").xml_parent(), None);
         assert_eq!(secondary("USING XML INDEX ").xml_parent(), None);
+    }
+}
+
+#[cfg(test)]
+mod duckdb_macro_tests {
+    use super::*;
+    use crate::intel::SqlDialect;
+
+    fn mac(args: &str, returns: &str, body: &str) -> RoutineInfo {
+        RoutineInfo {
+            name: "plus_one".into(),
+            schema: Some("main".into()),
+            kind: RoutineKind::Function,
+            arguments: args.into(),
+            identity_arguments: args.into(),
+            returns: returns.into(),
+            language: "SQL".into(),
+            body: body.into(),
+            ..Default::default()
+        }
+    }
+
+    /// **A macro is `CREATE MACRO`, not a MySQL function** — the text *Copy
+    /// DDL* and the dump write for one. It was `mysql_create_sql`'s
+    /// `CREATE FUNCTION … NOT DETERMINISTIC`, which DuckDB refuses.
+    #[test]
+    fn a_macro_is_created_as_a_macro() {
+        assert_eq!(
+            mac("x", "", "(x + 1)").create_sql(SqlDialect::DuckDb, false),
+            "CREATE MACRO \"main\".\"plus_one\"(x) AS (x + 1)"
+        );
+        assert_eq!(
+            mac("n", "TABLE", "SELECT * FROM range(n)").create_sql(SqlDialect::DuckDb, true),
+            "CREATE OR REPLACE MACRO \"main\".\"plus_one\"(n) AS TABLE SELECT * FROM range(n)"
+        );
     }
 }
 
