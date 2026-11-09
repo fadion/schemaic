@@ -2580,7 +2580,9 @@ impl RoutineDraft {
     /// grounds `blank_trigger` supplies its `RETURN NEW`: the first thing a new
     /// routine has to survive is the server's parse, and the shape of that parse
     /// is per-engine — PostgreSQL wants a `plpgsql` block and a return type, and
-    /// MySQL a `BEGIN … END` compound with no `LANGUAGE` of its own.
+    /// MySQL a `BEGIN … END` compound with no `LANGUAGE` of its own — and a
+    /// DuckDB function, being a macro, an expression and no return type
+    /// ([`function_needs_return_type`]): `CREATE MACRO f() AS 0`.
     ///
     /// The default kind is a **procedure** on MySQL and a **function**
     /// everywhere else only when the caller doesn't say; `kind` is passed in,
@@ -2592,12 +2594,19 @@ impl RoutineDraft {
         dialect: SqlDialect,
     ) -> RoutineDraft {
         let postgres = dialect == SqlDialect::Postgres;
+        // Where a function need not name a return type it is a DuckDB macro,
+        // whose body is an expression: a scalar one with an empty Returns. The
+        // MySQL blank it fell to emitted `CREATE MACRO f() AS BEGIN RETURN 0;
+        // END`, which DuckDB refuses.
+        let macro_fn = kind == RoutineKind::Function && !function_needs_return_type(dialect);
         let returns = match (kind, postgres) {
+            _ if macro_fn => String::new(),
             (RoutineKind::Procedure, _) => String::new(),
             (RoutineKind::Function, true) => "integer".to_string(),
             (RoutineKind::Function, false) => "INT".to_string(),
         };
         let body = match (kind, postgres) {
+            _ if macro_fn => "0",
             (RoutineKind::Function, true) => "BEGIN\n    RETURN 0;\nEND;",
             (RoutineKind::Procedure, true) => "BEGIN\nEND;",
             (RoutineKind::Function, false) => "BEGIN\n    RETURN 0;\nEND",
@@ -29665,6 +29674,29 @@ mod tests {
         }
         assert!(function_needs_return_type(MySql));
         assert!(!function_needs_return_type(DuckDb));
+    }
+
+    /// **A new DuckDB function starts as a macro DuckDB takes.** The blank
+    /// was MySQL's — Returns `INT`, a `BEGIN RETURN 0; END` body — so Create
+    /// > Function emitted `CREATE MACRO f() AS BEGIN …`, which DuckDB
+    /// refuses, until both fields were rewritten.
+    #[test]
+    fn a_blank_duckdb_function_is_a_scalar_macro() {
+        use crate::schema::RoutineKind;
+        let blank = RoutineDraft::blank(RoutineKind::Function, "f", Some("main".into()), DuckDb);
+        assert_eq!(blank.info.returns, "");
+        assert!(
+            blank.problems(DuckDb).is_empty(),
+            "{:?}",
+            blank.problems(DuckDb)
+        );
+        assert_eq!(
+            create_routine(&blank, DuckDb).emit(),
+            vec!["CREATE MACRO \"main\".\"f\"() AS 0".to_string()]
+        );
+        // MySQL's blank is untouched.
+        let my = RoutineDraft::blank(RoutineKind::Function, "f", None, MySql);
+        assert_eq!(my.info.returns, "INT");
     }
 
     /// DuckDB's macro statements (measured on 2.0.0): `CREATE [OR REPLACE]

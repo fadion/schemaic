@@ -2708,6 +2708,13 @@ engine, and a scalar macro's Returns *is* empty — so every scalar macro opened
 "The function needs a return type" and Preview SQL off, found in a sandboxed check of the
 editor. It asks `function_needs_return_type(dialect)` now, false on DuckDB alone
 (`a_scalar_duckdb_macro_needs_no_return_type`, red as `[NoReturnType]` against the unfixed
-tree). The live half,
+tree). **A new one starts as a macro DuckDB takes**: `RoutineDraft::blank` fell through to
+MySQL's arm — Returns `INT`, body `BEGIN RETURN 0; END` — so Create > Function applied unchanged
+emitted `CREATE MACRO "main"."new_function"() AS BEGIN RETURN 0; END`, which DuckDB refuses,
+and its `INT` was neither value a macro's Returns takes (empty, or `TABLE`). It asks the same
+predicate: where `function_needs_return_type` is false a function's blank is a scalar macro,
+Returns empty and body `0`, emitting `CREATE MACRO "main"."f"() AS 0`
+(`a_blank_duckdb_function_is_a_scalar_macro`, red on Returns `"INT"` against the unfixed tree;
+also found in a sandboxed check). The live half,
 `a_macro_is_created_edited_renamed_and_dropped` under `duckdb.rs`, runs each plan through
 `run_ddl` and reads the macros back.

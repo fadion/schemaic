@@ -66,7 +66,9 @@ under `schema.rs`). The reader now reads a default back from an export of the sc
 (`read_macro_defaults`, under `db/duckdb.rs`), so such a macro reopens with it. Returns is empty
 for a scalar macro and `TABLE` for a table one, and its placeholder says so in words
 (`routine-editor-returns-placeholder-duckdb`, *TABLE for a table macro*). The Body is one
-expression or one query (placeholder `a + b`).
+expression or one query (placeholder `a + b`). Create > Function opens on a scalar macro —
+Returns empty, body `0` — rather than MySQL's `INT` and `BEGIN … END`, which DuckDB refused at
+apply (`RoutineDraft::blank`, under `ddl.rs`).
 **MySQL's body is fetched a
 second time and it is not an optimisation** (`Db::routine_source` via `RoutineSrcFn`, gated on
 `ddl::catalogue_body_is_unescaped` as the trigger editor's fetch is, applied
