@@ -50,7 +50,9 @@ Schemaic exported imports back cleanly.
 Press **Import**. Schemaic first reads the whole file and checks every value against its
 column — numbers that aren't numbers, empty values in a column that can't be `NULL`, rows with
 the wrong number of fields. If anything is wrong, nothing is written: you get the list, with
-line numbers, to fix and try again. Beyond that, the database decides what it accepts.
+line numbers, to fix and try again. Beyond that, the database decides what it accepts. On
+DuckDB, text from the file is cast to each column's type, so booleans, timestamps and lists
+written in DuckDB's own form, such as `[1, 2]`, load as they are.
 
 Otherwise the rows go in inside one transaction, so a failure leaves the table as it was.
 **Cancel** while it runs rolls the import back.

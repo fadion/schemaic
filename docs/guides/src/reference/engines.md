@@ -89,6 +89,8 @@ A DuckDB connection is a database file on this machine, like SQLite's; see
   macros — and each object's DDL, which is DuckDB's own stored `CREATE` statement;
 - editing results in the grid, for a result read from one table with a primary key — see
   [Editing data](../results-grid/editing.md#what-can-be-edited);
+- **Import** into a table, from CSV, JSON or Excel, in one transaction — see
+  [Importing a file into a table](../import-export/import-file.md);
 - exporting results, and query plans, with **Analyze**;
 - **Server variables**, which lists DuckDB's settings;
 - **Back up**, which writes a new `.duckdb` file;
@@ -96,7 +98,6 @@ A DuckDB connection is a database file on this machine, like SQLite's; see
 
 *Not yet:*
 
-- **Import** into a table;
 - **Manual** transactions — a tab always runs in **Auto-commit**;
 - the table designer and the view and macro editors, so structure changes are SQL you write and run
   yourself;

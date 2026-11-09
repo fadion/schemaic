@@ -64,10 +64,10 @@ but nothing translates a type or option one has and the other lacks.
 - *Restore from file* is offered on MySQL, MariaDB and PostgreSQL only.
 - *Disable foreign-key checks* in a SQL export exists on MySQL, MariaDB and SQLite; elsewhere the
   file adds the foreign keys after the data instead.
-- *Import into a table* works on every engine but DuckDB, which has no SQL format under **Export**
-  yet either. Running a `.sql` file with **Import** on a DuckDB database does work. On a MySQL
-  table whose storage engine isn't transactional (MyISAM, for one), a failed import can't be
-  undone.
+- *Import into a table* works on every engine. On a MySQL table whose storage engine isn't
+  transactional (MyISAM, for one), a failed import can't be undone.
+- *A SQL export* isn't offered on DuckDB yet, though running a `.sql` file with **Import** on a
+  DuckDB database does work.
 
 ## In this section
 

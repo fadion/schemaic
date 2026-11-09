@@ -51,8 +51,9 @@
 //! `rowid` is never a key — a checkpoint renumbers it.
 //!
 //! **What the roadmap's phase 2 has not reached yet**, refused rather than
-//! faked: import ([`DbRefusal::DuckDbNotYet`]) and Manual tabs
-//! (`tx::supports_manual_mode`). DDL plans and `.sql` scripts run.
+//! faked: Manual tabs (`tx::supports_manual_mode`), the dump
+//! (`dump::supports_dump`) and the designer (`ddl::duckdb_supports`). DDL
+//! plans, `.sql` scripts and imports run.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -82,11 +83,6 @@ const D: SqlDialect = SqlDialect::DuckDb;
 /// the statement's, as on the other engines.
 fn query_err(e: duckdb::Error) -> DbError {
     DbError::Query(e.to_string())
-}
-
-/// The refusal for an operation phase 1 has not written.
-fn not_yet() -> DbError {
-    DbError::Refused(DbRefusal::DuckDbNotYet)
 }
 
 // ── The instance registry ───────────────────────────────────────────────────
@@ -2093,15 +2089,89 @@ pub(crate) async fn fetch_blob(
     .await
 }
 
-/// Not yet (roadmap, DuckDB phase 2); `import::supports_import` keeps the
-/// wizard off DuckDB connections until it is.
+/// Run `f` off the async executor: `block_in_place` on a multi-threaded
+/// runtime (the app's), inline on a current-thread one (the headless front
+/// ends'), where `block_in_place` panics — `sqlite::off_executor`'s shape.
+fn off_executor<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
+/// Bulk-load rows into one table in **one transaction**, as batched
+/// multi-row `INSERT`s from [`schemaic_core::import::build_insert_as`] — the
+/// statement text the other engines run, quoting and literals included, and
+/// the same guarantee: each batch must affect exactly the rows it carried, or
+/// the whole import rolls back ([`Rollback::Complete`](schemaic_core::model::Rollback::Complete),
+/// DuckDB having no non-transactional table).
+///
+/// A file's cells arrive as text, and DuckDB casts a string literal to the
+/// column's type on insert — a boolean, a timestamp, a list or a struct
+/// (`an_import_loads_every_batch_in_one_transaction`).
+///
+/// **Off the executor rather than on the blocking pool**, as SQLite's is:
+/// `RowSource` is a borrowed iterator that cannot move into a `'static` task,
+/// and the transaction needs one connection for every batch.
 pub(crate) async fn import_rows(
-    _db: &Db,
-    _target: crate::ImportTarget<'_>,
-    _rows: crate::RowSource<'_>,
-    _cancel: CancellationToken,
+    db: &Db,
+    target: crate::ImportTarget<'_>,
+    rows: crate::RowSource<'_>,
+    cancel: CancellationToken,
 ) -> Result<u64, DbError> {
-    Err(not_yet())
+    use schemaic_core::import::INSERT_BATCH_ROWS;
+    use schemaic_core::model::{Rollback, WriteCause};
+    refuse_if_cancelled(&cancel)?;
+    let (_inst, conn) = off_executor(|| connect(db))?;
+    off_executor(|| {
+        conn.execute_batch("BEGIN TRANSACTION").map_err(query_err)?;
+        let result = (|| -> Result<u64, DbError> {
+            let mut total = 0u64;
+            let mut batch: Vec<Vec<Value>> = Vec::with_capacity(INSERT_BATCH_ROWS);
+            let flush = |batch: &mut Vec<Vec<Value>>| -> Result<u64, DbError> {
+                let Some(sql) = target.insert_sql(batch, D)? else {
+                    return Ok(0);
+                };
+                let affected = conn.execute(&sql, []).map_err(query_err)? as u64;
+                if affected != batch.len() as u64 {
+                    return Err(DbError::write(
+                        WriteCause::Batch {
+                            rows: batch.len(),
+                            wrote: affected,
+                            affected: true,
+                        },
+                        Some(Rollback::Complete),
+                    ));
+                }
+                batch.clear();
+                Ok(affected)
+            };
+            for row in rows {
+                if cancel.is_cancelled() {
+                    return Err(DbError::Cancelled);
+                }
+                batch.push(row.map_err(crate::row_failure)?);
+                if batch.len() >= INSERT_BATCH_ROWS {
+                    total += flush(&mut batch)?;
+                }
+            }
+            total += flush(&mut batch)?;
+            Ok(total)
+        })();
+        match result {
+            Ok(total) => {
+                conn.execute_batch("COMMIT").map_err(query_err)?;
+                Ok(total)
+            }
+            Err(e) => {
+                // A failed statement has already aborted DuckDB's transaction;
+                // the `ROLLBACK` ends it, and either way nothing was written.
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -2662,6 +2732,119 @@ mod tests {
         let m = schemaic_core::edit::analyze_edit(&rs, D, schema_for);
         assert!(!m.any_editable());
         assert!(m.insert_target().is_none());
+    }
+
+    fn import_into<'a>(
+        schema: Option<&'a str>,
+        table: &'a str,
+        cols: &'a [String],
+    ) -> crate::ImportTarget<'a> {
+        crate::ImportTarget {
+            database: "memory",
+            schema,
+            table,
+            columns: cols,
+            ..Default::default()
+        }
+    }
+
+    /// An import is one transaction across all its batches, into the schema
+    /// it names, with a file's text cast by DuckDB to each column's type —
+    /// a boolean, a list, a timestamp arrive from a CSV as strings.
+    #[test]
+    fn an_import_loads_every_batch_in_one_transaction() {
+        let db = mem("import");
+        seed(
+            &db,
+            "CREATE SCHEMA other;
+             CREATE TABLE other.t(id INTEGER PRIMARY KEY, v VARCHAR, ok BOOLEAN, tags INT[],
+                                  seen TIMESTAMP);",
+        );
+        let rt = rt();
+        let n = schemaic_core::import::INSERT_BATCH_ROWS + 7;
+        let mut rows = (1..=n).map(|i| {
+            Ok(vec![
+                Value::Int(i as i64),
+                Value::Str(format!("it's {i}")),
+                Value::Str("true".into()),
+                Value::Str("[1, 2]".into()),
+                Value::Str("2020-01-02 03:04:05".into()),
+            ])
+        });
+        let cols: Vec<String> = ["id", "v", "ok", "tags", "seen"].map(String::from).to_vec();
+        let loaded = rt
+            .block_on(import_rows(
+                &db,
+                import_into(Some("other"), "t", &cols),
+                &mut rows,
+                CancellationToken::new(),
+            ))
+            .unwrap();
+        assert_eq!(loaded, n as u64);
+        let rs = rt
+            .block_on(q(
+                &db,
+                "SELECT count(*), min(v), bool_and(ok), max(len(tags)), max(seen)::VARCHAR \
+                 FROM other.t",
+            ))
+            .unwrap();
+        let row: Vec<String> = (0..5)
+            .map(|c| rs.cell(0, c).unwrap().display().to_string())
+            .collect();
+        assert_eq!(
+            row,
+            [
+                n.to_string().as_str(),
+                "it's 1",
+                "true",
+                "2",
+                "2020-01-02 03:04:05"
+            ]
+        );
+    }
+
+    /// A failure anywhere — here a duplicate key in the second batch — leaves
+    /// nothing of the first behind.
+    #[test]
+    fn a_failed_import_leaves_the_table_as_it_was() {
+        let db = mem("import-fail");
+        seed(&db, "CREATE TABLE t(id INTEGER PRIMARY KEY)");
+        let rt = rt();
+        let n = schemaic_core::import::INSERT_BATCH_ROWS + 3;
+        let mut rows = (1..=n).map(|i| Ok(vec![Value::Int(if i == n { 1 } else { i as i64 })]));
+        let cols = vec!["id".to_string()];
+        let e = rt.block_on(import_rows(
+            &db,
+            import_into(None, "t", &cols),
+            &mut rows,
+            CancellationToken::new(),
+        ));
+        assert!(e.is_err());
+        let rs = rt.block_on(q(&db, "SELECT count(*) FROM t")).unwrap();
+        assert_eq!(rs.cell(0, 0).unwrap().to_value(), Value::Int(0));
+    }
+
+    /// The headless front ends run on a current-thread runtime, where
+    /// `block_in_place` panics.
+    #[test]
+    fn an_import_runs_on_a_current_thread_runtime() {
+        let db = mem("import-ct");
+        seed(&db, "CREATE TABLE t(id INT)");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut rows = (1..=3).map(|i| Ok(vec![Value::Int(i)]));
+        let cols = vec!["id".to_string()];
+        let loaded = rt
+            .block_on(import_rows(
+                &db,
+                import_into(None, "t", &cols),
+                &mut rows,
+                CancellationToken::new(),
+            ))
+            .unwrap();
+        assert_eq!(loaded, 3);
     }
 
     /// The one-row safety net: a statement that matches no row fails the

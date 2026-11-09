@@ -3,8 +3,8 @@
 **`duckdb.rs` is the fifth engine** (the `duckdb` crate, the engine compiled in — `bundled`,
 with the `parquet` and `json` extensions linked statically), phase 1 and the first part of phase 2
 of the roadmap's *DuckDB as a fifth engine*: it connects, reads, introspects, validates, runs
-batches, scripts and DDL plans, plans a query, lists its settings, backs a file up and writes grid
-edits back. It is **embedded, as SQLite is**, so most
+batches, scripts and DDL plans, plans a query, lists its settings, backs a file up, writes grid
+edits back and imports a file into a table. It is **embedded, as SQLite is**, so most
 of `sqlite.rs`'s first paragraph holds here unchanged — there is no server, a connection is a
 file (`Db::file`, `connection::is_file_backed`), host/port/user/password/SSH are inert, the one
 database is the file's own catalog (`current_database()`, named after the file), and the driver
@@ -180,9 +180,22 @@ key and confirming columns, in `edit::refetch_key`'s order, and skips one no lon
 `fetch_blob` reads the **whole** value and cuts it to `blob::FETCH_CAP` on this side, DuckDB having
 no byte-slicing of a `BLOB` in SQL — so showing a large blob's first bytes still carries all of it
 across (`rows_are_refetched_and_blobs_read_by_key`).
-**What is not written yet is refused, never faked**: `import_rows` answers
-`DbRefusal::DuckDbNotYet`; `Session::open` refuses a pinned session (`DuckDbNoManual`) and `tx::supports_manual_mode` keeps
-the segment off; `import::supports_import` and `dump::supports_dump` say no, and
+**An import is `sqlite::import_rows`' shape** — one connection, one `BEGIN TRANSACTION`, the
+rows in batches of `import::INSERT_BATCH_ROWS` as the multi-row `INSERT`s every engine's load runs
+(`ImportTarget::insert_sql`, so `build_insert_as`, the table named `"schema"."table"`, never the catalog,
+through `export::qualified_table`), each batch held to exactly the rows it carried (`WriteCause::Batch`,
+`Rollback::Complete`), and `ROLLBACK` on any failure, a failed statement having already aborted
+DuckDB's transaction. It runs **off the executor rather than on the blocking pool** every other
+operation here uses (`off_executor`: `block_in_place` on a multi-thread runtime, inline on a
+current-thread one, where `block_in_place` panics), because `RowSource` is a borrowed iterator that
+cannot move into a `'static` task and the transaction needs the one connection for every batch.
+A file's cells arrive as text and DuckDB casts each literal to its column's type on insert —
+booleans, timestamps and lists included (`an_import_loads_every_batch_in_one_transaction`,
+`a_failed_import_leaves_the_table_as_it_was`, a duplicate key in the second batch leaving nothing
+of the first, and `an_import_runs_on_a_current_thread_runtime`).
+**What is not written yet is refused, never faked**: `Session::open` refuses a pinned session
+(`DuckDbNoManual`) and `tx::supports_manual_mode` keeps the segment off;
+`dump::supports_dump` says no, and
 `ddl::duckdb_supports` keeps the designer and the view, trigger and routine editors off. For
 when the session lands, `session::tx_engine_of` already maps DuckDB to PostgreSQL's model — it
 aborts a transaction on a failed statement and rolls DDL back, measured on 2.0.
@@ -197,8 +210,7 @@ the sanctioned exception in-memory SQLite already is: a `memory:<name>` target, 
 `cfg(test)`, is a shared in-memory instance the tests seed, held for the process in `KEEP`, since
 an in-memory instance *is* its data and letting it close between two operations of one test would
 empty it.
-**`duckdb.rs` answers every name in `ENGINE_ENTRY_POINTS`**, `import_rows` still with the
-refusal, and the dispatcher calls it for each — and all three convention tests hold it to that:
+**`duckdb.rs` answers every name in `ENGINE_ENTRY_POINTS`**, and the dispatcher calls it for each — and all three convention tests hold it to that:
 it is in the module list of `every_engine_module_answers_the_whole_interface` and the loop of
 `the_dispatcher_calls_every_engine_module_for_every_entry_point`, and
 `the_entry_point_list_is_what_the_dispatcher_actually_dispatches` intersects all five modules.

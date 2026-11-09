@@ -592,7 +592,6 @@ db-refused-sqlite-worker = the SQLite worker failed: { $error }
 db-refused-sqlite-no-column = { $table }.{ $column } is not a column this table has, so it has no default to write
 db-refused-sqlite-generated = { $column } is a generated column: it has no default to set it back to, and SQLite computes it from the row
 db-refused-duckdb-no-manual = DuckDB connections don't support manual transaction mode yet — statements run and commit as they are sent
-db-refused-duckdb-not-yet = This isn't available on DuckDB connections yet.
 db-refused-duckdb-no-file = no database file is set
 db-refused-duckdb-not-a-file = { $name } is not a database file — a DuckDB connection opens a file on this computer. Give the path to a .duckdb file.
 db-refused-duckdb-missing = There is no file at { $path }. Schemaic opens an existing DuckDB database and never creates one, so a mistyped path cannot become an empty database.
@@ -2169,7 +2168,7 @@ connections-database-file = Database file
 # The file pickers' window titles.
 connections-database-file-dialog = Select SQLite database
 connections-duckdb-file-dialog = Select DuckDB database
-connections-duckdb-hint = A DuckDB database is a single file, so there is no server to reach — no host, user, password or tunnel. Schemaic opens the file only while a statement runs, so another program can open it in between. Results from a table with a primary key can be edited; importing and Manual transactions aren't available on one yet.
+connections-duckdb-hint = A DuckDB database is a single file, so there is no server to reach — no host, user, password or tunnel. Schemaic opens the file only while a statement runs, so another program can open it in between. Results from a table with a primary key can be edited, and files imported; Manual transactions aren't available on one yet.
 connections-sqlite-hint = A SQLite database is a single file, so there is no server to reach — no host, user, password or tunnel. Manual transactions aren't available on one yet: statements commit as they are sent.
 connections-ssh-tunnel = SSH tunnel
 connections-ssh-tunnel-hint = Reach the server through an SSH tunnel.

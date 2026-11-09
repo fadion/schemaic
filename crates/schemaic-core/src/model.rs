@@ -1562,8 +1562,6 @@ pub enum DbRefusal {
     KeyringUnreadable(String),
     /// DuckDB has no Manual transaction mode here yet.
     DuckDbNoManual,
-    /// An operation not yet written for DuckDB connections (roadmap, DuckDB).
-    DuckDbNotYet,
     /// A DuckDB connection with no file.
     DuckDbNoFile,
     /// `:memory:` or a MotherDuck name as a DuckDB file.
@@ -1617,7 +1615,6 @@ impl DbRefusal {
             | DbRefusal::SqliteSizesTooLarge { .. }
             | DbRefusal::KeyringUnreadable(_)
             | DbRefusal::DuckDbNoManual
-            | DbRefusal::DuckDbNotYet
             | DbRefusal::DuckDbNoFile
             | DbRefusal::DuckDbNotAFile(_)
             | DbRefusal::DuckDbMissing(_) => true,
@@ -1770,9 +1767,6 @@ impl DbRefusal {
             DbRefusal::DuckDbNoManual => "DuckDB connections don't support manual transaction \
                                           mode yet — statements run and commit as they are sent"
                 .to_string(),
-            DbRefusal::DuckDbNotYet => {
-                "This isn't available on DuckDB connections yet.".to_string()
-            }
             DbRefusal::DuckDbNoFile => "no database file is set".to_string(),
             DbRefusal::DuckDbNotAFile(name) => format!(
                 "{name} is not a database file — a DuckDB connection opens a file on this \

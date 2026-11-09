@@ -792,14 +792,18 @@ pub fn coerce(
 
 /// Can a file be imported into a table on `dialect`?
 ///
-/// Four of the five, SQL Server since `db::mssql::import_rows` was written.
-/// The table menu's *Import* entry asks this, so an engine without one has the
-/// entry absent rather than a wizard whose last step is a refusal — DuckDB's
-/// `import_rows` is the roadmap's DuckDB phase 2, and refuses until then.
+/// All five now — SQL Server since `db::mssql::import_rows` was written,
+/// DuckDB since `db::duckdb::import_rows`. The table menu's *Import* entry
+/// asks this, so an engine without one has the entry absent rather than a
+/// wizard whose last step is a refusal. The match stays exhaustive so an
+/// engine added later has to answer it rather than inherit a yes.
 pub fn supports_import(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
-        SqlDialect::DuckDb => false,
+        SqlDialect::MySql
+        | SqlDialect::Postgres
+        | SqlDialect::Sqlite
+        | SqlDialect::MsSql
+        | SqlDialect::DuckDb => true,
     }
 }
 
@@ -3164,6 +3168,21 @@ pub fn non_finite_literal(f: f64, dialect: SqlDialect) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every engine imports now — DuckDB's `import_rows` landed with the
+    /// roadmap's phase 2 — so the table menu offers *Import* on each.
+    #[test]
+    fn every_engine_imports() {
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+            SqlDialect::DuckDb,
+        ] {
+            assert!(supports_import(d), "{d:?}");
+        }
+    }
     use crate::schema::ColumnInfo;
 
     #[test]

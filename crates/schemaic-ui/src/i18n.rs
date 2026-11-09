@@ -1264,7 +1264,6 @@ pub fn db_refusal_text(r: &schemaic_core::model::DbRefusal) -> String {
             tr!("db-refused-keyring-unreadable", error = error.as_str())
         }
         DbRefusal::DuckDbNoManual => tr!("db-refused-duckdb-no-manual"),
-        DbRefusal::DuckDbNotYet => tr!("db-refused-duckdb-not-yet"),
         DbRefusal::DuckDbNoFile => tr!("db-refused-duckdb-no-file"),
         DbRefusal::DuckDbNotAFile(name) => {
             tr!("db-refused-duckdb-not-a-file", name = name.as_str())
@@ -1905,7 +1904,6 @@ mod tests {
             },
             DbRefusal::KeyringUnreadable(s("keyring locked")),
             DbRefusal::DuckDbNoManual,
-            DbRefusal::DuckDbNotYet,
             DbRefusal::DuckDbNoFile,
             DbRefusal::DuckDbNotAFile(s(":memory:")),
             DbRefusal::DuckDbMissing(s("C:/data/x.duckdb")),
