@@ -1470,7 +1470,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   `supports_trigger_not_for_replication`, `supports_trigger_execute_as`,
   `supports_trigger_firing_rank`, `trigger_runs_function`, `supports_trigger_level_choice`,
   `supports_trigger_when`, `supports_trigger_update_of` and `supports_view_triggers`, the routine
-  form's `routine_takes_language`, `catalogue_body_is_unescaped` for both editors' source fetch, the
+  form's `routine_takes_language` and `function_needs_return_type`, false on DuckDB alone,
+  `catalogue_body_is_unescaped` for both editors' source fetch, the
   table designer's `takes_table_options`, `supports_column_on_update` and
   `supports_unenforced_check` — the last asked with the `ServerFlavour`, MariaDB lacking the clause
   MySQL has — plus

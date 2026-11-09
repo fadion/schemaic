@@ -2493,6 +2493,7 @@ ddl-risk-signature-lost = { $kind ->
        *[procedure] Procedure
     } { $name } is ondertekend (ADD SIGNATURE), en elke wijziging verwijdert de handtekening — Schemaic kan opnieuw ondertekenen niet zonder de sleutel van het certificaat. Wat het certificaat toestond, werkt niet meer tot je ADD SIGNATURE opnieuw uitvoert.
 ddl-risk-redefines-routine = Definieert { $name } opnieuw. Alles wat deze routine aanroept, voert vanaf nu de nieuwe inhoud uit, ook triggers op andere tabellen die deze bewerking nooit noemde.
+ddl-risk-redefines-routine-no-triggers = Herdefinieert { $name }. Alles wat haar aanroept, voert vanaf nu de nieuwe inhoud uit, ook views en andere functies die deze wijziging niet noemt.
 ddl-risk-routine-parameters-change = Wijzigt de parameterlijst van { $name }. Aanroepers die de oude argumenten doorgeven, komen er niet meer bij uit.
 ddl-risk-recreate-routine = Het opnieuw maken van { $held } verwijdert het eerst. Waar DDL niet transactioneel is (MySQL), laat een nieuwe definitie die de server weigert helemaal geen { $what } achter.
 ddl-risk-routine-grants-lost = { $comment ->

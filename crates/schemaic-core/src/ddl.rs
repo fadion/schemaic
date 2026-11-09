@@ -2653,8 +2653,12 @@ impl RoutineDraft {
             out.push(RoutineProblem::NoLanguage { kind });
         }
         // A procedure has no return type on either engine, and `RETURNS` on one
-        // is a syntax error rather than a harmless extra.
-        if f.kind == RoutineKind::Function && f.returns.trim().is_empty() {
+        // is a syntax error rather than a harmless extra. A DuckDB macro's
+        // empty Returns is a scalar macro (`function_needs_return_type`).
+        if f.kind == RoutineKind::Function
+            && function_needs_return_type(dialect)
+            && f.returns.trim().is_empty()
+        {
             out.push(RoutineProblem::NoReturnType);
         }
         if f.kind == RoutineKind::Procedure && !f.returns.trim().is_empty() {
@@ -5943,6 +5947,10 @@ pub enum Risk {
     },
     RedefinesRoutine {
         name: String,
+        /// Can a trigger be what calls it — [`supports_trigger_editing`]?
+        /// Not on DuckDB, where a macro's callers are queries, views and
+        /// other macros, and the sentence must not name a trigger.
+        triggers_call_it: bool,
     },
     RoutineParametersChange {
         name: String,
@@ -6286,9 +6294,20 @@ impl Risk {
                     SignedKind::Procedure => "Procedure",
                 }
             ),
-            Risk::RedefinesRoutine { name } => format!(
+            Risk::RedefinesRoutine {
+                name,
+                triggers_call_it: true,
+            } => format!(
                 "Redefines {name}. Everything that calls it runs the new body from \
                  now on, including triggers on other tables this edit never \
+                 mentioned."
+            ),
+            Risk::RedefinesRoutine {
+                name,
+                triggers_call_it: false,
+            } => format!(
+                "Redefines {name}. Everything that calls it runs the new body from \
+                 now on, including views and other functions this edit never \
                  mentioned."
             ),
             Risk::RoutineParametersChange { name } => format!(
@@ -7464,6 +7483,7 @@ impl Change {
                 let f = &draft.info;
                 let mut out = vec![Risk::RedefinesRoutine {
                     name: f.name.clone(),
+                    triggers_call_it: supports_trigger_editing(dialect),
                 }];
                 // The parameter list is the routine's *identity* where the
                 // engine overloads, so this is not a redefinition at all — the
@@ -15326,6 +15346,21 @@ pub fn replay_replaces_routine_in_place(dialect: SqlDialect, flavour: ServerFlav
         SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite | SqlDialect::DuckDb => {
             supports_or_replace_routine(dialect)
         }
+    }
+}
+
+/// Must a **function** name its return type — is an empty Returns a gap?
+///
+/// Yes on MySQL, PostgreSQL and SQL Server, where `RETURNS` is part of the
+/// statement. Not on DuckDB, whose functions are macros: Returns there is
+/// `TABLE` for a table macro and **empty for a scalar one**, so an empty field
+/// is a kind, not an omission — and [`RoutineDraft::problems`] asking it of
+/// every engine had made every scalar macro uneditable. SQLite has no stored
+/// functions; it answers as the others do.
+pub fn function_needs_return_type(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::DuckDb => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite => true,
     }
 }
 
@@ -29606,6 +29641,32 @@ mod tests {
         }
     }
 
+    /// **A scalar macro's empty Returns is its kind, not a gap.** The editor
+    /// refused every scalar DuckDB macro — opened unchanged, it said "The
+    /// function needs a return type" and kept Preview SQL off — because the
+    /// rule was asked of every engine. The other three still need one.
+    #[test]
+    fn a_scalar_duckdb_macro_needs_no_return_type() {
+        let scalar = RoutineDraft::from_info(&duck_macro("m", "a, b", "", "a + b"));
+        assert!(
+            scalar.problems(DuckDb).is_empty(),
+            "{:?}",
+            scalar.problems(DuckDb)
+        );
+        let table = RoutineDraft::from_info(&duck_macro("t", "n", "TABLE", "SELECT 1"));
+        assert!(table.problems(DuckDb).is_empty());
+        for d in [MySql, Postgres, MsSql] {
+            let mut f = RoutineDraft::from_info(&duck_macro("f", "", "", "BEGIN RETURN 1; END"));
+            f.info.language = "plpgsql".into();
+            assert!(
+                f.problems(d).contains(&RoutineProblem::NoReturnType),
+                "{d:?}"
+            );
+        }
+        assert!(function_needs_return_type(MySql));
+        assert!(!function_needs_return_type(DuckDb));
+    }
+
     /// DuckDB's macro statements (measured on 2.0.0): `CREATE [OR REPLACE]
     /// MACRO` and `DROP MACRO [TABLE]`. There is no `ALTER MACRO`, so a
     /// rename is a drop and a create, and no procedure at all — so the
@@ -29986,6 +30047,22 @@ mod tests {
         assert_eq!(
             diff_routine(&cur, &draft, DuckDb).emit()[1],
             "COMMENT ON MACRO \"main\".\"m\" IS 'multiplies';"
+        );
+        // Nor that triggers call it: DuckDB has none. The risk said "including
+        // triggers on other tables" of a macro until a GUI check read it.
+        let lines = diff_routine(&cur, &draft, DuckDb).risk_lines();
+        assert!(
+            lines.contains(&Risk::RedefinesRoutine {
+                name: "m".into(),
+                triggers_call_it: false,
+            }),
+            "{lines:?}"
+        );
+        assert!(
+            !diff_routine(&cur, &draft, DuckDb)
+                .destructive()
+                .iter()
+                .any(|r| r.contains("trigger")),
         );
         // Nor does the plan claim a grant is lost: DuckDB has none.
         draft.info.name = "renamed".into();

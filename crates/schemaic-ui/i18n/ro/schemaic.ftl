@@ -2567,6 +2567,7 @@ ddl-risk-signature-lost = { $kind ->
        *[procedure] Procedura { $name } este semnată
     } (ADD SIGNATURE), iar orice modificare elimină semnătura — Schemaic nu o poate semna din nou fără cheia certificatului. Ce îi permitea certificatul să facă nu mai funcționează până când rulezi din nou ADD SIGNATURE.
 ddl-risk-redefines-routine = Redefinește { $name }. Tot ce o apelează rulează noul corp de acum înainte, inclusiv triggere pe alte tabele pe care această editare nu le-a menționat niciodată.
+ddl-risk-redefines-routine-no-triggers = Redefinește { $name }. Tot ce o apelează rulează de acum corpul nou, inclusiv vizualizări și alte funcții pe care această editare nu le menționează.
 ddl-risk-routine-parameters-change = Modifică lista de parametri a { $name }. Apelanții care transmit argumentele vechi nu se mai rezolvă la ea.
 ddl-risk-recreate-routine = Recrearea { $held } o elimină mai întâi. Acolo unde DDL nu este tranzacțional (MySQL), o definiție nouă respinsă de server nu lasă deloc { $what }.
 ddl-risk-routine-grants-lost = { $comment ->

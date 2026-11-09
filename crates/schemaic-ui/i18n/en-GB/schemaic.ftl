@@ -2912,6 +2912,8 @@ ddl-risk-signature-lost = { $kind ->
        *[procedure] Procedure
     } { $name } is signed (ADD SIGNATURE), and any change to it removes the signature — Schemaic can't sign it again without the certificate's key. Whatever the certificate let it do stops working until you run ADD SIGNATURE again.
 ddl-risk-redefines-routine = Redefines { $name }. Everything that calls it runs the new body from now on, including triggers on other tables this edit never mentioned.
+# The same, on an engine with no triggers (DuckDB, whose functions are macros).
+ddl-risk-redefines-routine-no-triggers = Redefines { $name }. Everything that calls it runs the new body from now on, including views and other functions this edit never mentioned.
 ddl-risk-routine-parameters-change = Changes { $name }'s parameter list. Callers that pass the old arguments no longer resolve to it.
 ddl-risk-recreate-routine = Re-creating { $held } drops it first. Where DDL isn't transactional (MySQL), a new definition the server rejects leaves no { $what } at all.
 ddl-risk-routine-grants-lost = { $comment ->

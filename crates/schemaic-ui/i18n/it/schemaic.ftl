@@ -2493,6 +2493,7 @@ ddl-risk-signature-lost = { $kind ->
        *[procedure] La procedura
     } { $name } ha una firma (ADD SIGNATURE), e qualsiasi modifica la rimuove — Schemaic non può firmarla di nuovo senza la chiave del certificato. Ciò che il certificato le consentiva di fare smette di funzionare finché non esegui di nuovo ADD SIGNATURE.
 ddl-risk-redefines-routine = Ridefinisce { $name }. Tutto ciò che la chiama esegue da ora il nuovo corpo, compresi i trigger su altre tabelle che questa modifica non ha mai menzionato.
+ddl-risk-redefines-routine-no-triggers = Ridefinisce { $name }. Tutto ciò che la chiama esegue d'ora in poi il nuovo corpo, comprese viste e altre funzioni che questa modifica non menziona.
 ddl-risk-routine-parameters-change = Cambia l'elenco dei parametri di { $name }. I chiamanti che passano i vecchi argomenti non vi vengono più risolti.
 ddl-risk-recreate-routine = Ricreare { $held } prima la elimina. Dove il DDL non è transazionale (MySQL), una nuova definizione rifiutata dal server non lascia alcuna { $what }.
 ddl-risk-routine-grants-lost = { $comment ->

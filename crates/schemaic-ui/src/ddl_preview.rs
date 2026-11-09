@@ -2145,7 +2145,17 @@ pub(crate) fn risk_text(risk: &schemaic_core::ddl::Risk) -> String {
             },
             name = name.as_str()
         ),
-        R::RedefinesRoutine { name } => tr!("ddl-risk-redefines-routine", name = name.as_str()),
+        R::RedefinesRoutine {
+            name,
+            triggers_call_it: true,
+        } => tr!("ddl-risk-redefines-routine", name = name.as_str()),
+        R::RedefinesRoutine {
+            name,
+            triggers_call_it: false,
+        } => tr!(
+            "ddl-risk-redefines-routine-no-triggers",
+            name = name.as_str()
+        ),
         R::RoutineParametersChange { name } => {
             tr!("ddl-risk-routine-parameters-change", name = name.as_str())
         }
@@ -3089,7 +3099,14 @@ mod tests {
             R::DropTrigger { name: s("tr") },
             R::RedefineTriggerInPlace { name: s("tr") },
             R::RecreateTrigger { name: s("tr") },
-            R::RedefinesRoutine { name: s("f") },
+            R::RedefinesRoutine {
+                name: s("f"),
+                triggers_call_it: true,
+            },
+            R::RedefinesRoutine {
+                name: s("f"),
+                triggers_call_it: false,
+            },
             R::RoutineParametersChange { name: s("f") },
             R::DropEvent { name: s("ev") },
             R::OneShotEvent,

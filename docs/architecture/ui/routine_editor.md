@@ -29,7 +29,10 @@ and neither volatility nor strictness on a PostgreSQL *procedure*, whose `CREATE
 outright — so it hides what an engine can't express rather than offering it and failing at
 apply, which is a rule the kind axis needs as much as the engine one. The Language field is
 offered where `ddl::routine_takes_language` says so — PostgreSQL's alone, where the clause is
-required — and `RoutineDraft::validate`'s "needs a language" asks the same predicate. The dropdown
+required — and `RoutineDraft::validate`'s "needs a language" asks the same predicate. Whether an
+empty Returns is a refusal is `ddl::function_needs_return_type`, false on DuckDB alone, where it
+is how a scalar macro is spelt; asking it of every engine left every scalar macro opening with
+*The function needs a return type* and Preview SQL off (under `ddl.rs`). The dropdown
 carries the routine's own language alongside the two it proposes, for the same reason: a list
 that didn't would silently retype a `plpython3u` function the moment the control was touched.
 **SQL Server's options are an arm of their own**, and that is the fix as much as the feature:

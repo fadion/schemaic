@@ -2697,6 +2697,17 @@ cannot save a comment the replace already took — and `recreate_restates_routin
 is true (`a_duckdb_macro_replace_restates_its_comment`). **The recreate's grants sentence is
 pushed only where `users::supports_user_admin` says there are accounts to hold one**: DuckDB has
 no privileges, and `Risk::RoutineGrantsLost` would have told the user to re-grant what no one can
-grant (the same test asserts no risk line mentions a `GRANT`). The live half,
+grant (the same test asserts no risk line mentions a `GRANT`). **Nor does the replace's sentence
+name a trigger**: `Risk::RedefinesRoutine` carries `triggers_call_it`, set in `Change::risk_lines`
+from `supports_trigger_editing(dialect)`, and where it is false says "including views and other
+functions this edit never mentioned" rather than "triggers on other tables" — DuckDB has no
+triggers, and the sentence warned of callers that cannot exist (the same test, watched red with
+the flag hard-wired true). **An empty Returns is not a gap on DuckDB**: `RoutineDraft::problems`
+pushed `RoutineProblem::NoReturnType` for every function with an empty `returns`, on every
+engine, and a scalar macro's Returns *is* empty — so every scalar macro opened unchanged with
+"The function needs a return type" and Preview SQL off, found in a sandboxed check of the
+editor. It asks `function_needs_return_type(dialect)` now, false on DuckDB alone
+(`a_scalar_duckdb_macro_needs_no_return_type`, red as `[NoReturnType]` against the unfixed
+tree). The live half,
 `a_macro_is_created_edited_renamed_and_dropped` under `duckdb.rs`, runs each plan through
 `run_ddl` and reads the macros back.

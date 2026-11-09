@@ -822,6 +822,8 @@
     refusal is one `NotWhole { field: SequenceField }`, which the interface words as a whole
     message per field. `RoutineDraft::problems(dialect)` answers `RoutineProblem` (`NoName`,
     `NoLanguage` and `NoBody`, each carrying the `RoutineKind` its sentence names; `NoReturnType`,
+    pushed only where `ddl::function_needs_return_type` says so — not on DuckDB, whose scalar
+    macro has an empty Returns;
     `ProcedureReturns`, `BareParameter`, `RefusedOption { shape, option, native }` with the option
     as its SQL, `NativeNeedsSchemaBinding`, `InlineWithExecuteAs`, `NumberedRename { was, group }`
     with the group's names already joined, `TriggerFunctionArgs`). The trigger editor's two drafts
