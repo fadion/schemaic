@@ -4,8 +4,8 @@
 *complete* statement with a real per-dialect AST (`sqlparser`; `SqlDialect` seam — MySQL,
 PostgreSQL, SQLite, SQL Server and DuckDB all wired, `SqlDialect::ALL` the five, DuckDB on
 sqlparser's `DuckDbDialect`, whose grammar lacks DuckDB's own `SUMMARIZE`, `PIVOT`/`UNPIVOT`,
-`EXPORT`/`IMPORT`, `CHECKPOINT`, `FORCE` and `VACUUM`, so `parser_lacks_statement` leaves those
-unchecked rather than red — `duckdb_statements_the_parser_lacks` fails when sqlparser learns one,
+`EXPORT`/`IMPORT`, `CHECKPOINT`, `FORCE` and `VACUUM` and a macro's second overload (below), so
+`parser_lacks_statement` leaves those unchecked rather than red — `duckdb_statements_the_parser_lacks` fails when sqlparser learns one,
 as it already had a leading `FROM`) and answers what a token stream can't: `statement_scope`
 (the tables and aliases of every query around the caret and the statement's CTE names,
 AST-backed with a `skip_noncode` lexer fallback for mid-edit, and a trigger's `NEW`/`OLD` as
@@ -546,6 +546,23 @@ a mistake in a `DROP TABLE` still reports. The server stays the authority for th
 everything else. MySQL and SQLite answer `false`; PostgreSQL withholds a `DO` block's alone,
 which its grammar lacks outright and whose body is a string to the lexer, so nothing inside it
 went unchecked before — a `DO;` with no body still errs (`a_postgres_do_block_draws_no_error`).
+DuckDB's arm is the head words above and one statement decided by more than its head, the first
+of its kind: a macro with **more than one overload**, `CREATE MACRO m(a) AS (a * 10), (a, b) AS
+((a * 10) + b)` — what Generate DDL writes for an overloaded macro, which a sandboxed hand check
+found squiggled `Expected: end of statement, found: ,`, since sqlparser 0.62's
+`parse_create_macro` reads one `name(args) AS body` and stops. `duckdb_overload_splits` finds the
+candidate seams — after a `CREATE [OR REPLACE] [TEMP|TEMPORARY] MACRO|FUNCTION` head, each
+top-level comma followed by a parenthesis that closes on `AS` — but **the shape does not
+decide**: a table macro's select list holds `, (a) AS x` at the top level, and the first
+version, withholding on the shape, hid a broken macro's real error that way. So
+`duckdb_macro_overloads` parses each overload on its own — the first as written, each later one
+as `CREATE MACRO m` and its `(args) AS body` — and withholds the error only when every one
+parses; a macro of one overload is the parser's, errors and all. `duckdb_statements_the_parser_lacks`
+pins both halves: the overload forms draw no syntax error, while `CREATE MACRO m(a) AS a +;` and
+`CREATE MACRO t(a) AS TABLE SELECT a, (a) AS x FROM;` still do (the second red against the
+shape-only version). Its overload forms end in `;` on purpose: an unterminated last statement is
+the one being typed, whose parse error is withheld anyway, and written without one the test
+passed before the fix.
 **A clause the grammar lacks inside an
 ordinary statement is read past rather than given up at**: `grammar_gap_masks` finds T-SQL's
 query hint `OPTION (…)` at the top level, `WITH ROLLUP`/`WITH CUBE` after a `GROUP BY` at the
@@ -673,7 +690,13 @@ table on all four engines (`only_a_write_target_may_name_its_own_alias`). With t
 sigil kept, `as_declares_a_type` passes the `AS` of `DECLARE @t AS TABLE (…)` (`TABLE` is
 reserved): the word before it is a variable and the nearest statement head is `DECLARE`,
 `CREATE` or `ALTER` (`declaring_contexts`, one forward pass), so `SELECT @x AS order` is still
-flagged (`t_sql_prefixed_names_are_exempt_and_nothing_else_is`).
+flagged (`t_sql_prefixed_names_are_exempt_and_nothing_else_is`). A `CREATE` head passes an
+`AS TABLE` of its own: a table type's `CREATE TYPE t AS TABLE (…)` (`creates_type`) and DuckDB's
+table macro, `CREATE MACRO t(a) AS TABLE SELECT a` (`creates_macro` — `CREATE` with `MACRO` or
+`FUNCTION` among its first five words), where every DuckDB table macro, once per overload, drew
+`TABLE` as a reserved alias. The head decides, not the engine, since PostgreSQL and T-SQL spell a
+table function's `RETURNS TABLE`; `duckdb_statements_the_parser_lacks` asserts the overload forms
+and a plain table macro draw no error at all, which was red on that alias before.
 **A T-SQL three-part name is `database.schema.table`**, and the scanners took one optional
 `.name`, so `company.dbo.employees` was ``Table `dbo` not found in `company``` and
 `tempdb..#t` the table `tempdb`. `dotted_name` reads every part (`..`'s missing schema an empty

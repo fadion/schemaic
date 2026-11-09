@@ -11498,21 +11498,23 @@ fn parser_lacks_statement(sql: &str, toks: &[Token], dialect: SqlDialect) -> boo
         SqlDialect::MySql | SqlDialect::Sqlite => false,
         // DuckDB's own statements that sqlparser's DuckDB grammar does not
         // carry — each pinned by `duckdb_statements_the_parser_lacks`.
-        SqlDialect::DuckDb => matches!(
-            head_words(toks, 1).first().map(String::as_str),
-            Some(
-                "SUMMARIZE"
-                    | "PIVOT"
-                    | "UNPIVOT"
-                    | "PIVOT_WIDER"
-                    | "PIVOT_LONGER"
-                    | "EXPORT"
-                    | "IMPORT"
-                    | "CHECKPOINT"
-                    | "FORCE"
-                    | "VACUUM"
-            )
-        ),
+        SqlDialect::DuckDb => {
+            matches!(
+                head_words(toks, 1).first().map(String::as_str),
+                Some(
+                    "SUMMARIZE"
+                        | "PIVOT"
+                        | "UNPIVOT"
+                        | "PIVOT_WIDER"
+                        | "PIVOT_LONGER"
+                        | "EXPORT"
+                        | "IMPORT"
+                        | "CHECKPOINT"
+                        | "FORCE"
+                        | "VACUUM"
+                )
+            ) || duckdb_macro_overloads(sql, toks)
+        }
         SqlDialect::Postgres => match toks.first() {
             Some(t)
                 if !t.quoted
@@ -11688,6 +11690,96 @@ fn grant_beyond_the_grammar(sql: &str, toks: &[Token]) -> bool {
             .any(|w| w.is_some_and(|w| TSQL_PERMISSIONS.contains(&w.as_str())))
 }
 
+/// Is `toks` a DuckDB macro **with more than one overload** — `CREATE [OR
+/// REPLACE] [TEMP|TEMPORARY] MACRO|FUNCTION m(a) AS …, (a, b) AS …`?
+/// sqlparser reads one `name(args) AS body` and stops at the comma, so the
+/// statement Generate DDL writes for an overloaded macro squiggled.
+///
+/// A candidate split is a top-level `, (` whose parenthesis closes on `AS`;
+/// a table macro's select list can hold one (`SELECT a, (b) AS x`), so the
+/// shape alone does not decide. **Each overload is parsed on its own** — the
+/// first as written, each later one as `CREATE MACRO m` + its `(args) AS
+/// body` — and only when every one parses is the parser's error withheld. A
+/// broken macro, overloaded or not, keeps its syntax error.
+fn duckdb_macro_overloads(sql: &str, toks: &[Token]) -> bool {
+    let splits = duckdb_overload_splits(toks);
+    let (Some(first), Some(last)) = (toks.first(), toks.last()) else {
+        return false;
+    };
+    if splits.is_empty() {
+        return false;
+    }
+    let dialect = SqlDialect::DuckDb.parser();
+    let parses = |text: &str| sqlparser::parser::Parser::parse_sql(&*dialect, text).is_ok();
+    let mut from = first.at;
+    let mut pieces = Vec::new();
+    for &(at, end) in &splits {
+        pieces.push(&sql[from..at]);
+        from = end;
+    }
+    pieces.push(&sql[from..last.end]);
+    let mut pieces = pieces.into_iter();
+    pieces.next().is_some_and(parses)
+        && pieces.all(|p| parses(&format!("CREATE MACRO m {}", p.trim_end_matches(';'))))
+}
+
+/// [`duckdb_macro_overloads`]' candidate splits: each top-level comma, as
+/// `(at, end)` byte offsets, that stands after a macro head and before a
+/// parenthesis closing on `AS`.
+fn duckdb_overload_splits(toks: &[Token]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let word = |t: Option<&Token>, w: &str| {
+        t.is_some_and(|t| {
+            !t.quoted && matches!(&t.kind, TkKind::Word(x) if x.eq_ignore_ascii_case(w))
+        })
+    };
+    let mut i = 0;
+    if !word(toks.get(i), "CREATE") {
+        return out;
+    }
+    i += 1;
+    if word(toks.get(i), "OR") && word(toks.get(i + 1), "REPLACE") {
+        i += 2;
+    }
+    if word(toks.get(i), "TEMP") || word(toks.get(i), "TEMPORARY") {
+        i += 1;
+    }
+    if !(word(toks.get(i), "MACRO") || word(toks.get(i), "FUNCTION")) {
+        return out;
+    }
+    let mut depth = 0usize;
+    for (k, t) in toks.iter().enumerate().skip(i + 1) {
+        match t.kind {
+            TkKind::LParen => depth += 1,
+            TkKind::RParen => depth = depth.saturating_sub(1),
+            TkKind::Comma if depth == 0 => {
+                if !matches!(toks.get(k + 1).map(|t| &t.kind), Some(TkKind::LParen)) {
+                    continue;
+                }
+                // The parenthesis' match, then `AS`.
+                let mut d = 0usize;
+                for (j, u) in toks.iter().enumerate().skip(k + 1) {
+                    match u.kind {
+                        TkKind::LParen => d += 1,
+                        TkKind::RParen => {
+                            d -= 1;
+                            if d == 0 {
+                                if word(toks.get(j + 1), "AS") {
+                                    out.push((t.at, t.end));
+                                }
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Does a `,` stand at the top level of `toks` — outside every parenthesis?
 fn top_level_comma(toks: &[Token]) -> bool {
     let mut depth = 0usize;
@@ -11759,6 +11851,15 @@ fn alias_checks(
                 !t.quoted && matches!(&t.kind, TkKind::Word(w) if w.eq_ignore_ascii_case("VIEW"))
             }));
     let creates_type = head_words(&toks, 2) == ["CREATE", "TYPE"];
+    // DuckDB's table macro, `CREATE [OR REPLACE] [TEMP] MACRO m(a) AS TABLE
+    // SELECT …`, once per overload. Only a macro's head puts `TABLE` straight
+    // after `AS` — PostgreSQL and T-SQL spell a table function's `RETURNS
+    // TABLE` — so the head decides, not the engine.
+    let creates_macro = {
+        let h = head_words(&toks, 5);
+        h.first().is_some_and(|w| w == "CREATE")
+            && h.iter().any(|w| w == "MACRO" || w == "FUNCTION")
+    };
     // A default's or a rule's first `AS` opens its definition: T-SQL's
     // `CREATE DEFAULT d AS NULL`, PostgreSQL's `CREATE RULE r AS ON …`.
     let definition_as = matches!(
@@ -11799,7 +11900,8 @@ fn alias_checks(
         // A CTAS/view body isn't an alias (`CREATE TABLE t AS SELECT …`),
         // nor a table type's `CREATE TYPE t AS TABLE (…)`.
         if is_create
-            && (is_query_body_keyword(b) || (creates_type && b.eq_ignore_ascii_case("TABLE")))
+            && (is_query_body_keyword(b)
+                || ((creates_type || creates_macro) && b.eq_ignore_ascii_case("TABLE")))
         {
             continue;
         }
@@ -33403,6 +33505,13 @@ mod tests {
             "CHECKPOINT",
             "FORCE CHECKPOINT",
             "VACUUM",
+            // A macro's overloads: sqlparser reads one `name(args) AS body`
+            // and stops at the comma. The editor's own Generate DDL wrote
+            // these, and they squiggled.
+            // Terminated, as Generate DDL writes them: an unterminated last
+            // statement is the one being typed, whose error waits anyway.
+            "CREATE MACRO \"main\".\"ov\"(a) AS (a * 10), (a, b) AS ((a * 10) + b);",
+            "CREATE OR REPLACE MACRO tov(a) AS TABLE (SELECT a, 1), (a, b) AS TABLE SELECT a, b;",
         ] {
             let d = diag_d(sql, SqlDialect::DuckDb);
             assert!(
@@ -33416,6 +33525,30 @@ mod tests {
                     "{sql} parses now: drop its head from the list"
                 );
             }
+        }
+        // Nor any other error: `AS TABLE` is a table macro's, not an alias.
+        for sql in [
+            "CREATE MACRO \"main\".\"ov\"(a) AS (a * 10), (a, b) AS ((a * 10) + b);",
+            "CREATE OR REPLACE MACRO tov(a) AS TABLE (SELECT a, 1), (a, b) AS TABLE SELECT a, b;",
+            "CREATE MACRO t(a) AS TABLE SELECT a;",
+        ] {
+            let d = diag_d(sql, SqlDialect::DuckDb);
+            assert!(
+                !d.iter().any(|x| x.severity == Severity::Error),
+                "{sql}: {d:?}"
+            );
+        }
+        // A macro with one overload is the parser's, so its errors still show,
+        // and so does a select list's `, (b) AS x` inside a broken one.
+        for sql in [
+            "CREATE MACRO m(a) AS a +;",
+            "CREATE MACRO t(a) AS TABLE SELECT a, (a) AS x FROM;",
+        ] {
+            let d = diag_d(sql, SqlDialect::DuckDb);
+            assert!(
+                d.iter().any(|x| x.message().starts_with("Syntax error")),
+                "{sql}: {d:?}"
+            );
         }
     }
 
