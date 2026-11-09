@@ -3779,6 +3779,7 @@ gate-plan-connection-changed = Hai cambiato connessione mentre Schemaic verifica
 gate-plan-tab-moved-on = Hai cambiato scheda mentre la connessione veniva ricontrollata, quindi il piano non è stato eseguito. Descrive la scheda da cui è stato chiesto — torna a quella scheda e chiedi di nuovo.
 gate-connection-changed = Non eseguito su { $name } — hai cambiato connessione mentre Schemaic verificava che fosse raggiungibile. Torna indietro e riprova.
 gate-not-connected = Non connesso a { $name }. Il server non ha risposto — verifica che sia in esecuzione e che le impostazioni di questa connessione siano corrette.
+gate-not-connected-file = Impossibile aprire { $name }. Forse un altro programma ha aperto il file del database, oppure il file è stato spostato — chiudi quel programma o verifica il file della connessione e riprova.
 gate-this-connection = questa connessione
 gate-run-tab-moved-on = Hai cambiato scheda mentre la connessione veniva ricontrollata, quindi l'istruzione non è stata eseguita. È stata verificata rispetto alla scheda in cui è stata scritta, ed eseguirla qui la eseguirebbe altrove. Torna a quella scheda ed eseguila di nuovo.
 gate-commit-not-connected = Non connesso — il commit non è stato tentato. Le modifiche in sospeso vengono mantenute.

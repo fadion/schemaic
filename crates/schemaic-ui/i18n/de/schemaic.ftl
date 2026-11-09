@@ -3499,6 +3499,7 @@ gate-plan-connection-changed = Du hast die Verbindung gewechselt, während Schem
 gate-plan-tab-moved-on = Du hast den Tab gewechselt, während die Verbindung erneut geprüft wurde, daher wurde der Plan nicht ausgeführt. Er beschreibt den Tab, in dem er angefordert wurde – geh zu diesem Tab zurück und frag erneut.
 gate-connection-changed = Nicht auf { $name } ausgeführt – du hast die Verbindung gewechselt, während Schemaic geprüft hat, ob sie erreichbar ist. Wechsle zurück und versuch es erneut.
 gate-not-connected = Nicht mit { $name } verbunden. Der Server hat nicht geantwortet – prüfe, ob er läuft und ob die Einstellungen dieser Verbindung stimmen.
+gate-not-connected-file = { $name } konnte nicht geöffnet werden. Möglicherweise hat ein anderes Programm die Datenbankdatei geöffnet, oder die Datei wurde verschoben – schließe das Programm oder prüfe die Datei der Verbindung und versuch es erneut.
 gate-this-connection = diese Verbindung
 gate-run-tab-moved-on = Du hast den Tab gewechselt, während die Verbindung erneut geprüft wurde, daher wurde die Anweisung nicht ausgeführt. Sie wurde für den Tab geprüft, in dem sie geschrieben wurde, und hier würde sie woanders laufen. Geh zu diesem Tab zurück und führe sie erneut aus.
 gate-commit-not-connected = Nicht verbunden – das Commit wurde nicht versucht. Die vorgemerkten Änderungen bleiben erhalten.

@@ -3909,6 +3909,7 @@ gate-plan-connection-changed = Ai schimbat conexiunea în timp ce Schemaic verif
 gate-plan-tab-moved-on = Ai schimbat fila în timp ce conexiunea era reverificată, așa că planul nu a fost rulat. El descrie fila din care a fost cerut — revino la acea filă și cere din nou.
 gate-connection-changed = Nu s-a rulat pe { $name } — ai schimbat conexiunea în timp ce Schemaic verifica dacă e accesibilă. Revino și încearcă din nou.
 gate-not-connected = Neconectat la { $name }. Serverul nu a răspuns — verifică dacă rulează și dacă setările acestei conexiuni sunt corecte.
+gate-not-connected-file = Nu s-a putut deschide { $name }. Poate că un alt program ține deschis fișierul bazei de date sau fișierul a fost mutat — închide acel program sau verifică fișierul conexiunii și încearcă din nou.
 gate-this-connection = această conexiune
 gate-run-tab-moved-on = Ai schimbat fila în timp ce conexiunea era reverificată, așa că instrucțiunea nu a fost rulată. A fost verificată în raport cu fila în care a fost scrisă, iar rularea ei aici ar rula-o în altă parte. Revino la acea filă și rulează-o din nou.
 gate-commit-not-connected = Neconectat — nu s-a încercat commit-ul. Modificările în așteptare sunt păstrate.

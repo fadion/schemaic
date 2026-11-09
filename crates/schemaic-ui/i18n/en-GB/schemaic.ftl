@@ -4476,6 +4476,8 @@ gate-plan-tab-moved-on = You switched tabs while the connection was being re-che
 # $name is the connection's name, or gate-this-connection.
 gate-connection-changed = Didn't run against { $name } — you switched connection while Schemaic was checking that it was reachable. Switch back and try again.
 gate-not-connected = Not connected to { $name }. The server didn't answer — check that it's running and that this connection's settings are right.
+# $name is the connection's name. Said of SQLite and DuckDB, whose check is an open of the file.
+gate-not-connected-file = Couldn't open { $name }. Another program may have its database file open, or the file has moved — close that program or check the connection's file, then try again.
 # Stands in for $name above when the connection has no name to give.
 gate-this-connection = this connection
 gate-run-tab-moved-on = You switched tabs while the connection was being re-checked, so the statement was not run. It was checked against the tab it was typed in, and running it here would run it somewhere else. Go back to that tab and run it again.

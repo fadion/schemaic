@@ -3776,6 +3776,7 @@ gate-plan-connection-changed = Ndërruat lidhjen ndërsa Schemaic po kontrollont
 gate-plan-tab-moved-on = Ndërruat skedën ndërsa lidhja po rikontrollohej, kështu plani nuk u ekzekutua. Ai përshkruan skedën nga e cila u kërkua — kthehuni te ajo skedë dhe pyesni sërish.
 gate-connection-changed = Nuk u ekzekutua në { $name } — ndërruat lidhjen ndërsa Schemaic po kontrollonte nëse ishte e arritshme. Kthehuni dhe provoni sërish.
 gate-not-connected = Nuk jeni lidhur me { $name }. Serveri nuk u përgjigj — kontrolloni që po punon dhe që cilësimet e kësaj lidhjeje janë të sakta.
+gate-not-connected-file = { $name } nuk u hap dot. Ndoshta një program tjetër e ka hapur skedarin e bazës së të dhënave, ose skedari është zhvendosur — mbyllni atë program ose kontrolloni skedarin e lidhjes dhe provoni sërish.
 gate-this-connection = këtë lidhje
 gate-run-tab-moved-on = Ndërruat skedën ndërsa lidhja po rikontrollohej, kështu urdhri nuk u ekzekutua. Ai u kontrollua kundrejt skedës ku u shkrua, dhe ekzekutimi i tij këtu do ta ekzekutonte diku tjetër. Kthehuni te ajo skedë dhe ekzekutojeni sërish.
 gate-commit-not-connected = Nuk jeni lidhur — konfirmimi nuk u provua. Ndryshimet në pritje ruhen.

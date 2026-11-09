@@ -3776,6 +3776,7 @@ gate-plan-connection-changed = Je hebt van verbinding gewisseld terwijl Schemaic
 gate-plan-tab-moved-on = Je hebt van tabblad gewisseld terwijl de verbinding opnieuw werd gecontroleerd, dus het plan is niet uitgevoerd. Het beschrijft het tabblad waaruit het werd gevraagd — ga terug naar dat tabblad en vraag het opnieuw.
 gate-connection-changed = Niet uitgevoerd op { $name } — je hebt van verbinding gewisseld terwijl Schemaic controleerde of ze bereikbaar was. Wissel terug en probeer het opnieuw.
 gate-not-connected = Niet verbonden met { $name }. De server antwoordde niet — controleer of hij draait en of de instellingen van deze verbinding kloppen.
+gate-not-connected-file = Kon { $name } niet openen. Mogelijk heeft een ander programma het databasebestand geopend, of is het bestand verplaatst — sluit dat programma of controleer het bestand van de verbinding en probeer het opnieuw.
 gate-this-connection = deze verbinding
 gate-run-tab-moved-on = Je hebt van tabblad gewisseld terwijl de verbinding opnieuw werd gecontroleerd, dus de instructie is niet uitgevoerd. Ze is gecontroleerd tegen het tabblad waarin ze werd getypt, en haar hier uitvoeren zou haar ergens anders uitvoeren. Ga terug naar dat tabblad en voer haar opnieuw uit.
 gate-commit-not-connected = Niet verbonden — er is niet geprobeerd door te voeren. Klaargezette wijzigingen blijven behouden.

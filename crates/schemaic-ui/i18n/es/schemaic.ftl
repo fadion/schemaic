@@ -3773,6 +3773,7 @@ gate-plan-connection-changed = Has cambiado de conexión mientras Schemaic compr
 gate-plan-tab-moved-on = Has cambiado de pestaña mientras se volvía a comprobar la conexión, así que no se ha ejecutado el plan. Describe la pestaña desde la que se pidió: vuelve a esa pestaña y pregunta de nuevo.
 gate-connection-changed = No se ha ejecutado en { $name }: has cambiado de conexión mientras Schemaic comprobaba que se podía acceder a ella. Vuelve a cambiar e inténtalo de nuevo.
 gate-not-connected = Sin conexión con { $name }. El servidor no ha respondido: comprueba que esté en marcha y que los ajustes de esta conexión sean correctos.
+gate-not-connected-file = No se ha podido abrir { $name }. Puede que otro programa tenga abierto el archivo de la base de datos o que el archivo se haya movido: cierra ese programa o comprueba el archivo de la conexión e inténtalo de nuevo.
 gate-this-connection = esta conexión
 gate-run-tab-moved-on = Has cambiado de pestaña mientras se volvía a comprobar la conexión, así que no se ha ejecutado la sentencia. Se comprobó con la pestaña en la que se escribió, y ejecutarla aquí la ejecutaría en otro sitio. Vuelve a esa pestaña y ejecútala de nuevo.
 gate-commit-not-connected = Sin conexión: no se ha intentado la confirmación. Los cambios pendientes se conservan.

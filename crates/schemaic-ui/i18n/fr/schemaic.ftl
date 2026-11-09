@@ -3779,6 +3779,7 @@ gate-plan-connection-changed = Vous avez changé de connexion pendant que Schema
 gate-plan-tab-moved-on = Vous avez changé d'onglet pendant la nouvelle vérification de la connexion : le plan n'a donc pas été exécuté. Il décrit l'onglet depuis lequel il a été demandé — retournez dans cet onglet et relancez la demande.
 gate-connection-changed = Non exécuté sur { $name } — vous avez changé de connexion pendant que Schemaic vérifiait qu'elle était joignable. Revenez-y et réessayez.
 gate-not-connected = Non connecté à { $name }. Le serveur n'a pas répondu — vérifiez qu'il fonctionne et que les paramètres de cette connexion sont corrects.
+gate-not-connected-file = Impossible d'ouvrir { $name }. Un autre programme a peut-être ouvert le fichier de la base de données, ou le fichier a été déplacé — fermez ce programme ou vérifiez le fichier de la connexion, puis réessayez.
 gate-this-connection = cette connexion
 gate-run-tab-moved-on = Vous avez changé d'onglet pendant la nouvelle vérification de la connexion : l'instruction n'a donc pas été exécutée. Elle a été vérifiée pour l'onglet où elle a été saisie, et l'exécuter ici l'exécuterait ailleurs. Retournez dans cet onglet et exécutez-la de nouveau.
 gate-commit-not-connected = Non connecté — la validation n'a pas été tentée. Les modifications en attente sont conservées.

@@ -1454,6 +1454,21 @@ fn plan_refusal_text(why: Refusal) -> String {
     }
 }
 
+/// What the connection gate says when the check before an action failed.
+///
+/// **A file has no server to blame.** On SQLite and DuckDB the check is an
+/// open of the file, and what fails it is nearly always another program
+/// holding the file (DuckDB's lock) or a file that moved — the gate said "the
+/// server didn't answer — check that it's running" of a DuckDB file the
+/// `duckdb` CLI had open. `networked` is `connection::is_networked`.
+fn not_connected_text(name: &str, networked: bool) -> String {
+    if networked {
+        tr!("gate-not-connected", name = name.to_string())
+    } else {
+        tr!("gate-not-connected-file", name = name.to_string())
+    }
+}
+
 /// What *Import settings* asks before it applies `file`: how many settings
 /// would change and how many snippets would be added, as one catalogue
 /// message — both counts are plurals in it, where the phrase between them was
@@ -9606,13 +9621,18 @@ fn app_view(
                 action();
                 return;
             }
-            let name = connections
+            let (name, networked) = connections
                 .with_untracked(|cs| {
                     cs.iter()
                         .find(|c| c.id == active_conn.get_untracked())
-                        .map(|c| c.name.clone())
+                        .map(|c| {
+                            (
+                                c.name.clone(),
+                                schemaic_core::connection::is_networked(&c.db_type),
+                            )
+                        })
                 })
-                .unwrap_or_else(|| tr!("gate-this-connection"));
+                .unwrap_or_else(|| (tr!("gate-this-connection"), true));
             (check_conn_then)(Some(Rc::new(move |answer: CheckAnswer| {
                 // **The connection moved out from under the action.** Refusing
                 // is right — running it would send it to a server the user has
@@ -9643,10 +9663,8 @@ fn app_view(
                     // silently do nothing.
                     // Schemaic's sentence, not the server's: it carries no
                     // server text for "Explain" to work from.
-                    error_modal_text.set(Some(ModalError::app(tr!(
-                        "gate-not-connected",
-                        name = name.clone()
-                    ))));
+                    error_modal_text
+                        .set(Some(ModalError::app(not_connected_text(&name, networked))));
                     error_modal_open.set(true);
                     refused(Refusal::NotConnected);
                 }
@@ -17081,10 +17099,10 @@ mod app_tests {
     use super::{
         Action, CheckAnswer, CliLauncher, ConnGate, ConnGateElse, GridAiJobs, OnceReply, Refusal,
         RunTimeout, gate1, gate1_on_tab, gate1_on_tab_answered, health_check_lets_through,
-        inline_outcome, mssql_shell_config, mysql_shell_config, owning_tab_of, plan_refusal_text,
-        plan_refused, psql_database, psql_shell_config, resolve_cli_with, resolve_native_cli,
-        sqlite_shell_config, stop_grid_ai_jobs, test_outcome, timeout_message, tx_engine,
-        unique_name,
+        inline_outcome, mssql_shell_config, mysql_shell_config, not_connected_text, owning_tab_of,
+        plan_refusal_text, plan_refused, psql_database, psql_shell_config, resolve_cli_with,
+        resolve_native_cli, sqlite_shell_config, stop_grid_ai_jobs, test_outcome, timeout_message,
+        tx_engine, unique_name,
     };
     use floem::prelude::{SignalGet, SignalUpdate};
     use floem::reactive::RwSignal;
@@ -18980,6 +18998,21 @@ mod app_tests {
         // Each names what did *not* happen; a modal that only says "error" is
         // the thing being replaced.
         assert!(a.contains("was not run") && b.contains("was not run"));
+    }
+
+    /// **A file database has no server to blame.** A DuckDB file another
+    /// program held open failed the health ping, and the gate said "The
+    /// server didn't answer — check that it's running", of a file. A
+    /// networked engine keeps the server sentence.
+    #[test]
+    fn a_file_connection_that_will_not_open_is_not_called_a_server() {
+        let file = not_connected_text("shop", false);
+        assert!(file.contains("shop"), "{file}");
+        assert!(!file.to_lowercase().contains("server"), "{file}");
+        assert!(file.contains("file"), "{file}");
+        let server = not_connected_text("prod", true);
+        assert!(server.contains("server"), "{server}");
+        assert_ne!(file, not_connected_text("shop", true));
     }
 
     /// **`tr_static!` is the message, read once per site.** A file dialog's type
