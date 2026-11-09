@@ -7258,6 +7258,18 @@ mod create_menu_tests {
         );
     }
 
+    /// **DuckDB is offered a table, a view, a macro (a function) and a
+    /// schema** — `CREATE SCHEMA` there is the namespace, as on PostgreSQL —
+    /// and no sequence: its plans create one (schema compare does), but the
+    /// sequence form offers a type, a cache and a restart DuckDB has none of.
+    #[test]
+    fn duckdb_is_offered_what_it_emits() {
+        assert_eq!(
+            labels(SqlDialect::DuckDb),
+            vec!["Table", "View", "Function", "Schema"]
+        );
+    }
+
     /// **SQL Server is offered a table, a view, its four standalone objects,
     /// its routines and both containers** — the Creates whose statements it
     /// emits — and not PostgreSQL's type or domain.

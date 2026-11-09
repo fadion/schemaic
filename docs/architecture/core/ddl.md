@@ -13,7 +13,9 @@ answers per object**, and without an edit to any of them: `supports_change` send
 `duckdb_supports`, which admits a table's own changes — in place where DuckDB's `ALTER TABLE`
 can, by a rebuild where it cannot (`duckdb_rebuild_sql`, below) — and a view's create, replace,
 rename and drop (with the other engines' views, below), a macro's create, replace and drop (with
-the other engines' routines, below), and refuses every trigger change and a procedure: DuckDB has
+the other engines' routines, below), a schema's create and drop and a sequence's create, comment
+and drop (for schema compare, with the containers and `ObjectDraft::blank`, below), and refuses
+every trigger change and a procedure: DuckDB has
 no triggers and no procedures, a macro being a function to the model. DuckDB's DDL is
 close to PostgreSQL's but not the same (no `ADD CONSTRAINT` for a key or a foreign key once a
 table exists, no index rename, no `ALTER INDEX`, a table something depends on cannot be renamed
@@ -197,7 +199,7 @@ refuse at apply — after any `DROP` in the same set has already committed on My
 computed from a statement, so there is no `supports_change` to derive it from.
 `supports_database_editing` and `supports_namespace_editing` are the newest pair, for the
 **container** the rest of this module's objects live in: `CREATE`/`DROP DATABASE` on MySQL,
-PostgreSQL and SQL Server, and PostgreSQL's and SQL Server's `CREATE`/`DROP SCHEMA`. They are two predicates
+PostgreSQL and SQL Server, and PostgreSQL's, SQL Server's and DuckDB's `CREATE`/`DROP SCHEMA`. They are two predicates
 rather than one because MySQL answers them *differently* — its `CREATE SCHEMA` is a synonym for
 `CREATE DATABASE`, one level up from what the change means, so a single "supports containers"
 answer would have offered `Create schema` there and quietly made a database. SQLite answers no
@@ -270,6 +272,15 @@ ends `; DROP DATABASE x`; `every_offered_sql_server_collation_lands_in_the_claus
 `create_sql`'s clauses is gated on the capability that answers for it rather than on the field
 being set, since a draft outlives the form it came from: a draft carrying a character set, a
 collation and an owner emits for SQL Server with the collation alone.
+**DuckDB takes the namespace pair and not the database one**, admitted by `duckdb_supports` for
+schema compare (under `compare.rs`) — `CREATE SCHEMA "s";` and `DROP SCHEMA "s";` through the
+same two functions, and `supports_namespace_editing` followed with no edit of its own, so the
+Create menu's *Schema* and a namespace row's **Drop** came on. **A `CreateSchema` naming an owner
+is refused there**, not written without one: DuckDB's `CREATE SCHEMA … AUTHORIZATION` is a syntax
+error (measured on 2.0.0), and `supports_owners` already keeps the form from offering one. A
+schema takes no comment on DuckDB either (*not implemented*). `supports_drop_schema_cascade`
+answers yes for it, DuckDB having the clause, so the drop's warning says Schemaic never sends it
+(`duckdb_creates_and_drops_schemas_without_an_owner`).
 **Seven account changes join them in not addressing `ChangeSet::table`** — `CreateAccount`,
 `SetAccountPassword`, `DropAccount`, `Grant`/`RevokePrivileges` and `Grant`/`RevokeRole`, the
 Users and privileges
@@ -2282,8 +2293,18 @@ restart and applies with one at 600, and a sequence restarted on one side compar
 it into the editor: `from_item` answers it for `ObjectItem::Tsql`, and `kind`, `name`,
 `problems` (and so `validate`, its English) and `change_set` route to it. **`ObjectDraft::blank` takes the dialect now, because
 a sequence's draft depends on it** — PostgreSQL's `SequenceDraft` on PostgreSQL, MySQL and
-SQLite, a `TsqlObjectDraft` on SQL Server. The form and the plan follow the draft, so the wrong
-one would offer PostgreSQL's clauses and emit its grammar. A synonym, alias type or collection
+SQLite, a `TsqlObjectDraft` on SQL Server, and **none on DuckDB**, named in its own arm. The form
+and the plan follow the draft, so the wrong
+one would offer PostgreSQL's clauses and emit its grammar. DuckDB had no arm and fell through to
+the one below, SQL Server's draft; its plans now create a sequence (`duckdb_supports`, for schema
+compare), but only a `BIGINT` with no cache and no `OWNED BY` — its `CREATE SEQUENCE` takes
+neither `AS` nor `CACHE` — and nothing alters one once made: `ALTER SEQUENCE` refuses every
+option (*not yet supported*), `RESTART` does not parse and a rename is *not yet supported*, all
+measured on 2.0.0, so `AlterSequence`, `RestartSequence` and a sequence's `RenameObject` stay
+refused while its `DropObject` and `SetObjectComment` are admitted. PostgreSQL's form offers a
+type, a cache and a restart, so the blank is `None` and **the Sequences folder's Create stays off
+until a form shaped for DuckDB exists** (`duckdb_creates_comments_and_drops_sequences_and_alters_none`,
+which also pins `CREATE SEQUENCE "main"."s" INCREMENT BY 2;` and `DROP SEQUENCE`). A synonym, alias type or collection
 gets a `TsqlObjectDraft` whatever the dialect; the capability below is what keeps one from being
 offered where its plan would be refused. The comparison asks this same differ of two readings
 of one object, so a schema compare and the editor cannot disagree about what a change to one is
@@ -2300,9 +2321,11 @@ capability alone answers the same for both kinds
 PostgreSQL and SQL Server to both entries). It began because SQL Server's Sequences
 folder would have opened PostgreSQL's sequence form, whose `CREATE SEQUENCE` `tsql_supports`
 refuses. It answers Sequence, Synonym, Alias type and XML schema collection on SQL Server and
-not Type or Domain; Type, Domain and Sequence on PostgreSQL; and nothing on MySQL or SQLite
+not Type or Domain; Type, Domain and Sequence on PostgreSQL; and nothing on MySQL, SQLite or
+DuckDB, whose sequence has no form (above)
 (`a_folder_offers_create_where_the_engine_takes_the_form`; for the menu,
-`create_menu_tests::mysql_offers_only_what_it_has` and `sql_server_is_offered_what_it_emits`).
+`create_menu_tests::mysql_offers_only_what_it_has`, `sql_server_is_offered_what_it_emits` and
+`duckdb_is_offered_what_it_emits` — Table, View, Function, Schema).
 **It used to be sound only behind a folder that exists**: MySQL inherited `supports_change`'s
 blanket yes for PostgreSQL's three creates, so the predicate said yes to a MySQL sequence, and
 `overlays::create_children` kept a `dialect == Postgres` for Type, Domain and Sequence rather

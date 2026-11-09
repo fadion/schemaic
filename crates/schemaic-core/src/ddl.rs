@@ -4096,6 +4096,13 @@ impl ObjectDraft {
                 ObjectKind::Sequence,
                 SqlDialect::Postgres | SqlDialect::MySql | SqlDialect::Sqlite,
             ) => Some(ObjectDraft::Sequence(SequenceDraft::blank(name, schema))),
+            // **No blank form on DuckDB, deliberately.** Its plans create a
+            // sequence (`duckdb_supports`), which schema compare needs, but
+            // PostgreSQL's form offers a type, a cache and a restart, none of
+            // which DuckDB's grammar has — so the folder's *Create* entry stays
+            // off until a form shaped for DuckDB exists. Named here rather than
+            // left to the arm below, which would hand it SQL Server's draft.
+            (ObjectKind::Sequence, SqlDialect::DuckDb) => None,
             (
                 ObjectKind::Sequence
                 | ObjectKind::Synonym
@@ -14216,7 +14223,7 @@ pub fn supports_database_editing(dialect: SqlDialect) -> bool {
 
 /// Can `dialect` create and drop **namespaces inside** a database?
 ///
-/// PostgreSQL and SQL Server. MySQL's `CREATE SCHEMA` is a synonym for `CREATE DATABASE`
+/// PostgreSQL, SQL Server and DuckDB (with no owner). MySQL's `CREATE SCHEMA` is a synonym for `CREATE DATABASE`
 /// and means the level above this one; SQLite has no namespaces at all. The
 /// distinction from [`supports_database_editing`] is the whole point of having
 /// two predicates: on MySQL the first is true and this one is false, and a
@@ -19150,6 +19157,30 @@ fn duckdb_supports(change: &Change) -> bool {
             d.info.kind == crate::schema::RoutineKind::Function
         }
         Change::DropRoutine(_) => true,
+        // Schemas: `CREATE SCHEMA` and `DROP SCHEMA` (never `CASCADE`), with
+        // no owner — `AUTHORIZATION` is a syntax error — and no comment
+        // (*not implemented*).
+        Change::CreateSchema { owner, .. } => owner.as_deref().is_none_or(|o| o.trim().is_empty()),
+        Change::DropSchema { .. } => true,
+        // Sequences: created, commented and dropped, each a statement of its
+        // own. Every one is a `BIGINT` with no cache — `CREATE SEQUENCE`
+        // takes neither `AS` nor `CACHE` — and nothing alters one: `ALTER
+        // SEQUENCE` refuses every option, `RESTART` does not parse and a
+        // rename is *not yet supported* (all measured on 2.0.0). A sequence
+        // a column default uses cannot be dropped or replaced either, which
+        // DuckDB says itself, inside the plan's one transaction.
+        Change::CreateSequence(s) => {
+            s.data_type.trim().eq_ignore_ascii_case("bigint")
+                && s.cache == 1
+                && s.owned_by.is_none()
+        }
+        Change::DropObject {
+            kind: ObjectKind::Sequence,
+        }
+        | Change::SetObjectComment {
+            kind: ObjectKind::Sequence,
+            ..
+        } => true,
         // **Admitted when everything that differs is something an `ALTER
         // COLUMN` writes** — the rename, the type, nullability, the default
         // and the comment — asked of `columns_equal`, the comparison that
@@ -29440,6 +29471,104 @@ mod tests {
             assert!(supports_object_creation(e, ObjectKind::Function), "{e:?}");
             assert!(supports_object_creation(e, ObjectKind::Procedure), "{e:?}");
         }
+    }
+
+    /// DuckDB creates, comments and drops a sequence, each a statement of
+    /// its own, and has no `ALTER SEQUENCE` that changes anything (*option
+    /// not yet supported*), no `RESTART` and no rename (measured on 2.0.0).
+    /// Its `CREATE SEQUENCE` takes neither `AS <type>` nor `CACHE` — every
+    /// sequence is a `BIGINT` — so a definition naming either is refused
+    /// rather than written into a statement DuckDB's parser rejects.
+    #[test]
+    fn duckdb_creates_comments_and_drops_sequences_and_alters_none() {
+        let d = DuckDb;
+        let s = SequenceInfo {
+            name: "s".into(),
+            schema: Some("main".into()),
+            data_type: "BIGINT".into(),
+            increment: 2,
+            ..Default::default()
+        };
+        for c in [
+            Change::CreateSequence(Box::new(s.clone())),
+            Change::DropObject {
+                kind: ObjectKind::Sequence,
+            },
+            Change::SetObjectComment {
+                kind: ObjectKind::Sequence,
+                comment: Some("c".into()),
+            },
+        ] {
+            assert!(supports_change(d, &c), "{c:?}");
+        }
+        for c in [
+            Change::CreateSequence(Box::new(SequenceInfo {
+                data_type: "integer".into(),
+                ..s.clone()
+            })),
+            Change::CreateSequence(Box::new(SequenceInfo {
+                cache: 5,
+                ..s.clone()
+            })),
+            Change::AlterSequence {
+                from: Box::new(s.clone()),
+                to: Box::new(SequenceInfo {
+                    increment: 3,
+                    ..s.clone()
+                }),
+            },
+            Change::RestartSequence { to: 9 },
+            Change::RenameObject {
+                kind: ObjectKind::Sequence,
+                to: "t".into(),
+            },
+        ] {
+            assert!(!supports_change(d, &c), "{c:?}");
+        }
+        assert_eq!(
+            create_sequence(&SequenceDraft::from_info(&s), d).emit(),
+            ["CREATE SEQUENCE \"main\".\"s\"\n  INCREMENT BY 2;"]
+        );
+        assert_eq!(
+            drop_object(ObjectKind::Sequence, "s", Some("main"), d).emit(),
+            ["DROP SEQUENCE \"main\".\"s\";"]
+        );
+        // The plans create one; the folder's form, PostgreSQL's, is not
+        // offered, its type, cache and restart being clauses DuckDB lacks.
+        assert!(ObjectDraft::blank(ObjectKind::Sequence, "s", None, d).is_none());
+        assert!(!supports_object_creation(d, ObjectKind::Sequence));
+    }
+
+    /// A DuckDB schema is created and dropped as PostgreSQL's is — never
+    /// with `CASCADE` — but has no owner: `CREATE SCHEMA … AUTHORIZATION` is
+    /// a syntax error there (measured), so a draft naming one is refused.
+    #[test]
+    fn duckdb_creates_and_drops_schemas_without_an_owner() {
+        let d = DuckDb;
+        assert!(supports_namespace_editing(d));
+        assert!(!supports_change(
+            d,
+            &Change::CreateSchema {
+                name: "s".into(),
+                owner: Some("alice".into()),
+            }
+        ));
+        let create = ChangeSet {
+            table: String::new(),
+            schema: None,
+            dialect: d,
+            flavour: ServerFlavour::Unknown,
+            changes: vec![Change::CreateSchema {
+                name: "s".into(),
+                owner: None,
+            }],
+        };
+        assert_eq!(create.emit(), ["CREATE SCHEMA \"s\";"]);
+        let drop = ChangeSet {
+            changes: vec![Change::DropSchema { name: "s".into() }],
+            ..create
+        };
+        assert_eq!(drop.emit(), ["DROP SCHEMA \"s\";"]);
     }
 
     /// A macro is dropped as one — `DROP MACRO`, and `DROP MACRO TABLE` for a
