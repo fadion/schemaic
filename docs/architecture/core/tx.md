@@ -1,23 +1,25 @@
 # `core/tx.rs`
 
 `tx.rs` — the **manual-transaction** state machine behind `TxMode::Manual` (no DB, no UI).
-Three engines of the five: **SQLite and DuckDB have no manual mode**. DuckDB's is about this app
-rather than the engine — it holds transactions, read-only ones included, and its pinned
-`Session` is the roadmap's later DuckDB phase, so `Session::open` refuses it
-(`DbRefusal::DuckDbNoManual`) and `tx_engine_of` already maps it to PostgreSQL's model (a failed
-statement aborts the transaction; DDL rolls back — measured on 2.0); `offers_manual_mode`'s
-read-only-transaction answer for it is yes, `BEGIN TRANSACTION READ ONLY` refusing writes by
-their effect, for when the session lands. On SQLite the status-bar segment offering it
+Four engines of the five: **SQLite has no manual mode**. DuckDB's pinned `Session` holds a
+blocking connection and, with it, the file's instance and lock (under `db::duckdb`);
+`tx_engine_of` maps it to PostgreSQL's model (a failed statement aborts the transaction; DDL rolls
+back — measured on 2.0), and `offers_manual_mode`'s read-only-transaction answer for it is yes,
+`BEGIN TRANSACTION READ ONLY` refusing writes by their effect. **What DuckDB lacks is a
+`SAVEPOINT`**, so its grid commit in a Manual tab can never be `FailedIsolated`: a failed batch
+rolls the whole transaction back and is reported `StmtOutcome::FailedAndRolledBack` (below), and
+its reads are never fenced. On SQLite the status-bar segment offering it
 is hidden on such a connection and `Session::open` refuses one — not because SQLite lacks
 transactions but because a pinned `rusqlite::Connection` is blocking and `!Sync`, needing a
 thread of its own and a channel, which is worth building deliberately rather than as a side
 effect of adding an engine. Running the tab's statements on fresh connections instead would
 break the single promise the mode makes. `supports_manual_mode` is that answer, an exhaustive
 `match` (the footer asked `is_sqlite` before there was a second engine without one; SQL Server
-was that second engine until its pinned session was written, under `db::mssql`).
+was that second engine until its pinned session was written, under `db::mssql`, and DuckDB the
+next, until its own was).
 **`offers_manual_mode(dialect, read_only)` is what the footer actually asks** — its
 `manual_supported` memo, with the connection's `read_only` — and it is `supports_manual_mode`
-narrowed by whether the engine can hold a *read-only* transaction. MySQL and PostgreSQL can, so
+narrowed by whether the engine can hold a *read-only* transaction. MySQL, PostgreSQL and DuckDB can, so
 a read-only connection's pinned session is a read-only one (`Session::open_enforced`, under
 `schemaic-db`); SQL Server cannot, so `open_enforced` refuses a read-only SQL Server connection
 a session, and the segment is left off there rather than offering a mode whose every press ends
@@ -267,7 +269,8 @@ fact about the connection and the tab has to hear it. It is tested as the **comp
 `read_outcome` and then the fold — because either half alone is green:
 `on_statement(Postgres, "SELECT", Cancelled)` is *supposed* to poison, and the pinned session
 has no test seam of its own at all, `Session::open` refusing SQLite so the in-memory backend
-cannot reach it.
+cannot reach it. (DuckDB's in-memory target reaches a pinned session now, under `db::duckdb`, but
+none of its tests stops a read between transactions.)
 **SQL Server's state is read off the server after every statement, because its text decides
 none of it.** `probes_after_every_statement(engine)` is `true` for `TxEngine::MsSql` alone
 (`sql_server_has_a_manual_mode_that_asks_the_server`): `@@TRANCOUNT` counts nested `BEGIN TRAN`s, so a typed `COMMIT` may close nothing; `ROLLBACK
@@ -284,7 +287,8 @@ whose promise is that nothing commits by surprise. The probe's answers arrive as
 could produce. `OkAndClosed` was already there. `StmtOutcome::FailedAndRolledBack` — the server
 ended the transaction by rolling it back — folds to `Idle`, `FailedAndCommitted`'s mirror: the
 transaction is gone and the pill quiet either way, but here everything since `BEGIN` is undone
-rather than permanent. `StmtOutcome::FailedAndDoomed` — `XACT_STATE()` of -1, still open but
+rather than permanent. DuckDB's failed grid commit reports it too, for the `ROLLBACK` the session
+issued itself (`duckdb::pinned_write`). `StmtOutcome::FailedAndDoomed` — `XACT_STATE()` of -1, still open but
 uncommittable until a `ROLLBACK` — folds to `Poisoned`, PostgreSQL's aborted state by another
 name; an ordinary failure stays `Open` there, as on MySQL
 (`a_sql_server_failure_folds_to_what_the_server_said`). **`Poisoned` has one more exit, and it

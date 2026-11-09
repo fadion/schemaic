@@ -1420,6 +1420,11 @@ pub enum Rollback {
     /// It is the conservative answer, not a reassuring one: nothing is known,
     /// and the note says so.
     Unknown,
+    /// The batch could not be undone alone, so **the whole transaction it ran
+    /// in was rolled back** — every statement of a Manual tab's since it
+    /// began, not only these edits. DuckDB's, which has no `SAVEPOINT` to
+    /// nest a batch in (`db::duckdb::pinned_write`).
+    Transaction,
 }
 
 impl Rollback {
@@ -1438,6 +1443,11 @@ impl Rollback {
                 " — and the rollback could not be confirmed: the connection failed \
                  before the server answered. Rows may or may not remain. Check the \
                  table before retrying."
+            }
+            Rollback::Transaction => {
+                " — and the whole transaction was rolled back with them: this engine \
+                 cannot undo a batch of edits alone, so every statement this tab ran \
+                 since its transaction began is undone too."
             }
         }
     }
@@ -1560,8 +1570,6 @@ pub enum DbRefusal {
     /// The OS keyring would not give a saved connection's secret at connect
     /// time; the backend's own message. Nothing was deleted.
     KeyringUnreadable(String),
-    /// DuckDB has no Manual transaction mode here yet.
-    DuckDbNoManual,
     /// A DuckDB connection with no file.
     DuckDbNoFile,
     /// `:memory:` or a MotherDuck name as a DuckDB file.
@@ -1614,7 +1622,6 @@ impl DbRefusal {
             | DbRefusal::SqliteGenerated(_)
             | DbRefusal::SqliteSizesTooLarge { .. }
             | DbRefusal::KeyringUnreadable(_)
-            | DbRefusal::DuckDbNoManual
             | DbRefusal::DuckDbNoFile
             | DbRefusal::DuckDbNotAFile(_)
             | DbRefusal::DuckDbMissing(_) => true,
@@ -1764,9 +1771,6 @@ impl DbRefusal {
                 "Schemaic could not read the saved credentials for this connection from the OS \
                  keyring ({error}). Nothing was deleted: unlock the keyring and try again."
             ),
-            DbRefusal::DuckDbNoManual => "DuckDB connections don't support manual transaction \
-                                          mode yet — statements run and commit as they are sent"
-                .to_string(),
             DbRefusal::DuckDbNoFile => "no database file is set".to_string(),
             DbRefusal::DuckDbNotAFile(name) => format!(
                 "{name} is not a database file — a DuckDB connection opens a file on this \

@@ -1030,6 +1030,7 @@ pub fn write_failure_text(f: &schemaic_core::model::WriteFailure) -> String {
         Some(Rollback::Complete) => tr!("write-rollback-complete"),
         Some(Rollback::Incomplete) => tr!("write-rollback-incomplete"),
         Some(Rollback::Unknown) => tr!("write-rollback-unknown"),
+        Some(Rollback::Transaction) => tr!("write-rollback-transaction"),
     };
     let error = format!("{cause}{note}");
     if f.cause.is_statements() {
@@ -1263,7 +1264,6 @@ pub fn db_refusal_text(r: &schemaic_core::model::DbRefusal) -> String {
         DbRefusal::KeyringUnreadable(error) => {
             tr!("db-refused-keyring-unreadable", error = error.as_str())
         }
-        DbRefusal::DuckDbNoManual => tr!("db-refused-duckdb-no-manual"),
         DbRefusal::DuckDbNoFile => tr!("db-refused-duckdb-no-file"),
         DbRefusal::DuckDbNotAFile(name) => {
             tr!("db-refused-duckdb-not-a-file", name = name.as_str())
@@ -1903,7 +1903,6 @@ mod tests {
                 file: 3 * 1024 * 1024 * 1024,
             },
             DbRefusal::KeyringUnreadable(s("keyring locked")),
-            DbRefusal::DuckDbNoManual,
             DbRefusal::DuckDbNoFile,
             DbRefusal::DuckDbNotAFile(s(":memory:")),
             DbRefusal::DuckDbMissing(s("C:/data/x.duckdb")),
@@ -2082,6 +2081,7 @@ mod tests {
                 Some(Rollback::Complete),
                 Some(Rollback::Incomplete),
                 Some(Rollback::Unknown),
+                Some(Rollback::Transaction),
             ] {
                 let f = WriteFailure {
                     cause: cause.clone(),

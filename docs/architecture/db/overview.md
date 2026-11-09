@@ -700,8 +700,7 @@ read-only gate (`read_only_refusal(..).reason`), `kill_session`'s cancel, the bl
 code-page checks, `sqlite::open_target`'s three refusals, SQLite's "the SQLite worker failed: …"
 (a `Query` once) at each of its six sites, its default-reset refusals and `table_stats`' size
 cap, and DuckDB's — `duckdb::open_target`'s three, a sealed or unsealed instance asked for the
-other kind (`DuckDbSealedElsewhere`), its worker failing, and
-`Session::open`'s `DuckDbNoManual` (under `duckdb.rs`). It renders **as written**, `#[error("{0}")]` with no prefix — `DbRefusal`'s `Display`, its
+other kind (`DuckDbSealedElsewhere`) and its worker failing (under `duckdb.rs`). It renders **as written**, `#[error("{0}")]` with no prefix — `DbRefusal`'s `Display`, its
 English: each is already the whole sentence, and "query failed:" in front of "Commit cancelled
 — …" named a failure that was the user's own act. The window words it instead
 (`i18n::db_refusal_text`, from `db_error_shown`); the CLI, the MCP server and the logs keep
@@ -852,7 +851,7 @@ unlikely. **The length and
 the bytes come out of one row of one statement**, never two queries: asked separately they can
 straddle another session's `UPDATE`, and the pair is what `BlobValue::truncated` reads to decide
 whether a save would write a file that is not the data. `Session::fetch_blob` (MySQL,
-PostgreSQL and SQL Server) runs the same body on the pinned connection for `Session::refetch_rows`' reason: a
+PostgreSQL, SQL Server and DuckDB) runs the same body on the pinned connection for `Session::refetch_rows`' reason: a
 manual-transaction tab that has written a blob and not committed would otherwise open the panel
 on the pre-transaction bytes and call them current. Like every other `Session` call site, the app
 folds its `Outcome::stmt` into `TxState::on_statement`: a read is still a statement, and one that
@@ -877,7 +876,12 @@ sides of the connection lock: the overwhelmingly common cancellation there is th
 dismissed, and `NotSent` is the one outcome that leaves an *open* transaction alone with no
 bookkeeping at all. **SQL Server's reads are not fenced, and need not be**: `run_scope_sql`
 answers `false` there without asking, because a T-SQL savepoint cannot be released, and a
-cancelled read does not abort a SQL Server transaction — see `mssql.rs`.
+cancelled read does not abort a SQL Server transaction — see `mssql.rs`. **DuckDB's are not
+fenced either, but for want of the statement rather than of the need**: it has no `SAVEPOINT`, so
+`run_scope_sql` answers `false` there too, and a read stopped in a DuckDB Manual tab folds as a
+plain `Cancelled` — an aborted transaction in the PostgreSQL model `tx_engine_of` gives it, which is
+what an interrupt does to a DuckDB transaction (measured; `stop_interrupts_a_manual_tabs_statement`
+in `duckdb.rs`). There the panel's dismissal costs the transaction, with nothing to prevent it.
 **Both reads also leave through `Outcome::into_read`, and that is the half the fence cannot
 cover.** `fence_read` has no savepoint to set when there is no transaction to fence — PostgreSQL
 answers `ERROR: SAVEPOINT can only be used in transaction blocks`, so `run_scope_sql` reports
@@ -1339,7 +1343,10 @@ characteristics) — so every transaction for the tab's life is read-only in its
 nothing run inside it can undo (`a_read_only_pinned_session_cannot_be_lifted_across_a_commit`).
 SQL Server has no read-only transaction to hold, so there the `ReadOnly` open is **refused**
 rather than granted an unguarded session (under `mssql.rs`), and `Ctl::BeginReadOnly` is refused
-again in `control_on` rather than spelt as a plain `BEGIN TRANSACTION`.
+again in `control_on` rather than spelt as a plain `BEGIN TRANSACTION`. DuckDB's open sets
+nothing: `Ctl::BeginReadOnly` is `BEGIN TRANSACTION READ ONLY`, which refuses a write by its
+effect, and a Manual tab runs nothing outside a transaction `ensure_tx` opened
+(`a_read_only_manual_tab_refuses_a_write`, under `duckdb.rs`).
 `Db::explain` takes a `read_only` flag, because `EXPLAIN
 ANALYZE` *executes* the statement inside a transaction it always rolls back, and the rollback is
 not the guarantee it looks like: it undoes an InnoDB write but not a MyISAM or Aria one, and on

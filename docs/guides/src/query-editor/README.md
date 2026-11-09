@@ -82,11 +82,12 @@ A few things the server decides, not Schemaic:
 - *MySQL and MariaDB* commit an open transaction before running DDL such as `CREATE` or `ALTER`.
   Schemaic tells you when that has happened, since **Rollback** can no longer undo what came
   before.
-- *PostgreSQL* stops a transaction at the first failed statement. The footer then reads
-  *Tx aborted — rollback to continue*.
+- *PostgreSQL* and *DuckDB* stop a transaction at the first failed statement. The footer then
+  reads *Tx aborted — rollback to continue*, and only **Rollback** ends it.
+- *DuckDB* — while a tab is in **Manual**, Schemaic keeps the database file open, so no other
+  program can open it until the tab goes back to **Auto-commit**.
 - *SQLite* has no Manual mode in Schemaic, so the switch isn't shown: every statement commits as it
   runs. Nor does a read-only SQL Server connection.
-- *DuckDB* has no Manual mode in Schemaic yet, so the switch isn't shown there either.
 
 ## Panels beside the editor
 

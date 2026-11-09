@@ -66,32 +66,18 @@ Each of these is a one-session change.
 Phase 1 has landed: the engine reads, runs scripts and DDL plans, introspects, exports, plans,
 backs up and opens its CLI, behind its own read-only gate (`docs/architecture/db/duckdb.md`).
 Phase 2's grid write-back has landed too, on provenance read from the statement (`rowid` is never
-a key, because a checkpoint renumbers it), and so have import and the `.sql` dump. What is left is
-below. ClickHouse would come after
+a key, because a checkpoint renumbers it), and so have import, the `.sql` dump and Manual tabs (a
+failed grid commit there rolls the whole transaction back, DuckDB having no savepoint). What is
+left is below. ClickHouse would come after
 DuckDB.
 
 - **Decided — the unattended paths cannot read files:** done in phase 1 (`Db::sealed`, called by
   `cli::query`). The editor reads files as normal.
 - **Decided — linked in, extensions off:** done in phase 1.
 - **Decided — one instance per file, shared while operations overlap:** done in phase 1, and
-  stated in the invariants. A Manual tab's session will hold the instance — and with it the file's
-  lock — for as long as the tab is pinned, which is the one thing phase 2 must say in the UI.
+  stated in the invariants. A Manual tab's session holds the instance — and with it the file's
+  lock — for as long as the tab stays in Manual mode, and the connection form's hint says so.
 - **Phase 2 — the rest of the writes:**
-  - **Manual tabs** (`Session` for DuckDB, then `tx::supports_manual_mode`; `BEGIN TRANSACTION
-    READ ONLY` is the read-only session). There is **no SQLite pinned session to copy** —
-    `Session::open_enforced` refuses SQLite too — so this is a new `Backend` holding a blocking
-    connection (and its `Arc<Instance>`) across awaits, each call on the blocking pool, Stop
-    through the interrupt handle. `commit_writes`/`refetch_rows`/`fetch_blob` in `session.rs`
-    need DuckDB arms, and the write nests in `SAVEPOINT` (`TxScope::Savepoint`) — which **DuckDB
-    does not have** (2.0: a parser error), so a failed grid commit inside a Manual transaction
-    cannot be undone alone.
-  - **Decided — a failed grid commit in a Manual tab aborts the whole transaction**, as a failed
-    statement already does there (`tx_engine_of` maps DuckDB to PostgreSQL's model). The grid
-    commit is not refused inside a transaction. What follows from it: the DuckDB arm of
-    `session::commit_writes` runs the batch with no savepoint around it, and its failure has to
-    be reported as the *transaction's* loss, never as "rolled back these edits" — the earlier
-    statements of the tab's transaction are gone too, and `Rollback::note` must say so rather than
-    claim only the batch was undone. Test that wording against a real abort.
   - **The table designer and the view and macro editors.** `ddl::duckdb_supports` refuses every
     change today. **Trap:** `schema.rs`'s and `ddl.rs`'s DDL emitters branch on
     `dialect == Postgres` in many places, so DuckDB falls onto the MySQL shape wherever a `pg`
@@ -112,10 +98,13 @@ DuckDB.
   user type (`CREATE TYPE … AS ENUM`, a `STRUCT` alias): `duckdb_tables().sql` inlines it into each
   column, so the table restores without it, but a view or macro naming the type fails its restore
   — none is read into the model. Nor does it carry a view's or a macro's
-  comment (`docs/architecture/db/duckdb.md`).
+  comment (`docs/architecture/db/duckdb.md`). In a Manual tab, a read the user stops — the
+  binary-cell panel dismissed mid-read, a re-fetch stopped — aborts the transaction (measured),
+  since there is no savepoint to fence it in; reading such a cell on a fresh connection would see
+  none of the tab's uncommitted writes, so it is left an honest loss rather than a wrong answer.
 - **Phase 3:** translate the new strings (`db-refused-duckdb-*`, `connections-duckdb-*`,
-  `backup-kind-duckdb`, `dump-drop-hint-up-front-no-grants` are English in every catalogue but
-  `en-GB`); measure `intel::select_list_subquery_sees_earlier_aliases` (answered `false` unmeasured); the full CI
+  `backup-kind-duckdb`, `dump-drop-hint-up-front-no-grants`, `write-rollback-transaction` are
+  English in every catalogue but `en-GB`); measure `intel::select_list_subquery_sees_earlier_aliases` (answered `false` unmeasured); the full CI
   bar on every leg, which builds the amalgamation cold (about five minutes on this machine).
 
 ### Compare and sync table data

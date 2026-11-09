@@ -100,11 +100,15 @@ A DuckDB connection is a database file on this machine, like SQLite's; see
   carry on from the source's counter) and macros. A type made with `CREATE TYPE` isn't in the
   file as a type: DuckDB writes it into each column, so tables load, but a view or macro that
   names the type won't;
+- **Manual** transactions, as on PostgreSQL: a failed statement aborts the transaction and only
+  **Rollback** ends it. A read-only connection gets read-only transactions. The tab keeps the file
+  open, and other programs out of it, until it goes back to **Auto-commit**; and because DuckDB
+  has no savepoints, grid edits that fail to save roll back the whole transaction — see
+  [Editing data](../results-grid/editing.md#committing);
 - the `duckdb` command-line client in the terminal panel, when it's installed.
 
 *Not yet:*
 
-- **Manual** transactions — a tab always runs in **Auto-commit**;
 - the table designer and the view and macro editors, so structure changes are SQL you write and run
   yourself;
 - **Restore from file**.

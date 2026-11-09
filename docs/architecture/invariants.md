@@ -956,8 +956,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   cached past that. What is shared is therefore *instance* state, which is why a DuckDB init SQL
   may not `SET GLOBAL` (`init_sql`), and why a sealed and an unsealed handle cannot both have the
   file open at once (`DbRefusal::DuckDbSealedElsewhere`). A batch, a DDL plan and a script are each
-  one connection there as everywhere, and `Session::open` refuses a pinned session until the
-  roadmap's later DuckDB phase writes one.
+  one connection there as everywhere. A DuckDB Manual tab is the *first* exception, not this one —
+  its `Session` pins a connection like any engine's — but it pins the instance with it
+  (`duckdb::Pinned` keeps the `Arc<Instance>`), so the file stays locked against every other
+  program until the tab goes back to Auto, which the connection form's hint tells the user.
   **But the unit is the *operation*, and an operation is not a statement.** A batch, a DDL plan, an
   import and a script are each **one** — which is why `run_ddl` and `import_rows` hold a connection
   across many statements (as does `run_server_ddl`, on the three engines that have databases to
@@ -982,7 +984,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   fewer.
   In-transaction writes nest under a `SAVEPOINT` (`TxScope`; on SQL Server `SAVE TRANSACTION`,
   `mssql::WriteScope::Savepoint`) so the 1-row guard can roll back its own
-  batch without ending the user's transaction, and the transaction *state* is the pure, tested
+  batch without ending the user's transaction — **except on DuckDB, which has no savepoint**: its
+  failed batch rolls the whole transaction back and says so (`Rollback::Transaction`, under
+  *Write-back is transactional…*) — and the transaction *state* is the pure, tested
   `schemaic_core::tx::TxState` — engine divergence (PG poisons on error, MySQL implicitly commits on
   DDL, SQL Server's is read off the server) belongs there, not in UI conditionals. **Asking the
   server is the fallback wherever the statement's text cannot carry the fact, and there are three
@@ -1528,13 +1532,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   comparing *it* refused every write to the table rather than only the misdirected ones. Its rollback, by contrast, needs no
   hedging — there is no non-transactional table type — and SQL Server's is the second that needs
   none, answering `Complete` or `Unknown` and never `Incomplete` (`db::mssql`); DuckDB's, a third,
-  is always `Complete`, having no non-transactional table either (`db::duckdb`). That
+  is always `Complete`, having no non-transactional table either — except a Manual tab's, which is
+  `Transaction`, below (`db::duckdb`). That
   promise is MySQL-engine-dependent: `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV` ignore `BEGIN`/`ROLLBACK`,
   and `ROLLBACK` *succeeds* there while raising warning 1196. So no write path may discard a
   rollback's outcome (`let _ = conn.query_drop("ROLLBACK")` was the bug): roll back through
   `rollback()`, which reads `SHOW WARNINGS`, and carry the answer in the error — the `undone` of a
   `DbError::Write(WriteFailure)`, whose English appends `core::model::Rollback::note()` and whose
-  interface wording says the same in the user's language. **`Rollback` has three arms, and the third is there because two of them were one sentence.**
+  interface wording says the same in the user's language. **`Rollback` has four arms, and the third is there because two of them were one sentence.**
   `Incomplete` is warning 1196 and nothing else — it is the only thing that licenses *"this table's
   storage engine is not transactional, so the rows already written remain"*, which is a claim about
   the engine. A `ROLLBACK` down a socket that is already gone establishes nothing of the kind: the
@@ -1544,7 +1549,16 @@ Re-introducing the anti-patterns these guard against is a regression:
   confirmed and the rows may or may not remain. The unreadable-warnings route was worse than
   misdescribed — `unwrap_or_default()` turned a failed `SHOW WARNINGS` into an empty vector, no 1196
   was found, and the write path promised a clean rollback on the strength of a query that did not
-  run, which `rollback`'s own doc had claimed otherwise about since it was written. **A cancel is an exit like any other**: `Db::import_rows` used to `kill_query` and
+  run, which `rollback`'s own doc had claimed otherwise about since it was written. **The fourth,
+  `Transaction`, is there because `Complete` would have claimed too little.** A Manual tab's grid
+  commit nests in a savepoint so its failure undoes the batch alone, and DuckDB has none (2.0: a
+  parser error), so there a refused statement has aborted the user's transaction and a one-row
+  miss has written into it. `duckdb::pinned_write` rolls the whole transaction back — the
+  roadmap's decision, rather than refusing the grid commit inside a transaction — and the note says
+  every statement the tab ran since its transaction began is undone, where `Complete`'s *rolled
+  back all changes* would read as the batch alone and leave the user believing in earlier work
+  that is gone (`a_failed_grid_commit_rolls_the_manual_transaction_back_and_says_so`, red with that
+  `ROLLBACK` removed; UI key `write-rollback-transaction`). **A cancel is an exit like any other**: `Db::import_rows` used to `kill_query` and
   disconnect, and the modal then said "the transaction rolled back, so nothing was written" —
   which on those engines is false, so the user re-ran the import and doubled ~250k rows. It rolls
   back on the same connection now and reports what that achieved, `DbError::Cancelled` meaning the

@@ -56,10 +56,11 @@ Type the path in **Database file**, or press **Browse…** inside the field to p
 - *The file is open only while something runs.* Between statements Schemaic lets go of it, so
   another program, such as the `duckdb` command-line client, can open it. While that program
   holds it, Schemaic's own statements fail with DuckDB's error that the file is in use; close the
-  other program and run again.
+  other program and run again. The exception is a tab in **Manual** transaction mode: it keeps
+  the file open, and other programs out of it, until it goes back to **Auto-commit**.
 - *Nothing is downloaded.* DuckDB extensions are never installed or loaded behind a query. Parquet
   and JSON support are built in; any other extension isn't available.
-- *Not yet:* **Manual** transactions, designing tables, and editing views and macros. See [Engine differences](../reference/engines.md#duckdb).
+- *Not yet:* designing tables, and editing views and macros. See [Engine differences](../reference/engines.md#duckdb).
 
 ## Switching connections
 

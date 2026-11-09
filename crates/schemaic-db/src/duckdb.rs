@@ -51,9 +51,9 @@
 //! `rowid` is never a key — a checkpoint renumbers it.
 //!
 //! **What the roadmap's phase 2 has not reached yet**, refused rather than
-//! faked: Manual tabs (`tx::supports_manual_mode`) and the designer
-//! (`ddl::duckdb_supports`). DDL plans, `.sql` scripts, imports and the dump
-//! run.
+//! faked: the designer (`ddl::duckdb_supports`). DDL plans, `.sql` scripts,
+//! imports and the dump run, and a Manual tab holds a connection of its own
+//! ([`Pinned`]) — with the instance, and a file's lock, for as long as it does.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -2011,56 +2011,61 @@ pub(crate) async fn refetch_rows(
     }
     let template = template.clone();
     let rows = rows.to_vec();
-    with_conn_stoppable(db, cancel, move |conn| {
-        let cols = template
-            .columns
+    with_conn_stoppable(db, cancel, move |conn| refetch_on(conn, &template, &rows)).await
+}
+
+/// The body of [`refetch_rows`], on whichever connection — a fresh one, or
+/// a Manual tab's ([`pinned_refetch`]).
+fn refetch_on(
+    conn: &DuckConn,
+    template: &RefetchTemplate,
+    rows: &[RefetchRow],
+) -> Result<Vec<(usize, Vec<Value>)>, DbError> {
+    let cols = template
+        .columns
+        .iter()
+        .map(|c| crate::ident_duckdb(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = table_sql(template.schema.as_deref(), &template.table);
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        // Key then confirming columns, the order `edit::refetch_key`
+        // builds the values in.
+        let key: Vec<(String, Value)> = template
+            .key_cols
             .iter()
-            .map(|c| crate::ident_duckdb(c))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let table = table_sql(template.schema.as_deref(), &template.table);
-        let mut out = Vec::with_capacity(rows.len());
-        for row in &rows {
-            // Key then confirming columns, the order `edit::refetch_key`
-            // builds the values in.
-            let key: Vec<(String, Value)> = template
-                .key_cols
+            .chain(template.confirm_cols.iter())
+            .zip(&row.key)
+            .map(|(&ci, v)| (template.columns[ci].clone(), v.clone()))
+            .collect();
+        let mut params = Vec::new();
+        let w = where_clause(&key, &mut params);
+        let mut stmt = conn
+            .prepare(&format!("SELECT {cols} FROM {table} WHERE {w} LIMIT 1"))
+            .map_err(query_err)?;
+        let mut got = stmt
+            .query(duckdb::params_from_iter(params))
+            .map_err(query_err)?;
+        let kinds: Vec<(LogicalTypeId, String)> = match got.as_ref() {
+            Some(st) => (0..st.column_count())
+                .map(|i| {
+                    let lt = st.column_logical_type(i);
+                    (lt.id(), type_name(&lt))
+                })
+                .collect(),
+            None => continue,
+        };
+        if let Some(r) = got.next().map_err(query_err)? {
+            let cells = kinds
                 .iter()
-                .chain(template.confirm_cols.iter())
-                .zip(&row.key)
-                .map(|(&ci, v)| (template.columns[ci].clone(), v.clone()))
-                .collect();
-            let mut params = Vec::new();
-            let w = where_clause(&key, &mut params);
-            let mut stmt = conn
-                .prepare(&format!("SELECT {cols} FROM {table} WHERE {w} LIMIT 1"))
-                .map_err(query_err)?;
-            let mut got = stmt
-                .query(duckdb::params_from_iter(params))
-                .map_err(query_err)?;
-            let kinds: Vec<(LogicalTypeId, String)> = match got.as_ref() {
-                Some(st) => (0..st.column_count())
-                    .map(|i| {
-                        let lt = st.column_logical_type(i);
-                        (lt.id(), type_name(&lt))
-                    })
-                    .collect(),
-                None => continue,
-            };
-            if let Some(r) = got.next().map_err(query_err)? {
-                let cells = kinds
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (kind, name))| {
-                        decode_cell(r, i, *kind, || name.clone()).map(|(v, _)| v)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                out.push((row.data_row, cells));
-            }
+                .enumerate()
+                .map(|(i, (kind, name))| decode_cell(r, i, *kind, || name.clone()).map(|(v, _)| v))
+                .collect::<Result<Vec<_>, _>>()?;
+            out.push((row.data_row, cells));
         }
-        Ok(out)
-    })
-    .await
+    }
+    Ok(out)
 }
 
 /// Read one `BLOB` cell: its octet length and its first
@@ -2073,31 +2078,204 @@ pub(crate) async fn fetch_blob(
     cancel: CancellationToken,
 ) -> Result<Option<BlobValue>, DbError> {
     let r = r.clone();
-    with_conn_stoppable(db, cancel, move |conn| {
-        let mut params = Vec::new();
-        let w = where_clause(&r.key, &mut params);
-        let col = crate::ident_duckdb(&r.column);
-        let sql = format!(
-            "SELECT {col} FROM {} WHERE {w} LIMIT 1",
-            table_sql(r.schema.as_deref(), &r.table)
-        );
-        let mut stmt = conn.prepare(&sql).map_err(query_err)?;
-        let mut got = stmt
-            .query(duckdb::params_from_iter(params))
-            .map_err(query_err)?;
-        let Some(row) = got.next().map_err(query_err)? else {
-            return Ok(None);
-        };
-        match row.get::<_, DValue>(0).map_err(query_err)? {
-            DValue::Blob(mut bytes) | DValue::Geometry(mut bytes) => {
-                let len = bytes.len() as u64;
-                bytes.truncate(schemaic_core::blob::FETCH_CAP);
-                Ok(Some(BlobValue { bytes, len }))
-            }
-            _ => Ok(None),
+    with_conn_stoppable(db, cancel, move |conn| blob_on(conn, &r)).await
+}
+
+/// The body of [`fetch_blob`], on whichever connection.
+fn blob_on(conn: &DuckConn, r: &BlobRef) -> Result<Option<BlobValue>, DbError> {
+    let mut params = Vec::new();
+    let w = where_clause(&r.key, &mut params);
+    let col = crate::ident_duckdb(&r.column);
+    let sql = format!(
+        "SELECT {col} FROM {} WHERE {w} LIMIT 1",
+        table_sql(r.schema.as_deref(), &r.table)
+    );
+    let mut stmt = conn.prepare(&sql).map_err(query_err)?;
+    let mut got = stmt
+        .query(duckdb::params_from_iter(params))
+        .map_err(query_err)?;
+    let Some(row) = got.next().map_err(query_err)? else {
+        return Ok(None);
+    };
+    match row.get::<_, DValue>(0).map_err(query_err)? {
+        DValue::Blob(mut bytes) | DValue::Geometry(mut bytes) => {
+            let len = bytes.len() as u64;
+            bytes.truncate(schemaic_core::blob::FETCH_CAP);
+            Ok(Some(BlobValue { bytes, len }))
         }
+        _ => Ok(None),
+    }
+}
+
+// ── A Manual tab's pinned connection ────────────────────────────────────────
+
+/// The one connection a Manual tab's `Session` holds, **with the instance it
+/// keeps open** — and so, for a file, the file's lock, for as long as the tab
+/// stays in Manual mode: no other process can open the file meanwhile.
+///
+/// The connection is blocking, so every call runs on the blocking pool with
+/// it behind a lock of its own ([`on_pinned`]); the session's `tokio` mutex
+/// above that is what orders the tab's operations. Stop is the interrupt
+/// handle, which reaches the running statement from outside that lock.
+pub(crate) struct Pinned {
+    conn: Arc<Mutex<DuckConn>>,
+    interrupt: Arc<duckdb::InterruptHandle>,
+    /// The file's own catalog, read at open — what provenance compares a
+    /// later `USE` against ([`origins_of`]).
+    home: Option<String>,
+    _instance: Arc<Instance>,
+}
+
+/// Open a Manual tab's connection ([`Pinned`]).
+pub(crate) async fn pin(db: &Db) -> Result<Pinned, DbError> {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || {
+        let (instance, conn) = connect(&db)?;
+        let home = catalog(&conn).ok();
+        Ok(Pinned {
+            interrupt: conn.interrupt_handle(),
+            conn: Arc::new(Mutex::new(conn)),
+            home,
+            _instance: instance,
+        })
     })
     .await
+    .map_err(|e| DbError::Refused(DbRefusal::DuckDbWorker(e.to_string())))?
+}
+
+/// Run `f` on the pinned connection on the blocking pool, Stop interrupting
+/// it. **The worker is awaited even after a Stop**, so the next operation
+/// never starts while this one still holds the connection; an interrupted
+/// statement answers an error, which reads as [`DbError::Cancelled`].
+async fn on_pinned<T, F>(p: &Pinned, cancel: &CancellationToken, f: F) -> Result<T, DbError>
+where
+    T: Send + 'static,
+    F: FnOnce(&DuckConn, Option<&str>) -> Result<T, DbError> + Send + 'static,
+{
+    refuse_if_cancelled(cancel)?;
+    let conn = p.conn.clone();
+    let home = p.home.clone();
+    let work = tokio::task::spawn_blocking(move || {
+        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+        f(&conn, home.as_deref())
+    });
+    let interrupt = p.interrupt.clone();
+    let watcher = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            cancel.cancelled().await;
+            interrupt.interrupt();
+        })
+    };
+    let r = work
+        .await
+        .map_err(|e| DbError::Refused(DbRefusal::DuckDbWorker(e.to_string())));
+    watcher.abort();
+    match r? {
+        Err(_) if cancel.is_cancelled() => Err(DbError::Cancelled),
+        other => other,
+    }
+}
+
+/// Run one statement on the pinned connection, as [`fetch_query`] runs one
+/// on its own.
+pub(crate) async fn pinned_query(
+    p: &Pinned,
+    sql: &str,
+    row_cap: usize,
+    cancel: &CancellationToken,
+) -> Result<ResultSet, DbError> {
+    let sql = sql.to_string();
+    on_pinned(p, cancel, move |conn, home| {
+        run_query(conn, home, &sql, &mut crate::RowDest::Capped(row_cap))
+    })
+    .await
+}
+
+/// Run a statement of the session's own — `BEGIN`, `COMMIT`, `ROLLBACK`, or
+/// the probe whose failure says the transaction is aborted.
+pub(crate) async fn pinned_exec(p: &Pinned, sql: &'static str) -> Result<(), DbError> {
+    on_pinned(p, &CancellationToken::new(), move |conn, _| {
+        conn.execute_batch(sql).map_err(query_err)
+    })
+    .await
+}
+
+/// Write a batch of grid edits **inside the tab's open transaction**, each
+/// statement held to exactly one row.
+///
+/// **DuckDB has no `SAVEPOINT`** (2.0: a parser error), so a batch that
+/// fails cannot be undone alone: a statement the server refuses aborts the
+/// transaction, and a statement that touched the wrong number of rows has
+/// written into it. Either way the whole transaction is rolled back here —
+/// the roadmap's decision — and the failure says so
+/// ([`Rollback::Transaction`](schemaic_core::model::Rollback::Transaction)),
+/// never that only these edits were undone: the tab's earlier statements
+/// went with them. A Stop is the same loss.
+pub(crate) async fn pinned_write(
+    p: &Pinned,
+    write: &GridWrite,
+    cancel: &CancellationToken,
+) -> Result<u64, DbError> {
+    use schemaic_core::model::{Rollback, WriteCause, one_row_verdict};
+    // **A Stop before anything is sent costs nothing**: a plain `Cancelled`,
+    // the transaction untouched — the session reports it as not sent. Only a
+    // Stop that lands once the batch is on its way takes the transaction.
+    refuse_if_cancelled(cancel)?;
+    let write = write.clone();
+    let r = on_pinned(p, cancel, move |conn, _| {
+        let mut total = 0u64;
+        for step in write.plan() {
+            let (sql, params) = statement_for(step);
+            let affected = conn
+                .execute(&sql, duckdb::params_from_iter(params))
+                .map_err(|e| DbError::write(WriteCause::Server(e.to_string()), None))?
+                as u64;
+            one_row_verdict(step, affected)
+                .map_err(|miss| DbError::write(WriteCause::OneRow(miss), None))?;
+            total += affected;
+        }
+        Ok(total)
+    })
+    .await;
+    let Err(e) = r else { return r };
+    // Claimed only where the server took the `ROLLBACK`: one it refused
+    // leaves nothing known, and the note says that instead.
+    let undone = if pinned_exec(p, "ROLLBACK").await.is_ok() {
+        Rollback::Transaction
+    } else {
+        Rollback::Unknown
+    };
+    Err(match e {
+        DbError::Cancelled => DbError::write(WriteCause::CommitCancelled, Some(undone)),
+        DbError::Write(mut f) => {
+            f.undone = Some(undone);
+            DbError::Write(f)
+        }
+        other => other,
+    })
+}
+
+/// [`refetch_rows`] on the pinned connection, which alone sees the rows the
+/// open transaction wrote.
+pub(crate) async fn pinned_refetch(
+    p: &Pinned,
+    template: &RefetchTemplate,
+    rows: &[RefetchRow],
+    cancel: &CancellationToken,
+) -> Result<Vec<(usize, Vec<Value>)>, DbError> {
+    let (template, rows) = (template.clone(), rows.to_vec());
+    on_pinned(p, cancel, move |conn, _| refetch_on(conn, &template, &rows)).await
+}
+
+/// [`fetch_blob`] on the pinned connection.
+pub(crate) async fn pinned_blob(
+    p: &Pinned,
+    r: &BlobRef,
+    cancel: &CancellationToken,
+) -> Result<Option<BlobValue>, DbError> {
+    let r = r.clone();
+    on_pinned(p, cancel, move |conn, _| blob_on(conn, &r)).await
 }
 
 /// Run `f` off the async executor: `block_in_place` on a multi-threaded
@@ -3424,5 +3602,262 @@ mod tests {
             other => panic!("{other:?}\n{file}"),
         }
         assert_eq!(fingerprint(&src), before);
+    }
+
+    // ── Manual tabs ─────────────────────────────────────────────────────────
+
+    use schemaic_core::tx::StmtOutcome;
+
+    /// Run `sql` on `s` as a Manual tab does: `ensure_tx`, then the statement.
+    async fn tab_run(s: &crate::Session, sql: &str) -> crate::Outcome<ResultSet> {
+        s.ensure_tx().await.expect("BEGIN");
+        s.fetch_query(sql, 100, CancellationToken::new()).await
+    }
+
+    /// **A Manual tab's statements are one transaction** no other connection
+    /// sees until Commit, and Rollback undoes them.
+    #[test]
+    fn a_manual_tab_holds_its_writes_until_commit() {
+        let db = provenance_db("manual-commit");
+        let rt = rt();
+        rt.block_on(async {
+            let s = crate::Session::open(&db, None).await.expect("a session");
+            let out = tab_run(&s, "UPDATE p SET name = 'uno' WHERE id = 1").await;
+            assert_eq!(out.stmt, StmtOutcome::Ok, "{:?}", out.result);
+            let seen = tab_run(&s, "SELECT name FROM p").await.result.unwrap();
+            assert_eq!(seen.cell(0, 0).unwrap().display().to_string(), "uno");
+        });
+        assert_eq!(names(&db, &rt), ["1:one:x"], "not committed yet");
+        rt.block_on(async {
+            let s = crate::Session::open(&db, None).await.unwrap();
+            tab_run(&s, "UPDATE p SET name = 'gone' WHERE id = 1").await;
+            s.rollback().await.unwrap();
+            tab_run(&s, "UPDATE p SET name = 'uno' WHERE id = 1").await;
+            s.commit().await.unwrap();
+        });
+        assert_eq!(names(&db, &rt), ["1:uno:x"]);
+    }
+
+    /// **A failed grid commit inside a Manual transaction takes the whole
+    /// transaction with it**, and says so: DuckDB has no savepoint to undo
+    /// the batch alone. The tab's earlier statement is gone too, the outcome
+    /// folds the pill to no transaction, and the next statement starts a new
+    /// one.
+    #[test]
+    fn a_failed_grid_commit_rolls_the_manual_transaction_back_and_says_so() {
+        use schemaic_core::model::{Rollback, WriteFailure};
+        let db = provenance_db("manual-grid-miss");
+        let rt = rt();
+        rt.block_on(async {
+            let s = crate::Session::open(&db, None).await.unwrap();
+            tab_run(&s, "INSERT INTO p (id, name) VALUES (5, 'five')").await;
+            let write = GridWrite {
+                updates: vec![
+                    edit(vec![("name", CellEdit::Text("changed".into()))], 1),
+                    edit(vec![("name", CellEdit::Text("ghost".into()))], 99),
+                ],
+                ..Default::default()
+            };
+            s.ensure_tx().await.unwrap();
+            let out = s.commit_writes(&write, CancellationToken::new()).await;
+            assert_eq!(out.stmt, StmtOutcome::FailedAndRolledBack);
+            match out.result {
+                Err(DbError::Write(WriteFailure { undone, .. })) => {
+                    assert_eq!(undone, Some(Rollback::Transaction));
+                }
+                other => panic!("{other:?}"),
+            }
+            // A new transaction, which commits on its own.
+            let out = tab_run(&s, "INSERT INTO p (id, name) VALUES (6, 'six')").await;
+            assert_eq!(out.stmt, StmtOutcome::Ok, "{:?}", out.result);
+            s.commit().await.unwrap();
+        });
+        assert_eq!(names(&db, &rt), ["1:one:x", "6:six:x"]);
+    }
+
+    /// **A grid commit stopped before it is sent costs the transaction
+    /// nothing**: reported as not sent, and the tab's earlier work commits.
+    #[test]
+    fn a_grid_commit_stopped_before_it_is_sent_keeps_the_transaction() {
+        let db = provenance_db("manual-grid-not-sent");
+        let rt = rt();
+        rt.block_on(async {
+            let s = crate::Session::open(&db, None).await.unwrap();
+            tab_run(&s, "INSERT INTO p (id, name) VALUES (5, 'five')").await;
+            let write = GridWrite {
+                updates: vec![edit(vec![("name", CellEdit::Text("uno".into()))], 1)],
+                ..Default::default()
+            };
+            let stopped = CancellationToken::new();
+            stopped.cancel();
+            let out = s.commit_writes(&write, stopped).await;
+            assert_eq!(out.stmt, StmtOutcome::NotSent);
+            assert!(
+                matches!(out.result, Err(DbError::Cancelled)),
+                "{:?}",
+                out.result
+            );
+            s.commit().await.unwrap();
+        });
+        assert_eq!(names(&db, &rt), ["1:one:x", "5:five:x"]);
+    }
+
+    /// The same with a statement the server refuses mid-batch: a duplicate
+    /// key, after an edit that succeeded.
+    #[test]
+    fn a_refused_grid_statement_rolls_the_manual_transaction_back_too() {
+        use schemaic_core::model::{Rollback, WriteFailure};
+        let db = provenance_db("manual-grid-refused");
+        let rt = rt();
+        rt.block_on(async {
+            let s = crate::Session::open(&db, None).await.unwrap();
+            tab_run(
+                &s,
+                "INSERT INTO p (id, name, code) VALUES (5, 'five', 'c5')",
+            )
+            .await;
+            let write = GridWrite {
+                updates: vec![
+                    edit(vec![("name", CellEdit::Text("changed".into()))], 1),
+                    edit(vec![("code", CellEdit::Text("c1".into()))], 5),
+                ],
+                ..Default::default()
+            };
+            s.ensure_tx().await.unwrap();
+            let out = s.commit_writes(&write, CancellationToken::new()).await;
+            assert_eq!(out.stmt, StmtOutcome::FailedAndRolledBack);
+            assert!(
+                matches!(
+                    out.result,
+                    Err(DbError::Write(WriteFailure {
+                        undone: Some(Rollback::Transaction),
+                        ..
+                    }))
+                ),
+                "{:?}",
+                out.result
+            );
+        });
+        assert_eq!(names(&db, &rt), ["1:one:x"]);
+    }
+
+    /// A grid commit that succeeds stays inside the transaction, and the
+    /// re-fetch on the pinned connection sees what it wrote.
+    #[test]
+    fn a_manual_grid_commit_is_refetched_on_the_pinned_connection() {
+        let db = provenance_db("manual-grid-ok");
+        let rt = rt();
+        rt.block_on(async {
+            let s = crate::Session::open(&db, None).await.unwrap();
+            let write = GridWrite {
+                updates: vec![edit(vec![("name", CellEdit::Text("uno".into()))], 1)],
+                ..Default::default()
+            };
+            s.ensure_tx().await.unwrap();
+            let out = s.commit_writes(&write, CancellationToken::new()).await;
+            assert_eq!(out.result.unwrap(), 1);
+            let template = RefetchTemplate {
+                database: "memory".into(),
+                schema: Some("main".into()),
+                table: "p".into(),
+                columns: vec!["id".into(), "name".into()],
+                key_cols: vec![0],
+                confirm_cols: vec![],
+            };
+            let rows = [RefetchRow {
+                data_row: 0,
+                key: vec![Value::Int(1)],
+            }];
+            let got = s
+                .refetch_rows(&template, &rows, CancellationToken::new())
+                .await
+                .result
+                .unwrap();
+            assert_eq!(got[0].1[1], Value::Str("uno".into()));
+        });
+        assert_eq!(names(&db, &rt), ["1:one:x"], "never committed");
+    }
+
+    /// **A failed statement aborts the transaction, and Commit says so**
+    /// rather than committing nothing under a success.
+    #[test]
+    fn commit_after_a_failed_statement_reports_the_abort() {
+        let db = provenance_db("manual-abort");
+        let rt = rt();
+        rt.block_on(async {
+            let s = crate::Session::open(&db, None).await.unwrap();
+            tab_run(&s, "UPDATE p SET name = 'uno' WHERE id = 1").await;
+            let out = tab_run(&s, "SELECT * FROM nosuch").await;
+            assert_eq!(out.stmt, StmtOutcome::Failed);
+            let e = s.commit().await.unwrap_err();
+            assert!(
+                matches!(e, DbError::Refused(DbRefusal::CommitAborted)),
+                "{e:?}"
+            );
+        });
+        assert_eq!(names(&db, &rt), ["1:one:x"]);
+    }
+
+    /// A read-only connection's Manual tab refuses a write by its effect.
+    #[test]
+    fn a_read_only_manual_tab_refuses_a_write() {
+        let db = provenance_db("manual-read-only");
+        let rt = rt();
+        rt.block_on(async {
+            let s = crate::Session::open_enforced(&db, None, Some(crate::Enforce::ReadOnly))
+                .await
+                .unwrap();
+            let out = tab_run(&s, "UPDATE p SET name = 'uno' WHERE id = 1").await;
+            assert!(out.result.is_err(), "{:?}", out.result);
+            s.rollback().await.unwrap();
+        });
+        assert_eq!(names(&db, &rt), ["1:one:x"]);
+    }
+
+    /// **Stop interrupts a statement on the pinned connection — and aborts
+    /// the transaction, as PostgreSQL's cancel does** (measured: the next
+    /// statement answers *Current transaction is aborted*), so `Cancelled`
+    /// folding to an aborted pill is the truth, and Commit says so. After
+    /// Rollback the connection runs the next statement.
+    #[test]
+    fn stop_interrupts_a_manual_tabs_statement() {
+        let db = mem("manual-stop");
+        let rt = rt();
+        rt.block_on(async {
+            let s = crate::Session::open(&db, None).await.unwrap();
+            s.ensure_tx().await.unwrap();
+            let cancel = CancellationToken::new();
+            let stop = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                stop.cancel();
+            });
+            let out = s
+                .fetch_query("SELECT count(*) FROM range(100000000000) a", 10, cancel)
+                .await;
+            assert!(
+                matches!(out.result, Err(DbError::Cancelled)),
+                "{:?}",
+                out.result
+            );
+            assert_eq!(out.stmt, StmtOutcome::Cancelled);
+            assert!(
+                matches!(
+                    s.commit().await,
+                    Err(DbError::Refused(DbRefusal::CommitAborted))
+                ),
+                "an interrupt aborts the transaction"
+            );
+            let out = tab_run(&s, "SELECT 42").await;
+            assert_eq!(
+                out.result
+                    .unwrap()
+                    .cell(0, 0)
+                    .unwrap()
+                    .display()
+                    .to_string(),
+                "42"
+            );
+        });
     }
 }

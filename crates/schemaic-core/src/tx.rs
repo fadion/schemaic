@@ -45,11 +45,10 @@ pub enum TxEngine {
 pub fn supports_manual_mode(dialect: crate::intel::SqlDialect) -> bool {
     use crate::intel::SqlDialect;
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => true,
-        // DuckDB holds transactions, read-only ones included, but its pinned
-        // `Session` is not written yet (roadmap, DuckDB phase 2) — the answer
-        // is about this app, not the engine, and changes with that phase.
-        SqlDialect::Sqlite | SqlDialect::DuckDb => false,
+        // DuckDB's pinned session holds its instance — and a file's lock —
+        // while the tab is pinned (`schemaic_db::Session::open`).
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb => true,
+        SqlDialect::Sqlite => false,
     }
 }
 
@@ -1547,6 +1546,8 @@ mod tests {
         }
         assert!(offers_manual_mode(MySql, true) && offers_manual_mode(Postgres, true));
         assert!(!offers_manual_mode(MsSql, true));
+        // DuckDB's session holds a `BEGIN TRANSACTION READ ONLY`.
+        assert!(offers_manual_mode(DuckDb, false) && offers_manual_mode(DuckDb, true));
         assert!(!offers_manual_mode(Sqlite, false) && !offers_manual_mode(Sqlite, true));
     }
 

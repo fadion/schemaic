@@ -1655,7 +1655,8 @@ this bundle's.
   between staged statements and mid-statement, kills the query server-side, *awaits* the killed
   statement so the connection's result stream stays in sync, and then asks the server what an
   explicit `ROLLBACK` achieved; a Manual tab's through `Session::commit_writes`, whose savepoint and
-  `classify_isolated` answer for what survived. That machinery is there because a
+  `classify_isolated` answer for what survived — on DuckDB, which has no savepoint, a Stop rolls the
+  whole transaction back and says so (`Rollback::Transaction`, under `db::duckdb`). That machinery is there because a
   cancelled-and-dropped write once left durable `MyISAM` rows under a report saying nothing was
   written — the measured account is under *Write-back is transactional…* in *Architecture
   invariants*. So wiring a Stop control here would need no `schemaic-db` change at all: only the

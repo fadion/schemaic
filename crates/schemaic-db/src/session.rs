@@ -92,6 +92,11 @@ enum Backend {
     MsSql {
         client: Box<crate::mssql::MsClient>,
     },
+    /// DuckDB's blocking connection with the instance it keeps open — see
+    /// `duckdb::Pinned`.
+    DuckDb {
+        pinned: Box<crate::duckdb::Pinned>,
+    },
     /// A SQL Server connection closed because it fell out of step after a
     /// Stop, with no new one to put in its place — see
     /// [`Session::resync_after_stop`]. Everything on it answers
@@ -296,11 +301,17 @@ impl Session {
             Engine::Sqlite => {
                 return Err(DbError::Refused(crate::DbRefusal::SqliteNoManual));
             }
-            // Not yet: DuckDB holds transactions, read-only ones included, and
-            // its pinned session is the roadmap's DuckDB phase 2.
-            Engine::DuckDb => {
-                return Err(DbError::Refused(crate::DbRefusal::DuckDbNoManual));
-            }
+            // **A connection held, and with it the instance — and the file's
+            // lock — for as long as the tab is pinned.** A read-only one needs
+            // nothing set here: every transaction `ensure_tx` opens on it is
+            // `BEGIN TRANSACTION READ ONLY`, which refuses a write by its
+            // effect, and a Manual tab runs nothing outside one.
+            Engine::DuckDb => (
+                Backend::DuckDb {
+                    pinned: Box::new(crate::duckdb::pin(db).await?),
+                },
+                None,
+            ),
             // **SQL Server holds no read-only transaction**, so a read-only
             // connection is refused a pinned session rather than given an
             // unguarded one. Its fresh-connection guard is a transaction that
@@ -404,6 +415,15 @@ impl Session {
                     Ctl::Rollback => "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION",
                 };
                 crate::mssql::drain(client, sql).await
+            }
+            Backend::DuckDb { pinned } => {
+                let sql = match ctl {
+                    Ctl::Begin => "BEGIN TRANSACTION",
+                    Ctl::BeginReadOnly => "BEGIN TRANSACTION READ ONLY",
+                    Ctl::Commit => "COMMIT",
+                    Ctl::Rollback => "ROLLBACK",
+                };
+                crate::duckdb::pinned_exec(pinned, sql).await
             }
             // The server rolled back what the closed connection held, so a
             // Rollback has nothing left to do; anything else cannot be done.
@@ -509,6 +529,11 @@ impl Session {
         match guard {
             Backend::MySql { .. } => false,
             Backend::Postgres { client } => client.batch_execute("SELECT 1").await.is_err(),
+            // Aborted the way PostgreSQL's is: every statement refused until
+            // `ROLLBACK`.
+            Backend::DuckDb { pinned } => crate::duckdb::pinned_exec(pinned, "SELECT 1")
+                .await
+                .is_err(),
             Backend::MsSql { client } => crate::mssql::tx_state(client)
                 .await
                 .is_none_or(|(_, state)| state == -1),
@@ -545,6 +570,10 @@ impl Session {
                 let _ =
                     crate::mssql::drain(client, "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION").await;
             }
+            // The instance — and the file's lock — goes when the session drops.
+            Backend::DuckDb { pinned } => {
+                let _ = crate::duckdb::pinned_exec(pinned, "ROLLBACK").await;
+            }
             Backend::Retired => {}
         }
     }
@@ -561,6 +590,8 @@ impl Session {
             // tiberius has no liveness flag to read; the cheapest statement is
             // the question.
             Backend::MsSql { client } => crate::mssql::drain(client, "SELECT 1").await.is_ok(),
+            // In this process: there is no connection to lose.
+            Backend::DuckDb { .. } => true,
             Backend::Retired => false,
         }
     }
@@ -629,7 +660,10 @@ impl Session {
         match guard {
             Backend::MySql { conn, .. } => conn.query_drop(sql).await.is_ok(),
             Backend::Postgres { client } => client.batch_execute(sql).await.is_ok(),
-            Backend::MsSql { .. } | Backend::Retired => false,
+            // **DuckDB has no savepoints** (2.0: a parser error), so its
+            // reads are unfenced and its grid writes undo the whole
+            // transaction on failure — see `duckdb::pinned_write`.
+            Backend::MsSql { .. } | Backend::DuckDb { .. } | Backend::Retired => false,
         }
     }
 
@@ -804,6 +838,9 @@ impl Session {
             Backend::MsSql { client } => {
                 let mut dest = crate::RowDest::Capped(row_cap);
                 crate::mssql::run_statement(client, sql, &mut dest, &cancel).await
+            }
+            Backend::DuckDb { pinned } => {
+                crate::duckdb::pinned_query(pinned, sql, row_cap, &cancel).await
             }
             Backend::Retired => Err(retired_error()),
         };
@@ -1111,7 +1148,9 @@ impl Session {
     ///
     /// Nested under a savepoint, so the exactly-one-row guard rolls back its own
     /// batch without ending the transaction the user is building. On PostgreSQL
-    /// the savepoint is also what keeps a failed batch recoverable.
+    /// the savepoint is also what keeps a failed batch recoverable. **Not on
+    /// DuckDB**, which has none: there a failed batch takes the transaction
+    /// with it, and says so.
     pub async fn commit_writes(
         &self,
         write: &GridWrite,
@@ -1193,6 +1232,30 @@ impl Session {
                 }
                 return out;
             }
+            // **No savepoint, so a failure is the transaction's**: the batch
+            // runs bare inside it, and `pinned_write` rolls the whole
+            // transaction back when any part of it fails or is stopped — the
+            // roadmap's decision, since DuckDB cannot undo the batch alone.
+            // Reported as gone and undone, never as isolated.
+            Backend::DuckDb { pinned } => {
+                let r = crate::duckdb::pinned_write(pinned, write, &cancel).await;
+                // Stopped before anything was sent: the transaction is as
+                // it was.
+                if matches!(r, Err(DbError::Cancelled)) {
+                    return Outcome {
+                        result: r,
+                        stmt: StmtOutcome::NotSent,
+                    };
+                }
+                if r.is_err() {
+                    self.in_tx.store(false, Ordering::SeqCst);
+                    return Outcome {
+                        result: r,
+                        stmt: StmtOutcome::FailedAndRolledBack,
+                    };
+                }
+                return Outcome::ok(r.unwrap_or_default());
+            }
             Backend::Retired => Err(retired_error()),
         };
         Session::classify_isolated(&mut guard, result).await
@@ -1254,6 +1317,7 @@ impl Session {
             }
             // Raced against Stop inside, the attention on this connection.
             Backend::MsSql { client } => crate::mssql::blob_on(client, r, &cancel).await,
+            Backend::DuckDb { pinned } => crate::duckdb::pinned_blob(pinned, r, &cancel).await,
             Backend::Retired => Err(retired_error()),
         };
         if self.lost_after_stop(&mut guard, &result).await {
@@ -1327,6 +1391,9 @@ impl Session {
             // Each row's read raced against Stop inside.
             Backend::MsSql { client } => {
                 crate::mssql::refetch_on(client, template, rows, &cancel).await
+            }
+            Backend::DuckDb { pinned } => {
+                crate::duckdb::pinned_refetch(pinned, template, rows, &cancel).await
             }
             Backend::Retired => Err(retired_error()),
         };

@@ -4,7 +4,8 @@
 with the `parquet` and `json` extensions linked statically), phase 1 and the first part of phase 2
 of the roadmap's *DuckDB as a fifth engine*: it connects, reads, introspects, validates, runs
 batches, scripts and DDL plans, plans a query, lists its settings, backs a file up, writes grid
-edits back, imports a file into a table and dumps to a `.sql` file. It is **embedded, as SQLite is**, so most
+edits back, imports a file into a table, dumps to a `.sql` file and holds a Manual tab's
+transaction. It is **embedded, as SQLite is**, so most
 of `sqlite.rs`'s first paragraph holds here unchanged — there is no server, a connection is a
 file (`Db::file`, `connection::is_file_backed`), host/port/user/password/SSH are inert, the one
 database is the file's own catalog (`current_database()`, named after the file), and the driver
@@ -22,7 +23,9 @@ second being refused the lock — and the instance closes, releasing the file to
 any other program, the moment the last operation holding it ends. That is this engine's
 exception to the one-connection-per-operation invariant, and it is narrower than it sounds:
 connections are still per operation, and only the database underneath them is shared while they
-overlap (`overlapping_operations_share_one_instance`). **It is why the init SQL refuses `SET
+overlap (`overlapping_operations_share_one_instance`). A Manual tab's pinned connection (below) is
+not this exception but the invariant's existing `TxMode::Manual` one, and it holds the instance —
+and the file's lock — for as long as the tab stays in Manual mode. **It is why the init SQL refuses `SET
 GLOBAL` here** (`init_sql`'s `DUCKDB_SETTINGS` and its `duckdb` arm): a `GLOBAL` setting is the
 instance's, and the instance belongs to whatever else is open on the file at that moment. The init
 SQL itself runs on each operation's cloned connection, in `connect`.
@@ -187,13 +190,15 @@ for integers, decimals, zoned timestamps, intervals, booleans, UUIDs and `HUGEIN
 the forms `cell_of` writes), and a `NULL` key compares `IS NULL`. A staged `CellEdit::Default` is
 the keyword `DEFAULT` in `SET` and in `VALUES` alike (measured), and an insert that stages no
 column at all is `DEFAULT VALUES`. The commit is one transaction, each statement held to `one_row_verdict`, and its
-rollback is always `Rollback::Complete`, DuckDB having no non-transactional table
+rollback is always `Rollback::Complete`, DuckDB having no non-transactional table — a Manual
+tab's batch, below, is the one that reports more
 (`a_grid_commit_updates_inserts_and_deletes_in_one_transaction`,
 `a_write_that_misses_its_row_rolls_the_whole_commit_back`). `refetch_rows` looks a row up by its
 key and confirming columns, in `edit::refetch_key`'s order, and skips one no longer there.
 `fetch_blob` reads the **whole** value and cuts it to `blob::FETCH_CAP` on this side, DuckDB having
 no byte-slicing of a `BLOB` in SQL — so showing a large blob's first bytes still carries all of it
-across (`rows_are_refetched_and_blobs_read_by_key`).
+across (`rows_are_refetched_and_blobs_read_by_key`). The two reads' bodies are `refetch_on` and
+`blob_on`, over any connection, so a Manual tab's pinned one runs the same lookup (below).
 **An import is `sqlite::import_rows`' shape** — one connection, one `BEGIN TRANSACTION`, the
 rows in batches of `import::INSERT_BATCH_ROWS` as the multi-row `INSERT`s every engine's load runs
 (`ImportTarget::insert_sql`, so `build_insert_as`, the table named `"schema"."table"`, never the catalog,
@@ -232,11 +237,57 @@ ENUM('ok', 'sad')`), so the table restores without the named type, and the type 
 carried, none being read into the model; a view or macro naming the type would fail its restore.
 A view's or a macro's comment is not carried either — only a table's and its columns' are — nor a
 macro parameter's default, for the reason above.
-**What is not written yet is refused, never faked**: `Session::open` refuses a pinned session
-(`DuckDbNoManual`) and `tx::supports_manual_mode` keeps the segment off, and
-`ddl::duckdb_supports` keeps the designer and the view, trigger and routine editors off. For
-when the session lands, `session::tx_engine_of` already maps DuckDB to PostgreSQL's model — it
-aborts a transaction on a failed statement and rolls DDL back, measured on 2.0.
+**A Manual tab pins one connection, and with it the file** (`Pinned`, opened by `pin`, behind
+`session.rs`'s `Backend::DuckDb`). It is the connection an operation would take — `connect`'s, so
+the init SQL runs on it — held with its interrupt handle, the file's own catalog read at open
+(`home`, for provenance as above) and the `Arc<Instance>` it came off, so the instance does not
+close between the tab's statements and **no other program can open the file until the tab goes
+back to Auto**. That is the one thing the roadmap said this mode had to tell the user, and the
+connection form's hint says it (`connections-duckdb-hint`). The driver is blocking, so `on_pinned`
+runs each call on the blocking pool with the connection behind a `std::sync::Mutex` of its own —
+the session's `tokio` mutex above it is what orders the tab's operations — and a watcher task
+interrupts it on Stop. **Unlike `with_conn_stoppable`, it awaits the worker after a Stop**, because
+this connection outlives the statement: the tab's next operation never starts while the
+interrupted one still holds it. An error after a Stop reads as
+`DbError::Cancelled` (`stop_interrupts_a_manual_tabs_statement`, which then runs a statement on the
+same connection). `pinned_query`, `pinned_exec`, `pinned_refetch` and `pinned_blob` are the
+session's calls over it, the last two on the pinned connection because only it sees what the open
+transaction wrote (`a_manual_grid_commit_is_refetched_on_the_pinned_connection`). The session
+spells its transaction `BEGIN TRANSACTION`, `BEGIN TRANSACTION READ ONLY`, `COMMIT` and `ROLLBACK`,
+and **a read-only connection needs nothing set at open**: every transaction `ensure_tx` opens on it
+is `READ ONLY`, which refuses a write by its effect, and a Manual tab runs nothing outside one
+(`a_read_only_manual_tab_refuses_a_write`). A failed statement aborts the transaction, as on
+PostgreSQL — `session::tx_engine_of` maps DuckDB to that model, measured on 2.0 — so
+`Session::commit` probes `SELECT 1` first, as it does there, and reports the abort rather than a
+commit of nothing (`commit_after_a_failed_statement_reports_the_abort`); the tab's statements are
+one transaction no other connection sees until Commit (`a_manual_tab_holds_its_writes_until_commit`).
+`Session::alive` answers yes without asking: there is no connection in this process to lose.
+**DuckDB has no `SAVEPOINT`** (2.0: a parser error), and two things follow from it. **A failed grid
+commit takes the whole transaction with it.** The other engines nest the batch in a savepoint so a
+failure undoes it alone; here `pinned_write` runs it bare inside the tab's transaction, where a
+statement the engine refuses has aborted the transaction and a one-row miss has written into it,
+so on **any** failure — those two, or a Stop — it issues `ROLLBACK` and fails with
+`Rollback::Transaction`, whose note says every statement the tab ran since its transaction began
+is undone, not only the edits. `Session::commit_writes`' DuckDB arm then clears `in_tx` and reports
+`StmtOutcome::FailedAndRolledBack`, folding the pill to `Idle`, never an isolated outcome. That is
+the roadmap's decision: the grid commit is not refused inside a transaction, and its failure is
+reported as the transaction's loss rather than claimed as a batch undone alone
+(`a_failed_grid_commit_rolls_the_manual_transaction_back_and_says_so` — a one-row miss after an
+edit that landed, the tab's earlier `INSERT` gone too, the next statement opening a fresh
+transaction that commits; red with the `ROLLBACK` removed — and
+`a_refused_grid_statement_rolls_the_manual_transaction_back_too`). **A Stop before the batch is
+sent costs nothing**: `pinned_write` answers a plain `Cancelled` without a `ROLLBACK`, and the
+session reports it `NotSent` (`a_grid_commit_stopped_before_it_is_sent_keeps_the_transaction`, red
+without that check). And `Rollback::Transaction` is claimed only where the server took the
+`ROLLBACK`; one it refused is `Rollback::Unknown`. **And the reads are unfenced.**
+`run_scope_sql` answers `false` for DuckDB, so `fence_read` sets no savepoint around
+`refetch_rows` or `fetch_blob`, and a read stopped in a Manual tab folds as a plain `Cancelled` —
+an aborted transaction in PostgreSQL's model, **which is the truth here**: an interrupt aborts
+DuckDB's transaction as PostgreSQL's cancel does, the next statement answering *Current
+transaction is aborted* (measured on 2.0; `stop_interrupts_a_manual_tabs_statement` holds Commit to
+reporting the abort).
+**What is not written yet is refused, never faked**: `ddl::duckdb_supports` keeps the designer and
+the view, trigger and routine editors off.
 **A missing file is refused, never created** (`open_target`, `DbRefusal::DuckDbMissing`). DuckDB's
 open creates one, which for a database *client* is the wrong default by some distance: a mistyped
 path would open an empty database that looked like it worked. An empty path is `DuckDbNoFile`, and

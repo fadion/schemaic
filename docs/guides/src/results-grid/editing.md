@@ -85,7 +85,9 @@ so re-run a result that has been open a long time before editing it.
 On success, updated rows are refreshed in place; adding or deleting rows re-runs the query.
 
 - *In a Manual transaction tab*, the commit goes into your open transaction, and is permanent only
-  when you commit that.
+  when you commit that. *On DuckDB*, which can't undo the edits alone, a commit that fails or is
+  stopped rolls back the whole transaction, including the statements the tab ran before, and the
+  error says so.
 - *On a MySQL `MyISAM` table*, there is no transaction to roll back. If a commit fails part-way,
   Schemaic says so rather than claiming nothing was written.
 - *If another session holds a lock* on a row you are writing, the commit waits, and a note at the
