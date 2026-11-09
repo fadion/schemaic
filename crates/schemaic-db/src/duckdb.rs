@@ -141,10 +141,8 @@ fn open_target(
     if let Some(name) = f.strip_prefix("memory:") {
         return Ok((format!("memory:{name}"), Target::Memory));
     }
-    if f.eq_ignore_ascii_case(":memory:")
-        || f.to_ascii_lowercase().starts_with("md:")
-        || f.to_ascii_lowercase().starts_with("motherduck:")
-    {
+    // The form's own answer (`memory:` was taken above, as a session's).
+    if !schemaic_core::connection::duckdb_names_a_file(f) {
         return Err(DbError::Refused(DbRefusal::DuckDbNotAFile(f.to_string())));
     }
     let path = std::path::Path::new(f);

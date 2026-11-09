@@ -1858,6 +1858,9 @@ impl Connection {
 
     /// Is this an **Open data file** session rather than a saved connection?
     ///
+    /// A `memory:` path typed into the form is not one in the making — the
+    /// form says so ([`duckdb_names_a_file`]), and a save leaves it out.
+    ///
     /// **Asked of the connection, not remembered**, as
     /// [`is_untouched_new`](Self::is_untouched_new) is and for its reason: the
     /// answer has to be the same at every site that saves, lists or exports.
@@ -2503,6 +2506,22 @@ pub fn is_sqlite(db_type: &str) -> bool {
 /// the app asks [`is_file_backed`] rather than this.
 pub fn is_duckdb(db_type: &str) -> bool {
     db_type.trim().eq_ignore_ascii_case("duckdb")
+}
+
+/// Does a DuckDB connection's `file`, as typed, name **a file on this
+/// computer**? Not an in-memory database — `:memory:`, which would die with
+/// each operation's instance, or `memory:<name>`, which only an *Open data
+/// file* session holds and a save leaves out — and not a MotherDuck `md:`
+/// name, whose extension this build does not fetch. The connection form says
+/// so under the path as it is typed; `db::duckdb::open_target` refuses the
+/// same text at a connect (a `memory:` target there being a session's own).
+/// Empty answers yes: a missing path is its own refusal.
+pub fn duckdb_names_a_file(file: &str) -> bool {
+    let f = file.trim().to_ascii_lowercase();
+    !(f == ":memory:"
+        || f.starts_with("memory:")
+        || f.starts_with("md:")
+        || f.starts_with("motherduck:"))
 }
 
 /// Is this engine's whole target **a file on this machine** rather than a
@@ -4661,6 +4680,33 @@ mod tests {
         let mut lite = c.clone();
         lite.db_type = "SQLite".into();
         assert!(!lite.is_data_session());
+    }
+
+    /// What the DuckDB form refuses as typed: an in-memory database, by
+    /// either spelling, and a MotherDuck name — none of them a file on this
+    /// computer. A path that merely contains one of the words is a file.
+    #[test]
+    fn a_duckdb_path_names_a_file_unless_it_names_memory_or_motherduck() {
+        for f in [
+            "memory:session-1",
+            " memory:x",
+            ":memory:",
+            ":MEMORY:",
+            "md:my_db",
+            "MD:x",
+            "motherduck:x",
+        ] {
+            assert!(!duckdb_names_a_file(f), "{f}");
+        }
+        for f in [
+            r"C:\data\memory.duckdb",
+            "/home/a/md.duckdb",
+            "sales.duckdb",
+            // Empty is a missing file, said by its own refusal.
+            "",
+        ] {
+            assert!(duckdb_names_a_file(f), "{f}");
+        }
     }
 
     /// A session is never written to `connections.json`, and an active id

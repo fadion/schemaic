@@ -89,8 +89,7 @@ come after DuckDB.
   edit does not restate them, the new body's columns being unknown until it runs.
   An Open data file session is out of the AI panel's reach: its MCP server is a subprocess that
   reads `connections.json`, where a session never is, and could not share the in-process database
-  if it did. A `memory:` path typed into the connection form is not refused at Save — it is only
-  never saved, and connecting says the session is closed; a form-level refusal would be clearer.
+  if it did.
   The read-time options of `read_csv` (delimiter, header, types) are DuckDB's sniffer's alone; a
   file it guesses wrong needs the view rewritten by hand.
 - **Phase 3:** the full CI bar on every leg, which builds the amalgamation cold (about five

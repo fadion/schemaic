@@ -255,7 +255,10 @@ file* is a `path_field` too since then, where `sqlite_fields` had carried a hand
 duplicate of its layout; its Browse went from tabindex 62 to 61 in the move, the order
 unchanged. That block is **`file_fields`** now, built for SQLite and for DuckDB (`DbKind::DuckDb`)
 alike — a file and nothing else — with the dialog title and the hint passed in as each engine's
-own words (`connections-duckdb-file-dialog`, `connections-duckdb-hint`).
+own words (`connections-duckdb-file-dialog`, `connections-duckdb-hint`), and a `names_a_file`
+check: DuckDB's is `connection::duckdb_names_a_file`, and while it says no the hint is replaced
+by `db-refused-duckdb-not-a-file` in the error colour, as the init SQL's refusal is shown;
+SQLite's answers yes to anything.
 **An *Authentication* picker appears only on an engine offering more than one mode** — SQL
 Server, PostgreSQL and the MySQL family, through `AuthMode::offered`; SQLite and DuckDB have none — between Database and the credentials, at tabindex 68 in
 the gap the surrounding indices were spaced to leave. `DraftSignals::auth` is threaded through

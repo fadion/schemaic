@@ -1866,13 +1866,18 @@ fn windows_sign_in_hint_for(domain: Option<&str>, user: Option<&str>) -> String 
 /// form is unchanged and the indices after it are untouched.
 ///
 /// DuckDB's is the same block — a file and nothing else — with its own dialog
-/// title and hint, so `dialog` and `hint` are the engine's words.
+/// title and hint, so `dialog` and `hint` are the engine's words. Its path can
+/// also name no file at all (`connection::duckdb_names_a_file`), which
+/// `names_a_file` asks as it is typed: the hint then says so, as the connect
+/// would, in place of a `memory:` path that saved and then failed.
 fn file_fields(
     draft: DraftSignals,
     ring: FocusRing,
     dialog: String,
     hint: String,
+    names_a_file: fn(&str) -> bool,
 ) -> impl IntoView {
+    let refused = move || draft.file.with(|f| !names_a_file(f));
     // The SSH key's and TLS certificates' control: a path editable by hand, with
     // Browse inside it as its own stop right after the path (61). It was a
     // second copy of `path_field` until GitHub #19 moved the button in.
@@ -1884,7 +1889,21 @@ fn file_fields(
             ring,
             60,
         ),
-        form_hint(hint).style(|s| s.width_full()),
+        label(move || {
+            if refused() {
+                tr!(
+                    "db-refused-duckdb-not-a-file",
+                    name = draft.file.with(|f| f.trim().to_string())
+                )
+            } else {
+                hint.clone()
+            }
+        })
+        .style(move |s| {
+            crate::widgets::form_hint_style(s)
+                .width_full()
+                .apply_if(refused(), |s| s.color(theme::error()))
+        }),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
 }
@@ -2018,6 +2037,7 @@ fn conn_form(
                 ring_engine.clone(),
                 tr!("connections-database-file-dialog"),
                 tr!("connections-sqlite-hint"),
+                |_| true,
             )
             .into_any(),
             DbKind::DuckDb => file_fields(
@@ -2025,6 +2045,7 @@ fn conn_form(
                 ring_engine.clone(),
                 tr!("connections-duckdb-file-dialog"),
                 tr!("connections-duckdb-hint"),
+                schemaic_core::connection::duckdb_names_a_file,
             )
             .into_any(),
             _ => server_fields(draft, ring_engine.clone()).into_any(),

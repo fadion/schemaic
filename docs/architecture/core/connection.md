@@ -41,10 +41,14 @@ left out, and `active_to_save` the active id it writes — `None` when that id n
 startup falls back as for any id that names nothing (`startup_active_id`) — because a session's
 data is in this process alone and after a restart it would be a connection to nothing
 (`a_save_leaves_the_data_sessions_out`). The app's save and its connection export both write
-through `to_save` (under `app/main.rs`). **What it does not cover**: a `memory:` path typed into
-the connection form is not refused at Save. It answers `is_data_session` like a session's, so it is
-never written, and connecting is refused in the closed-session words (`DuckDbSessionClosed`) — or,
-should it name a session this process holds, reaches that session's database.
+through `to_save` (under `app/main.rs`). **A `memory:` path typed into the connection form** is
+not refused at Save — it answers `is_data_session` like a session's, so it is never written, and
+connecting is refused in the closed-session words (`DuckDbSessionClosed`), or, should it name a
+session this process holds, reaches that session's database — but the form says so as it is typed:
+**`duckdb_names_a_file`** is false for it, for `:memory:` and for a MotherDuck `md:` name, and the
+form shows `db-refused-duckdb-not-a-file` under the path in place of the hint. `db::duckdb::open_target`
+asks the same function for the spellings it refuses at a connect, a `memory:` target there being a
+session's own (`a_duckdb_path_names_a_file_unless_it_names_memory_or_motherduck`).
 **`sql_server_address` is the one reading of a SQL Server Host field**, as Microsoft's clients
 read it: a leading `tcp:` (any case) is the protocol and goes, `.` and `(local)` are
 `localhost`, a trailing `,port` is the port — a non-zero `u16`, or the text stays in `server`
