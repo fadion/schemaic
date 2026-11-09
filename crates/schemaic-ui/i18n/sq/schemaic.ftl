@@ -2454,6 +2454,11 @@ ddl-risk-recreate-view = Rikrijimi i { $name } e fshin më parë. { $cost } { $w
         [sqlserver] sp_rename i SQL Server do ta linte përkufizimin e ruajtur të pamjes duke emërtuar emrin e vjetër, kështu një riemërtim ndjek këtë rrugë.
        *[postgres] PostgreSQL nuk mund të zëvendësojë një pamje kolonat e së cilës ndryshuan emër, tip ose renditje, kështu kjo është e vetmja mënyrë për të zbatuar redaktimin.
     }
+# DuckDB: $columns are those whose comments a view replace clears, joined.
+ddl-risk-view-column-comments-cleared = { $count ->
+        [one] Zëvendësimi i pamjes fshin komentin në { $columns } — kolonat e saj nuk mund të lexohen nga SELECT-i i ri për ta rikthyer. Emërtoni kolonat në vend që të zgjidhni *, ose vendoseni sërish më pas.
+       *[other] Zëvendësimi i pamjes fshin komentet në { $columns } — kolonat e saj nuk mund të lexohen nga SELECT-i i ri për t'i rikthyer. Emërtoni kolonat në vend që të zgjidhni *, ose vendosini sërish më pas.
+    }
 ddl-risk-view-statements-replayed = { $count ->
         [one] { $count } urdhër i fshirë bashkë me të rikthehet më pas, në të njëjtin transaksion.
        *[other] { $count } urdhra të fshirë bashkë me të rikthehen më pas, në të njëjtin transaksion.

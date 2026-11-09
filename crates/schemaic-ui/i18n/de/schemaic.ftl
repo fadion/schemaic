@@ -869,6 +869,11 @@ ddl-risk-recreate-view = Das Neuerstellen von { $name } löscht die Sicht zuerst
         [sqlserver] sp_rename von SQL Server würde die gespeicherte Definition der Sicht beim alten Namen belassen, daher nimmt eine Umbenennung diesen Weg.
        *[postgres] PostgreSQL kann eine Sicht, deren Spalten Name, Typ oder Reihenfolge geändert haben, nicht ersetzen, daher ist dies der einzige Weg, die Änderung anzuwenden.
     }
+# DuckDB: $columns are those whose comments a view replace clears, joined.
+ddl-risk-view-column-comments-cleared = { $count ->
+        [one] Das Ersetzen der Sicht löscht den Kommentar zu { $columns } — ihre Spalten lassen sich aus dem neuen SELECT nicht ablesen, um ihn wiederherzustellen. Benennen Sie die Spalten statt * zu wählen, oder setzen Sie ihn danach neu.
+       *[other] Das Ersetzen der Sicht löscht die Kommentare zu { $columns } — ihre Spalten lassen sich aus dem neuen SELECT nicht ablesen, um sie wiederherzustellen. Benennen Sie die Spalten statt * zu wählen, oder setzen Sie sie danach neu.
+    }
 ddl-risk-view-statements-replayed = { $count ->
         [one] { $count } mit ihr gelöschte Anweisung wird danach in derselben Transaktion wiederhergestellt.
        *[other] { $count } mit ihr gelöschte Anweisungen werden danach in derselben Transaktion wiederhergestellt.

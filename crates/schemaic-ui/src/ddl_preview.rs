@@ -2096,6 +2096,11 @@ pub(crate) fn risk_text(risk: &schemaic_core::ddl::Risk) -> String {
                 RecreateViewWhy::Postgres => "postgres",
             }
         ),
+        R::ViewColumnCommentsCleared { columns } => tr!(
+            "ddl-risk-view-column-comments-cleared",
+            count = columns.len(),
+            columns = list(columns)
+        ),
         &R::ViewStatementsReplayed { count } => {
             tr!("ddl-risk-view-statements-replayed", count = count)
         }
@@ -3074,6 +3079,10 @@ mod tests {
             R::DropUniqueIndex { name: s("ux") },
             R::ViewStatementsReplayed { count: 1 },
             R::ViewStatementsReplayed { count: 3 },
+            R::ViewColumnCommentsCleared { columns: v(&["a"]) },
+            R::ViewColumnCommentsCleared {
+                columns: v(&["a", "b"]),
+            },
             R::AddNotNullColumn { name: s("qty") },
             R::DropCheck { name: s("ck") },
             R::KeepLossyIndex { name: s("ix") },

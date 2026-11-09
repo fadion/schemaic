@@ -2454,6 +2454,11 @@ ddl-risk-recreate-view = Het opnieuw maken van { $name } verwijdert hem eerst. {
         [sqlserver] Met sp_rename van SQL Server zou de opgeslagen definitie van de view nog de oude naam noemen, dus een hernoeming gaat via deze route.
        *[postgres] PostgreSQL kan geen view vervangen waarvan de kolommen van naam, type of volgorde zijn veranderd, dus dit is de enige manier om de bewerking toe te passen.
     }
+# DuckDB: $columns are those whose comments a view replace clears, joined.
+ddl-risk-view-column-comments-cleared = { $count ->
+        [one] Het vervangen van de view wist het commentaar op { $columns } — de kolommen zijn niet uit de nieuwe SELECT af te lezen om het terug te zetten. Noem de kolommen in plaats van * te selecteren, of stel het daarna opnieuw in.
+       *[other] Het vervangen van de view wist de commentaren op { $columns } — de kolommen zijn niet uit de nieuwe SELECT af te lezen om ze terug te zetten. Noem de kolommen in plaats van * te selecteren, of stel ze daarna opnieuw in.
+    }
 ddl-risk-view-statements-replayed = { $count ->
         [one] { $count } instructie die mee is verwijderd, wordt daarna teruggezet, in dezelfde transactie.
        *[other] { $count } instructies die mee zijn verwijderd, worden daarna teruggezet, in dezelfde transactie.

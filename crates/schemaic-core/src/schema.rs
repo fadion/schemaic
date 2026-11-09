@@ -2277,6 +2277,13 @@ pub struct ViewOptions {
     /// ([`crate::ddl::replace_clears_comment`]). `None` on the engines whose
     /// replace keeps it, and only the DuckDB reader fills it.
     pub comment: Option<String>,
+    /// **DuckDB.** Each column's comment, as `(column, comment)` in column
+    /// order, for the reason [`Self::comment`] is carried: `CREATE OR REPLACE
+    /// VIEW` clears a view's column comments too (measured on 2.0.0), so the
+    /// plan restates each one whose column the new body still has
+    /// ([`crate::ddl::view_comments_restated`]). Empty on the engines whose
+    /// replace keeps them, and only the DuckDB reader fills it.
+    pub column_comments: Vec<(String, String)>,
     /// **SQL Server's view attributes** — `SCHEMABINDING`, `VIEW_METADATA` —
     /// upper-cased, in the order the header states them. Empty elsewhere.
     ///
@@ -2445,6 +2452,7 @@ impl Default for ViewOptions {
             populated: true,
             column_list: None,
             comment: None,
+            column_comments: Vec::new(),
             attributes: Vec::new(),
             tsql: TsqlView::default(),
         }

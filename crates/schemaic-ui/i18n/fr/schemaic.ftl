@@ -2454,6 +2454,11 @@ ddl-risk-recreate-view = Recréer { $name } commence par la supprimer. { $cost }
         [sqlserver] Le sp_rename de SQL Server laisserait la définition stockée de la vue nommer l'ancien nom : un renommage passe donc par cette voie.
        *[postgres] PostgreSQL ne peut pas remplacer une vue dont les colonnes ont changé de nom, de type ou d'ordre : c'est donc la seule façon d'appliquer la modification.
     }
+# DuckDB: $columns are those whose comments a view replace clears, joined.
+ddl-risk-view-column-comments-cleared = { $count ->
+        [one] Remplacer la vue efface le commentaire de { $columns } : ses colonnes ne peuvent pas être lues dans le nouveau SELECT pour le rétablir. Nommez ses colonnes plutôt que de sélectionner *, ou redéfinissez-le ensuite.
+       *[other] Remplacer la vue efface les commentaires de { $columns } : ses colonnes ne peuvent pas être lues dans le nouveau SELECT pour les rétablir. Nommez ses colonnes plutôt que de sélectionner *, ou redéfinissez-les ensuite.
+    }
 ddl-risk-view-statements-replayed = { $count ->
         [one] { $count } instruction supprimée avec elle est rétablie ensuite, dans la même transaction.
        *[other] { $count } instructions supprimées avec elle sont rétablies ensuite, dans la même transaction.

@@ -1985,9 +1985,30 @@ exhaustive `match`, has the in-place `ReplaceView` arm follow the replace with a
 … IS …` from `ViewOptions::comment`, under the name the server still knows — **before** any
 rename, which then carries it along (`a_duckdb_view_replace_restates_the_comment_it_clears`,
 which also pins that a rename alone restates nothing and that PostgreSQL, whose replace keeps its
-comment, is written no such statement). The comment is carried, not edited: the view editor has
-no control for it. The live half, `a_view_edit_keeps_its_column_list_and_comment` under
-`duckdb.rs`, runs a body change and a rename end to end and reads the list and the comment back.
+comment, is written no such statement). **The replace clears the view's column comments too**
+(measured on 2.0.0), and an edit lost them silently while only the view's own was restated. They
+ride in `ViewOptions::column_comments`, and **`view_comments_restated(draft, dialect)`**, beside
+`replace_clears_comment` and empty wherever it answers no, returns `(restated, lost)`: the
+comments whose column the **new** body still has, and the rest. The arm writes a `COMMENT ON
+COLUMN` per restated one after the `COMMENT ON VIEW`, under the same name the server knows, and
+`Change::risk_lines` names the lost ones as `Risk::ViewColumnCommentsCleared` — one function
+answering both, so the script and its warning cannot disagree. The names are read off the
+statement: the explicit column list where there is one, parsed as `SELECT <list>` for one parser
+and one set of quoting rules, else the body's own through `intel::select_output_names`, matched
+case-insensitively. A column the edit removed takes its comment with it — that is the edit, and a
+`COMMENT ON COLUMN` naming it would fail the whole plan. Which is why, **where the names cannot be
+read** — a `*`, an unnamed expression, a set operation — nothing is restated and every comment
+is reported lost rather than guessed at
+(`a_views_column_comments_are_restated_where_the_body_names_the_column`,
+`a_views_column_comments_are_lost_where_the_body_cannot_be_read`,
+`a_views_column_comments_are_restated_only_where_the_replace_clears_them`, and
+`a_duckdb_view_replace_restates_or_names_its_column_comments` for the statement and the risk line
+together). Schema compare converges on them with no code of its own: differing `column_comments`
+make `diff_view`'s `draft.options != old_options`, so the source's are planned onto the target's
+view. The comments are carried, not edited: the view editor has no control for either. The live
+half, `a_view_edit_keeps_its_column_list_and_comment` under `duckdb.rs`, runs a body change and a
+rename end to end and reads the list and the comment back; its siblings there do the same for the
+column comments.
 **DuckDB tracks no view's dependents**: a replace or a drop that breaks another view succeeds, and
 the other fails when it is next read, as on MySQL.
 The MySQL `ALGORITHM` a replace would reset arrives *after* the editor opens

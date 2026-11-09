@@ -5900,6 +5900,12 @@ pub enum Risk {
     ViewStatementsReplayed {
         count: usize,
     },
+    /// DuckDB: the replace clears these columns' comments, and the new body's
+    /// columns cannot be read off it to restate them
+    /// ([`view_comments_restated`]).
+    ViewColumnCommentsCleared {
+        columns: Vec<String>,
+    },
     /// An indexed view's alter: `dropped` its indexes, `again` those built
     /// again, `gone` those that are not.
     ViewIndexesDropped {
@@ -6185,6 +6191,15 @@ impl Risk {
                 };
                 format!("Re-creating {name} drops it first. {} {why}", cost.message())
             }
+            Risk::ViewColumnCommentsCleared { columns } => format!(
+                "Replacing the view clears the comment{} on {} — its columns can't be \
+                 read off the new SELECT to put {} back. Name its columns rather than \
+                 selecting *, or set {} again afterwards.",
+                if columns.len() == 1 { "" } else { "s" },
+                list(columns),
+                if columns.len() == 1 { "it" } else { "them" },
+                if columns.len() == 1 { "it" } else { "them" },
+            ),
             Risk::ViewStatementsReplayed { count } => format!(
                 "{count} statement{} dropped with it {} put back afterwards, in the \
                  same transaction.",
@@ -7362,9 +7377,18 @@ impl Change {
                 recreate: false,
                 server_indexes,
                 ..
-            } => view_indexes_rebuilt(draft, server_indexes)
-                .into_iter()
-                .collect(),
+            } => {
+                let mut out: Vec<Risk> = view_indexes_rebuilt(draft, server_indexes)
+                    .into_iter()
+                    .collect();
+                // **DuckDB's replace clears its column comments**, and those
+                // whose column the new body may not have are not restated.
+                let lost = view_comments_restated(draft, dialect).1;
+                if !lost.is_empty() {
+                    out.push(Risk::ViewColumnCommentsCleared { columns: lost });
+                }
+                out
+            }
             // **Nothing is lost and the plan may simply fail** — which is worth
             // a sentence for the same reason `KeepLossyIndex` is: the preview is
             // where the plan says what it won't do for you. Every existing row
@@ -9626,6 +9650,11 @@ impl ChangeSet {
                                 qualified(server_name, draft.schema.as_deref(), d),
                                 ddl_string(comment, d)
                             ));
+                        }
+                        // And its columns' — those the new body still has.
+                        let qview = qualified(server_name, draft.schema.as_deref(), d);
+                        for (column, comment) in view_comments_restated(draft, d).0 {
+                            out.push(comment_on_column(&qview, &column, Some(&comment), d));
                         }
                     }
                 }
@@ -14900,6 +14929,58 @@ pub fn replace_clears_comment(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::DuckDb => true,
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// The view's column comments an in-place replace of `draft` has to restate,
+/// and those it cannot — the answer [`ChangeSet::emit`] and the preview's
+/// risk block both read, so the script and its warning cannot disagree.
+///
+/// On an engine whose replace clears them ([`replace_clears_comment`]), a
+/// `COMMENT ON COLUMN` after the replace puts each back — but only on a column
+/// the **new** body still has: one naming a column the edit took away fails,
+/// and with it the whole plan. So the new body's column names are read off the
+/// statement — the explicit column list where there is one, else the
+/// `SELECT`'s own ([`crate::intel::select_output_names`]) — and a comment is
+/// restated where its column is among them (case-insensitively: DuckDB's
+/// names are). A column the edit dropped takes its comment with it, which is
+/// the edit.
+///
+/// **Where the names cannot be read** — a `*`, an unnamed expression, a set
+/// operation — no comment is restated and every one is returned as lost:
+/// guessing would fail the plan on the first column that is gone, so the
+/// preview says instead which comments the replace clears.
+///
+/// `(restated, lost)`: `(column, comment)` pairs, and column names.
+pub fn view_comments_restated(
+    draft: &ViewDraft,
+    dialect: SqlDialect,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let comments = &draft.options.column_comments;
+    if !replace_clears_comment(dialect) || comments.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    // An explicit list read as a `SELECT` of it: the same parser, the same
+    // quoting rules, and a name per item.
+    let names = match draft.options.column_list.as_deref() {
+        Some(list) if !list.trim().is_empty() => {
+            crate::intel::select_output_names(&format!("SELECT {list}"), dialect)
+        }
+        _ => crate::intel::select_output_names(draft.select.trim(), dialect),
+    };
+    match names {
+        Some(names) => (
+            comments
+                .iter()
+                .filter(|(c, _)| names.iter().any(|n| n.eq_ignore_ascii_case(c)))
+                .cloned()
+                .collect(),
+            Vec::new(),
+        ),
+        None => (
+            Vec::new(),
+            comments.iter().map(|(c, _)| c.clone()).collect(),
+        ),
     }
 }
 
@@ -29700,6 +29781,124 @@ mod tests {
             ..v
         };
         assert_eq!(view_comment_sql(&table, DuckDb), None);
+    }
+
+    /// A view draft carrying column comments `a` and `C`.
+    fn commented_view(select: &str, column_list: Option<&str>) -> ViewDraft {
+        ViewDraft {
+            original: Some("v".into()),
+            name: "v".into(),
+            schema: Some("main".into()),
+            select: select.into(),
+            options: ViewOptions {
+                column_list: column_list.map(str::to_string),
+                column_comments: vec![("a".into(), "A".into()), ("C".into(), "see".into())],
+                ..Default::default()
+            },
+            force_recreate: false,
+        }
+    }
+
+    /// The comments a replace restates are those whose column the new body
+    /// names — read off the `SELECT`, an alias or a qualified name included,
+    /// case-insensitively — and none is lost.
+    #[test]
+    fn a_views_column_comments_are_restated_where_the_body_names_the_column() {
+        let pair = |c: &str, t: &str| (c.to_string(), t.to_string());
+        assert_eq!(
+            view_comments_restated(
+                &commented_view("SELECT t.a, b, x AS c FROM t", None),
+                DuckDb
+            ),
+            (vec![pair("a", "A"), pair("C", "see")], vec![])
+        );
+        // `C` is gone from the body: dropped with it, not restated.
+        assert_eq!(
+            view_comments_restated(&commented_view("SELECT a, b FROM t", None), DuckDb),
+            (vec![pair("a", "A")], vec![])
+        );
+        // An explicit column list names the columns, not the body.
+        assert_eq!(
+            view_comments_restated(&commented_view("SELECT * FROM t", Some("\"C\", z")), DuckDb),
+            (vec![pair("C", "see")], vec![])
+        );
+    }
+
+    /// Where the body's names cannot be read — `*`, an unnamed expression, a
+    /// set operation — nothing is restated and every comment is lost, for
+    /// the preview to say.
+    #[test]
+    fn a_views_column_comments_are_lost_where_the_body_cannot_be_read() {
+        let lost = || (vec![], vec!["a".to_string(), "C".to_string()]);
+        for body in [
+            "SELECT * FROM t",
+            "SELECT a, b + 1 FROM t",
+            "SELECT a FROM t UNION SELECT a FROM u",
+            "not a query at all",
+        ] {
+            assert_eq!(
+                view_comments_restated(&commented_view(body, None), DuckDb),
+                lost(),
+                "{body}"
+            );
+        }
+    }
+
+    /// Nothing to restate where the replace keeps them, or there are none.
+    #[test]
+    fn a_views_column_comments_are_restated_only_where_the_replace_clears_them() {
+        for d in [MySql, Postgres, Sqlite, MsSql] {
+            assert_eq!(
+                view_comments_restated(&commented_view("SELECT * FROM t", None), d),
+                (vec![], vec![]),
+                "{d:?}"
+            );
+        }
+        let mut bare = commented_view("SELECT * FROM t", None);
+        bare.options.column_comments.clear();
+        assert_eq!(view_comments_restated(&bare, DuckDb), (vec![], vec![]));
+    }
+
+    /// The emitted plan and its risk block read the same answer: a restated
+    /// comment is a `COMMENT ON COLUMN` after the replace, under the name the
+    /// server knows, and a lost one is a risk line, not a statement.
+    #[test]
+    fn a_duckdb_view_replace_restates_or_names_its_column_comments() {
+        let cs = |draft: ViewDraft| ChangeSet {
+            table: "v".into(),
+            schema: Some("main".into()),
+            dialect: DuckDb,
+            flavour: ServerFlavour::Unknown,
+            changes: vec![Change::ReplaceView {
+                draft: Box::new(draft),
+                recreate: false,
+                replay: Vec::new(),
+                server_indexes: Vec::new(),
+            }],
+        };
+        let named = cs(commented_view("SELECT a, c FROM t", None));
+        let stmts = named.emit();
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s == "COMMENT ON COLUMN \"main\".\"v\".\"a\" IS 'A';"),
+            "{stmts:#?}"
+        );
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s == "COMMENT ON COLUMN \"main\".\"v\".\"C\" IS 'see';"),
+            "{stmts:#?}"
+        );
+        assert!(named.risk_lines().is_empty());
+        let star = cs(commented_view("SELECT * FROM t", None));
+        assert!(star.emit().iter().all(|s| !s.contains("COMMENT ON COLUMN")));
+        assert_eq!(
+            star.risk_lines(),
+            [Risk::ViewColumnCommentsCleared {
+                columns: vec!["a".into(), "C".into()]
+            }]
+        );
     }
 
     /// A DuckDB schema is created and dropped as PostgreSQL's is — never

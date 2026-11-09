@@ -119,7 +119,11 @@ A DuckDB connection is a database file on this machine, like SQLite's; see
 - the view editor: **Edit view**, a new view from **Create** › **View** or the query editor's
   **Create view**, renaming a view in its name field, and **Drop**. An edit keeps the view's
   **Column names** and its comment, which Schemaic sets again after the replace, since DuckDB's
-  would clear it. DuckDB doesn't track which views read a view, so a change that breaks another
+  would clear it. Its columns' comments are set again too, for each column the new `SELECT` or
+  **Column names** still names; a column you remove takes its comment with it. When the columns
+  can't be read from the text — a `SELECT *`, an unnamed expression such as `b + 1`, a `UNION` —
+  the preview warns which column comments the replace clears: name the columns, or set the
+  comments again afterwards. DuckDB doesn't track which views read a view, so a change that breaks another
   view goes through, and that view fails the next time it's read;
 - the macro editor, from the edit entry on a macro's right-click menu, and a new macro from
   **Create** › **Function**. There's no **Procedure**, since DuckDB has none. Leave **Returns**

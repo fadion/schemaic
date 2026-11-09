@@ -95,7 +95,10 @@ is read out of `duckdb_views().sql` by the same `ddl::view_column_list` as SQLit
 **`comment` is DuckDB's alone**, beside `TableInfo::comment`, which every engine fills: DuckDB's
 `CREATE OR REPLACE VIEW` clears a view's comment (measured on 2.0.0), so the plan restates it after
 the replace (`ddl::replace_clears_comment`). Only the DuckDB reader fills it, and it is `None` on
-the engines whose replace keeps the comment.
+the engines whose replace keeps the comment. **`column_comments` is DuckDB's alone for the same
+reason** — `(column, comment)` in column order, since the replace clears the view's column
+comments too (measured on 2.0.0) — and is empty elsewhere; the plan restates only those whose
+column the new body still has (`ddl::view_comments_restated`).
 **`attributes` is SQL Server's alone** — `SCHEMABINDING` and `VIEW_METADATA`, upper-cased in
 the header's order, empty elsewhere — restated for the same `ALTER VIEW` reason: a schema-bound
 view altered without the word comes back unbound. Restating it does **not** keep the view's

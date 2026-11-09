@@ -2869,6 +2869,11 @@ ddl-risk-recreate-view = Re-creating { $name } drops it first. { $cost } { $why 
         [sqlserver] SQL Server's sp_rename would leave the view's stored definition naming the old one, so a rename takes this route.
        *[postgres] PostgreSQL can't replace a view whose columns changed name, type or order, so this is the only way to apply the edit.
     }
+# DuckDB: $columns are those whose comments a view replace clears, joined.
+ddl-risk-view-column-comments-cleared = { $count ->
+        [one] Replacing the view clears the comment on { $columns } — its columns can't be read off the new SELECT to put it back. Name its columns rather than selecting *, or set it again afterwards.
+       *[other] Replacing the view clears the comments on { $columns } — its columns can't be read off the new SELECT to put them back. Name its columns rather than selecting *, or set them again afterwards.
+    }
 ddl-risk-view-statements-replayed = { $count ->
         [one] { $count } statement dropped with it is put back afterwards, in the same transaction.
        *[other] { $count } statements dropped with it are put back afterwards, in the same transaction.

@@ -82,8 +82,6 @@ come after DuckDB.
   binary-cell panel dismissed mid-read, a re-fetch stopped — aborts the transaction (measured),
   since there is no savepoint to fence it in; reading such a cell on a fresh connection would see
   none of the tab's uncommitted writes, so it is left an honest loss rather than a wrong answer.
-  A view's **column** comments are cleared by `CREATE OR REPLACE VIEW` too (measured), and an
-  edit does not restate them, the new body's columns being unknown until it runs.
   An Open data file session is out of the AI panel's reach: its MCP server is a subprocess that
   reads `connections.json`, where a session never is, and could not share the in-process database
   if it did.

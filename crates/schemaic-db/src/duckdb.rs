@@ -1776,9 +1776,19 @@ fn read_schema(conn: &DuckConn) -> Result<DbSchema, DbError> {
         } else {
             (default, None)
         };
+        let name: String = r.get(2).map_err(query_err)?;
+        let comment = r
+            .get::<_, Option<String>>(6)
+            .map_err(query_err)?
+            .filter(|c| !c.is_empty());
+        // A view's column comment is what its replace clears, so it is
+        // carried with what the replace has to restate (`ViewOptions`).
+        if let (Some(o), Some(c)) = (tables[k].view_options.as_mut(), &comment) {
+            o.column_comments.push((name.clone(), c.clone()));
+        }
         tables[k].columns.push(ColumnInfo {
             generated,
-            name: r.get(2).map_err(query_err)?,
+            name,
             type_name,
             nullable: r.get(4).map_err(query_err)?,
             // A key counted from a sequence is DuckDB's auto-number.
@@ -1786,10 +1796,7 @@ fn read_schema(conn: &DuckConn) -> Result<DbSchema, DbError> {
                 .as_deref()
                 .is_some_and(|d| d.trim_start().to_ascii_lowercase().starts_with("nextval(")),
             default,
-            comment: r
-                .get::<_, Option<String>>(6)
-                .map_err(query_err)?
-                .filter(|c| !c.is_empty()),
+            comment,
             ..Default::default()
         });
     }
@@ -5206,6 +5213,114 @@ mod tests {
             after.view_definition.as_deref(),
             Some("SELECT a, (b * 10) FROM t")
         );
+    }
+
+    /// Run `cs` on `db` and read view `name` back.
+    fn applied_view(db: &Db, cs: &schemaic_core::ddl::ChangeSet, name: &str) -> TableInfo {
+        let stmts = cs.emit();
+        rt().block_on(db.run_ddl("", &stmts, CancellationToken::new()))
+            .unwrap_or_else(|e| panic!("{e} — plan {stmts:#?}"));
+        table_of(db, name)
+    }
+
+    fn column_comments(t: &TableInfo) -> Vec<(&str, Option<&str>)> {
+        t.columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.comment.as_deref()))
+            .collect()
+    }
+
+    /// **A view edit keeps its columns' comments**, which `CREATE OR REPLACE
+    /// VIEW` clears: each column the new body still has gets its comment back
+    /// — named in the `SELECT` or in an explicit column list, renamed view or
+    /// not — and a column the edit took away takes its comment with it rather
+    /// than failing the plan.
+    #[test]
+    fn a_view_edit_keeps_its_column_comments() {
+        use schemaic_core::ddl::{ViewDraft, diff_view};
+        let d = SqlDialect::DuckDb;
+        let db = mem("view-column-comments");
+        seed(
+            &db,
+            "CREATE TABLE t(a INTEGER, b INTEGER, c INTEGER);
+             CREATE VIEW v AS SELECT a, b, c FROM t;
+             COMMENT ON COLUMN v.a IS 'the a';
+             COMMENT ON COLUMN v.c IS 'the c';
+             CREATE VIEW l (x, y) AS SELECT a, b FROM t;
+             COMMENT ON COLUMN l.y IS 'the y';",
+        );
+        // The body edited, `c` dropped, the view renamed: `a`'s comment back,
+        // `c`'s gone with it.
+        let before = table_of(&db, "v");
+        let mut draft = ViewDraft::from_table(&before).unwrap();
+        assert!(diff_view(&before, &draft, d).changes.is_empty());
+        draft.select = "SELECT a, b FROM t WHERE a > 0".into();
+        draft.name = "w".into();
+        let cs = diff_view(&before, &draft, d);
+        assert!(cs.risk_lines().is_empty(), "{:?}", cs.risk_lines());
+        let after = applied_view(&db, &cs, "w");
+        assert_eq!(column_comments(&after), [("a", Some("the a")), ("b", None)]);
+        // An explicit column list names the columns.
+        let before = table_of(&db, "l");
+        let mut draft = ViewDraft::from_table(&before).unwrap();
+        draft.select = "SELECT a, b * 2 FROM t".into();
+        let after = applied_view(&db, &diff_view(&before, &draft, d), "l");
+        assert_eq!(column_comments(&after), [("x", None), ("y", Some("the y"))]);
+    }
+
+    /// **Where the new body's columns cannot be read, the preview says what
+    /// is lost** instead of guessing: a `SELECT *` restates no column comment
+    /// — one naming a column that is gone would fail the plan — and the risk
+    /// block names those the replace clears. The plan still applies.
+    #[test]
+    fn a_star_view_edit_says_which_column_comments_it_clears() {
+        use schemaic_core::ddl::{Risk, ViewDraft, diff_view};
+        let d = SqlDialect::DuckDb;
+        let db = mem("view-column-comments-star");
+        seed(
+            &db,
+            "CREATE TABLE t(a INTEGER, b INTEGER);
+             CREATE VIEW v AS SELECT a, b FROM t;
+             COMMENT ON COLUMN v.b IS 'the b';",
+        );
+        let before = table_of(&db, "v");
+        let mut draft = ViewDraft::from_table(&before).unwrap();
+        draft.select = "SELECT * FROM t".into();
+        let cs = diff_view(&before, &draft, d);
+        assert_eq!(
+            cs.risk_lines(),
+            [Risk::ViewColumnCommentsCleared {
+                columns: vec!["b".into()]
+            }]
+        );
+        let after = applied_view(&db, &cs, "v");
+        assert_eq!(column_comments(&after), [("a", None), ("b", None)]);
+    }
+
+    /// Schema compare carries a view's column comments too: the source's
+    /// are planned onto the target's view, and a second comparison finds
+    /// nothing left.
+    #[test]
+    fn a_compare_carries_a_views_column_comments() {
+        let dst = mem("compare-view-comments-dst");
+        let src = mem("compare-view-comments-src");
+        let common = "CREATE TABLE t(a INTEGER, b INTEGER);
+             CREATE VIEW v AS SELECT a, b FROM t;";
+        seed(&dst, common);
+        seed(&src, common);
+        seed(&src, "COMMENT ON COLUMN v.a IS 'from the source';");
+        let stmts = compared(&dst, &src).plan(|_| true).emit();
+        rt().block_on(dst.run_ddl("", &stmts, CancellationToken::new()))
+            .unwrap_or_else(|e| panic!("{e} — plan {stmts:#?}"));
+        assert_eq!(
+            column_comments(&table_of(&dst, "v")),
+            [("a", Some("from the source")), ("b", None)]
+        );
+        let left: Vec<String> = compared(&dst, &src)
+            .differences()
+            .map(|e| e.label())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     /// A view dropped from its tree row: `DROP VIEW`, as the shortcut raises it.

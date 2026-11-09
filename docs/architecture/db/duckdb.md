@@ -393,10 +393,18 @@ VIEW`, whose entry under `ddl.rs` has the measurements — and `read_schema` fil
 `ViewOptions` with what a replace would lose: the explicit column list, out of
 `duckdb_views().sql` through `ddl::view_column_list` as SQLite's reader takes it, and the comment,
 which DuckDB's `CREATE OR REPLACE VIEW` clears and the plan restates after it
-(`ddl::replace_clears_comment`). `a_view_edit_keeps_its_column_list_and_comment` runs a body change
+(`ddl::replace_clears_comment`) — and the column comments, which the replace clears as well, taken
+in the `duckdb_columns()` loop for a view's columns into `ViewOptions::column_comments`
+(`ddl::view_comments_restated` decides which the plan can put back).
+`a_view_edit_keeps_its_column_list_and_comment` runs a body change
 and a rename through `diff_view` → `emit` → `run_ddl` and reads back the list, the comment and the
 body in DuckDB's own rendering — it re-prints what it stores, so the draft's text is not what reads
-back — and `a_view_drops` drops one.
+back — and `a_view_drops` drops one. `a_view_edit_keeps_its_column_comments` edits a body, drops a
+column and renames the view, and reads back the surviving column's comment with the dropped one's
+gone, and an explicit list's names carrying theirs;
+`a_star_view_edit_says_which_column_comments_it_clears` pins that a `SELECT *` restates none, names the cleared one as a risk, and still applies; and
+`a_compare_carries_a_views_column_comments` plans a source's column comment onto the target's view
+and finds nothing left to compare after.
 **So is the macro editor** — the routine editor over a macro, `CREATE [OR REPLACE] MACRO` and
 `DROP MACRO [TABLE]`, whose entry under `ddl.rs` has the measurements. A macro is a *function* to
 the model and DuckDB has no procedure, so `duckdb_supports` admits a function's create and

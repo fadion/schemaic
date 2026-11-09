@@ -2527,6 +2527,11 @@ ddl-risk-recreate-view = Recrearea { $name } o elimină mai întâi. { $cost } {
         [sqlserver] sp_rename din SQL Server ar lăsa definiția stocată a vizualizării cu numele vechi, așa că o redenumire urmează această cale.
        *[postgres] PostgreSQL nu poate înlocui o vizualizare ale cărei coloane și-au schimbat numele, tipul sau ordinea, așa că aceasta este singura cale de a aplica editarea.
     }
+# DuckDB: $columns are those whose comments a view replace clears, joined.
+ddl-risk-view-column-comments-cleared = { $count ->
+        [one] Înlocuirea vizualizării șterge comentariul de pe { $columns } — coloanele ei nu pot fi citite din noul SELECT pentru a-l reface. Numiți coloanele în loc să selectați *, sau setați-l din nou după aceea.
+       *[other] Înlocuirea vizualizării șterge comentariile de pe { $columns } — coloanele ei nu pot fi citite din noul SELECT pentru a le reface. Numiți coloanele în loc să selectați *, sau setați-le din nou după aceea.
+    }
 ddl-risk-view-statements-replayed = { $count ->
         [one] { $count } instrucțiune eliminată odată cu ea este pusă la loc după aceea, în aceeași tranzacție.
         [few] { $count } instrucțiuni eliminate odată cu ea sunt puse la loc după aceea, în aceeași tranzacție.
