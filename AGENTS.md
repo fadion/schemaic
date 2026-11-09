@@ -16,8 +16,8 @@ grid edits back (on provenance read from the statement, never keyed on `rowid`) 
 tab's transaction — pinning the file's instance, and its lock, while it does — and edits
 **tables** (in place where its `ALTER TABLE` can, through a rebuild where it cannot —
 `ddl::duckdb_rebuild_sql`, decided per table by `ddl::alters_in_place`), **views** and
-**macros** — a macro whose parameter defaults its catalogue hides is listed but not editable — and
-opens a CSV, Parquet or JSON file as a view in an in-memory session that is never saved
+**macros** — a macro whose parameter defaults its catalogue hides is listed but not editable — compares two files' schemas (creating and dropping schemas and sequences on the way),
+and opens a CSV, Parquet or JSON file as a view in an in-memory session that is never saved
 (`db::duckdb::DataSession`, `Connection::is_data_session`).
 SQLite reads, writes, imports and edits **tables** (through the twelve-step rebuild —
 `ddl::sqlite_rebuild_sql`), **views** and **triggers**, but has **no manual-transaction mode** — a

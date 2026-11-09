@@ -1224,6 +1224,7 @@ compare-held-partitioning-differs = de partitionering verschilt, en deze vergeli
 compare-held-sequence-unwritten = deze vergelijking schrijft geen instructie voor een reeks — kopieer die uit `SHOW CREATE SEQUENCE`, die het paneel ervan toont
 compare-held-partitioned-unrestated = hij is gepartitioneerd, en geen CREATE TABLE hier herhaalt het partitieschema — maak met de hand de partitiefunctie en het schema, daarna de tabel
 compare-held-sequence-range = de teller van het doel staat op { $at }, buiten het nieuwe bereik { $min } tot { $max }, en de server weigert een reeks te versmallen voorbij een waarde die hij al heeft uitgegeven. Herstart hem op het doel (ALTER SEQUENCE … RESTART WITH) op een waarde die geen tabel bevat, en vergelijk daarna opnieuw
+compare-held-defaults-unread = DuckDB does not report its parameter defaults, so a statement written from it would drop them — copy it from the source by hand
 compare-note-set-aside = { $aside } — { $side ->
         [target] het doel
        *[source] de bron

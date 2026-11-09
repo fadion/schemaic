@@ -69,10 +69,11 @@ Phase 2's grid write-back has landed too, on provenance read from the statement 
 a key, because a checkpoint renumbers it), and so have import, the `.sql` dump and Manual tabs (a
 failed grid commit there rolls the whole transaction back, DuckDB having no savepoint), and so
 has the table designer — in place where DuckDB's `ALTER TABLE` can, by a rebuild where it cannot
-— and so have the view and macro editors, and **Open data file**, a CSV, Parquet or JSON file
-read through a view in an in-memory session that is never saved (`docs/architecture/db/duckdb.md`).
-What is left is below. ClickHouse would come after
-DuckDB.
+— and so have the view and macro editors, **Open data file**, a CSV, Parquet or JSON file
+read through a view in an in-memory session that is never saved, and **schema compare** between
+two DuckDB files, which creates and drops schemas and sequences as well
+(`docs/architecture/db/duckdb.md`). Phase 2 is done; what is left is below. ClickHouse would
+come after DuckDB.
 
 - **Decided — the unattended paths cannot read files:** done in phase 1 (`Db::sealed`, called by
   `cli::query`). The editor reads files as normal.
@@ -80,9 +81,11 @@ DuckDB.
 - **Decided — one instance per file, shared while operations overlap:** done in phase 1, and
   stated in the invariants. A Manual tab's session holds the instance — and with it the file's
   lock — for as long as the tab stays in Manual mode, and the connection form's hint says so.
-- **Phase 2 — the rest of the writes:**
-  - **Schema compare** between two DuckDB files.
-- **Loose ends:** the read-only half of the seal (`AccessMode::ReadOnly`) has no test, the
+- **Loose ends:** a sequence editor shaped for DuckDB: its plans create, comment and drop one,
+  but the tree offers no *Create* for it, PostgreSQL's form having a type, a cache and a restart
+  DuckDB's `CREATE SEQUENCE` lacks — and nothing alters one there (`ALTER SEQUENCE` refuses
+  every option on 2.0.0), so a compare that finds a sequence changed has no statement for it; a
+  re-create would have to drop it, which DuckDB refuses while a column default uses it. The read-only half of the seal (`AccessMode::ReadOnly`) has no test, the
   suites' in-memory instance having no file to open read-only. The designer offers a column
   collation, which `ALTER` refuses to change and the rebuild writes, but the reader does not read
   one back, so a collation set there shows as an edit again on the next open. A file named
@@ -112,7 +115,8 @@ DuckDB.
   `ddl-withheld-strands-generated-column`, which no longer names SQLite in `en-GB` now DuckDB
   shares it,
   `backup-kind-duckdb`, `dump-drop-hint-up-front-no-grants`, `write-rollback-transaction`,
-  `routine-editor-returns-placeholder-duckdb`, `ddl-risk-view-cost-duckdb` are
+  `routine-editor-returns-placeholder-duckdb`, `ddl-risk-view-cost-duckdb`,
+  `compare-held-defaults-unread` are
   English in every catalogue but `en-GB`); measure `intel::select_list_subquery_sees_earlier_aliases` (answered `false` unmeasured); the full CI
   bar on every leg, which builds the amalgamation cold (about five minutes on this machine).
 

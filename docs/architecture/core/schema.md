@@ -730,7 +730,9 @@ exists, never what it is, and sets the flag. Any restatement would drop the defa
 `is_editable` is false; and `duckdb_create_sql` heads the statement with a `-- DuckDB does not
 report this macro's parameter defaults; they are not restated below.` line, so *Copy DDL* and the
 dump hand over a macro that says what it lost rather than one that lost it silently
-(`a_macro_with_unread_defaults_is_not_editable_and_says_so`). **`object_keyword(dialect)` is the
+(`a_macro_with_unread_defaults_is_not_editable_and_says_so`). Schema compare asks it too: a
+source macro with the flag is held back (`HeldBack::DefaultsUnread`, under `compare.rs`).
+**`object_keyword(dialect)` is the
 words that address a routine in a `DROP` or a `COMMENT ON`** — the kind's keyword, and on DuckDB
 `MACRO`, or `MACRO TABLE` where `returns` reads `TABLE` — because a scalar and a table macro of
 one name are separate catalogue entries there (`DROP MACRO t` drops the scalar one when both

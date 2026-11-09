@@ -1221,6 +1221,7 @@ compare-held-partitioning-differs = разделянето му на дялов�
 compare-held-sequence-unwritten = това сравнение не пише израз за последователност — копирайте го от `SHOW CREATE SEQUENCE`, който се показва в панела ѝ
 compare-held-partitioned-unrestated = тя е разделена на дялове, а никой CREATE TABLE тук не възпроизвежда схемата ѝ на разделяне — създайте ръчно функцията и схемата на разделяне, а след това таблицата
 compare-held-sequence-range = броячът в целевата база е достигнал { $at }, извън новия диапазон от { $min } до { $max }, а сървърът отказва да стесни последователност след стойност, която вече е раздал. Рестартирайте я в целевата база (ALTER SEQUENCE … RESTART WITH) от стойност, която никоя таблица не съдържа, и сравнете отново
+compare-held-defaults-unread = DuckDB does not report its parameter defaults, so a statement written from it would drop them — copy it from the source by hand
 compare-note-set-aside = { $aside } — { $side ->
         [target] целевата страна
        *[source] източникът

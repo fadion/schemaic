@@ -967,6 +967,9 @@ pub(crate) fn omission_text(o: &schemaic_core::compare::PlanOmission) -> String 
                     min = min.as_str(),
                     max = max.as_str()
                 ),
+                OmissionWhy::HeldBack(HeldBack::DefaultsUnread) => {
+                    tr!("compare-held-defaults-unread")
+                }
                 OmissionWhy::NeedsSource => tr!("compare-omitted-needs-source"),
                 OmissionWhy::Unread => tr!("compare-omitted-unread"),
                 OmissionWhy::NoStatement => tr!("compare-omitted-no-statement"),
@@ -1552,6 +1555,7 @@ mod tests {
                 min: "1".into(),
                 max: "1000".into(),
             }),
+            OmissionWhy::HeldBack(HeldBack::DefaultsUnread),
         ] {
             for kind in [
                 CompareKind::Table,

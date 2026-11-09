@@ -4905,4 +4905,173 @@ mod tests {
         let left: Vec<String> = macros_of(&db).into_iter().map(|m| m.name).collect();
         assert_eq!(left, ["t"]);
     }
+
+    // ── Schema compare between two files ─────────────────────────────────
+
+    /// `dst` compared with `src`: the source is `src`, the DDL runs on `dst`,
+    /// as the compare view has it.
+    fn compared(dst: &Db, src: &Db) -> schemaic_core::compare::SchemaComparison {
+        let r = rt();
+        schemaic_core::compare::SchemaComparison::of(
+            &r.block_on(fetch_schema(dst, CancellationToken::new()))
+                .unwrap(),
+            &r.block_on(fetch_schema(src, CancellationToken::new()))
+                .unwrap(),
+            SqlDialect::DuckDb,
+        )
+    }
+
+    /// What needs a rebuild, a sequence a dropped table used and a view's
+    /// comment: a keyed table is rebuilt with its rows (the widened column
+    /// cast, the dropped one gone), the table that used the sequence goes
+    /// before it, and the view is replaced with its comment restated.
+    ///
+    /// **And what cannot be planned is said, not lost**: a macro whose
+    /// parameter defaults DuckDB hides is held back — planned, it was created
+    /// without them and differed again after every Apply — and a table
+    /// another table's key references, which DuckDB cannot rebuild, is
+    /// withheld while the rest of the plan applies.
+    #[test]
+    fn a_compare_rebuilds_what_it_must_and_holds_back_what_it_cannot_restate() {
+        let common = "CREATE TABLE p(id INTEGER PRIMARY KEY, v INTEGER);
+             INSERT INTO p VALUES (1, 1);
+             CREATE TABLE keyed(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, pid INTEGER REFERENCES p(id));
+             CREATE INDEX keyed_a ON keyed(a);
+             INSERT INTO keyed VALUES (1, 10, 5, 1);
+             CREATE SEQUENCE sq;
+             CREATE TABLE uses(id BIGINT DEFAULT nextval('sq'));
+             CREATE VIEW kv AS SELECT * FROM keyed;";
+        let dst = mem("compare_rebuild_dst");
+        let src = mem("compare_rebuild_src");
+        seed(&dst, common);
+        seed(&src, common);
+        // `p` is referenced by `keyed`, so a type change there is a rebuild
+        // DuckDB refuses.
+        seed(
+            &src,
+            "DROP VIEW kv;
+             DROP TABLE keyed;
+             DROP TABLE uses;
+             DROP SEQUENCE sq;
+             CREATE MACRO withdef(a, b := 2) AS a + b;
+             DROP TABLE p;
+             CREATE TABLE p(id INTEGER PRIMARY KEY, v BIGINT);
+             INSERT INTO p VALUES (1, 1);
+             CREATE TABLE keyed(id INTEGER PRIMARY KEY, a BIGINT, c INTEGER, pid INTEGER REFERENCES p(id));
+             CREATE INDEX keyed_a ON keyed(a);
+             COMMENT ON COLUMN keyed.a IS 'widened';
+             CREATE VIEW kv AS SELECT * FROM keyed;
+             COMMENT ON VIEW kv IS 'the view';",
+        );
+        let cmp = compared(&dst, &src);
+        // The whole plan names `p`'s refused rebuild, which is what keeps
+        // Apply off (`ddl_preview`) until its tick is cleared.
+        let whole = cmp.plan(|_| true).unsupported();
+        assert!(
+            whole
+                .iter()
+                .any(|w| w.starts_with("main.p — ") && w.contains("keyed")),
+            "{whole:#?}"
+        );
+        let plan = cmp.plan(|e| e.label() != "main.p");
+        let stmts = plan.emit();
+        assert!(plan.unsupported().is_empty(), "{:#?}", plan.unsupported());
+        assert!(
+            stmts
+                .iter()
+                .any(|s| s.starts_with("CREATE TABLE \"main\".\"keyed_schemaic_rebuild\"")),
+            "{stmts:#?}"
+        );
+        let drop_table = stmts
+            .iter()
+            .position(|s| s.contains("DROP TABLE \"main\".\"uses\""));
+        let drop_seq = stmts
+            .iter()
+            .position(|s| s.contains("DROP SEQUENCE \"main\".\"sq\""));
+        assert!(drop_table < drop_seq, "{stmts:#?}");
+        assert!(stmts.iter().all(|s| !s.contains("withdef")), "{stmts:#?}");
+        let omitted = plan.omitted();
+        assert!(
+            omitted
+                .iter()
+                .any(|o| o.contains("withdef") && o.contains("defaults")),
+            "{omitted:#?}"
+        );
+        rt().block_on(dst.run_ddl("", &stmts, CancellationToken::new()))
+            .unwrap_or_else(|e| panic!("{e} — plan {stmts:#?}"));
+        assert_eq!(
+            cells(&dst, "SELECT id, a, c, pid FROM keyed"),
+            vec![vec!["1", "10", "NULL", "1"]]
+        );
+        let kv = table_of(&dst, "kv");
+        assert_eq!(kv.comment.as_deref(), Some("the view"));
+        // What is left is exactly what was held back or withheld.
+        let left: Vec<String> = compared(&dst, &src)
+            .differences()
+            .map(|e| e.label())
+            .collect();
+        assert_eq!(left, ["main.p", "main.withdef(a, b)"]);
+    }
+
+    /// Two files compared and the plan applied: every kind DuckDB holds —
+    /// a schema, a sequence a new table's default draws on, tables created,
+    /// altered in place and dropped, views and macros of both shapes — and
+    /// a second comparison finds nothing left. The rows the target held stay.
+    #[test]
+    fn two_files_compare_the_same_once_the_plan_is_applied() {
+        let common = "CREATE TABLE p(id INTEGER PRIMARY KEY, v INTEGER);
+             INSERT INTO p VALUES (1, 1);
+             CREATE TABLE plain(a INTEGER, b VARCHAR);
+             INSERT INTO plain VALUES (1, 'x');
+             CREATE TABLE keyed(id INTEGER PRIMARY KEY, a INTEGER, pid INTEGER REFERENCES p(id));
+             INSERT INTO keyed VALUES (1, 10, 1);
+             CREATE TABLE gone(x INTEGER);
+             CREATE VIEW vw AS SELECT a FROM plain;
+             CREATE MACRO mul(a, b) AS a * b;
+             CREATE MACRO old(a) AS a + 1;
+             CREATE SEQUENCE s1;";
+        let dst = mem("compare_dst");
+        let src = mem("compare_src");
+        seed(&dst, common);
+        seed(&src, common);
+        seed(
+            &src,
+            "DROP TABLE gone;
+             ALTER TABLE plain ADD COLUMN c INTEGER;
+             COMMENT ON TABLE plain IS 'plainly';
+             DROP VIEW vw;
+             CREATE VIEW vw AS SELECT a, b FROM plain;
+             CREATE VIEW vw2 AS SELECT * FROM keyed;
+             DROP MACRO old;
+             DROP MACRO mul;
+             CREATE MACRO mul(a, b) AS a * b * 2;
+             CREATE MACRO nums(n) AS TABLE SELECT * FROM range(n);
+             CREATE SEQUENCE s2 START 5;
+             CREATE TABLE fresh(id INTEGER DEFAULT nextval('s2') PRIMARY KEY, pid INTEGER REFERENCES p(id));
+             CREATE SCHEMA other;
+             CREATE TABLE other.t(z INTEGER);
+             COMMENT ON SEQUENCE s2 IS 'counts';",
+        );
+        let cmp = compared(&dst, &src);
+        let plan = cmp.plan(|_| true);
+        let stmts = plan.emit();
+        assert!(plan.omitted().is_empty(), "{:#?}", plan.omitted());
+        assert!(plan.unsupported().is_empty(), "{:#?}", plan.unsupported());
+        // The schema before what lives in it, the sequence before the table
+        // whose default draws on it.
+        let at = |needle: &str| {
+            stmts
+                .iter()
+                .position(|s| s.contains(needle))
+                .unwrap_or_else(|| panic!("{needle}: {stmts:#?}"))
+        };
+        assert!(at("CREATE SCHEMA \"other\"") < at("CREATE TABLE \"other\".\"t\""));
+        assert!(at("CREATE SEQUENCE \"main\".\"s2\"") < at("CREATE TABLE \"main\".\"fresh\""));
+        rt().block_on(dst.run_ddl("", &stmts, CancellationToken::new()))
+            .unwrap_or_else(|e| panic!("{e} — plan {stmts:#?}"));
+        let again = compared(&dst, &src).plan(|_| true).emit();
+        assert!(again.is_empty(), "still: {again:#?}");
+        assert_eq!(cells(&dst, "SELECT count(*) FROM plain"), vec![vec!["1"]]);
+        assert_eq!(cells(&dst, "SELECT nextval('s2')"), vec![vec!["5"]]);
+    }
 }

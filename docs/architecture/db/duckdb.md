@@ -1,11 +1,12 @@
 # `db/duckdb.rs`
 
 **`duckdb.rs` is the fifth engine** (the `duckdb` crate, the engine compiled in — `bundled`,
-with the `parquet` and `json` extensions linked statically), phase 1 and the first part of phase 2
+with the `parquet` and `json` extensions linked statically), phases 1 and 2
 of the roadmap's *DuckDB as a fifth engine*: it connects, reads, introspects, validates, runs
 batches, scripts and DDL plans, plans a query, lists its settings, backs a file up, writes grid
 edits back, imports a file into a table, dumps to a `.sql` file, holds a Manual tab's
-transaction, designs tables and edits views and macros, and opens a CSV, Parquet or JSON file into a
+transaction, designs tables and edits views and macros, creates and drops schemas, compares two
+files' schemas (*Schema compare*, below), and opens a CSV, Parquet or JSON file into a
 throwaway in-memory session (*Open data file*, below). It is **embedded, as SQLite is**, so most
 of `sqlite.rs`'s first paragraph holds here unchanged — there is no server, a connection is a
 file (`Db::file`, `connection::is_file_backed`), host/port/user/password/SSH are inert, the one
@@ -360,6 +361,35 @@ the editor's plans end to end through `diff_routine` → `emit` → `run_ddl`: a
 its comment kept, a table macro turned scalar leaving one `t` with its comment, a rename leaving
 no old name, a new table macro, and a drop of each kind. The body reads back in DuckDB's own
 rendering (`a * b` as `(a * b)`), as a view's does.
+**Schema compare between two files needed no gate of its own.** `compare::comparable` is dialect
+equality, so two DuckDB connections always passed it, and the picker's second step lists the one
+database a DuckDB connection holds (`fetch_databases`, the file's catalog) — two files are two
+connections. What it needed was for the plans a comparison writes to be ones `duckdb_supports`
+admits, and two kinds of statement were missing: **schemas** — `CREATE SCHEMA` with no owner
+(`AUTHORIZATION` is a syntax error) and `DROP SCHEMA`, never `CASCADE`; a schema takes no comment
+here (*not implemented*) — and **sequences**, created, commented and dropped and never altered,
+every fact measured on 2.0.0 under `ddl.rs`. Admitting the schema pair turned
+`supports_namespace_editing` true with no edit of its own, so the tree's Create menu offers
+*Schema* and a namespace row offers **Drop** (`overlays::duckdb_is_offered_what_it_emits`); the
+sequence form is still not offered (`ObjectDraft::blank`, under `ddl.rs`). A sequence a column
+default uses can be neither dropped nor replaced — DuckDB says so itself (*Dependency Error*),
+inside the plan's one transaction — and a sequence whose options differ between the files is
+disclosed with the generic *no statement for the difference it found*, its `AlterSequence`
+emitting nothing. A source macro whose parameter defaults the catalogue hides
+(`defaults_unread`, above) is held back rather than created without them
+(`HeldBack::DefaultsUnread`, under `compare.rs`). The plans are run end to end on in-memory
+instances — compare, plan, `run_ddl`, compare again: `two_files_compare_the_same_once_the_plan_is_applied`
+covers every kind DuckDB holds — a schema created before the table in it, a sequence before the
+table whose default draws on it, tables created, altered in place and dropped, views and macros
+of both shapes, a sequence comment — and finds nothing left, the target's rows kept and the new
+sequence handing out its source's start. `a_compare_rebuilds_what_it_must_and_holds_back_what_it_cannot_restate`
+holds the rest: a keyed table rebuilt by the plan with its rows (the widened column cast, the
+dropped one gone), a dropped table that used a sequence dropped before the sequence, a view's
+comment restated after its replace, the defaulted macro kept out of the statements and named in
+`omitted()`, and a referenced table's refused rebuild (`Withheld::DuckDbReferenced`) in the
+whole plan's `unsupported()` — which keeps Apply off until its tick is cleared, the same gate as
+on every engine — while the plan without it applies; a second comparison then finds exactly
+those two left.
 **What DuckDB does not have is refused, never faked**: a procedure, as above, and the trigger
 editor, DuckDB having no triggers, through `ddl::duckdb_supports`.
 **A missing file is refused, never created** (`open_target`, `DbRefusal::DuckDbMissing`). DuckDB's

@@ -1224,6 +1224,7 @@ compare-held-partitioning-differs = ndarja e saj ndryshon, dhe ky krahasim nuk s
 compare-held-sequence-unwritten = ky krahasim nuk shkruan urdhër për një sekuencë — kopjojeni nga `SHOW CREATE SEQUENCE`, që e shfaq paneli i saj
 compare-held-partitioned-unrestated = është e ndarë, dhe asnjë CREATE TABLE këtu nuk e riformulon skemën e saj të ndarjes — krijoni funksionin dhe skemën e ndarjes, pastaj tabelën, me dorë
 compare-held-sequence-range = numëruesi i objektivit ka arritur { $at }, jashtë intervalit të ri { $min } deri { $max }, dhe serveri refuzon ta ngushtojë një sekuencë përtej një vlere që e ka dhënë. Riniseni në objektiv (ALTER SEQUENCE … RESTART WITH) në një vlerë që nuk e mban asnjë tabelë, pastaj krahasoni sërish
+compare-held-defaults-unread = DuckDB does not report its parameter defaults, so a statement written from it would drop them — copy it from the source by hand
 compare-note-set-aside = { $aside } — { $side ->
         [target] objektivi
        *[source] burimi

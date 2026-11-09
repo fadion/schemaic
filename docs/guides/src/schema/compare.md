@@ -38,9 +38,23 @@ Objects you left unticked are listed there too, so it's clear what the migration
 ## Limits
 
 - Both databases must be on the same kind of engine. MySQL and MariaDB compare with each other;
-  any other mix can't be compared.
+  any other mix can't be compared. Two DuckDB files can be compared: each is its own connection,
+  with one database to pick.
 - On MySQL and MariaDB, a trigger, routine or event body is shown but can't be ticked: the server
   has to give its definition again before Schemaic can recreate it safely.
 - A few differences are shown but held back from the migration, each with a note saying why — for
   example a table whose partitioning differs.
 - Both databases are read in full every time, so comparing a large server takes a moment.
+
+On DuckDB, the whole migration runs in one transaction, and a few things stop it:
+
+- *A sequence that differs* gets no statement, because DuckDB can't alter one. Sequences that exist
+  on one side only are created or dropped.
+- *A macro with parameter defaults* (`b := 2`) on the source-of-truth side is held back: DuckDB
+  doesn't report the defaults, so a statement written from it would lose them. Copy that macro
+  across by hand.
+- *A table another table's foreign key points at can't be rebuilt.* The preview lists it under
+  **This engine can't express part of this plan**, and **Apply** stays off until you leave that
+  table unticked.
+- *A sequence a column default uses can't be dropped.* DuckDB refuses, and the whole migration
+  rolls back.

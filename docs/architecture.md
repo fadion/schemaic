@@ -18,7 +18,8 @@ yet is named rather than left to a label, under `db::mssql`; the last index kind
 selective XML index and an ordered columnstore one, are read, restated and authored now.
 **DuckDB is a fifth, embedded like SQLite and not yet a full one**: it connects to a file, reads,
 introspects, runs scripts and DDL plans, shows a plan, backs the file up, writes grid edits back,
-imports, dumps, holds a Manual tab's transaction, designs tables and edits views and macros, and
+imports, dumps, holds a Manual tab's transaction, designs tables and edits views and macros,
+creates and drops schemas, compares two files' schemas and applies the plan, and
 opens a CSV, Parquet or JSON file into an in-memory session that is never saved; what is left of it
 is the roadmap's entry, and `db::duckdb` names what it refuses.
 

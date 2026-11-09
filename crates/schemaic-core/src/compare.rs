@@ -474,6 +474,10 @@ pub enum HeldBack {
         min: String,
         max: String,
     },
+    /// A DuckDB macro whose parameter defaults the catalogue does not report
+    /// ([`RoutineInfo::defaults_unread`]): written from its reading, it would
+    /// lose them.
+    DefaultsUnread,
 }
 
 impl HeldBack {
@@ -504,6 +508,9 @@ impl HeldBack {
                  on the target (ALTER SEQUENCE … RESTART WITH) at a value no table holds, then \
                  compare again"
             ),
+            HeldBack::DefaultsUnread => "DuckDB does not report its parameter defaults, so a \
+                 statement written from it would drop them — copy it from the source by hand"
+                .to_string(),
         }
     }
 }
@@ -3289,6 +3296,13 @@ fn routine_entry(
     // are never planned there.
     let unread_member =
         l.is_none() && r.is_some_and(|r| r.tsql.numbered.iter().any(|(_, t)| t.trim().is_empty()));
+    // **A DuckDB source macro whose parameter defaults are unread** is held
+    // back for the same reason: its `CREATE` would be the macro without them
+    // — created "successfully", then differing again after every Apply. A
+    // target macro like that is replaced or dropped as any other, the
+    // source's reading being whole, but a match with it is never vouched for.
+    let defaults_unread = r.is_some_and(|r| r.defaults_unread);
+    let unread_source = unread_source || defaults_unread;
     let changes = match (l, r) {
         _ if unread_source || unread_member => empty_set(&any.name, any.schema.as_deref(), dialect),
         (Some(l), Some(r)) => {
@@ -3323,8 +3337,10 @@ fn routine_entry(
         status: unread_status(l.is_some(), unread_source, &left_ddl, &right_ddl)
             .unwrap_or_else(|| status_of(l.is_some(), r.is_some(), &changes)),
         changes,
-        uncertain: (unread_source && l.is_some()) || members_differ,
-        held_back: None,
+        uncertain: (unread_source && l.is_some())
+            || members_differ
+            || (r.is_some() && l.is_some_and(|l| l.defaults_unread)),
+        held_back: defaults_unread.then_some(HeldBack::DefaultsUnread),
         left_ddl,
         right_ddl,
     }
@@ -8049,6 +8065,77 @@ mod tests {
         assert!(comparable(SqlDialect::MySql, SqlDialect::MySql).is_ok());
         assert!(comparable(SqlDialect::Postgres, SqlDialect::Postgres).is_ok());
         assert!(comparable(SqlDialect::Sqlite, SqlDialect::Sqlite).is_ok());
+        assert!(comparable(SqlDialect::DuckDb, SqlDialect::DuckDb).is_ok());
+        assert!(comparable(SqlDialect::DuckDb, SqlDialect::Sqlite).is_err());
+    }
+
+    fn duck_macro(body: &str, defaults_unread: bool) -> RoutineInfo {
+        RoutineInfo {
+            name: "m".into(),
+            schema: Some("main".into()),
+            kind: RoutineKind::Function,
+            arguments: "a, b".into(),
+            identity_arguments: "a, b".into(),
+            language: "SQL".into(),
+            body: body.into(),
+            defaults_unread,
+            ..Default::default()
+        }
+    }
+
+    fn duck_schema(routines: Vec<RoutineInfo>) -> DbSchema {
+        DbSchema {
+            routines: routines.into_iter().map(std::sync::Arc::new).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A DuckDB macro whose parameter defaults the catalogue does not report
+    /// (`b := 2`) cannot be restated: created or replaced from its reading,
+    /// it arrived without them — silently, then differed again after every
+    /// Apply (measured). So a source macro like that is held back, saying
+    /// why, wherever the comparison would write it.
+    #[test]
+    fn a_duckdb_macro_whose_defaults_are_unread_is_held_back() {
+        let d = SqlDialect::DuckDb;
+        let source = duck_schema(vec![duck_macro("(a + b)", true)]);
+        for target in [
+            duck_schema(vec![]),
+            duck_schema(vec![duck_macro("(a * b)", false)]),
+        ] {
+            let c = SchemaComparison::of(&target, &source, d);
+            let e = &c.entries[0];
+            assert!(e.status.is_difference(), "{:?}", e.status);
+            assert!(e.unplannable(), "{:?}", e.changes.emit());
+            assert_eq!(
+                e.omission().why,
+                OmissionWhy::HeldBack(HeldBack::DefaultsUnread)
+            );
+            assert!(c.plan(|_| true).emit().is_empty());
+        }
+    }
+
+    /// The other side of it: a target macro whose defaults are unread is
+    /// replaced or dropped as any other — the source's reading is whole —
+    /// but one that matches the source is a match nobody can vouch for, its
+    /// hidden defaults being exactly what could differ.
+    #[test]
+    fn a_duckdb_target_macro_with_unread_defaults_is_replaced_but_never_vouched_for() {
+        let d = SqlDialect::DuckDb;
+        let target = duck_schema(vec![duck_macro("(a + b)", true)]);
+        let c = SchemaComparison::of(&target, &duck_schema(vec![duck_macro("(a * b)", false)]), d);
+        let plan = c.plan(|_| true).emit();
+        assert!(
+            plan.iter().any(|s| s.contains("CREATE OR REPLACE MACRO")),
+            "{plan:?}"
+        );
+        let same =
+            SchemaComparison::of(&target, &duck_schema(vec![duck_macro("(a + b)", false)]), d);
+        assert!(same.entries[0].uncertain);
+        // Both unread and the same text: the defaults may still differ.
+        let both = SchemaComparison::of(&target, &target, d);
+        assert_eq!(both.entries[0].status, ObjectStatus::Same);
+        assert!(both.entries[0].uncertain);
     }
 
     #[test]

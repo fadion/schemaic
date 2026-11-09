@@ -110,7 +110,11 @@ A DuckDB connection is a database file on this machine, like SQLite's; see
 - the [table designer](../schema/table-designer.md#what-differs-between-engines), **Copy to** and
   **Compare with**. DuckDB's `ALTER TABLE` refuses most changes to a table that anything depends
   on, so many changes rebuild the table in one transaction, and a table another table's foreign key
-  points at can't be rebuilt;
+  points at can't be rebuilt. **Compare with** compares one DuckDB file with another, and runs its
+  migration in one transaction; see [Comparing schemas](../schema/compare.md#limits) for what it
+  leaves out;
+- new schemas from **Create** › **Schema**, and **Drop** on a schema's row, which DuckDB refuses
+  while the schema still holds anything. There's no **Create** entry for a sequence;
 - the view editor: **Edit view**, a new view from **Create** › **View** or the query editor's
   **Create view**, renaming a view in its name field, and **Drop**. An edit keeps the view's
   **Column names** and its comment, which Schemaic sets again after the replace, since DuckDB's

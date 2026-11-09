@@ -2,7 +2,7 @@
 
 `core/compare.rs` — **two databases, object by object**, and a chosen subset of the differences as
 one migration. The pure half of schema compare (the UI half is `ui/compare_view.rs`): no DB, no
-view code, nothing here runs anything (98 unit tests).
+view code, nothing here runs anything (176 unit tests).
 **The differ is the comparator.** An object is `ObjectStatus::Differing` precisely when
 `ddl::diff` — or `diff_view`/`diff_trigger`/`diff_routine`/`diff_event`/`diff_enum`/
 `diff_domain`/`diff_sequence`/`diff_tsql_object` — hands back a non-empty `ChangeSet` for it, and
@@ -362,14 +362,15 @@ sentence, which would send the reader to check a privilege that is fine. **The t
 that emits and must not run.** `CompareEntry::held_back` is the reason no plan may carry an
 entry's changes — a `HeldBack`, one variant per reason (`PartitionOfHeld { parent, sub }`,
 `PartitioningDiffers`, `SequenceUnwritten`, `PartitionedUnrestated`, `SequenceRangeLeft { at,
-min, max }`), whose `message()` is the sentence — set where the server would refuse the
+min, max }`, `DefaultsUnread`), whose `message()` is the sentence — set where the server would refuse the
 statements and the only change it would take does damage the comparison may not choose for the
 user, or where the difference needs a statement the comparison does not write at all;
 `unplannable` is true whenever it is set, and `omission` reads it ahead of its other three
-arms, as `OmissionWhy::HeldBack`, so the omitted line is that sentence. Three producers set it — `tsql_entry`, through
+arms, as `OmissionWhy::HeldBack`, so the omitted line is that sentence. Four producers set it — `tsql_entry`, through
 `held_back_sequence`, for a SQL Server sequence's range, `table_entry` for a table whose
-partitioning differs or a partitioned one no `CREATE TABLE` can restate, and
-`hold_partitions_of_held_tables` for a partition of a table so held (all below) — and every other entry is built with `None`. `is_planned` carries the same term, so counting and building cannot answer
+partitioning differs or a partitioned one no `CREATE TABLE` can restate,
+`hold_partitions_of_held_tables` for a partition of a table so held, and `routine_entry` for a
+DuckDB source macro whose parameter defaults are unread (all below) — and every other entry is built with `None`. `is_planned` carries the same term, so counting and building cannot answer
 differently.
 It is a second list rather than more lines in
 `unsupported()` because the two ask different things of the reader: `unsupported` means this plan
@@ -611,6 +612,19 @@ two sides' texts (two encrypted modules are the same, flagged `uncertain`), and 
 entry is a `Differing` one `unplannable` discloses. The target's being unreadable is not this
 case — a readable source replaces it (`a_module_the_source_could_not_read_is_disclosed_not_planned`;
 live, `a_comparison_discloses_the_modules_the_source_would_not_show`, 2022 and 2025).
+**A DuckDB source macro whose parameter defaults are unread is held back the same way**
+(`RoutineInfo::defaults_unread`, under `schema.rs` and `db/duckdb.rs`: the catalogue lists
+`b := 2` as `b`). `routine_entry` gives it the empty set and sets `held_back` to
+`HeldBack::DefaultsUnread`, *"DuckDB does not report its parameter defaults, so a statement
+written from it would drop them — copy it from the source by hand"*. Planned, it was created or
+replaced without its defaults — reported as a success — and differed again after every Apply
+(measured by the change's author). Only the **source** side is held: a target macro like that is
+replaced or dropped as any other, the source's reading being whole, but a pair with it is
+`uncertain`, the target's reading being unable to show the defaults that could tell the two apart
+(`a_duckdb_macro_whose_defaults_are_unread_is_held_back`,
+`a_duckdb_target_macro_with_unread_defaults_is_replaced_but_never_vouched_for`; end to end on
+in-memory DuckDB, `a_compare_rebuilds_what_it_must_and_holds_back_what_it_cannot_restate` under
+`duckdb.rs`). Its `compare-held-defaults-unread` is English in every catalogue for now.
 Triggers pair on the qualified table *and* the name, because MySQL scopes a trigger name to the
 schema and PostgreSQL to the table and the wider key is right under both; routines on kind,
 qualified name and `identity_arguments`, because PostgreSQL overloads on the arguments and a key
