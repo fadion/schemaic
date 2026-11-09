@@ -4065,6 +4065,17 @@ pub struct RoutineInfo {
     /// **SQL Server**: the `WITH` options and fallbacks — see
     /// [`TsqlRoutine`]. Default everywhere else.
     pub tsql: TsqlRoutine,
+    /// **DuckDB.** The macro has parameter defaults (`b := 2`) the catalogue
+    /// does not report: `duckdb_functions()` lists such a parameter as a bare
+    /// `b`, and no column holds the value (measured on 2.0.0). The reader
+    /// learns that one exists by binding a call that only a default could
+    /// complete (`db::duckdb`), not what it is.
+    ///
+    /// Such a macro is **listed and droppable, and not editable**
+    /// ([`RoutineInfo::is_editable`]) — any restatement would drop the
+    /// defaults — and its `CREATE` says so above itself
+    /// ([`RoutineInfo::create_sql`]).
+    pub defaults_unread: bool,
 }
 
 impl RoutineInfo {
@@ -4100,6 +4111,27 @@ impl RoutineInfo {
             "c" | "internal"
         ) && self.tsql.verbatim.is_none()
             && !self.tsql.hidden
+            // A DuckDB macro whose parameter defaults the catalogue does not
+            // report: any restatement would drop them.
+            && !self.defaults_unread
+    }
+
+    /// The words that address the routine in a `DROP` or a `COMMENT ON`: the
+    /// kind's keyword, and on DuckDB `MACRO` or `MACRO TABLE` — a table macro
+    /// is a catalogue entry of its own, apart from a scalar macro of the same
+    /// name (measured on 2.0.0: `DROP MACRO t` drops the scalar one when both
+    /// exist, and `COMMENT ON MACRO t` does not find a table macro).
+    ///
+    /// Every `DROP` of a routine asks this — the editor's drop and recreate,
+    /// the dump's drop up front, and the replacing script — so none spells a
+    /// macro as the `FUNCTION` its [`RoutineKind`] says.
+    pub fn object_keyword(&self, dialect: crate::intel::SqlDialect) -> &'static str {
+        use crate::intel::SqlDialect as D;
+        match dialect {
+            D::DuckDb if self.returns.trim().eq_ignore_ascii_case("TABLE") => "MACRO TABLE",
+            D::DuckDb => "MACRO",
+            D::MySql | D::Postgres | D::Sqlite | D::MsSql => self.kind.sql_keyword(),
+        }
     }
 
     /// What kind of SQL Server object this routine is, read off its kind and
@@ -4339,10 +4371,20 @@ impl RoutineInfo {
     /// not in the catalogue and is not restated.
     /// It was `mysql_create_sql`'s `CREATE FUNCTION … NOT DETERMINISTIC` until
     /// this arm existed, which DuckDB refuses — *Copy DDL* on a macro wrote it.
+    ///
+    /// A macro whose defaults the catalogue hid ([`RoutineInfo::defaults_unread`])
+    /// says so in a comment above the statement, so *Copy DDL* and the dump do
+    /// not hand over a macro that silently lost them.
     fn duckdb_create_sql(&self, replace: bool) -> String {
         let d = crate::intel::SqlDialect::DuckDb;
+        let note = if self.defaults_unread {
+            "-- DuckDB does not report this macro's parameter defaults; \
+             they are not restated below.\n"
+        } else {
+            ""
+        };
         format!(
-            "CREATE {}MACRO {}({}) AS {}{}",
+            "{note}CREATE {}MACRO {}({}) AS {}{}",
             if replace { "OR REPLACE " } else { "" },
             qualified_ident(&self.name, self.schema.as_deref(), d),
             self.arguments.trim(),
@@ -5834,7 +5876,7 @@ impl ObjectItem {
                 r,
                 dialect,
                 false,
-                Some(drop(r.kind.sql_keyword())),
+                Some(drop(r.object_keyword(dialect))),
             )),
             ObjectItem::Event(e) => {
                 let create = e.create_sql(dialect);
@@ -8658,6 +8700,49 @@ mod duckdb_macro_tests {
             body: body.into(),
             ..Default::default()
         }
+    }
+
+    /// A macro whose parameter defaults the catalogue hid is listed and
+    /// droppable but not editable — any restatement drops the defaults — and
+    /// its `CREATE` says so rather than handing over a macro that lost them.
+    #[test]
+    fn a_macro_with_unread_defaults_is_not_editable_and_says_so() {
+        let plain = mac("a, b", "", "(a + b)");
+        assert!(plain.is_editable());
+        assert!(
+            plain
+                .create_sql(SqlDialect::DuckDb, false)
+                .starts_with("CREATE MACRO")
+        );
+        let hidden = RoutineInfo {
+            defaults_unread: true,
+            ..plain
+        };
+        assert!(!hidden.is_editable());
+        let sql = hidden.create_sql(SqlDialect::DuckDb, false);
+        assert!(sql.starts_with("-- DuckDB does not report"), "{sql}");
+        assert!(
+            sql.ends_with("\nCREATE MACRO \"main\".\"plus_one\"(a, b) AS (a + b)"),
+            "{sql}"
+        );
+    }
+
+    /// A table macro is addressed as one in a `DROP` or a `COMMENT ON`, and
+    /// the other engines keep their kind's keyword.
+    #[test]
+    fn a_macro_is_addressed_by_its_own_kind() {
+        assert_eq!(
+            mac("x", "", "x").object_keyword(SqlDialect::DuckDb),
+            "MACRO"
+        );
+        assert_eq!(
+            mac("n", "TABLE", "SELECT 1").object_keyword(SqlDialect::DuckDb),
+            "MACRO TABLE"
+        );
+        assert_eq!(
+            mac("x", "", "x").object_keyword(SqlDialect::Postgres),
+            "FUNCTION"
+        );
     }
 
     /// **A macro is `CREATE MACRO`, not a MySQL function** — the text *Copy

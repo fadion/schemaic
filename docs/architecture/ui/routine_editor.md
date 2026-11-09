@@ -1,7 +1,8 @@
 # `ui/routine_editor.rs`
 
 `routine_editor.rs` — the **stored routine** modal: one form for a function or a procedure,
-over `core::ddl`'s `RoutineDraft`, on the three engines that have them. Reached from the schema
+over `core::ddl`'s `RoutineDraft`, on the engines that have them — DuckDB's being its macros,
+always functions. Reached from the schema
 tree's Functions/Procedures folders (row **Edit**, folder **Create**), from the database and
 namespace **Create** submenus, from Find-Anywhere, and from the trigger editor's
 **New function** / **Edit** buttons — which is the path it was born on and the reason
@@ -49,6 +50,18 @@ toggle captures the routine as opened, because `set_null_input`'s "off" is the s
 original had, and a toggle flipped and flipped back is no change. The
 Parameters and Returns placeholders are a `match` per engine too, SQL Server's naming the `@`
 its parameters take and the `TABLE` a table function returns.
+**DuckDB's options are an arm of their own as well, holding only the comment.** A macro has
+none of MySQL's characteristics — no determinism, data access, security or definer clause — and
+DuckDB fell into MySQL's arm until it had one, so the form offered four controls whose clauses
+the macro's `CREATE` does not write. The comment is the one thing it carries, set by `COMMENT ON
+MACRO` after every create and replace (`ddl::replace_clears_comment`, under `ddl.rs`), and its
+field is now one `comment_setting` closure the MySQL, SQL Server and DuckDB arms all push, rather
+than a copy per arm. The Parameters placeholder is `a, b INTEGER` — names, a type where wanted,
+and no default, deliberately: the catalogue never reports a `b := 0`, so a macro given one here
+would not be editable again (`RoutineInfo::defaults_unread`, under `schema.rs`). Returns is empty
+for a scalar macro and `TABLE` for a table one, and its placeholder says so in words
+(`routine-editor-returns-placeholder-duckdb`, *TABLE for a table macro*). The Body is one
+expression or one query (placeholder `a + b`).
 **MySQL's body is fetched a
 second time and it is not an optimisation** (`Db::routine_source` via `RoutineSrcFn`, gated on
 `ddl::catalogue_body_is_unescaped` as the trigger editor's fetch is, applied
@@ -67,8 +80,9 @@ kind**, edit or create × function or procedure
 (`routine-editor-title-{edit,create}-{function,procedure}`), where it had been
 `format!("Edit {} …", RoutineKind::label())` — the sentence
 assembled from an English noun that `database_editor`'s titles stopped being for the same
-reason. Of the placeholders only SQL Server's Returns (*int, or TABLE*) and Execute as have
-words in them, so those two go through `FieldCfg::placeholder_of`, Returns' still a `match` on
+reason. Of the placeholders only SQL Server's and DuckDB's Returns (*int, or TABLE*; *TABLE for
+a table macro*) and Execute as have words in them, so those go through
+`FieldCfg::placeholder_of`, Returns' still a `match` on
 the dialect; the rest are SQL samples and stay, as do the keyword choices (`VOLATILE`,
 `CONTAINS SQL`, `INLINE = ON`, …). The local `bound_toggle` takes its label and hint as
 `String`. The footer's refusals and Preview's readiness read `RoutineDraft::problems` and

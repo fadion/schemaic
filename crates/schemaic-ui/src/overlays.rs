@@ -664,20 +664,20 @@ pub(crate) fn create_children(
             disabled: read_only,
         }),
     );
-    // Stored routines, on the three engines that have them. A **capability**, not
-    // an engine test — SQLite has no `CREATE PROCEDURE` and no catalogue of one,
+    // Stored routines, on the engines that have them. A **capability**, not an
+    // engine test — SQLite has no `CREATE PROCEDURE` and no catalogue of one,
     // so the entries are absent there rather than dimmed, which is the same call
-    // the view entry above makes.
-    if schemaic_core::ddl::supports_routine_editing(dialect) {
-        out.extend(
-            [ObjectKind::Function, ObjectKind::Procedure]
-                .into_iter()
-                .map(|kind| CreateEntry {
-                    kind: CreateKind::Object(kind),
-                    disabled: read_only,
-                }),
-        );
-    }
+    // the view entry above makes. Asked per kind: DuckDB's macros are
+    // functions, and it has no procedure.
+    out.extend(
+        [ObjectKind::Function, ObjectKind::Procedure]
+            .into_iter()
+            .filter(|kind| schemaic_core::ddl::supports_object_creation(dialect, *kind))
+            .map(|kind| CreateEntry {
+                kind: CreateKind::Object(kind),
+                disabled: read_only,
+            }),
+    );
     // Scheduled events, on the one engine that has them. A **capability**, not
     // an engine test, and absent rather than dimmed where the engine has no
     // `CREATE EVENT` at all — the same call the view and routine entries make.

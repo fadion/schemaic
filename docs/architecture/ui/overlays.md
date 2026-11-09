@@ -83,6 +83,10 @@ second door into the same designer (`a_foreign_table_offers_its_drop_and_not_the
 before the containers (`only_postgres_is_offered_an_extension`;
 `postgres_offers_its_standalone_objects_too` pins PostgreSQL's whole list). It opens
 `database_editor::open_for_extension` on the node's database rather than the object editor.
+**Function and Procedure are asked one kind at a time** (`ddl::supports_object_creation`), where
+`create_children` asked `supports_routine_editing` once for both: DuckDB's macros are functions
+and it has no procedure, so once its routine editor came on, one answer for both would have
+offered it a *Procedure* whose plan `ddl::duckdb_supports` refuses. The entries are absent where the predicate says no, as before.
 **`whole_ui_gate` 13 → 4, and six of the nine that came down were the small menus** — they read
 their bundles into locals at the top and never touch the root again, so `popup_menu_overlay`
 and `tx_prompt_overlay` take `OverlayUi`, `db_visibility_overlay` `SchemaUi`,

@@ -3580,7 +3580,7 @@ pub fn plan(
                         replaced.push(display_name(r.schema.as_deref(), &r.name));
                         Some(format!(
                             "DROP {} IF EXISTS {};",
-                            kind.sql_keyword(),
+                            r.object_keyword(dialect),
                             crate::schema::qualified_ident(o.name(), o.schema(), dialect)
                         ))
                     });

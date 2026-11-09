@@ -12,13 +12,14 @@ for a fourth engine as confidently as for these three. **DuckDB is the engine th
 answers per object**, and without an edit to any of them: `supports_change` sends it to
 `duckdb_supports`, which admits a table's own changes — in place where DuckDB's `ALTER TABLE`
 can, by a rebuild where it cannot (`duckdb_rebuild_sql`, below) — and a view's create, replace,
-rename and drop (with the other engines' views, below), and refuses every trigger and macro
-change: DuckDB has no triggers, and macros wait on the roadmap's later DuckDB phase. DuckDB's DDL is
+rename and drop (with the other engines' views, below), a macro's create, replace and drop (with
+the other engines' routines, below), and refuses every trigger change and a procedure: DuckDB has
+no triggers and no procedures, a macro being a function to the model. DuckDB's DDL is
 close to PostgreSQL's but not the same (no `ADD CONSTRAINT` for a key or a foreign key once a
 table exists, no index rename, no `ALTER INDEX`, a table something depends on cannot be renamed
 or retyped), so the designer — **Edit table**, **Edit column**, the key rows' edit entries and,
-through `CreateTable`, a new table — and the view editor are on for a DuckDB connection, while the
-trigger and routine editors and *Apply* stay off, each because its `supports_*` gate computes
+through `CreateTable`, a new table — the view editor and the routine editor are on for a DuckDB
+connection, while the trigger editor and *Apply* stay off, each because its `supports_*` gate computes
 from the same table. `emit`'s DuckDB arm is `emit_duckdb`, below with the rebuild. Two more join them.
 `supports_table_design` is what the tree's **Edit table**, **Edit column** and **Edit index**
 entries ask — three literal `true`s until it existed — and its probe is a column retype, since
@@ -2290,8 +2291,13 @@ of one object, so a schema compare and the editor cannot disagree about what a c
 **`supports_object_creation(dialect, kind)` is what an object folder's Create entry and the
 database node's Create ▸ ask**, computed from the plan the blank form raises —
 `ObjectDraft::blank(kind, …, dialect)` through `change_set(None, …)`, every change in it asked
-of `supports_change` — with routines and events deferring to
-`supports_routine_editing`/`supports_event_editing`. It began because SQL Server's Sequences
+of `supports_change` — with events deferring to `supports_event_editing`, and routines to
+`supports_routine_editing` **and** a `CreateRoutine` of a blank draft of the folder's kind, asked
+of `supports_change`. That second probe is DuckDB's: its macros are functions and it has no
+procedure, so it is offered *Create function* and not *Create procedure*, where the editor's
+capability alone answers the same for both kinds
+(`duckdb_creates_replaces_and_drops_macros_and_has_no_procedures`, which also holds MySQL,
+PostgreSQL and SQL Server to both entries). It began because SQL Server's Sequences
 folder would have opened PostgreSQL's sequence form, whose `CREATE SEQUENCE` `tsql_supports`
 refuses. It answers Sequence, Synonym, Alias type and XML schema collection on SQL Server and
 not Type or Domain; Type, Domain and Sequence on PostgreSQL; and nothing on MySQL or SQLite
@@ -2585,7 +2591,8 @@ rather than `TABLE`. **The recreate's risk sentences were written for the other 
 and had to learn this**: they told the user the comment "does not survive … re-apply any
 COMMENT" over a plan that sets it again, and named the new name as the one dropped. The comment
 half now asks `recreate_restates_routine_comment` (MySQL's `CREATE` carries a `COMMENT` clause,
-SQL Server's plan sets it after; PostgreSQL's `COMMENT ON` is not repeated), the sentence names
+SQL Server's plan sets it after, and so does DuckDB's, below; PostgreSQL's `COMMENT ON` is not
+repeated), the sentence names
 the name the server holds, and `RoutineDraft::clash` (behind `name_clash`) asks `ddl_is_transactional` for its
 consequence — on MySQL the `DROP` commits before the `CREATE` is refused, so the rename destroys
 the original; SQL Server's `run_ddl` is one transaction, so the refused `CREATE` takes the
@@ -2611,3 +2618,34 @@ option the routine's shape cannot carry (`TsqlShape::allows`), because the serve
 names neither the option nor why, and `INLINE = ON` beside `EXECUTE AS`, which a scalar function
 cannot be inlined with (Msg 16203, measured on SQL Server 2022)
 (`a_sql_server_routine_option_its_shape_refuses_is_refused`).
+**DuckDB's routines are its macros, and the routine editor came on for them the way the view
+editor did** — every engine fact here measured on the bundled 2.0.0. `duckdb_supports` admits
+`CreateRoutine` and `ReplaceRoutine` when the draft is a `RoutineKind::Function` — a macro is a
+function to the model, and DuckDB has no procedure, so one is refused — and `DropRoutine`, and
+`supports_routine_editing` followed with no edit of its own. `RenameRoutine` stays refused: there
+is no `ALTER MACRO`, `supports_routine_rename(DuckDb)` answers no, and `diff_routine` folds a
+rename into a recreate, `DROP` and `CREATE` inside `run_ddl`'s one transaction, as on SQL Server.
+`emit_duckdb` reaches them through `emit_postgres`, and so through `routine_statements` and
+`RoutineInfo::create_sql`'s DuckDB arm (under `schema.rs`). **Every routine `DROP` names its
+object through `RoutineInfo::object_keyword`** — the kind's keyword elsewhere, and on DuckDB
+`MACRO` or `MACRO TABLE` — in both of `routine_statements`' drops (the recreate's and
+`DropRoutine`'s), the comment below, `ObjectItem::replacing_sql` and the dump's drop up front:
+a scalar and a table macro of one name are separate catalogue entries, `DROP MACRO t` drops the
+scalar one when both exist, and `COMMENT ON MACRO t` does not find a table macro. `DROP FUNCTION
+[IF EXISTS]` also dropped a lone macro, so the dump as shipped was not broken — this is precision
+for the two-kinds case, not a live fix (`a_duckdb_macro_is_dropped_as_a_macro_of_its_own_kind`).
+**A switch between scalar and table is a recreate**, because `CREATE OR REPLACE MACRO t AS …`
+over a table macro `t` leaves both standing: `routine_signature_changed`'s shared arm compares
+`returns` as well as the arguments, so the switch sets `recreate`, and the drop names the
+server's copy by *its* kind (`a_duckdb_macro_changing_kind_drops_the_one_the_server_holds`, which
+also pins a rename's drop and create). **The comment is set again after every create and
+replace**: `CREATE OR REPLACE MACRO` clears it as `CREATE OR REPLACE VIEW` does
+(`replace_clears_comment`, whose doc now names both), so `routine_follow_ups`' DuckDB arm writes
+`COMMENT ON MACRO [TABLE] … IS …` whenever the routine carries one, changed or not — `before`
+cannot save a comment the replace already took — and `recreate_restates_routine_comment(DuckDb)`
+is true (`a_duckdb_macro_replace_restates_its_comment`). **The recreate's grants sentence is
+pushed only where `users::supports_user_admin` says there are accounts to hold one**: DuckDB has
+no privileges, and `Risk::RoutineGrantsLost` would have told the user to re-grant what no one can
+grant (the same test asserts no risk line mentions a `GRANT`). The live half,
+`a_macro_is_created_edited_renamed_and_dropped` under `duckdb.rs`, runs each plan through
+`run_ddl` and reads the macros back.

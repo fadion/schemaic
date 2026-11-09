@@ -1319,6 +1319,7 @@ routine-editor-name = Име
 routine-editor-parameters = Параметри
 routine-editor-returns = Връща
 routine-editor-returns-placeholder-mssql = int или TABLE
+routine-editor-returns-placeholder-duckdb = TABLE for a table macro
 routine-editor-language = Език
 routine-editor-body = Тяло
 routine-editor-recompile = Повторно компилиране

@@ -1526,6 +1526,7 @@ routine-editor-parameters = Parameters
 routine-editor-returns = Returns
 # SQL Server's: a scalar type, or TABLE for a table function. int and TABLE are SQL.
 routine-editor-returns-placeholder-mssql = int, or TABLE
+routine-editor-returns-placeholder-duckdb = TABLE for a table macro
 routine-editor-language = Language
 routine-editor-body = Body
 routine-editor-recompile = Recompile

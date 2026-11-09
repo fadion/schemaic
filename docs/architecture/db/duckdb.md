@@ -5,7 +5,7 @@ with the `parquet` and `json` extensions linked statically), phase 1 and the fir
 of the roadmap's *DuckDB as a fifth engine*: it connects, reads, introspects, validates, runs
 batches, scripts and DDL plans, plans a query, lists its settings, backs a file up, writes grid
 edits back, imports a file into a table, dumps to a `.sql` file, holds a Manual tab's
-transaction, designs tables and edits views. It is **embedded, as SQLite is**, so most
+transaction, designs tables and edits views and macros. It is **embedded, as SQLite is**, so most
 of `sqlite.rs`'s first paragraph holds here unchanged — there is no server, a connection is a
 file (`Db::file`, `connection::is_file_backed`), host/port/user/password/SSH are inert, the one
 database is the file's own catalog (`current_database()`, named after the file), and the driver
@@ -115,16 +115,37 @@ for its closing bracket over `sql::skip_noncode`; anything else is kept as read
 (`a_generated_expression_loses_only_the_cast_duckdb_added`). **Which tables other tables' keys
 point at is linked after the keys are read** (`schema::link_inbound_foreign_keys`, so
 `TableInfo::referenced_by` is filled here as on SQL Server), since the designer's rebuild cannot
-drop such a table and says so. **Macros are DuckDB's user functions and arrive as `RoutineInfo`** — one per name,
-an overload being the same macro to `DROP MACRO`, a table macro's `returns` reading `TABLE`.
+drop such a table and says so. **Macros are DuckDB's user functions and arrive as `RoutineInfo`** — one per name
+and kind, an overload being the same macro to `DROP MACRO`, a table macro's `returns` reading
+`TABLE`. **A scalar and a table macro of one name are two macros**, not overloads of one: they
+are separate catalogue entries (measured on 2.0.0 — `CREATE OR REPLACE MACRO t(n) AS n + 1` over
+a table macro `t` adds a second rather than replacing it), so only entries of the same kind fold
+(`a_scalar_and_a_table_macro_of_one_name_read_as_two`).
 `body` is `duckdb_functions().macro_definition`, the expression or query alone, and a later
 overload is folded into it as `…, (a, b) AS expr` — the form one `CREATE MACRO` declares them all
 in — so `RoutineInfo::create_sql`'s DuckDB arm (`duckdb_create_sql`) writes the whole macro back
 as `CREATE MACRO s.m(args) AS [TABLE] …` (`a_macros_ddl_replays_as_the_same_macro`, which replays
 each one into a fresh database and calls every overload). Until that arm existed DuckDB fell on
-MySQL's emitter, and *Copy DDL* on a macro wrote `CREATE FUNCTION … NOT DETERMINISTIC`. **A
-parameter's default is not carried**: the catalogue lists `b := 2` as `b` (measured on 2.0), so
-the text declares the parameter without it.
+MySQL's emitter, and *Copy DDL* on a macro wrote `CREATE FUNCTION … NOT DETERMINISTIC`. The
+argument list is `macro_parameters` over `parameters` and `parameter_types`, the second read
+position by position (`positional_strings`, an untyped parameter's type being `NULL`), so a typed
+macro reads as `a INTEGER, b INTEGER`; before, it was read by name alone and *Copy DDL* and the
+dump restated it untyped. **A parameter's default is not carried**: the catalogue lists `b := 2`
+as `b` and holds the value in no column (measured on 2.0.0), so the text declares the parameter
+without it. **Whether a macro has one is found by binding** (`macro_hides_defaults`): a default
+is the one thing that lets a call pass fewer arguments than an overload declares, so for each `k`
+below the largest overload's arity a call with `k` `NULL`s is *prepared* — bound, never run — and
+how many overloads accepted it, read off the error (*Macro m() does not support the supplied
+arguments*: none; *has multiple overloads*: two or more; anything else, success included: at
+least one), is compared with how many declare `k`. More acceptors than declarers is a default.
+**It fails closed**: an error in a form it does not recognise counts as accepted, and two
+overloads of one arity below the largest — typed, where the count cannot tell them apart —
+count as a default outright; either way the cost is a macro left uneditable, never a default
+dropped. Such a macro is `RoutineInfo::defaults_unread`: listed and droppable, not editable
+(`is_editable`), its `CREATE` headed by a `-- DuckDB does not report this macro's parameter
+defaults …` line so *Copy DDL* and the dump say what they leave out
+(`a_macros_hidden_defaults_are_found_by_binding`, over a defaulted macro, a defaulted overload, a
+defaulted table macro and their undefaulted twins, a typed one and a nullary one).
 `main` is always among the namespaces (`schema::DUCKDB_DEFAULT_SCHEMA`, `default_namespace`), and
 names compare ignoring case (`names_ignore_case`). Table sizes are `duckdb_tables()`'
 `estimated_size` rows and nothing on disk, DuckDB keeping no per-table figure; the Server
@@ -142,8 +163,7 @@ modal open for its whole length with the button reading *Stop*. An interrupt sur
 ordinary error, so the token is what maps it to `DdlCause::Cancelled`
 (`stop_interrupts_a_running_ddl_statement`, a `CREATE TABLE … AS` counting 10^11 rows). The
 table designer's plans reach it now — `ALTER TABLE` one action at a time where the table allows,
-the rebuild where it does not (below) — and the view editor's, and nothing from the routine
-editor does yet.
+the rebuild where it does not (below) — and the view editor's and the macro editor's.
 `run_script`
 is one connection for the whole file and wraps nothing, with SQLite's runtime-flavour choice between
 `block_in_place` and `spawn_blocking`. **A backup is `ATTACH` + `COPY FROM DATABASE` + `DETACH`**
@@ -248,7 +268,9 @@ mood AS ENUM …`, a `STRUCT` alias — is inlined into each column in `duckdb_t
 ENUM('ok', 'sad')`), so the table restores without the named type, and the type itself is not
 carried, none being read into the model; a view or macro naming the type would fail its restore.
 A view's or a macro's comment is not carried either — only a table's and its columns' are — nor a
-macro parameter's default, for the reason above.
+macro parameter's default, for the reason above, though a macro the reader found one on says so
+in the line above its `CREATE`. A macro is dropped up front as what it is, `DROP MACRO [TABLE] IF EXISTS`
+(`RoutineInfo::object_keyword`, under `schema.rs`).
 **A Manual tab pins one connection, and with it the file** (`Pinned`, opened by `pin`, behind
 `session.rs`'s `Backend::DuckDb`). It is the connection an operation would take — `connect`'s, so
 the init SQL runs on it — held with its interrupt handle, the file's own catalog read at open
@@ -324,8 +346,20 @@ which DuckDB's `CREATE OR REPLACE VIEW` clears and the plan restates after it
 and a rename through `diff_view` → `emit` → `run_ddl` and reads back the list, the comment and the
 body in DuckDB's own rendering — it re-prints what it stores, so the draft's text is not what reads
 back — and `a_view_drops` drops one.
-**What is not written yet is refused, never faked**: `ddl::duckdb_supports` keeps the routine
-editor off until the macro editor lands, and the trigger editor, DuckDB having no triggers.
+**So is the macro editor** — the routine editor over a macro, `CREATE [OR REPLACE] MACRO` and
+`DROP MACRO [TABLE]`, whose entry under `ddl.rs` has the measurements. A macro is a *function* to
+the model and DuckDB has no procedure, so `duckdb_supports` admits a function's create and
+replace alone and the Create menus offer *Function* and not *Procedure*. There is no `ALTER
+MACRO`, so a rename is a drop and a create in `run_ddl`'s one transaction; a change between a
+scalar and a table macro is too, its drop naming the kind the server holds — a replace across the
+two kinds would leave both standing (above). The comment, which a replace clears as a view's does,
+is set again after every create and replace. `a_macro_is_created_edited_renamed_and_dropped` runs
+the editor's plans end to end through `diff_routine` → `emit` → `run_ddl`: a body replaced with
+its comment kept, a table macro turned scalar leaving one `t` with its comment, a rename leaving
+no old name, a new table macro, and a drop of each kind. The body reads back in DuckDB's own
+rendering (`a * b` as `(a * b)`), as a view's does.
+**What DuckDB does not have is refused, never faked**: a procedure, as above, and the trigger
+editor, DuckDB having no triggers, through `ddl::duckdb_supports`.
 **A missing file is refused, never created** (`open_target`, `DbRefusal::DuckDbMissing`). DuckDB's
 open creates one, which for a database *client* is the wrong default by some distance: a mistyped
 path would open an empty database that looked like it worked. An empty path is `DuckDbNoFile`, and

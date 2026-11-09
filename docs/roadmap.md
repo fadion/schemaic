@@ -69,7 +69,8 @@ Phase 2's grid write-back has landed too, on provenance read from the statement 
 a key, because a checkpoint renumbers it), and so have import, the `.sql` dump and Manual tabs (a
 failed grid commit there rolls the whole transaction back, DuckDB having no savepoint), and so
 has the table designer — in place where DuckDB's `ALTER TABLE` can, by a rebuild where it cannot
-(`docs/architecture/db/duckdb.md`). What is left is below. ClickHouse would come after
+— and so have the view and macro editors (`docs/architecture/db/duckdb.md`). What is left is
+below. ClickHouse would come after
 DuckDB.
 
 - **Decided — the unattended paths cannot read files:** done in phase 1 (`Db::sealed`, called by
@@ -79,12 +80,6 @@ DuckDB.
   stated in the invariants. A Manual tab's session holds the instance — and with it the file's
   lock — for as long as the tab stays in Manual mode, and the connection form's hint says so.
 - **Phase 2 — the rest of the writes:**
-  - **The view and macro editors.** `ddl::duckdb_supports` refuses every view and routine
-    change today. DuckDB has `CREATE OR REPLACE VIEW`, `ALTER VIEW … RENAME TO`,
-    `CREATE OR REPLACE MACRO`, `DROP MACRO [TABLE]` and `COMMENT ON VIEW`/`MACRO [TABLE]`, and no
-    `ALTER MACRO` (measured on 2.0.0), so a renamed macro is a drop and a create. **Trap:**
-    `create_view_sql` and the routine emitter branch on `dialect == Postgres`/`MySql` flags — audit
-    each before turning a change on, as `definition_sql` was.
   - **Open data file:** a CSV, Parquet or JSON file opened in a throwaway in-memory session —
     which the test-only `memory:` target in `db::duckdb` already models. **Trap:** an in-memory
     instance is its data, so it must be held for as long as the session is open, not closed with
@@ -103,11 +98,18 @@ DuckDB.
   binary-cell panel dismissed mid-read, a re-fetch stopped — aborts the transaction (measured),
   since there is no savepoint to fence it in; reading such a cell on a fresh connection would see
   none of the tab's uncommitted writes, so it is left an honest loss rather than a wrong answer.
+  A macro parameter's default (`b := 2`) is in no catalogue column, so such a macro is found by
+  binding and left listed but not editable, and its *Copy DDL* and dump say above the `CREATE`
+  that the defaults are not restated (unmeasured: whether `EXPORT DATABASE` writes them, which
+  would be a source for them).
+  A view's **column** comments are cleared by `CREATE OR REPLACE VIEW` too (measured), and an
+  edit does not restate them, the new body's columns being unknown until it runs.
 - **Phase 3:** translate the new strings (`db-refused-duckdb-*`, `connections-duckdb-*`,
   `ddl-withheld-duckdb-referenced`, `table-problem-sequence-no-default`, and retranslate
   `ddl-withheld-strands-generated-column`, which no longer names SQLite in `en-GB` now DuckDB
   shares it,
-  `backup-kind-duckdb`, `dump-drop-hint-up-front-no-grants`, `write-rollback-transaction` are
+  `backup-kind-duckdb`, `dump-drop-hint-up-front-no-grants`, `write-rollback-transaction`,
+  `routine-editor-returns-placeholder-duckdb` are
   English in every catalogue but `en-GB`); measure `intel::select_list_subquery_sees_earlier_aliases` (answered `false` unmeasured); the full CI
   bar on every leg, which builds the amalgamation cold (about five minutes on this machine).
 

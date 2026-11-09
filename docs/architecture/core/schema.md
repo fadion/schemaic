@@ -699,7 +699,8 @@ because most SQLite checks have none and `CONSTRAINT "" CHECK (…)` is not a na
 but a syntax error — while inventing a name would make a rebuild read as though it renamed
 something.
 **`RoutineInfo`/`RoutineKind`/`SqlDataAccess`/`Volatility`/`RoutineSource`** are the stored
-functions and procedures, on the three engines that have them, under the same rule again — a
+functions and procedures, on the engines that have them (DuckDB's macros arrive as functions),
+under the same rule again — a
 redefinition replaces the whole routine, so anything the statement doesn't restate reverts.
 Which fields those are is per-engine: PostgreSQL's `volatility`, `strict`, `language`, the
 per-routine `SET` clauses (a `SECURITY DEFINER` function that loses its pinned `search_path`
@@ -722,7 +723,21 @@ that could be built in two clicks and could only fail at Apply.
 routine's *source*, which is right for every language whose body is source text and wrong for
 `LANGUAGE c` and `LANGUAGE internal`, where `prosrc` is a link symbol and the recreate needs
 `AS 'obj_file', 'link_symbol'` — so those are listed and droppable but not editable, the call a
-materialized view gets.
+materialized view gets. **`defaults_unread` is DuckDB's case of the same gate**: a macro
+parameter's default (`b := 2`) is in no catalogue column — `duckdb_functions()` lists the
+parameter as a bare `b` (measured on 2.0.0) — so `db::duckdb`'s reader learns by binding that one
+exists, never what it is, and sets the flag. Any restatement would drop the default, so
+`is_editable` is false; and `duckdb_create_sql` heads the statement with a `-- DuckDB does not
+report this macro's parameter defaults; they are not restated below.` line, so *Copy DDL* and the
+dump hand over a macro that says what it lost rather than one that lost it silently
+(`a_macro_with_unread_defaults_is_not_editable_and_says_so`). **`object_keyword(dialect)` is the
+words that address a routine in a `DROP` or a `COMMENT ON`** — the kind's keyword, and on DuckDB
+`MACRO`, or `MACRO TABLE` where `returns` reads `TABLE` — because a scalar and a table macro of
+one name are separate catalogue entries there (`DROP MACRO t` drops the scalar one when both
+exist; `COMMENT ON MACRO t` does not find a table macro; measured on 2.0.0), and the
+`FUNCTION` the `RoutineKind` spells cannot tell them apart. Every routine `DROP` asks it — the
+editor's drop and recreate, the dump's drop up front and `ObjectItem::replacing_sql`
+(`a_macro_is_addressed_by_its_own_kind`; the plans' side is under `ddl.rs`).
 **SQL Server's arm of `create_sql` rebuilds the routine from its parts** (`tsql_create_sql`,
 `replace` being `CREATE OR ALTER`): `CREATE [OR ALTER] PROCEDURE name` with the parameter list
 on the next line, or `FUNCTION name (params)` then `RETURNS …`; the `WITH` options; a

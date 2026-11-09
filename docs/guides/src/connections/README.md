@@ -60,7 +60,8 @@ Type the path in **Database file**, or press **Browse…** inside the field to p
   the file open, and other programs out of it, until it goes back to **Auto-commit**.
 - *Nothing is downloaded.* DuckDB extensions are never installed or loaded behind a query. Parquet
   and JSON support are built in; any other extension isn't available.
-- *Not yet:* editing macros. See [Engine differences](../reference/engines.md#duckdb).
+
+What else differs on DuckDB is in [Engine differences](../reference/engines.md#duckdb).
 
 ## Switching connections
 

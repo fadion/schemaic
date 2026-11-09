@@ -1322,6 +1322,7 @@ routine-editor-name = Nome
 routine-editor-parameters = Parametri
 routine-editor-returns = Restituisce
 routine-editor-returns-placeholder-mssql = int, o TABLE
+routine-editor-returns-placeholder-duckdb = TABLE for a table macro
 routine-editor-language = Linguaggio
 routine-editor-body = Corpo
 routine-editor-recompile = Ricompila

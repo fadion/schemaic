@@ -50,11 +50,11 @@
 //! base table and proves it against the catalogue, or attributes nothing.
 //! `rowid` is never a key — a checkpoint renumbers it.
 //!
-//! **What the roadmap's phase 2 has not reached yet**, refused rather than
-//! faked: the macro editor (`ddl::duckdb_supports`). The view editor runs,
-//! restating the column list and the comment a replace would lose, and the
-//! table designer runs — in place where DuckDB's `ALTER TABLE` can, by rebuilding
-//! the table where it cannot (`ddl::duckdb_rebuild_sql`) — as do DDL plans,
+//! **The editors run**: the view editor, restating the column list and the
+//! comment a replace would lose; the macro editor, except on a macro whose
+//! parameter defaults the catalogue hides ([`macro_hides_defaults`]); and the
+//! table designer, in place where DuckDB's `ALTER TABLE` can and by rebuilding
+//! the table where it cannot (`ddl::duckdb_rebuild_sql`). So do DDL plans,
 //! `.sql` scripts, imports and the dump, and a Manual tab holds a connection
 //! of its own ([`Pinned`]) — with the instance, and a file's lock, for as long
 //! as it does.
@@ -1196,6 +1196,94 @@ fn strings(v: DValue) -> Vec<String> {
     }
 }
 
+/// A `VARCHAR[]` read position by position, a `NULL` entry kept as `None` —
+/// where [`strings`] drops it, and with it the alignment with a sibling list.
+fn positional_strings(v: DValue) -> Vec<Option<String>> {
+    match v {
+        DValue::List(items) | DValue::Array(items) => items
+            .into_iter()
+            .map(|x| match x {
+                DValue::Text(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A macro's parameter list as its `CREATE MACRO` declares it: each name,
+/// and its type where it was declared with one (`a INTEGER`, DuckDB 1.3 on).
+/// `duckdb_functions()` reports the two as sibling lists, an untyped
+/// parameter's type `NULL` (measured on 2.0.0); left out, a typed macro was
+/// restated untyped. A default (`b := 2`) is in neither list —
+/// [`macro_hides_defaults`].
+fn macro_parameters(names: &[String], types: &[Option<String>]) -> String {
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| match types.get(i).cloned().flatten() {
+            Some(t) if !t.is_empty() => format!("{n} {t}"),
+            _ => n.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Does macro `m` have a parameter default the catalogue does not report?
+/// `arities` holds each overload's parameter count.
+///
+/// `duckdb_functions()` lists `b := 2` as a bare `b` and keeps the value
+/// nowhere (measured on 2.0.0), so a macro restated from the reading loses
+/// its defaults. Whether it has one can still be asked of the binder: a
+/// default is the one thing that lets a call pass **fewer** arguments than an
+/// overload declares. So a call with `k` `NULL`s is prepared — bound, never
+/// run — for each `k` below the largest arity, and its outcome compared with
+/// how many overloads declare exactly `k`:
+///
+/// - *"Macro m() does not support the supplied arguments"*: none accepts `k`;
+/// - *"Macro m() has multiple overloads that match"*: two or more do;
+/// - anything else, success or another error, means the arguments were
+///   matched and binding went on to the body: at least one does.
+///
+/// More acceptors than declarers is a default. **It fails closed**: a message
+/// in a form not recognised here counts as matched, and so as a default, and
+/// two overloads of one arity (typed: `(a INTEGER)`, `(a VARCHAR)`) — where
+/// the count cannot tell — count as one too. Either leaves a macro listed and
+/// droppable rather than editable, which is the safe direction.
+fn macro_hides_defaults(conn: &DuckConn, m: &RoutineInfo, arities: &[usize]) -> bool {
+    let max = arities.iter().copied().max().unwrap_or(0);
+    let name = schemaic_core::schema::qualified_ident(&m.name, m.schema.as_deref(), D);
+    let none = format!("Macro {}() does not support the supplied arguments", m.name);
+    let many = format!("Macro {}() has multiple overloads", m.name);
+    let table = m.returns == "TABLE";
+    (0..max).any(|k| {
+        let declared = arities.iter().filter(|a| **a == k).count();
+        if declared >= 2 {
+            return true;
+        }
+        let args = vec!["NULL"; k].join(", ");
+        let sql = if table {
+            format!("SELECT * FROM {name}({args})")
+        } else {
+            format!("SELECT {name}({args})")
+        };
+        let accepted = match conn.prepare(&sql) {
+            Ok(_) => 1,
+            Err(e) => {
+                let e = e.to_string();
+                if e.contains(&none) {
+                    0
+                } else if e.contains(&many) {
+                    2
+                } else {
+                    1
+                }
+            }
+        };
+        accepted > declared
+    })
+}
+
 /// The `SELECT` of a stored `CREATE VIEW` — what follows its first top-level
 /// `AS` — or the whole text where it has none. DuckDB keeps the view's
 /// statement as written (`duckdb_views().sql`); the editor and the differ want
@@ -1499,10 +1587,12 @@ fn read_schema(conn: &DuckConn) -> Result<DbSchema, DbError> {
 
     // Macros — DuckDB's user functions: an expression or a table query.
     let mut routines: Vec<Arc<RoutineInfo>> = Vec::new();
+    // Each entry's overload arities, beside it, for the defaults probe.
+    let mut arities: Vec<Vec<usize>> = Vec::new();
     let mut stmt = conn
         .prepare(
             "SELECT schema_name, function_name, function_type, parameters, macro_definition, \
-                    comment \
+                    comment, parameter_types \
                FROM duckdb_functions() \
               WHERE database_name = current_database() AND NOT internal \
                 AND function_type IN ('macro', 'table_macro') \
@@ -1513,51 +1603,60 @@ fn read_schema(conn: &DuckConn) -> Result<DbSchema, DbError> {
     while let Some(r) = rows.next().map_err(query_err)? {
         let schema: String = r.get(0).map_err(query_err)?;
         let name: String = r.get(1).map_err(query_err)?;
-        let kind: String = r.get(2).map_err(query_err)?;
-        let params = strings(r.get(3).map_err(query_err)?);
-        // **One entry per name**: an overload is the same macro to `DROP
+        let returns = if r.get::<_, String>(2).map_err(query_err)? == "table_macro" {
+            "TABLE"
+        } else {
+            ""
+        };
+        let names = strings(r.get(3).map_err(query_err)?);
+        let types = positional_strings(r.get(6).map_err(query_err)?);
+        let params = macro_parameters(&names, &types);
+        let def: String = r
+            .get::<_, Option<String>>(4)
+            .map_err(query_err)?
+            .unwrap_or_default();
+        // **One entry per macro**: an overload is the same macro to `DROP
         // MACRO`, and one `CREATE MACRO` declares them all —
         // `m(a) AS a, (a, b) AS a + b`. So a later overload is folded into the
         // first entry's body in exactly that form, and `create_sql` writes the
         // whole statement back (`a_macros_ddl_replays_as_the_same_macro`).
-        if let Some(first) = routines
-            .iter_mut()
-            .find(|x| x.name == name && x.schema.as_deref() == Some(schema.as_str()))
-        {
-            let def: String = r
-                .get::<_, Option<String>>(4)
-                .map_err(query_err)?
-                .unwrap_or_default();
-            let table = if kind == "table_macro" { "TABLE " } else { "" };
-            let first = Arc::make_mut(first);
-            first.body = format!("{}, ({}) AS {table}{}", first.body, params.join(", "), def);
+        // **A scalar and a table macro of one name are two macros** (measured:
+        // `CREATE OR REPLACE MACRO t(n) AS n + 1` over a table macro `t` adds
+        // a second), so only the same kind folds.
+        if let Some(i) = routines.iter().position(|x| {
+            x.name == name && x.schema.as_deref() == Some(schema.as_str()) && x.returns == returns
+        }) {
+            let table = if returns.is_empty() { "" } else { "TABLE " };
+            let first = Arc::make_mut(&mut routines[i]);
+            first.body = format!("{}, ({params}) AS {table}{def}", first.body);
+            arities[i].push(names.len());
             continue;
         }
         routines.push(Arc::new(RoutineInfo {
             name,
             schema: Some(schema),
             kind: RoutineKind::Function,
-            arguments: params.join(", "),
-            identity_arguments: params.join(", "),
-            returns: if kind == "table_macro" {
-                "TABLE".into()
-            } else {
-                String::new()
-            },
+            arguments: params.clone(),
+            identity_arguments: params,
+            returns: returns.to_string(),
             language: "SQL".to_string(),
-            body: r
-                .get::<_, Option<String>>(4)
-                .map_err(query_err)?
-                .unwrap_or_default(),
+            body: def,
             comment: r
                 .get::<_, Option<String>>(5)
                 .map_err(query_err)?
                 .filter(|c| !c.is_empty()),
             ..Default::default()
         }));
+        arities.push(vec![names.len()]);
     }
     drop(rows);
     drop(stmt);
+    // What the catalogue leaves out: a parameter's default.
+    for (r, arities) in routines.iter_mut().zip(&arities) {
+        if macro_hides_defaults(conn, r, arities) {
+            Arc::make_mut(r).defaults_unread = true;
+        }
+    }
 
     Ok(DbSchema {
         tables,
@@ -4439,5 +4538,170 @@ mod tests {
             .block_on(fetch_schema(&db, CancellationToken::new()))
             .unwrap();
         assert!(s.tables.iter().all(|t| t.name != "v"));
+    }
+
+    /// The macros as the reader hands them to the editor.
+    fn macros_of(db: &Db) -> Vec<RoutineInfo> {
+        rt().block_on(fetch_schema(db, CancellationToken::new()))
+            .unwrap()
+            .routines
+            .iter()
+            .map(|r| (**r).clone())
+            .collect()
+    }
+
+    fn macro_named<'a>(ms: &'a [RoutineInfo], name: &str, returns: &str) -> &'a RoutineInfo {
+        ms.iter()
+            .find(|m| m.name == name && m.returns == returns)
+            .unwrap_or_else(|| panic!("no macro {name} returning {returns:?} in {ms:#?}"))
+    }
+
+    /// **A default the catalogue hides is found by binding.** Each macro
+    /// below with one is marked, and so listed but not editable; each
+    /// without one is left editable — overloads, table macros and typed
+    /// parameters included. A typed macro's types are read back with it.
+    #[test]
+    fn a_macros_hidden_defaults_are_found_by_binding() {
+        let db = mem("macro-defaults");
+        seed(
+            &db,
+            "CREATE MACRO m(a, b := 2) AS a + b;
+             CREATE MACRO p(a, b) AS a + b;
+             CREATE MACRO ov(a) AS a, (a, b) AS a + b;
+             CREATE MACRO ovd(a) AS a, (a, b := 5) AS a + b;
+             CREATE MACRO tmd(n, k := 1) AS TABLE SELECT * FROM range(n);
+             CREATE MACRO tmp(n) AS TABLE SELECT * FROM range(n);
+             CREATE MACRO typed(a INTEGER, b INTEGER) AS a + b;
+             CREATE MACRO zero() AS 42;",
+        );
+        let ms = macros_of(&db);
+        for (name, returns, hidden) in [
+            ("m", "", true),
+            ("p", "", false),
+            ("ov", "", false),
+            ("ovd", "", true),
+            ("tmd", "TABLE", true),
+            ("tmp", "TABLE", false),
+            ("typed", "", false),
+            ("zero", "", false),
+        ] {
+            let m = macro_named(&ms, name, returns);
+            assert_eq!(m.defaults_unread, hidden, "{name}");
+            assert_eq!(m.is_editable(), !hidden, "{name}");
+        }
+        assert_eq!(
+            macro_named(&ms, "typed", "").arguments,
+            "a INTEGER, b INTEGER"
+        );
+    }
+
+    /// A scalar and a table macro of one name are two macros to DuckDB, and
+    /// read as two — not folded into one statement that declares both.
+    #[test]
+    fn a_scalar_and_a_table_macro_of_one_name_read_as_two() {
+        let db = mem("macro-two-kinds");
+        seed(
+            &db,
+            "CREATE MACRO t(n) AS TABLE SELECT * FROM range(n);
+             CREATE MACRO t(n) AS n + 1;",
+        );
+        let ms = macros_of(&db);
+        assert_eq!(ms.len(), 2, "{ms:#?}");
+        // DuckDB's own rendering of the query.
+        assert_eq!(
+            macro_named(&ms, "t", "TABLE").body,
+            "SELECT * FROM \"range\"(n)"
+        );
+        assert_eq!(macro_named(&ms, "t", "").body, "(n + 1)");
+    }
+
+    /// Run `cs` through `run_ddl`, as the preview's Apply does.
+    fn applied(db: &Db, cs: &schemaic_core::ddl::ChangeSet) -> Vec<String> {
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        let stmts = cs.emit();
+        assert!(!stmts.is_empty());
+        rt().block_on(db.run_ddl("", &stmts, CancellationToken::new()))
+            .unwrap_or_else(|e| panic!("{e} — plan {stmts:#?}"));
+        stmts
+    }
+
+    /// The macro editor's edits, end to end through `diff_routine` → `emit`
+    /// → `run_ddl`: a body replaced in place keeps its comment (the replace
+    /// clears it, the plan sets it again), a table macro turned scalar
+    /// leaves no table macro behind, a rename leaves no old name, and a new
+    /// macro and a drop of each kind do what they say.
+    #[test]
+    fn a_macro_is_created_edited_renamed_and_dropped() {
+        use schemaic_core::ddl::{RoutineDraft, create_routine, diff_routine, drop_routine};
+        let db = mem("macro-edit");
+        seed(
+            &db,
+            "CREATE MACRO m(a, b) AS a + b;
+             COMMENT ON MACRO m IS 'adds';
+             CREATE MACRO t(n) AS TABLE SELECT * FROM range(n);
+             COMMENT ON MACRO TABLE t IS 'rows';",
+        );
+        let d = SqlDialect::DuckDb;
+        let edit = |r: &RoutineInfo, f: &dyn Fn(&mut RoutineInfo)| {
+            let mut draft = RoutineDraft {
+                info: r.clone(),
+                original: Some(r.name.clone()),
+            };
+            f(&mut draft.info);
+            diff_routine(r, &draft, d)
+        };
+
+        // A body edit: in place, the comment kept.
+        let ms = macros_of(&db);
+        let plan = applied(
+            &db,
+            &edit(macro_named(&ms, "m", ""), &|i| i.body = "a * b".into()),
+        );
+        let ms = macros_of(&db);
+        let m = macro_named(&ms, "m", "");
+        assert_eq!(m.body, "(a * b)", "plan {plan:#?}");
+        assert_eq!(m.comment.as_deref(), Some("adds"), "plan {plan:#?}");
+
+        // A table macro turned scalar: one `t`, scalar, its comment kept.
+        let plan = applied(
+            &db,
+            &edit(macro_named(&ms, "t", "TABLE"), &|i| {
+                i.returns = String::new();
+                i.body = "n + 1".into();
+            }),
+        );
+        let ms = macros_of(&db);
+        let ts: Vec<_> = ms.iter().filter(|m| m.name == "t").collect();
+        assert_eq!(ts.len(), 1, "plan {plan:#?} left {ts:#?}");
+        assert_eq!(ts[0].returns, "");
+        assert_eq!(ts[0].comment.as_deref(), Some("rows"));
+
+        // A rename: the old name gone, the new one there.
+        applied(
+            &db,
+            &edit(macro_named(&ms, "m", ""), &|i| i.name = "mul".into()),
+        );
+        let ms = macros_of(&db);
+        assert!(ms.iter().all(|m| m.name != "m"));
+        assert_eq!(macro_named(&ms, "mul", "").comment.as_deref(), Some("adds"));
+
+        // A new table macro, then a drop of each kind.
+        let new = RoutineDraft {
+            info: RoutineInfo {
+                name: "nums".into(),
+                schema: Some("main".into()),
+                arguments: "n".into(),
+                returns: "TABLE".into(),
+                body: "SELECT * FROM range(n)".into(),
+                ..Default::default()
+            },
+            original: None,
+        };
+        applied(&db, &create_routine(&new, d));
+        let ms = macros_of(&db);
+        applied(&db, &drop_routine(macro_named(&ms, "nums", "TABLE"), d));
+        applied(&db, &drop_routine(macro_named(&ms, "mul", ""), d));
+        let left: Vec<String> = macros_of(&db).into_iter().map(|m| m.name).collect();
+        assert_eq!(left, ["t"]);
     }
 }

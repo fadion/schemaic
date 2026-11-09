@@ -1322,6 +1322,7 @@ routine-editor-name = Emri
 routine-editor-parameters = Parametrat
 routine-editor-returns = Kthen
 routine-editor-returns-placeholder-mssql = int, ose TABLE
+routine-editor-returns-placeholder-duckdb = TABLE for a table macro
 routine-editor-language = Gjuha
 routine-editor-body = Trupi
 routine-editor-recompile = Rikompilo

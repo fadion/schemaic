@@ -1714,6 +1714,7 @@ routine-editor-name = Name
 routine-editor-parameters = Parameter
 routine-editor-returns = Rückgabe
 routine-editor-returns-placeholder-mssql = int oder TABLE
+routine-editor-returns-placeholder-duckdb = TABLE for a table macro
 routine-editor-language = Sprache
 routine-editor-body = Rumpf
 routine-editor-recompile = Neu kompilieren

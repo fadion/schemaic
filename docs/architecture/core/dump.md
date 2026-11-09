@@ -495,6 +495,11 @@ where it cycles, and a used-up one that does not cycle keeping its last, whose c
 refuses loudly as the source's exhausted sequence does. Created at its declared start, a
 `nextval` default after a restore handed out a key the rows already held and the first insert
 failed on the primary key. Without the rows it keeps its declared start, having nothing to clear.
+**A macro is dropped up front as a macro of its own kind**, `DROP MACRO [TABLE] IF EXISTS`
+(`RoutineInfo::object_keyword`, under `schema.rs`), where the section wrote the `DROP FUNCTION
+IF EXISTS` its `RoutineKind` spells. That worked on a lone macro (measured on 2.0.0), so no
+shipped file was broken; the kind is what names the right one where a scalar and a table macro
+share a name, `DROP MACRO t` taking the scalar one when both exist.
 A DuckDB table's captured `CREATE TABLE` carries its keys, so it skips the closing constraints
 section as SQLite's does (`needs_fk_section`), and its indexes are `create_ddl_holding`'s held
 half, built after every table's rows in the section SQL Server's checks use, headed

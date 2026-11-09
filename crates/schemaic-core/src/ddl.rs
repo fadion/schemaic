@@ -7474,10 +7474,15 @@ impl Change {
                     // back** (`recreate_restates_routine_comment`): SQL Server's
                     // sets it again after the create, and telling the user to
                     // re-apply it asked for work already done.
-                    out.push(Risk::RoutineGrantsLost {
-                        held: held.to_string(),
-                        comment: !recreate_restates_routine_comment(dialect),
-                    });
+                    //
+                    // **And only where there are grants to lose**: DuckDB has
+                    // no privileges at all, and puts the comment back.
+                    if crate::users::supports_user_admin(dialect) {
+                        out.push(Risk::RoutineGrantsLost {
+                            held: held.to_string(),
+                            comment: !recreate_restates_routine_comment(dialect),
+                        });
+                    }
                 }
                 // An alter drops a signature as surely as a drop does.
                 if server.tsql.module.signed {
@@ -9857,7 +9862,7 @@ impl ChangeSet {
                         // unrun.
                         drop = Some(format!(
                             "DROP {} IF EXISTS {};",
-                            held.kind.sql_keyword(),
+                            held.object_keyword(d),
                             held.signature_sql(d)
                         ));
                     }
@@ -9892,7 +9897,7 @@ impl ChangeSet {
                 // the other way round.
                 Change::DropRoutine(f) => out.push(format!(
                     "DROP {} {};",
-                    f.kind.sql_keyword(),
+                    f.object_keyword(d),
                     f.signature_sql(d)
                 )),
                 _ => {}
@@ -13278,8 +13283,10 @@ fn fks_equal(a: &ForeignKeyInfo, b: &ForeignKeyInfo) -> bool {
 /// with it. `before` is the server's copy when the routine was altered in
 /// place — then only a changed comment is written — and `None` when it was
 /// created, fresh or again, and any comment is. Set whether or not one is
-/// there (`TsqlComment::set`). Nothing on the other engines, whose comment is
-/// part of the `CREATE` (MySQL) or its own change (PostgreSQL).
+/// there (`TsqlComment::set`). On DuckDB a macro's comment, `COMMENT ON MACRO
+/// [TABLE]`, after every create and replace — the replace clears it. Nothing
+/// on the other engines, whose comment is part of the `CREATE` (MySQL) or its
+/// own change (PostgreSQL).
 fn routine_follow_ups(f: &RoutineInfo, before: Option<&RoutineInfo>, d: SqlDialect) -> Vec<String> {
     match d {
         SqlDialect::MsSql => {
@@ -13302,9 +13309,20 @@ fn routine_follow_ups(f: &RoutineInfo, before: Option<&RoutineInfo>, d: SqlDiale
             };
             vec![on.set(comment)]
         }
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
-            Vec::new()
-        }
+        // A macro's `CREATE [OR REPLACE]` has no comment clause and the
+        // replace clears the one it had ([`replace_clears_comment`]), so any
+        // comment the routine carries is set after it, whether it changed or
+        // not — `before` cannot save one the replace already took.
+        SqlDialect::DuckDb => match blank_as_none(f.comment.as_deref()) {
+            Some(c) if replace_clears_comment(d) => vec![format!(
+                "COMMENT ON {} {} IS {};",
+                f.object_keyword(d),
+                f.signature_sql(d),
+                ddl_string(c, d)
+            )],
+            _ => Vec::new(),
+        },
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => Vec::new(),
     }
 }
 
@@ -14871,11 +14889,14 @@ pub fn replace_clears_comment(dialect: SqlDialect) -> bool {
 /// MySQL's `CREATE` carries a `COMMENT` clause, and SQL Server's plan sets the
 /// `MS_Description` again after it (`routine_follow_ups`); PostgreSQL's
 /// `COMMENT ON` is a statement the recreate does not repeat, and SQLite has
-/// no routines. What the recreate's risk sentence may say is lost.
+/// no routines. DuckDB's plan sets the comment again after every create
+/// (`routine_follow_ups`), its replace clearing it anyway
+/// ([`replace_clears_comment`]). What the recreate's risk sentence may say is
+/// lost.
 fn recreate_restates_routine_comment(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::MsSql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
+        SqlDialect::MySql | SqlDialect::MsSql | SqlDialect::DuckDb => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite => false,
     }
 }
 
@@ -15014,7 +15035,24 @@ pub fn supports_event_editing(dialect: SqlDialect) -> bool {
 /// own form and its own capability.
 pub fn supports_object_creation(dialect: SqlDialect, kind: ObjectKind) -> bool {
     match kind {
-        ObjectKind::Function | ObjectKind::Procedure => return supports_routine_editing(dialect),
+        // The editor, and a create of this kind: DuckDB edits its macros,
+        // which are functions, and has no procedure to create.
+        ObjectKind::Function | ObjectKind::Procedure => {
+            let kind = if kind == ObjectKind::Function {
+                crate::schema::RoutineKind::Function
+            } else {
+                crate::schema::RoutineKind::Procedure
+            };
+            let blank = RoutineDraft {
+                info: RoutineInfo {
+                    kind,
+                    ..Default::default()
+                },
+                original: None,
+            };
+            return supports_routine_editing(dialect)
+                && supports_change(dialect, &Change::CreateRoutine(Box::new(blank)));
+        }
         ObjectKind::Event => return supports_event_editing(dialect),
         ObjectKind::Enum
         | ObjectKind::Domain
@@ -19088,6 +19126,17 @@ fn duckdb_supports(change: &Change) -> bool {
         | Change::DropView {
             materialized: false,
         } => true,
+        // Macros: `CREATE [OR REPLACE] MACRO` and `DROP MACRO [TABLE]`
+        // ([`RoutineInfo::object_keyword`]). A macro is a function to the
+        // model; DuckDB has **no procedure**, so one is refused, which is
+        // what keeps the Create menu from offering it
+        // ([`supports_object_creation`]). No `ALTER MACRO` either, so
+        // `RenameRoutine` is never raised — a rename is a recreate
+        // ([`supports_routine_rename`]) — and is refused.
+        Change::CreateRoutine(d) | Change::ReplaceRoutine { draft: d, .. } => {
+            d.info.kind == crate::schema::RoutineKind::Function
+        }
+        Change::DropRoutine(_) => true,
         // **Admitted when everything that differs is something an `ALTER
         // COLUMN` writes** — the rename, the type, nullability, the default
         // and the comment — asked of `columns_equal`, the comparison that
@@ -29285,6 +29334,180 @@ mod tests {
                 .emit()
                 .iter()
                 .any(|s| s.starts_with("COMMENT")),
+        );
+    }
+
+    /// A DuckDB macro, scalar (`returns` empty) or table (`TABLE`).
+    fn duck_macro(name: &str, args: &str, returns: &str, body: &str) -> RoutineInfo {
+        RoutineInfo {
+            name: name.into(),
+            schema: Some("main".into()),
+            kind: crate::schema::RoutineKind::Function,
+            arguments: args.into(),
+            identity_arguments: args.into(),
+            returns: returns.into(),
+            language: "SQL".into(),
+            body: body.into(),
+            ..Default::default()
+        }
+    }
+
+    /// DuckDB's macro statements (measured on 2.0.0): `CREATE [OR REPLACE]
+    /// MACRO` and `DROP MACRO [TABLE]`. There is no `ALTER MACRO`, so a
+    /// rename is a drop and a create, and no procedure at all — so the
+    /// Create menu offers a function (a macro) and never a procedure.
+    #[test]
+    fn duckdb_creates_replaces_and_drops_macros_and_has_no_procedures() {
+        use crate::schema::RoutineKind;
+        let d = DuckDb;
+        let m = duck_macro("m", "a", "", "a + 1");
+        let draft = |info: RoutineInfo| {
+            Box::new(RoutineDraft {
+                info,
+                original: None,
+            })
+        };
+        for c in [
+            Change::CreateRoutine(draft(m.clone())),
+            Change::ReplaceRoutine {
+                draft: draft(m.clone()),
+                server: Box::new(m.clone()),
+                recreate: false,
+            },
+            Change::ReplaceRoutine {
+                draft: draft(m.clone()),
+                server: Box::new(m.clone()),
+                recreate: true,
+            },
+            Change::DropRoutine(Box::new(m.clone())),
+        ] {
+            assert!(supports_change(d, &c), "{c:?}");
+        }
+        let procedure = RoutineInfo {
+            kind: RoutineKind::Procedure,
+            ..m.clone()
+        };
+        for c in [
+            Change::CreateRoutine(draft(procedure.clone())),
+            Change::ReplaceRoutine {
+                draft: draft(procedure.clone()),
+                server: Box::new(procedure),
+                recreate: false,
+            },
+            Change::RenameRoutine {
+                from: Box::new(m.clone()),
+                to: "n".into(),
+            },
+        ] {
+            assert!(!supports_change(d, &c), "{c:?}");
+        }
+        assert!(supports_routine_editing(d));
+        assert!(supports_object_creation(d, ObjectKind::Function));
+        assert!(!supports_object_creation(d, ObjectKind::Procedure));
+        // The engines with procedures keep both entries.
+        for e in [MySql, Postgres, MsSql] {
+            assert!(supports_object_creation(e, ObjectKind::Function), "{e:?}");
+            assert!(supports_object_creation(e, ObjectKind::Procedure), "{e:?}");
+        }
+    }
+
+    /// A macro is dropped as one — `DROP MACRO`, and `DROP MACRO TABLE` for a
+    /// table macro — never as the `FUNCTION` its model kind spells. DuckDB
+    /// keeps a scalar and a table macro of one name apart (measured), and
+    /// `DROP MACRO t` drops the scalar one when both exist.
+    #[test]
+    fn a_duckdb_macro_is_dropped_as_a_macro_of_its_own_kind() {
+        let drop = |m: RoutineInfo| {
+            ChangeSet {
+                table: m.name.clone(),
+                schema: m.schema.clone(),
+                dialect: DuckDb,
+                flavour: ServerFlavour::Unknown,
+                changes: vec![Change::DropRoutine(Box::new(m))],
+            }
+            .emit()
+        };
+        assert_eq!(
+            drop(duck_macro("m", "a", "", "a")),
+            vec!["DROP MACRO \"main\".\"m\";".to_string()]
+        );
+        assert_eq!(
+            drop(duck_macro("t", "n", "TABLE", "SELECT 1")),
+            vec!["DROP MACRO TABLE \"main\".\"t\";".to_string()]
+        );
+    }
+
+    /// A body edit is a `CREATE OR REPLACE MACRO`, which clears the macro's
+    /// comment (measured on 2.0.0), so the comment is set again after it.
+    #[test]
+    fn a_duckdb_macro_replace_restates_its_comment() {
+        let cur = RoutineInfo {
+            comment: Some("adds".into()),
+            ..duck_macro("m", "a, b", "", "(a + b)")
+        };
+        let mut draft = RoutineDraft {
+            info: cur.clone(),
+            original: Some("m".into()),
+        };
+        draft.info.body = "a * b".into();
+        let cs = diff_routine(&cur, &draft, DuckDb);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        assert_eq!(
+            cs.emit(),
+            vec![
+                "CREATE OR REPLACE MACRO \"main\".\"m\"(a, b) AS a * b".to_string(),
+                "COMMENT ON MACRO \"main\".\"m\" IS 'adds';".to_string(),
+            ]
+        );
+        // A comment edited in the form is the comment set.
+        draft.info.comment = Some("multiplies".into());
+        assert_eq!(
+            diff_routine(&cur, &draft, DuckDb).emit()[1],
+            "COMMENT ON MACRO \"main\".\"m\" IS 'multiplies';"
+        );
+        // Nor does the plan claim a grant is lost: DuckDB has none.
+        draft.info.name = "renamed".into();
+        let cs = diff_routine(&cur, &draft, DuckDb);
+        assert!(
+            !cs.destructive().iter().any(|r| r.contains("GRANT")),
+            "{:?}",
+            cs.destructive()
+        );
+    }
+
+    /// **Turning a table macro into a scalar one, or back, drops the old one
+    /// by its own kind.** `CREATE OR REPLACE MACRO t(n) AS n + 1` over a table
+    /// macro `t` creates a second, scalar `t` beside it (measured), so the
+    /// switch is a recreate whose drop names what the server holds.
+    #[test]
+    fn a_duckdb_macro_changing_kind_drops_the_one_the_server_holds() {
+        let table = duck_macro("t", "n", "TABLE", "SELECT * FROM range(n)");
+        let mut draft = RoutineDraft {
+            info: table.clone(),
+            original: Some("t".into()),
+        };
+        draft.info.returns = String::new();
+        draft.info.body = "n + 1".into();
+        assert_eq!(
+            diff_routine(&table, &draft, DuckDb).emit(),
+            vec![
+                "DROP MACRO TABLE IF EXISTS \"main\".\"t\";".to_string(),
+                "CREATE MACRO \"main\".\"t\"(n) AS n + 1".to_string(),
+            ]
+        );
+        // And a rename, which DuckDB has no statement for, is the same route.
+        let scalar = duck_macro("s", "a", "", "a");
+        let mut draft = RoutineDraft {
+            info: scalar.clone(),
+            original: Some("s".into()),
+        };
+        draft.info.name = "s2".into();
+        assert_eq!(
+            diff_routine(&scalar, &draft, DuckDb).emit(),
+            vec![
+                "DROP MACRO IF EXISTS \"main\".\"s\";".to_string(),
+                "CREATE MACRO \"main\".\"s2\"(a) AS a".to_string(),
+            ]
         );
     }
 

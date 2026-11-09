@@ -536,9 +536,11 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                         SqlDialect::Postgres => "a integer, b text DEFAULT ''",
                         SqlDialect::MsSql => "@sku varchar(20), @n int = 0 OUTPUT",
                         SqlDialect::MySql | SqlDialect::Sqlite => "IN sku VARCHAR(20), OUT n INT",
-                        // A macro's parameters are names alone. Unreachable
-                        // until DuckDB's routines are edited (roadmap).
-                        SqlDialect::DuckDb => "a, b := 0",
+                        // A macro's parameters: names, a type where wanted.
+                        // A default (`b := 0`) is not offered: the catalogue
+                        // never reports one, so a macro with one would not
+                        // be editable again (`RoutineInfo::defaults_unread`).
+                        SqlDialect::DuckDb => "a, b INTEGER",
                     },
                     mono: true,
                     focus: Some((ring.clone(), TAB_ARGS)),
@@ -566,7 +568,8 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                         SqlDialect::Postgres => "integer".to_string(),
                         SqlDialect::MsSql => tr!("routine-editor-returns-placeholder-mssql"),
                         SqlDialect::MySql | SqlDialect::Sqlite => "INT".to_string(),
-                        SqlDialect::DuckDb => String::new(),
+                        // Empty for a scalar macro, `TABLE` for a table one.
+                        SqlDialect::DuckDb => tr!("routine-editor-returns-placeholder-duckdb"),
                     })),
                     mono: true,
                     focus: Some((ring.clone(), TAB_RETURNS)),
@@ -651,6 +654,33 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
     // resets. On PostgreSQL the sharpest is the `SET search_path` pinned to a
     // SECURITY DEFINER function; on MySQL it is the definer itself.
     let mut options: Vec<AnyView> = Vec::new();
+    // The comment, on the three engines whose plan writes one: MySQL's
+    // `COMMENT` clause, SQL Server's `MS_Description`, DuckDB's `COMMENT ON
+    // MACRO`. One field, built by whichever arm below offers it.
+    let comment_setting = {
+        let ring = ring.clone();
+        let initial = draft.info.comment.clone().unwrap_or_default();
+        move || -> AnyView {
+            form_setting(
+                tr!("routine-editor-comment"),
+                bound_field(
+                    d,
+                    initial,
+                    FieldCfg {
+                        placeholder_of: Some(Rc::new(|| tr!("editor-comment-placeholder"))),
+                        focus: Some((ring, TAB_OPT + 40)),
+                        ..Default::default()
+                    },
+                    |d, v| {
+                        let v = v.trim();
+                        d.info.comment = (!v.is_empty()).then(|| v.to_string());
+                    },
+                )
+                .style(move |s| s.width(field_w() * 1.6)),
+            )
+            .into_any()
+        }
+    };
     // SQL Server's `WITH` options: `RECOMPILE` and `SCHEMABINDING` as toggles
     // over `TsqlRoutine::set_option`; `EXECUTE AS`, the null-input clause and
     // `INLINE` through the slot setters, each holding one value in place so
@@ -750,26 +780,7 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                     .into_any(),
                 );
             }
-            options.push(
-                form_setting(
-                    tr!("routine-editor-comment"),
-                    bound_field(
-                        d,
-                        draft.info.comment.clone().unwrap_or_default(),
-                        FieldCfg {
-                            placeholder_of: Some(Rc::new(|| tr!("editor-comment-placeholder"))),
-                            focus: Some((ring.clone(), TAB_OPT + 40)),
-                            ..Default::default()
-                        },
-                        |d, v| {
-                            let v = v.trim();
-                            d.info.comment = (!v.is_empty()).then(|| v.to_string());
-                        },
-                    )
-                    .style(move |s| s.width(field_w() * 1.6)),
-                )
-                .into_any(),
-            );
+            options.push(comment_setting());
         }
         SqlDialect::Postgres => {
             // **Volatility and strictness are function-only.** PostgreSQL's
@@ -834,7 +845,11 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                 .into_any(),
             );
         }
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+        // A macro has none of MySQL's characteristics — no determinism, data
+        // access, security or definer clause — only its comment, which the
+        // plan sets again after every replace (`ddl::replace_clears_comment`).
+        SqlDialect::DuckDb => options.push(comment_setting()),
+        SqlDialect::MySql | SqlDialect::Sqlite => {
             options.push(bound_toggle(
                 d,
                 tr!("routine-editor-deterministic"),
@@ -901,26 +916,7 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                 )
                 .into_any(),
             );
-            options.push(
-                form_setting(
-                    tr!("routine-editor-comment"),
-                    bound_field(
-                        d,
-                        draft.info.comment.clone().unwrap_or_default(),
-                        FieldCfg {
-                            placeholder_of: Some(Rc::new(|| tr!("editor-comment-placeholder"))),
-                            focus: Some((ring.clone(), TAB_OPT + 40)),
-                            ..Default::default()
-                        },
-                        |d, v| {
-                            let v = v.trim();
-                            d.info.comment = (!v.is_empty()).then(|| v.to_string());
-                        },
-                    )
-                    .style(move |s| s.width(field_w() * 1.6)),
-                )
-                .into_any(),
-            );
+            options.push(comment_setting());
         }
     }
 
