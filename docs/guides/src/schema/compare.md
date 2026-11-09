@@ -50,9 +50,10 @@ On DuckDB, the whole migration runs in one transaction, and a few things stop it
 
 - *A sequence that differs* gets no statement, because DuckDB can't alter one. Sequences that exist
   on one side only are created or dropped.
-- *A macro with parameter defaults* (`b := 2`) on the source-of-truth side is held back: DuckDB
-  doesn't report the defaults, so a statement written from it would lose them. Copy that macro
-  across by hand.
+- *A macro with parameter defaults* (`b := 2`) on the source-of-truth side is held back by the MCP
+  server's `compare_schemas`. DuckDB's catalogue doesn't hold the defaults, and Schemaic reads them
+  from DuckDB's own export, which needs file access the MCP server turns off. **Compare with**
+  plans such a macro like any other.
 - *A table another table's foreign key points at can't be rebuilt.* The preview lists it under
   **This engine can't express part of this plan**, and **Apply** stays off until you leave that
   table unticked.

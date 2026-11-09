@@ -614,7 +614,9 @@ case — a readable source replaces it (`a_module_the_source_could_not_read_is_d
 live, `a_comparison_discloses_the_modules_the_source_would_not_show`, 2022 and 2025).
 **A DuckDB source macro whose parameter defaults are unread is held back the same way**
 (`RoutineInfo::defaults_unread`, under `schema.rs` and `db/duckdb.rs`: the catalogue lists
-`b := 2` as `b`). `routine_entry` gives it the empty set and sets `held_back` to
+`b := 2` as `b`). The reader now reads such defaults from an export of the schema, so a macro
+with them is compared and planned like any other; the flag, and this hold, remain for where that
+export cannot be read — a sealed handle. `routine_entry` gives it the empty set and sets `held_back` to
 `HeldBack::DefaultsUnread`, *"DuckDB does not report its parameter defaults, so a statement
 written from it would drop them — copy it from the source by hand"*. Planned, it was created or
 replaced without its defaults — reported as a success — and differed again after every Apply
@@ -624,7 +626,8 @@ replaced or dropped as any other, the source's reading being whole, but a pair w
 (`a_duckdb_macro_whose_defaults_are_unread_is_held_back`,
 `a_duckdb_target_macro_with_unread_defaults_is_replaced_but_never_vouched_for`; end to end on
 in-memory DuckDB, `a_compare_rebuilds_what_it_must_and_holds_back_what_it_cannot_restate` under
-`duckdb.rs`). Its `compare-held-defaults-unread` is English in every catalogue for now.
+`duckdb.rs` now pins the other side — a defaulted macro planned with its defaults, nothing
+omitted). Its `compare-held-defaults-unread` is English in every catalogue for now.
 Triggers pair on the qualified table *and* the name, because MySQL scopes a trigger name to the
 schema and PostgreSQL to the table and the wider key is right under both; routines on kind,
 qualified name and `identity_arguments`, because PostgreSQL overloads on the arguments and a key

@@ -56,9 +56,11 @@ DuckDB fell into MySQL's arm until it had one, so the form offered four controls
 the macro's `CREATE` does not write. The comment is the one thing it carries, set by `COMMENT ON
 MACRO` after every create and replace (`ddl::replace_clears_comment`, under `ddl.rs`), and its
 field is now one `comment_setting` closure the MySQL, SQL Server and DuckDB arms all push, rather
-than a copy per arm. The Parameters placeholder is `a, b INTEGER` — names, a type where wanted,
-and no default, deliberately: the catalogue never reports a `b := 0`, so a macro given one here
-would not be editable again (`RoutineInfo::defaults_unread`, under `schema.rs`). Returns is empty
+than a copy per arm. The Parameters placeholder is `a INTEGER, b := 0` — names, a type where
+wanted, and a default. It used to leave the default out on purpose: the catalogue never reports a
+`b := 0`, so a macro given one here was not editable again (`RoutineInfo::defaults_unread`,
+under `schema.rs`). The reader now reads a default back from an export of the schema
+(`read_macro_defaults`, under `db/duckdb.rs`), so such a macro reopens with it. Returns is empty
 for a scalar macro and `TABLE` for a table one, and its placeholder says so in words
 (`routine-editor-returns-placeholder-duckdb`, *TABLE for a table macro*). The Body is one
 expression or one query (placeholder `a + b`).

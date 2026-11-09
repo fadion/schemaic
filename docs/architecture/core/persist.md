@@ -443,6 +443,8 @@ difference from `write_file_atomic` is only the *new* file: a script saved for t
 takes the default mode, since it "narrows no permissions", where an export's new destination is
 owner-only. Windows sets no mode — the file inherits the directory's ACL, as before. **No test
 pins any of it**: every property is about a real file, and the workspace's no-filesystem rule
-admits exactly one exception, `export::export_xlsx_chunks`. Not covered either:
+admits a closed list of exceptions — `export::export_xlsx_chunks`, `db::duckdb`'s
+`a_sealed_file_is_opened_read_only` and `read_macro_defaults`' temp directory — of which this
+is none. Not covered either:
 `write_file_atomic`'s own fallback when the rename is refused, a direct `fs::write` of the
 user-chosen target path itself, which S31 left as it was.

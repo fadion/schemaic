@@ -1297,8 +1297,14 @@ Re-introducing the anti-patterns these guard against is a regression:
   call, so a test of it is still deterministic and still needs no server; it is the same pragmatic
   exception in-memory SQLite already is in `schemaic-db` and `cli::catalog`'s tests, and in-memory
   DuckDB in `db::duckdb`'s (a `memory:<name>` target, which only a `cfg(test)` build may *create*
-  unheld — a release build reaches one only while a `DataSession` holds it). Read it as the one case, not as licence
-  for a second: anything else wanting a file still models it at the boundary.
+  unheld — a release build reaches one only while a `DataSession` holds it). **Two more cases,
+  both in `db::duckdb` and both with the user's say-so (2026-11-09)**, make the list a closed one
+  of three: `a_sealed_file_is_opened_read_only`, since the seal's `AccessMode::ReadOnly` needs a
+  file to open and an in-memory instance has none; and `read_macro_defaults`, whose `EXPORT
+  DATABASE` of a row-less copy writes a directory under the system temp directory, DuckDB 2.0.0
+  having no in-memory filesystem to export to — every test reading a macro with a parameter
+  default goes through it (both under `db/duckdb.md`). Read them as a closed list, not as licence
+  for a fourth: anything else wanting a file still models it at the boundary.
 - **What the source knew is carried, never re-derived from the text it rendered into.** Two
   separate defects turned out to be one shape — a precise oracle two functions upstream, dropped by
   a type, then guessed at downstream from a string — and both were fixed by carrying the fact

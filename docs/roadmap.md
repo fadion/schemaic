@@ -74,8 +74,7 @@ come after DuckDB.
 - **Loose ends:** nothing alters a DuckDB sequence once made (`ALTER SEQUENCE` refuses every
   option on 2.0.0), so a compare that finds one changed has no statement for it, and its form
   edits only the comment; a re-create would have to drop it, which DuckDB refuses while a column
-  default uses it. The read-only half of the seal (`AccessMode::ReadOnly`) has no test, the
-  suites' in-memory instance having no file to open read-only. A file named
+  default uses it. A file named
   `main.duckdb` makes `main.t` both a schema and a catalog, and its results are not attributed;
   accept the reading where both resolve to the same table, if anyone hits it. A user type is read
   for the dump alone (`DbSchema::user_types`): the tree does not show one and schema compare does
@@ -83,10 +82,6 @@ come after DuckDB.
   binary-cell panel dismissed mid-read, a re-fetch stopped — aborts the transaction (measured),
   since there is no savepoint to fence it in; reading such a cell on a fresh connection would see
   none of the tab's uncommitted writes, so it is left an honest loss rather than a wrong answer.
-  A macro parameter's default (`b := 2`) is in no catalogue column, so such a macro is found by
-  binding and left listed but not editable, and its *Copy DDL* and dump say above the `CREATE`
-  that the defaults are not restated (unmeasured: whether `EXPORT DATABASE` writes them, which
-  would be a source for them).
   A view's **column** comments are cleared by `CREATE OR REPLACE VIEW` too (measured), and an
   edit does not restate them, the new body's columns being unknown until it runs.
   An Open data file session is out of the AI panel's reach: its MCP server is a subprocess that

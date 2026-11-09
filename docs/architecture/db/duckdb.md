@@ -42,8 +42,12 @@ gate (`sql::read_only_reason`) names the readers first; the seal is what holds w
 slips past it. **An instance is sealed or not for its whole life**, so a handle asking for the
 other kind while one is open is refused — `DbRefusal::DuckDbSealedElsewhere`, which does not
 `stand`, since the file is free again once the other run ends — rather than
-quietly given the wrong one. The test's in-memory instance is sealed without the read-only open,
-there being no file to open read-only, so that half of the seal has no test. **Who seals:**
+quietly given the wrong one. That test's in-memory instance is sealed without the read-only open,
+there being no file to open read-only, so the other half has a test of its own on a real file —
+one of the workspace's sanctioned filesystem exceptions, with the user's say-so
+(`a_sealed_file_is_opened_read_only`: a file made under the system temp directory, opened
+sealed, reads, and refuses `INSERT`, `CREATE` and `DROP` as *read-only*; reopened unsealed, it
+holds what it held, and the directory is removed however the test ends). **Who seals:**
 `cli::query`'s `read_only_query`, `read_only_export` and `read_only_explain` each call
 `db.clone().sealed()` before they run (`schemaic query`/`export`/`explain`), and the MCP server
 seals every handle it serves in `mcp::serve`/`serve_many` — none of its tools writes, and
@@ -130,29 +134,60 @@ a table macro `t` adds a second rather than replacing it), so only entries of th
 (`a_scalar_and_a_table_macro_of_one_name_read_as_two`).
 `body` is `duckdb_functions().macro_definition`, the expression or query alone, and a later
 overload is folded into it as `…, (a, b) AS expr` — the form one `CREATE MACRO` declares them all
-in — so `RoutineInfo::create_sql`'s DuckDB arm (`duckdb_create_sql`) writes the whole macro back
-as `CREATE MACRO s.m(args) AS [TABLE] …` (`a_macros_ddl_replays_as_the_same_macro`, which replays
-each one into a fresh database and calls every overload). Until that arm existed DuckDB fell on
+in (`fold_overloads`). **A table macro with more than one overload has each query in
+parentheses**: folded bare, `SELECT a, 1, (a, b) AS TABLE SELECT a, b` is a parse error (measured
+on 2.0.0), the `SELECT`'s own commas running on into the next overload, and *Copy DDL*, the dump
+and every edit of such a macro failed (`an_overloaded_table_macro_replays`,
+`overloads_fold_into_one_declaration`); a scalar body is one expression, with no top-level comma
+to confuse, and a lone table query is left bare — so `RoutineInfo::create_sql`'s DuckDB arm
+(`duckdb_create_sql`) writes the whole macro back as `CREATE MACRO s.m(args) AS [TABLE] …`
+(`a_macros_ddl_replays_as_the_same_macro`, which replays each one into a fresh database and
+calls every overload). Until that arm existed DuckDB fell on
 MySQL's emitter, and *Copy DDL* on a macro wrote `CREATE FUNCTION … NOT DETERMINISTIC`. The
 argument list is `macro_parameters` over `parameters` and `parameter_types`, the second read
 position by position (`positional_strings`, an untyped parameter's type being `NULL`), so a typed
 macro reads as `a INTEGER, b INTEGER`; before, it was read by name alone and *Copy DDL* and the
-dump restated it untyped. **A parameter's default is not carried**: the catalogue lists `b := 2`
-as `b` and holds the value in no column (measured on 2.0.0), so the text declares the parameter
-without it. **Whether a macro has one is found by binding** (`macro_hides_defaults`): a default
-is the one thing that lets a call pass fewer arguments than an overload declares, so for each `k`
+dump restated it untyped. **A parameter's default is not in the catalogue**: it lists `b := 2`
+as `b` and holds the value in no column (measured on 2.0.0), so a text built from it declares the
+parameter without it. **Whether a macro has one is found by binding** (`macro_hides_defaults`):
+a default is the one thing that lets a call pass fewer arguments than an overload declares, so for each `k`
 below the largest overload's arity a call with `k` `NULL`s is *prepared* — bound, never run — and
 how many overloads accepted it, read off the error (*Macro m() does not support the supplied
 arguments*: none; *has multiple overloads*: two or more; anything else, success included: at
 least one), is compared with how many declare `k`. More acceptors than declarers is a default.
 **It fails closed**: an error in a form it does not recognise counts as accepted, and two
 overloads of one arity below the largest — typed, where the count cannot tell them apart —
-count as a default outright; either way the cost is a macro left uneditable, never a default
-dropped. Such a macro is `RoutineInfo::defaults_unread`: listed and droppable, not editable
-(`is_editable`), its `CREATE` headed by a `-- DuckDB does not report this macro's parameter
-defaults …` line so *Copy DDL* and the dump say what they leave out
-(`a_macros_hidden_defaults_are_found_by_binding`, over a defaulted macro, a defaulted overload, a
-defaulted table macro and their undefaulted twins, a typed one and a nullary one).
+count as a default outright; either way the cost is an export asked for needlessly, or a macro
+left uneditable, never a default dropped. **What the default is, is read from an export**
+(`read_macro_defaults`), the one place DuckDB 2.0.0 prints it — asked once per schema read,
+however many macros want it, and only when one does. An `EXPORT DATABASE` of the file itself
+would write every table's rows, so it never runs there: an in-memory database is `ATTACH`ed
+under a name unique to the process and the call, `COPY FROM DATABASE <catalog> TO <scratch>
+(SCHEMA)` copies the catalog into it without rows — a macro whole, defaults and all (measured on
+2.0.0) — and that empty copy is exported to a fresh directory under the system temp directory,
+whose `schema.sql` is read before the scratch database is `DETACH`ed and the directory removed.
+Nothing is written to the user's file. **The directory is not a choice**: DuckDB 2.0.0 has no
+in-memory filesystem to export to (`memory://` is read as a relative path), which makes this one
+of the workspace's sanctioned filesystem exceptions — in the app at every such read, and in every
+test here that reads a macro with a default. `exported_macros`/`exported_macro` read the script's
+`CREATE MACRO` statements, whose form is regular (measured on 2.0.0):
+`CREATE MACRO s."n" (a, b := 2) AS ((a + b)), (a) AS (a);`, every body inside one pair of the
+export's own parentheses — which is what lets a top-level comma end an overload even after a
+table macro's `SELECT x, y`. That pair is taken off, so a body reads as `macro_definition` gives
+it, and a statement out of that form is skipped, never guessed at
+(`the_exports_macros_are_read_with_their_defaults`, `an_export_statement_out_of_form_is_skipped`).
+A detected macro whose export entry agrees on schema, name, kind and number of overloads takes
+its parameter lists and bodies from there, defaults and all, and is editable like any other
+(`a_macros_hidden_defaults_are_read_from_the_export`, over a defaulted macro, a defaulted
+overload, a defaulted table macro and their undefaulted twins, a typed one and a nullary one,
+and that no scratch database is left attached; `a_macro_read_with_its_defaults_replays_with_them`,
+whose replayed `m(1)` still answers `3`). **Where the export cannot be read, the macro is
+marked instead** — a sealed handle, its external access off, fails at the export, and so does any
+failed step, or an export with no entry that agrees. Such a macro is
+`RoutineInfo::defaults_unread`: listed and droppable, not editable (`is_editable`), its `CREATE`
+headed by a `-- DuckDB does not report this macro's parameter defaults …` line so *Copy DDL* and
+the dump say what they leave out (`a_hidden_default_the_export_cannot_reach_is_marked`, the same
+macros on a sealed handle).
 `main` is always among the namespaces (`schema::DUCKDB_DEFAULT_SCHEMA`, `default_namespace`), and
 names compare ignoring case (`names_ignore_case`). Table sizes are `duckdb_tables()`'
 `estimated_size` rows and nothing on disk, DuckDB keeping no per-table figure; the Server
@@ -283,8 +318,9 @@ sequence; a type in a namespace the export does not carry is left out, as a sequ
 its `CREATE` (`ddl::script_restates_object_comments`, `view_comment_sql`, `routine_comment_sql`,
 in *Copy DDL* too) — the dump dropped both, keeping only a table's and its columns'
 (`a_dump_carries_user_types_and_view_and_macro_comments`, into an empty database and replayed
-onto its source). **What the file does not carry** is a macro parameter's default, for the
-reason above, though a macro the reader found one on says so in the line above its `CREATE`. A macro is dropped up front as what it is, `DROP MACRO [TABLE] IF EXISTS`
+onto its source). **A macro parameter's default is carried where the reader could read it** from
+the export, above; where it could not, the file does not carry it, and the macro says so in the
+line above its `CREATE`. A macro is dropped up front as what it is, `DROP MACRO [TABLE] IF EXISTS`
 (`RoutineInfo::object_keyword`, under `schema.rs`).
 **A Manual tab pins one connection, and with it the file** (`Pinned`, opened by `pin`, behind
 `session.rs`'s `Backend::DuckDb`). It is the connection an operation would take — `connect`'s, so
@@ -389,8 +425,9 @@ the `sequence_*` capabilities, under `ddl.rs`). A sequence a column
 default uses can be neither dropped nor replaced — DuckDB says so itself (*Dependency Error*),
 inside the plan's one transaction — and a sequence whose options differ between the files is
 disclosed with the generic *no statement for the difference it found*, its `AlterSequence`
-emitting nothing. A source macro whose parameter defaults the catalogue hides
-(`defaults_unread`, above) is held back rather than created without them
+emitting nothing. A source macro whose parameter defaults the catalogue hides is planned with
+them, read from the export (above); only where the export could not be read (`defaults_unread`,
+above — a sealed handle) is it held back rather than created without them
 (`HeldBack::DefaultsUnread`, under `compare.rs`). The plans are run end to end on in-memory
 instances — compare, plan, `run_ddl`, compare again: `two_files_compare_the_same_once_the_plan_is_applied`
 covers every kind DuckDB holds — a schema created before the table in it, a sequence before the
@@ -399,11 +436,12 @@ of both shapes, a sequence comment — and finds nothing left, the target's rows
 sequence handing out its source's start. `a_compare_rebuilds_what_it_must_and_holds_back_what_it_cannot_restate`
 holds the rest: a keyed table rebuilt by the plan with its rows (the widened column cast, the
 dropped one gone), a dropped table that used a sequence dropped before the sequence, a view's
-comment restated after its replace, the defaulted macro kept out of the statements and named in
+comment restated after its replace, the defaulted macro planned with its `b := 2` and nothing in
 `omitted()`, and a referenced table's refused rebuild (`Withheld::DuckDbReferenced`) in the
 whole plan's `unsupported()` — which keeps Apply off until its tick is cleared, the same gate as
-on every engine — while the plan without it applies; a second comparison then finds exactly
-those two left.
+on every engine — while the plan without it applies; a second comparison then finds only that
+table left. Before the export was read, the defaulted macro was the second thing left; the
+held-back case is now `compare.rs`'s own tests'.
 **What DuckDB does not have is refused, never faked**: a procedure, as above, and the trigger
 editor, DuckDB having no triggers, through `ddl::duckdb_supports`.
 **A missing file is refused, never created** (`open_target`, `DbRefusal::DuckDbMissing`). DuckDB's

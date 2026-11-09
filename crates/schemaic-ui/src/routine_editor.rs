@@ -536,11 +536,10 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                         SqlDialect::Postgres => "a integer, b text DEFAULT ''",
                         SqlDialect::MsSql => "@sku varchar(20), @n int = 0 OUTPUT",
                         SqlDialect::MySql | SqlDialect::Sqlite => "IN sku VARCHAR(20), OUT n INT",
-                        // A macro's parameters: names, a type where wanted.
-                        // A default (`b := 0`) is not offered: the catalogue
-                        // never reports one, so a macro with one would not
-                        // be editable again (`RoutineInfo::defaults_unread`).
-                        SqlDialect::DuckDb => "a, b INTEGER",
+                        // A macro's parameters: names, a type where wanted,
+                        // a default — read back from an export of the schema,
+                        // since the catalogue never reports one (`db::duckdb`).
+                        SqlDialect::DuckDb => "a INTEGER, b := 0",
                     },
                     mono: true,
                     focus: Some((ring.clone(), TAB_ARGS)),

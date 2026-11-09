@@ -51,8 +51,10 @@
 //! `rowid` is never a key — a checkpoint renumbers it.
 //!
 //! **The editors run**: the view editor, restating the column list and the
-//! comment a replace would lose; the macro editor, except on a macro whose
-//! parameter defaults the catalogue hides ([`macro_hides_defaults`]); and the
+//! comment a replace would lose; the macro editor, with a parameter default
+//! the catalogue hides ([`macro_hides_defaults`]) read from an export of the
+//! schema ([`read_macro_defaults`]), or the macro left uneditable where that
+//! export cannot be made; and the
 //! table designer, in place where DuckDB's `ALTER TABLE` can and by rebuilding
 //! the table where it cannot (`ddl::duckdb_rebuild_sql`). So do DDL plans,
 //! `.sql` scripts, imports and the dump, and a Manual tab holds a connection
@@ -1399,6 +1401,77 @@ fn macro_hides_defaults(conn: &DuckConn, m: &RoutineInfo, arities: &[usize]) -> 
     })
 }
 
+/// The database's macros as `EXPORT DATABASE` prints them — parameter
+/// defaults included, which no catalogue column holds
+/// ([`RoutineInfo::defaults_unread`]). `None` where any step fails, and the
+/// macros it was asked for then stay as the catalogue reads them: listed, not
+/// editable.
+///
+/// An export writes every table's rows as well, so it is never run on the
+/// file itself: the catalog is first copied **without rows** (`COPY FROM
+/// DATABASE … (SCHEMA)`, which carries a macro whole, defaults and all —
+/// measured on 2.0.0) into an attached in-memory database, and that empty
+/// copy is exported to a fresh directory under the system temp directory,
+/// whose `schema.sql` is read and which is then deleted. Nothing is written to
+/// the user's file. DuckDB 2.0.0 has no in-memory filesystem to export to
+/// (`memory://` is read as a relative path), hence the directory.
+///
+/// A sealed handle, whose external access is off, fails at the export and so
+/// answers `None` — the unattended paths keep the catalogue's reading.
+fn read_macro_defaults(conn: &DuckConn) -> Option<Vec<ExportedMacro>> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tag = format!("schemaic_macro_defaults_{}_{n}", std::process::id());
+    let dir = std::env::temp_dir().join(&tag);
+    let src = schemaic_core::export::ident_sql(&catalog(conn).ok()?, D);
+    let alias = schemaic_core::export::ident_sql(&tag, D);
+    let path = schemaic_core::export::sql_literal(
+        &Value::Str(dir.to_string_lossy().replace('\\', "/")),
+        D,
+    );
+    conn.execute_batch(&format!("ATTACH ':memory:' AS {alias}"))
+        .ok()?;
+    let exported = conn
+        .execute_batch(&format!(
+            "COPY FROM DATABASE {src} TO {alias} (SCHEMA); EXPORT DATABASE {alias} TO {path}"
+        ))
+        .ok()
+        .and_then(|()| std::fs::read_to_string(dir.join("schema.sql")).ok());
+    let _ = conn.execute_batch(&format!("DETACH {alias}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(exported_macros(&exported?))
+}
+
+/// A macro's overloads written as one `CREATE MACRO` declares them, after the
+/// first's parameter list: `body, (a, b) AS body2`. A **table** macro with
+/// more than one has each query in parentheses — `AS TABLE SELECT a, 1, (a, b)
+/// AS TABLE …` is a parse error (measured on 2.0.0), the `SELECT`'s own commas
+/// running on into the next overload; a scalar body is one expression, with no
+/// top-level comma to confuse.
+fn fold_overloads(table: bool, overloads: &[(String, String)]) -> String {
+    let wrap = table && overloads.len() > 1;
+    let body = |b: &str| {
+        if wrap {
+            format!("({b})")
+        } else {
+            b.to_string()
+        }
+    };
+    let kw = if table { "TABLE " } else { "" };
+    overloads
+        .iter()
+        .enumerate()
+        .map(|(i, (p, b))| {
+            if i == 0 {
+                body(b)
+            } else {
+                format!("({p}) AS {kw}{}", body(b))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The `SELECT` of a stored `CREATE VIEW` — what follows its first top-level
 /// `AS` — or the whole text where it has none. DuckDB keeps the view's
 /// statement as written (`duckdb_views().sql`); the editor and the differ want
@@ -1430,6 +1503,168 @@ fn view_body(sql: &str) -> String {
         i += 1;
     }
     sql.trim().trim_end_matches(';').trim().to_string()
+}
+
+/// One `CREATE MACRO` of an `EXPORT DATABASE` script, as
+/// [`exported_macros`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExportedMacro {
+    schema: String,
+    name: String,
+    table: bool,
+    /// Each overload's parameter list, defaults and all (`a, b := 2`), and its
+    /// body with the parentheses the export wraps it in taken off.
+    overloads: Vec<(String, String)>,
+}
+
+/// The `CREATE MACRO` statements of the `schema.sql` that `EXPORT DATABASE`
+/// writes — the one place DuckDB 2.0.0 prints a macro's parameter defaults
+/// ([`RoutineInfo::defaults_unread`]; [`read_macro_defaults`]).
+///
+/// The export's form is regular (measured on 2.0.0):
+/// `CREATE MACRO s."n" (a, b := 2) AS ((a + b)), (a) AS (a);`, or
+/// `AS TABLE (SELECT …)` — every body inside one pair of parentheses of the
+/// export's own, which is what lets a top-level comma end an overload even
+/// after a table macro's `SELECT x, y`. That pair is taken off, so a body reads
+/// as `duckdb_functions().macro_definition` gives it. A statement that is not
+/// in this form is skipped, never guessed at.
+fn exported_macros(script: &str) -> Vec<ExportedMacro> {
+    schemaic_core::sql::statement_ranges(script, D)
+        .into_iter()
+        .filter_map(|(s, e)| exported_macro(script[s..e].trim().trim_end_matches(';').trim()))
+        .collect()
+}
+
+/// [`exported_macros`] for one statement.
+fn exported_macro(stmt: &str) -> Option<ExportedMacro> {
+    let head = "CREATE MACRO ";
+    if !stmt
+        .get(..head.len())
+        .is_some_and(|h| h.eq_ignore_ascii_case(head))
+    {
+        return None;
+    }
+    let b = stmt.as_bytes();
+    // The name: dotted parts, each bare or double-quoted, up to the first `(`.
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = head.len();
+    loop {
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        if b.get(i) == Some(&b'"') {
+            let end = schemaic_core::sql::skip_noncode(b, i, D)?;
+            parts.push(stmt[i + 1..end - 1].replace("\"\"", "\""));
+            i = end;
+        } else {
+            let start = i;
+            while b
+                .get(i)
+                .is_some_and(|c| schemaic_core::sql::is_word_byte(*c))
+            {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+            parts.push(stmt[start..i].to_string());
+        }
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        match b.get(i) {
+            Some(b'.') => i += 1,
+            Some(b'(') => break,
+            _ => return None,
+        }
+    }
+    let (schema, name) = match parts.as_slice() {
+        [n] => (
+            schemaic_core::schema::DUCKDB_DEFAULT_SCHEMA.to_string(),
+            n.clone(),
+        ),
+        [s, n] => (s.clone(), n.clone()),
+        [_, s, n] => (s.clone(), n.clone()),
+        _ => return None,
+    };
+    let mut overloads = Vec::new();
+    let mut table = None;
+    loop {
+        // `(params)`
+        let close = matching_paren(b, i)?;
+        let params = stmt[i + 1..close].trim().to_string();
+        i = close + 1;
+        // `AS [TABLE]`
+        let rest = stmt[i..].trim_start();
+        i = stmt.len() - rest.len();
+        if !rest.get(..3).is_some_and(|w| w.eq_ignore_ascii_case("AS ")) {
+            return None;
+        }
+        i += 3;
+        let rest = stmt[i..].trim_start();
+        i = stmt.len() - rest.len();
+        let is_table = rest
+            .get(..6)
+            .is_some_and(|w| w.eq_ignore_ascii_case("TABLE "));
+        if is_table {
+            i += 6;
+            let rest = stmt[i..].trim_start();
+            i = stmt.len() - rest.len();
+        }
+        if *table.get_or_insert(is_table) != is_table {
+            return None;
+        }
+        // `(body)` — the export's own pair.
+        if b.get(i) != Some(&b'(') {
+            return None;
+        }
+        let close = matching_paren(b, i)?;
+        overloads.push((params, stmt[i + 1..close].trim().to_string()));
+        i = close + 1;
+        let rest = stmt[i..].trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        let rest = rest.strip_prefix(',')?.trim_start();
+        i = stmt.len() - rest.len();
+        if b.get(i) != Some(&b'(') {
+            return None;
+        }
+    }
+    Some(ExportedMacro {
+        schema,
+        name,
+        table: table?,
+        overloads,
+    })
+}
+
+/// The index of the `)` closing the `(` at `open`, skipping strings, quoted
+/// names and comments.
+fn matching_paren(b: &[u8], open: usize) -> Option<usize> {
+    if b.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < b.len() {
+        if let Some(next) = schemaic_core::sql::skip_noncode(b, i, D) {
+            i = next;
+            continue;
+        }
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Introspect the file's catalog: its schemas, tables and views with their
@@ -1716,7 +1951,10 @@ fn read_schema(conn: &DuckConn) -> Result<DbSchema, DbError> {
 
     // Macros — DuckDB's user functions: an expression or a table query.
     let mut routines: Vec<Arc<RoutineInfo>> = Vec::new();
-    // Each entry's overload arities, beside it, for the defaults probe.
+    // Each entry's overloads, beside it — parameter list and body — folded
+    // into its body once all are read ([`fold_overloads`]).
+    let mut overloads: Vec<Vec<(String, String)>> = Vec::new();
+    // And their arities, for the defaults probe.
     let mut arities: Vec<Vec<usize>> = Vec::new();
     let mut stmt = conn
         .prepare(
@@ -1755,12 +1993,11 @@ fn read_schema(conn: &DuckConn) -> Result<DbSchema, DbError> {
         if let Some(i) = routines.iter().position(|x| {
             x.name == name && x.schema.as_deref() == Some(schema.as_str()) && x.returns == returns
         }) {
-            let table = if returns.is_empty() { "" } else { "TABLE " };
-            let first = Arc::make_mut(&mut routines[i]);
-            first.body = format!("{}, ({params}) AS {table}{def}", first.body);
+            overloads[i].push((params, def));
             arities[i].push(names.len());
             continue;
         }
+        overloads.push(vec![(params.clone(), def.clone())]);
         routines.push(Arc::new(RoutineInfo {
             name,
             schema: Some(schema),
@@ -1780,11 +2017,40 @@ fn read_schema(conn: &DuckConn) -> Result<DbSchema, DbError> {
     }
     drop(rows);
     drop(stmt);
-    // What the catalogue leaves out: a parameter's default.
-    for (r, arities) in routines.iter_mut().zip(&arities) {
-        if macro_hides_defaults(conn, r, arities) {
-            Arc::make_mut(r).defaults_unread = true;
+    // What the catalogue leaves out: a parameter's default. Where a macro has
+    // one, the export is asked for its declaration ([`read_macro_defaults`]) —
+    // once, however many macros want it — and the macro is read from there
+    // when it lists as many overloads as the catalogue does. Otherwise it is
+    // left as read, and marked.
+    let mut exported: Option<Option<Vec<ExportedMacro>>> = None;
+    for ((r, arities), overloads) in routines.iter_mut().zip(&arities).zip(&mut overloads) {
+        if !macro_hides_defaults(conn, r, arities) {
+            continue;
         }
+        let table = r.returns == "TABLE";
+        let found = exported
+            .get_or_insert_with(|| read_macro_defaults(conn))
+            .as_ref()
+            .and_then(|ms| {
+                ms.iter().find(|m| {
+                    Some(m.schema.as_str()) == r.schema.as_deref()
+                        && m.name == r.name
+                        && m.table == table
+                        && m.overloads.len() == arities.len()
+                })
+            });
+        let r = Arc::make_mut(r);
+        match found {
+            Some(m) => {
+                *overloads = m.overloads.clone();
+                r.arguments = overloads[0].0.clone();
+            }
+            None => r.defaults_unread = true,
+        }
+    }
+    for (r, overloads) in routines.iter_mut().zip(&overloads) {
+        let table = r.returns == "TABLE";
+        Arc::make_mut(r).body = fold_overloads(table, overloads);
     }
 
     Ok(DbSchema {
@@ -2740,6 +3006,114 @@ mod tests {
             .await
     }
 
+    /// `EXPORT DATABASE`'s `schema.sql` as 2.0.0 writes it (measured): each
+    /// macro's overloads come back with their parameter lists, defaults and
+    /// all, and their bodies without the export's own parentheses. A quoted,
+    /// qualified name and a default holding a comma and a parenthesis are
+    /// read whole; the statements that are not macros are passed over.
+    #[test]
+    fn the_exports_macros_are_read_with_their_defaults() {
+        let script = "CREATE SCHEMA s;\n\
+            CREATE TABLE t(i INTEGER DEFAULT(nextval('sq')) PRIMARY KEY);\n\
+            CREATE MACRO m (a, b := 2) AS ((a + b));\n\
+            CREATE MACRO s.\"we,ird (m)\" (a INTEGER, b := 'x, (y)') AS (a);\n\
+            CREATE MACRO ov (a) AS (a), (a, b := 3) AS ((a * b)), \
+              (a, b, c := \"system\".main.list_value(1, 2)) AS (c[a]);\n\
+            CREATE MACRO tov (a) AS TABLE (SELECT a, 1), (a, b := 2) AS TABLE (SELECT a, b);\n\
+            CREATE VIEW v AS SELECT * FROM t;\n\n";
+        let ms = exported_macros(script);
+        let o = |p: &str, b: &str| (p.to_string(), b.to_string());
+        assert_eq!(
+            ms,
+            [
+                ExportedMacro {
+                    schema: "main".into(),
+                    name: "m".into(),
+                    table: false,
+                    overloads: vec![o("a, b := 2", "(a + b)")],
+                },
+                ExportedMacro {
+                    schema: "s".into(),
+                    name: "we,ird (m)".into(),
+                    table: false,
+                    overloads: vec![o("a INTEGER, b := 'x, (y)'", "a")],
+                },
+                ExportedMacro {
+                    schema: "main".into(),
+                    name: "ov".into(),
+                    table: false,
+                    overloads: vec![
+                        o("a", "a"),
+                        o("a, b := 3", "(a * b)"),
+                        o("a, b, c := \"system\".main.list_value(1, 2)", "c[a]"),
+                    ],
+                },
+                ExportedMacro {
+                    schema: "main".into(),
+                    name: "tov".into(),
+                    table: true,
+                    overloads: vec![o("a", "SELECT a, 1"), o("a, b := 2", "SELECT a, b")],
+                },
+            ]
+        );
+    }
+
+    /// A statement not in the export's form is skipped, not guessed at: a
+    /// body without the export's parentheses, a missing `AS`, a scalar and a
+    /// table overload in one statement, an unclosed list.
+    #[test]
+    fn an_export_statement_out_of_form_is_skipped() {
+        for s in [
+            "CREATE MACRO m (a) AS a + 1",
+            "CREATE MACRO m (a) (a)",
+            "CREATE MACRO m (a) AS (a), (a, b) AS TABLE (SELECT 1)",
+            "CREATE MACRO m (a, b := 2 AS (a)",
+            "CREATE MACRO (a) AS (a)",
+            "CREATE TABLE m (a INT)",
+        ] {
+            assert_eq!(exported_macros(s), [], "{s}");
+        }
+    }
+
+    /// Overloads fold into the form one `CREATE MACRO` declares them in; a
+    /// table macro's queries are parenthesised once there is more than one,
+    /// since `AS TABLE SELECT a, 1, (a, b) AS TABLE …` does not parse.
+    #[test]
+    fn overloads_fold_into_one_declaration() {
+        let o = |p: &str, b: &str| (p.to_string(), b.to_string());
+        assert_eq!(fold_overloads(false, &[o("a", "(a + 1)")]), "(a + 1)");
+        assert_eq!(
+            fold_overloads(false, &[o("a", "a"), o("a, b := 2", "(a * b)")]),
+            "a, (a, b := 2) AS (a * b)"
+        );
+        assert_eq!(fold_overloads(true, &[o("n", "SELECT 1")]), "SELECT 1");
+        assert_eq!(
+            fold_overloads(true, &[o("a", "SELECT a, 1"), o("a, b", "SELECT a, b")]),
+            "(SELECT a, 1), (a, b) AS TABLE (SELECT a, b)"
+        );
+    }
+
+    /// **An overloaded table macro replays.** Its overloads were folded
+    /// with bare queries, `SELECT a, 1, (a, b) AS TABLE SELECT a, b`, which
+    /// DuckDB refuses — *Copy DDL*, the dump and every edit of one failed.
+    #[test]
+    fn an_overloaded_table_macro_replays() {
+        let db = mem("macro-table-overloads");
+        seed(
+            &db,
+            "CREATE MACRO tov(a) AS TABLE (SELECT a, 1), (a, b) AS TABLE SELECT a, b;",
+        );
+        let ms = macros_of(&db);
+        let sql = macro_named(&ms, "tov", "TABLE").create_sql(SqlDialect::DuckDb, true);
+        let (_i, c) = connect(&db).unwrap();
+        c.execute_batch(&sql)
+            .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        let n: i64 = c
+            .query_row("SELECT count(*) FROM tov(1, 2)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
     /// A path with no file behind it is refused before DuckDB is asked —
     /// DuckDB's open would create one.
     #[test]
@@ -2894,6 +3268,74 @@ mod tests {
             c.execute_batch("SET enable_external_access = true")
                 .is_err()
         );
+    }
+
+    /// **The read-only half of the seal, on a real file.** An in-memory
+    /// instance has no file to open `AccessMode::ReadOnly`, so this is the
+    /// one test here that makes one (the user's say-so, 2026-11-09): a
+    /// sealed handle reads the file and refuses every write, and the file
+    /// holds what it held.
+    #[test]
+    fn a_sealed_file_is_opened_read_only() {
+        /// Removes the directory however the test ends.
+        struct Dir(std::path::PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir =
+            Dir(std::env::temp_dir().join(format!("schemaic-sealed-file-{}", std::process::id())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("sealed.duckdb");
+        DuckConn::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE t(x INT); INSERT INTO t VALUES (1);")
+            .unwrap();
+        let file = path.to_string_lossy().into_owned();
+        let handle = |sealed: bool| {
+            let db = Db::from_parts(
+                crate::Engine::DuckDb,
+                String::new(),
+                0,
+                String::new(),
+                String::new(),
+                file.clone(),
+            );
+            if sealed { db.sealed() } else { db }
+        };
+        {
+            let (_i, c) = connect(&handle(true)).unwrap();
+            let n: i64 = c
+                .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1);
+            for write in [
+                "INSERT INTO t VALUES (2)",
+                "CREATE TABLE u(y INT)",
+                "DROP TABLE t",
+            ] {
+                let Err(e) = c.execute_batch(write) else {
+                    panic!("a sealed file took {write}");
+                };
+                assert!(e.to_string().contains("read-only"), "{write}: {e}");
+            }
+        }
+        // The sealed instance has closed with its last connection, so the
+        // file opens the other way, and holds what it did.
+        let (_i, c) = connect(&handle(false)).unwrap();
+        let tables: Vec<String> = c
+            .prepare("SELECT table_name FROM duckdb_tables()")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(tables, ["t"]);
+        let n: i64 = c
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]
@@ -4806,24 +5248,89 @@ mod tests {
             .unwrap_or_else(|| panic!("no macro {name} returning {returns:?} in {ms:#?}"))
     }
 
-    /// **A default the catalogue hides is found by binding.** Each macro
-    /// below with one is marked, and so listed but not editable; each
-    /// without one is left editable — overloads, table macros and typed
-    /// parameters included. A typed macro's types are read back with it.
+    /// The macros below, some with defaults the catalogue hides.
+    const MACROS_WITH_DEFAULTS: &str = "CREATE MACRO m(a, b := 2) AS a + b;
+         CREATE MACRO p(a, b) AS a + b;
+         CREATE MACRO ov(a) AS a, (a, b) AS a + b;
+         CREATE MACRO ovd(a) AS a, (a, b := 5) AS a + b;
+         CREATE MACRO tmd(n, k := 1) AS TABLE SELECT * FROM range(n);
+         CREATE MACRO tmp(n) AS TABLE SELECT * FROM range(n);
+         CREATE MACRO typed(a INTEGER, b INTEGER) AS a + b;
+         CREATE MACRO zero() AS 42;";
+
+    /// **A default the catalogue hides is read from the export.** Each macro
+    /// with one comes back with its parameter list as declared, defaults and
+    /// all, and editable; each without one reads as the catalogue gives it —
+    /// overloads, table macros and typed parameters included.
     #[test]
-    fn a_macros_hidden_defaults_are_found_by_binding() {
+    fn a_macros_hidden_defaults_are_read_from_the_export() {
         let db = mem("macro-defaults");
-        seed(
-            &db,
-            "CREATE MACRO m(a, b := 2) AS a + b;
-             CREATE MACRO p(a, b) AS a + b;
-             CREATE MACRO ov(a) AS a, (a, b) AS a + b;
-             CREATE MACRO ovd(a) AS a, (a, b := 5) AS a + b;
-             CREATE MACRO tmd(n, k := 1) AS TABLE SELECT * FROM range(n);
-             CREATE MACRO tmp(n) AS TABLE SELECT * FROM range(n);
-             CREATE MACRO typed(a INTEGER, b INTEGER) AS a + b;
-             CREATE MACRO zero() AS 42;",
-        );
+        seed(&db, MACROS_WITH_DEFAULTS);
+        let ms = macros_of(&db);
+        for (name, returns, arguments, body) in [
+            ("m", "", "a, b := 2", "(a + b)"),
+            ("p", "", "a, b", "(a + b)"),
+            ("ov", "", "a", "a, (a, b) AS (a + b)"),
+            ("ovd", "", "a", "a, (a, b := 5) AS (a + b)"),
+            ("tmd", "TABLE", "n, k := 1", "SELECT * FROM \"range\"(n)"),
+            ("tmp", "TABLE", "n", "SELECT * FROM \"range\"(n)"),
+            ("typed", "", "a INTEGER, b INTEGER", "(a + b)"),
+            ("zero", "", "", "42"),
+        ] {
+            let m = macro_named(&ms, name, returns);
+            assert!(!m.defaults_unread, "{name}");
+            assert!(m.is_editable(), "{name}");
+            assert_eq!(
+                (m.arguments.as_str(), m.body.as_str()),
+                (arguments, body),
+                "{name}"
+            );
+        }
+        // The scratch database the export was made from is gone.
+        let (_i, c) = connect(&db).unwrap();
+        let attached: i64 = c
+            .query_row(
+                "SELECT count(*) FROM duckdb_databases() \
+                  WHERE database_name LIKE 'schemaic_macro_defaults%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(attached, 0);
+    }
+
+    /// What is read replays: each macro's `CREATE`, run on a fresh
+    /// database, makes a macro that still answers a call leaning on its
+    /// defaults — `m(1)` is `3`, `ovd(1, 1)` and `ovd(1)` both still bind.
+    #[test]
+    fn a_macro_read_with_its_defaults_replays_with_them() {
+        let db = mem("macro-defaults-replay");
+        seed(&db, MACROS_WITH_DEFAULTS);
+        let fresh = mem("macro-defaults-replay-into");
+        let (_i, c) = connect(&fresh).unwrap();
+        for m in macros_of(&db) {
+            let sql = m.create_sql(SqlDialect::DuckDb, false);
+            assert!(!sql.starts_with("--"), "{sql}");
+            c.execute_batch(&sql)
+                .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        }
+        let three: i64 = c.query_row("SELECT m(1)", [], |r| r.get(0)).unwrap();
+        assert_eq!(three, 3);
+        let six: i64 = c.query_row("SELECT ovd(1, 5)", [], |r| r.get(0)).unwrap();
+        assert_eq!(six, 6);
+        let rows: i64 = c
+            .query_row("SELECT count(*) FROM tmd(4)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 4);
+    }
+
+    /// **Where the export cannot be made, the macro is marked** — listed,
+    /// not editable — rather than read without its defaults. A sealed handle
+    /// has external access off, so its export fails.
+    #[test]
+    fn a_hidden_default_the_export_cannot_reach_is_marked() {
+        let db = mem("macro-defaults-sealed").sealed();
+        seed(&db, MACROS_WITH_DEFAULTS);
         let ms = macros_of(&db);
         for (name, returns, hidden) in [
             ("m", "", true),
@@ -4839,10 +5346,6 @@ mod tests {
             assert_eq!(m.defaults_unread, hidden, "{name}");
             assert_eq!(m.is_editable(), !hidden, "{name}");
         }
-        assert_eq!(
-            macro_named(&ms, "typed", "").arguments,
-            "a INTEGER, b INTEGER"
-        );
     }
 
     /// A scalar and a table macro of one name are two macros to DuckDB, and
@@ -4975,11 +5478,12 @@ mod tests {
     /// cast, the dropped one gone), the table that used the sequence goes
     /// before it, and the view is replaced with its comment restated.
     ///
-    /// **And what cannot be planned is said, not lost**: a macro whose
-    /// parameter defaults DuckDB hides is held back — planned, it was created
-    /// without them and differed again after every Apply — and a table
-    /// another table's key references, which DuckDB cannot rebuild, is
-    /// withheld while the rest of the plan applies.
+    /// **And what cannot be planned is said, not lost**: a table another
+    /// table's key references, which DuckDB cannot rebuild, is withheld while
+    /// the rest of the plan applies. A macro whose parameter defaults the
+    /// catalogue hides is planned with them, read from the export; it was
+    /// held back while they were unreadable, and is still where the export
+    /// cannot be made (`compare`'s own tests).
     #[test]
     fn a_compare_rebuilds_what_it_must_and_holds_back_what_it_cannot_restate() {
         let common = "CREATE TABLE p(id INTEGER PRIMARY KEY, v INTEGER);
@@ -5038,14 +5542,12 @@ mod tests {
             .iter()
             .position(|s| s.contains("DROP SEQUENCE \"main\".\"sq\""));
         assert!(drop_table < drop_seq, "{stmts:#?}");
-        assert!(stmts.iter().all(|s| !s.contains("withdef")), "{stmts:#?}");
-        let omitted = plan.omitted();
+        // The macro's default is read from the export, so it is planned with it.
         assert!(
-            omitted
-                .iter()
-                .any(|o| o.contains("withdef") && o.contains("defaults")),
-            "{omitted:#?}"
+            stmts.iter().any(|s| s.contains("\"withdef\"(a, b := 2)")),
+            "{stmts:#?}"
         );
+        assert!(plan.omitted().is_empty(), "{:#?}", plan.omitted());
         rt().block_on(dst.run_ddl("", &stmts, CancellationToken::new()))
             .unwrap_or_else(|e| panic!("{e} — plan {stmts:#?}"));
         assert_eq!(
@@ -5059,7 +5561,7 @@ mod tests {
             .differences()
             .map(|e| e.label())
             .collect();
-        assert_eq!(left, ["main.p", "main.withdef(a, b)"]);
+        assert_eq!(left, ["main.p"]);
     }
 
     /// Two files compared and the plan applied: every kind DuckDB holds —

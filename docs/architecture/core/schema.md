@@ -726,7 +726,10 @@ routine's *source*, which is right for every language whose body is source text 
 materialized view gets. **`defaults_unread` is DuckDB's case of the same gate**: a macro
 parameter's default (`b := 2`) is in no catalogue column — `duckdb_functions()` lists the
 parameter as a bare `b` (measured on 2.0.0) — so `db::duckdb`'s reader learns by binding that one
-exists, never what it is, and sets the flag. Any restatement would drop the default, so
+exists and reads what it is from an `EXPORT DATABASE` of a row-less copy of the schema
+(`read_macro_defaults`, under `db/duckdb.rs`). Only where that export cannot be read — a sealed
+handle, whose external access is off — does the reader know a default exists without knowing it,
+and set the flag. Any restatement would then drop the default, so
 `is_editable` is false; and `duckdb_create_sql` heads the statement with a `-- DuckDB does not
 report this macro's parameter defaults; they are not restated below.` line, so *Copy DDL* and the
 dump hand over a macro that says what it lost rather than one that lost it silently

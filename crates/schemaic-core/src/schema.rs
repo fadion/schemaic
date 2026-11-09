@@ -4066,11 +4066,13 @@ pub struct RoutineInfo {
     /// **SQL Server**: the `WITH` options and fallbacks — see
     /// [`TsqlRoutine`]. Default everywhere else.
     pub tsql: TsqlRoutine,
-    /// **DuckDB.** The macro has parameter defaults (`b := 2`) the catalogue
-    /// does not report: `duckdb_functions()` lists such a parameter as a bare
-    /// `b`, and no column holds the value (measured on 2.0.0). The reader
-    /// learns that one exists by binding a call that only a default could
-    /// complete (`db::duckdb`), not what it is.
+    /// **DuckDB.** The macro has parameter defaults (`b := 2`) that could not
+    /// be read: `duckdb_functions()` lists such a parameter as a bare `b`, and
+    /// no column holds the value (measured on 2.0.0). The reader learns that
+    /// one exists by binding a call that only a default could complete, then
+    /// reads the declaration from an `EXPORT DATABASE` of the schema
+    /// (`db::duckdb`); this is set only where that export could not be made —
+    /// a sealed handle, whose external access is off.
     ///
     /// Such a macro is **listed and droppable, and not editable**
     /// ([`RoutineInfo::is_editable`]) — any restatement would drop the
@@ -4369,7 +4371,8 @@ impl RoutineInfo {
     /// A macro's later overloads arrive folded into `body` as
     /// `…, (a, b) AS expr` (`db::duckdb`), the form one `CREATE MACRO`
     /// declares them in, so they come back with it. A parameter's default is
-    /// not in the catalogue and is not restated.
+    /// in `arguments` where the reader could read it (`db::duckdb`), and so
+    /// restated.
     /// It was `mysql_create_sql`'s `CREATE FUNCTION … NOT DETERMINISTIC` until
     /// this arm existed, which DuckDB refuses — *Copy DDL* on a macro wrote it.
     ///

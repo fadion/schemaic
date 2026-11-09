@@ -87,9 +87,9 @@ A DuckDB connection is a database file on this machine, like SQLite's; see
 - running statements and scripts, including `.sql` files;
 - the schema tree — schemas, tables and views with their columns, keys and indexes, sequences, and
   macros — and each object's DDL, which is DuckDB's own stored `CREATE` statement. A macro's is
-  rebuilt from the catalogue, every overload included, but DuckDB doesn't keep a parameter's
-  default there, so `CREATE MACRO m(a, b := 2)` comes back as `m(a, b)`, under a comment line
-  saying the defaults aren't restated. A dump writes the macro the same way;
+  rebuilt from the catalogue, every overload included. DuckDB doesn't keep a parameter's default
+  there, so Schemaic reads defaults such as `b := 2` back from DuckDB's own export of the schema,
+  and a dump writes the macro the same way;
 - editing results in the grid, for a result read from one table with a primary key — see
   [Editing data](../results-grid/editing.md#what-can-be-edited);
 - **Import** into a table, from CSV, JSON or Excel, in one transaction — see
@@ -124,15 +124,11 @@ A DuckDB connection is a database file on this machine, like SQLite's; see
 - the macro editor, from the edit entry on a macro's right-click menu, and a new macro from
   **Create** › **Function**. There's no **Procedure**, since DuckDB has none. Leave **Returns**
   empty for a scalar macro, or write `TABLE` for a table macro, whose **Body** is a query.
-  **Parameters** are names, optionally typed (`a, b INTEGER`), and further overloads go in
-  **Body** the way one `CREATE MACRO` declares them: `a + 1, (a, b) AS a + b`. Renaming a macro,
-  or switching it between scalar and table, drops and re-creates it in one transaction. The
+  **Parameters** are names, optionally typed, with defaults where wanted (`a INTEGER, b := 0`),
+  and further overloads go in **Body** the way one `CREATE MACRO` declares them:
+  `a + 1, (a, b) AS a + b`. Renaming a macro, or switching it between scalar and table, drops and
+  re-creates it in one transaction. The
   **Comment** is kept across every edit, and **Drop** works on both kinds.
-
-  A macro with parameter defaults (`b := 2`) can be dropped but not edited, because DuckDB doesn't
-  report the defaults and Schemaic can't write them back: its edit entry is greyed out, and
-  double-clicking it does nothing. Defaults you type into **Parameters** are accepted, but the
-  macro can't be edited in Schemaic again after that.
 
 There's no **Restore from file**: to restore a backup, open the copy as a connection, as on SQLite.
 

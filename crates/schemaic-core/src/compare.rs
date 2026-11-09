@@ -474,7 +474,7 @@ pub enum HeldBack {
         min: String,
         max: String,
     },
-    /// A DuckDB macro whose parameter defaults the catalogue does not report
+    /// A DuckDB macro whose parameter defaults could not be read
     /// ([`RoutineInfo::defaults_unread`]): written from its reading, it would
     /// lose them.
     DefaultsUnread,

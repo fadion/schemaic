@@ -16,7 +16,7 @@ grid edits back (on provenance read from the statement, never keyed on `rowid`) 
 tab's transaction — pinning the file's instance, and its lock, while it does — and edits
 **tables** (in place where its `ALTER TABLE` can, through a rebuild where it cannot —
 `ddl::duckdb_rebuild_sql`, decided per table by `ddl::alters_in_place`), **views** and
-**macros** — a macro whose parameter defaults its catalogue hides is listed but not editable — compares two files' schemas (creating and dropping schemas and sequences on the way),
+**macros** — the parameter defaults its catalogue hides read back from an export of the schema — compares two files' schemas (creating and dropping schemas and sequences on the way),
 and opens a CSV, Parquet or JSON file as a view in an in-memory session that is never saved
 (`db::duckdb::DataSession`, `Connection::is_data_session`).
 SQLite reads, writes, imports and edits **tables** (through the twelve-step rebuild —
@@ -262,10 +262,15 @@ start with a failing test, then the code that makes it pass.
   unheld.
   Use SQLite's shared-cache memory URI (`file:name?mode=memory&cache=shared`, unique name per test)
   where several connections must reach one database, as the write paths do — a plain `:memory:` is
-  private to one connection, and a temp file would break the rule for real. **Exactly one function
-  is sanctioned to break it** — `export::export_xlsx_chunks`, with the user's say-so; why, and what
-  it costs, is in `docs/architecture/core/export.md`. Read it as *the* one case, not as licence for a second:
-  anything else wanting a real file still models it at the boundary. Don't commit with failing
+  private to one connection, and a temp file would break the rule for real. **Three cases are
+  sanctioned to break it, each with the user's say-so**: `export::export_xlsx_chunks` (why, and what
+  it costs, is in `docs/architecture/core/export.md`); `db::duckdb`'s
+  `a_sealed_file_is_opened_read_only`, since `AccessMode::ReadOnly` needs a file to open and an
+  in-memory instance has none; and `db::duckdb::read_macro_defaults`, whose `EXPORT DATABASE` of an
+  empty schema copy writes a directory under the system temp directory — every DuckDB test that
+  reads a macro with a parameter default goes through it, DuckDB 2.0.0 having no in-memory
+  filesystem to export to (`docs/architecture/db/duckdb.md`). Read them as a closed list, not as
+  licence for a fourth: anything else wanting a real file still models it at the boundary. Don't commit with failing
   or `#[ignore]`d tests unless the user asks. **Reading the repository's own source is the one
   exempt kind of filesystem access**, because there the thing under test *is* a file:
   `core/tests/doc_coverage.rs` asserts every `src/*.rs` module is named somewhere in the
