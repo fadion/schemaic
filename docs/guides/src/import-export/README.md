@@ -66,8 +66,9 @@ but nothing translates a type or option one has and the other lacks.
   file adds the foreign keys after the data instead.
 - *Import into a table* works on every engine. On a MySQL table whose storage engine isn't
   transactional (MyISAM, for one), a failed import can't be undone.
-- *A SQL export* isn't offered on DuckDB yet, though running a `.sql` file with **Import** on a
-  DuckDB database does work.
+- *A SQL export* on DuckDB with **Drop before create** but not **One transaction** stops, when
+  replayed onto a database that still holds the tables, at the first table a foreign key points
+  at, or at the first macro. Leave **One transaction** on for that.
 
 ## In this section
 

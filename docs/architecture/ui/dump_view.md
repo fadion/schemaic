@@ -38,7 +38,10 @@ since there the file replaces each routine it carries beside its `CREATE` (`dump
 under `core/dump.rs`); SQLite's still speaks of tables alone. Where a table's drop takes its
 owner and grants (`access::drop_resets_table_access`) the hint says they are put back at the end,
 and MySQL's that the routine grants its drops revoke are granted back where the account can read
-`mysql.procs_priv`.
+`mysql.procs_priv`. DuckDB, which drops up front with no owner or grant to lose, gets
+`DropHint::UpFrontNoGrants` (`dump-drop-hint-up-front-no-grants`): no promise to put any back,
+and that without *One transaction* a replay stops at the first table a foreign key points at, or
+at the first routine (`english_hints_every_replay_toggle_as_core_does` holds its English to core's).
 **One panel serves all six, and the split is asked as a capability.** Which entry was clicked is
 `DumpTarget::format`, and `DumpTarget::writes_folder()` — `!matches!(format, Sql)`, written once
 — is what the modal branches on: the title (`Export sakila to CSV`, the one thing about this

@@ -66,7 +66,8 @@ Each of these is a one-session change.
 Phase 1 has landed: the engine reads, runs scripts and DDL plans, introspects, exports, plans,
 backs up and opens its CLI, behind its own read-only gate (`docs/architecture/db/duckdb.md`).
 Phase 2's grid write-back has landed too, on provenance read from the statement (`rowid` is never
-a key, because a checkpoint renumbers it), and so has import. What is left is below. ClickHouse would come after
+a key, because a checkpoint renumbers it), and so have import and the `.sql` dump. What is left is
+below. ClickHouse would come after
 DuckDB.
 
 - **Decided — the unattended paths cannot read files:** done in phase 1 (`Db::sealed`, called by
@@ -76,19 +77,6 @@ DuckDB.
   stated in the invariants. A Manual tab's session will hold the instance — and with it the file's
   lock — for as long as the tab is pinned, which is the one thing phase 2 must say in the UI.
 - **Phase 2 — the rest of the writes:**
-  - **The dump** (`dump::supports_dump`). Not "every arm already answers", as its comment says:
-    `drops_up_front` comes out true for DuckDB (no FK switch, no `CASCADE`), which puts it on SQL
-    Server's path — `plan` then writes T-SQL `IF OBJECT_ID(…)` guards and `DropHint::UpFront`
-    describes SQL Server; a table's verbatim `create_sql` carries no `CREATE INDEX`, so indexes
-    are lost (SQLite appends its index statements to the text; DuckDB has them in `IndexInfo`); a
-    sequence is restated at its start value, so a `nextval` default collides after a restore; and
-    a table outside `main` may be printed unqualified by `duckdb_tables().sql` — measure it.
-    Write the dump → `run_script` round trip in `db::duckdb`'s tests (the live `mssql.rs`
-    `dump_file`/`restore_file` are the shape).
-    Measured already: `duckdb_tables/views/indexes().sql` are schema-qualified; a sequence's
-    `sql` restates the current counter (`START 9` after two `nextval`s from 5 by 2) but **drops its
-    schema**; comments are in none of them; `DROP MACRO [TABLE] IF EXISTS` and `DROP FUNCTION IF
-    EXISTS` both drop a macro.
   - **Manual tabs** (`Session` for DuckDB, then `tx::supports_manual_mode`; `BEGIN TRANSACTION
     READ ONLY` is the read-only session). There is **no SQLite pinned session to copy** —
     `Session::open_enforced` refuses SQLite too — so this is a new `Backend` holding a blocking
@@ -120,10 +108,14 @@ DuckDB.
   DuckDB connection with every change refused behind it (*Copy to* is already hidden, through
   `ddl::supports_table_design`) — it clears itself when the designer lands. A file named
   `main.duckdb` makes `main.t` both a schema and a catalog, and its results are not attributed;
-  accept the reading where both resolve to the same table, if anyone hits it.
+  accept the reading where both resolve to the same table, if anyone hits it. The dump carries no
+  user type (`CREATE TYPE … AS ENUM`, a `STRUCT` alias): `duckdb_tables().sql` inlines it into each
+  column, so the table restores without it, but a view or macro naming the type fails its restore
+  — none is read into the model. Nor does it carry a view's or a macro's
+  comment (`docs/architecture/db/duckdb.md`).
 - **Phase 3:** translate the new strings (`db-refused-duckdb-*`, `connections-duckdb-*`,
-  `backup-kind-duckdb` are English in every catalogue but `en-GB`); measure
-  `intel::select_list_subquery_sees_earlier_aliases` (answered `false` unmeasured); the full CI
+  `backup-kind-duckdb`, `dump-drop-hint-up-front-no-grants` are English in every catalogue but
+  `en-GB`); measure `intel::select_list_subquery_sees_earlier_aliases` (answered `false` unmeasured); the full CI
   bar on every leg, which builds the amalgamation cold (about five minutes on this machine).
 
 ### Compare and sync table data

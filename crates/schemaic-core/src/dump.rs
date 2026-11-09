@@ -384,15 +384,17 @@ pub fn cancel_note(name: &str, partial: bool) -> String {
 /// Can a database be dumped to a `.sql` file on `dialect`?
 ///
 /// Every engine can now — SQL Server's took [`identity_insert_sql`] around an
-/// identity table's rows and [`close_batches`]' `GO` lines — but the match
-/// stays exhaustive, so an engine added later has to answer it rather than
-/// inherit a yes. The Export menu's *SQL* entry asks this.
+/// identity table's rows and [`close_batches`]' `GO` lines, DuckDB's took
+/// [`drop_key_if_present_sql`] and [`counter_restarts_as_start`] — but the
+/// match stays exhaustive, so an engine added later has to answer it rather
+/// than inherit a yes. The Export menu's *SQL* entry asks this.
 pub fn supports_dump(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
-        // Not yet: the DuckDB dump lands with the engine's write paths
-        // (roadmap, DuckDB phase 2). Every arm below already answers for it.
-        SqlDialect::DuckDb => false,
+        SqlDialect::MySql
+        | SqlDialect::Postgres
+        | SqlDialect::Sqlite
+        | SqlDialect::MsSql
+        | SqlDialect::DuckDb => true,
     }
 }
 
@@ -859,6 +861,60 @@ pub fn drops_up_front(dialect: SqlDialect) -> bool {
     fk_guard_sql(dialect).is_none() && drop_cascade(dialect).is_empty()
 }
 
+/// Is a sequence's `START WITH` the only way a file can put its counter back
+/// — so a dump that carries rows creates it starting at the value the source
+/// hands out next ([`crate::schema::SequenceInfo::continued`])?
+///
+/// **DuckDB's**: it has no `setval` and no `ALTER SEQUENCE … RESTART`, so a
+/// sequence created at its declared start handed out keys the restored rows
+/// already held, and the first insert after a restore failed on the primary
+/// key. DuckDB's own `duckdb_sequences().sql` restates the counter the same
+/// way. PostgreSQL moves a key's sequence on after the rows
+/// ([`sequence_resync_sql`]), SQL Server takes the used range
+/// (`TsqlObject::restart_sql`), and MariaDB restarts its sequence table
+/// (`TableInfo::sequence_restart_sql`).
+pub fn counter_restarts_as_start(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::DuckDb => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// The statement that drops the foreign key `name` from `table` (already
+/// quoted and qualified; the key lives in `namespace`) **only where it is
+/// there** — the first part of the section a file that [`drops_up_front`]
+/// opens with — or `None` where the file writes none.
+///
+/// **SQL Server's** is a guarded `ALTER TABLE … DROP CONSTRAINT`: a fresh
+/// database has no key to drop, and its tables then drop in any order.
+///
+/// **DuckDB has no `ALTER TABLE … DROP CONSTRAINT`** (2.0: *not
+/// implemented*), so its keys go with their tables, and the section's
+/// table drops — the mirror of the creation order, every referencing table
+/// before the one it references — are what let each drop through. A key
+/// from a table outside the file still refuses its target's drop, loudly,
+/// inside the transaction the section is only written in.
+pub fn drop_key_if_present_sql(
+    dialect: SqlDialect,
+    name: &str,
+    namespace: Option<&str>,
+    table: &str,
+) -> Option<String> {
+    match dialect {
+        SqlDialect::MsSql => {
+            let key = crate::schema::qualified_ident(name, namespace, dialect);
+            Some(format!(
+                "IF OBJECT_ID({}, N'F') IS NOT NULL ALTER TABLE {table} DROP CONSTRAINT {};",
+                crate::schema::ddl_string(&key, dialect),
+                ident_sql(name, dialect)
+            ))
+        }
+        // The engines that do not drop up front never ask: their keys go
+        // under the session switch or with `CASCADE`.
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => None,
+    }
+}
+
 /// The statement that stops a replay **before it drops anything** where
 /// `object` (an already-quoted, qualified name) is there — for something the
 /// file creates but cannot put back as it is, so must not drop — or `None`
@@ -919,6 +975,9 @@ pub fn drop_before_create_hint(dialect: SqlDialect) -> &'static str {
 pub enum DropHint {
     /// The file drops up front ([`drops_up_front`]).
     UpFront,
+    /// It drops up front where a drop takes no owner or grant
+    /// ([`crate::access::drop_resets_table_access`]) — DuckDB.
+    UpFrontNoGrants,
     /// Routines are replaced in place, beside each table.
     RoutinesInPlace,
     /// MySQL 8 drops each routine first; MariaDB replaces in place.
@@ -938,6 +997,12 @@ impl DropHint {
                  Without One transaction it leaves routines as they are, so a replay onto a \
                  database that still has them stops at the first one. Each table's owner and \
                  permissions are put back at the end."
+            }
+            DropHint::UpFrontNoGrants => {
+                "Drop each table and view before its CREATE, so the file loads onto a database \
+                 that already holds them. With One transaction it also replaces every routine in \
+                 their schemas. Without One transaction a replay onto a database that still holds \
+                 them stops at the first table a foreign key points at, or at the first routine."
             }
             DropHint::RoutinesInPlace => {
                 "DROP TABLE IF EXISTS before each CREATE, so the file loads onto a database \
@@ -961,8 +1026,10 @@ impl DropHint {
 
 /// See [`drop_before_create_hint`], whose rules this is.
 pub fn drop_hint(dialect: SqlDialect) -> DropHint {
-    if drops_up_front(dialect) {
+    if drops_up_front(dialect) && crate::access::drop_resets_table_access(dialect) {
         DropHint::UpFront
+    } else if drops_up_front(dialect) {
+        DropHint::UpFrontNoGrants
     } else if crate::ddl::supports_routine_editing(dialect)
         && crate::ddl::replay_replaces_routine_in_place(dialect, ServerFlavour::MySql)
     {
@@ -3463,7 +3530,17 @@ pub fn plan(
                         kind,
                         ObjectKind::Function | ObjectKind::Procedure | ObjectKind::Event
                     );
-                    let mut sql = o.create_sql(dialect);
+                    // A sequence goes on from where the source's counter is,
+                    // where its `START` is the only way to say so — the rows
+                    // carry keys it handed out.
+                    let mut sql = match &o {
+                        crate::schema::ObjectItem::Sequence(s)
+                            if opts.data && counter_restarts_as_start(dialect) =>
+                        {
+                            s.continued().create_sql(dialect)
+                        }
+                        _ => o.create_sql(dialect),
+                    };
                     // Replayed where nothing was dropped up front, written so
                     // a name already there does not stop the run — see
                     // `replay_create`.
@@ -3483,6 +3560,13 @@ pub fn plan(
                                 regranted.push((r.name.clone(), r.kind));
                             }
                         }
+                    } else if opts.structure && opts.drop_if_exists && kind == ObjectKind::Sequence
+                    {
+                        // **Where the file drops up front, a sequence is not
+                        // among the drops** — its position is state, and a
+                        // table outside the file may draw from it — so a
+                        // replay meets it standing, and keeps its counter.
+                        sql = sql.replacen("CREATE SEQUENCE ", "CREATE SEQUENCE IF NOT EXISTS ", 1);
                     }
                     // A routine the file recreates is dropped with the tables:
                     // replayed onto its source, its `CREATE` otherwise stops
@@ -3681,13 +3765,11 @@ pub fn plan(
                 {
                     continue;
                 }
-                let fk_name =
-                    crate::schema::qualified_ident(&fk.name, t.schema.as_deref(), dialect);
-                drops.push(format!(
-                    "IF OBJECT_ID({}, N'F') IS NOT NULL ALTER TABLE {} DROP CONSTRAINT {};",
-                    crate::schema::ddl_string(&fk_name, dialect),
-                    qname(t),
-                    q(&fk.name)
+                drops.extend(drop_key_if_present_sql(
+                    dialect,
+                    &fk.name,
+                    t.schema.as_deref(),
+                    &qname(t),
                 ));
             }
         }
@@ -4000,8 +4082,16 @@ pub fn plan(
     }
 
     // ── Checks that were off, once the rows they spared are in ───────────────
+    // On DuckDB, what waits for the rows is each table's indexes instead
+    // (`TableInfo::create_ddl_holding`).
     if !held_checks.is_empty() {
-        steps.push(DumpStep::Text("-- Checks".to_string()));
+        let heading = match dialect {
+            SqlDialect::DuckDb => "-- Indexes",
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => {
+                "-- Checks"
+            }
+        };
+        steps.push(DumpStep::Text(heading.to_string()));
         steps.extend(held_checks.into_iter().map(DumpStep::Text));
     }
 
@@ -8163,9 +8253,121 @@ mod tests {
             SqlDialect::Postgres,
             SqlDialect::Sqlite,
             SqlDialect::MsSql,
+            SqlDialect::DuckDb,
         ] {
             assert!(supports_dump(d), "{d:?}");
         }
+    }
+
+    /// **DuckDB drops up front with no key drop**: it has no `ALTER TABLE …
+    /// DROP CONSTRAINT`, and the T-SQL guard SQL Server's section opens with
+    /// stopped the restore at its first line. The referencing table is
+    /// dropped before the one it references instead; a sequence is created
+    /// only where missing, from the value the source hands out next; and the
+    /// hint speaks of no owner or permission.
+    #[test]
+    fn a_duckdb_dump_drops_children_first_and_continues_its_sequences() {
+        let d = SqlDialect::DuckDb;
+        let mut parent = table("parent");
+        parent.schema = Some("main".to_string());
+        parent.create_sql = Some("CREATE TABLE parent(id INTEGER PRIMARY KEY);".to_string());
+        let mut child = refs(table("child"), "parent");
+        child.schema = Some("main".to_string());
+        child.create_sql =
+            Some("CREATE TABLE child(id INTEGER REFERENCES parent(id));".to_string());
+        let mut s = schema_of(vec![child, parent]);
+        s.sequences.push(crate::schema::SequenceInfo {
+            name: "ids".to_string(),
+            schema: Some("main".to_string()),
+            start: 5,
+            increment: 2,
+            last_value: Some(7),
+            ..Default::default()
+        });
+        let file = file_of(&plan(&s, "shop", &all(&s), DumpOptions::default(), d));
+        assert!(!file.contains("OBJECT_ID"), "{file}");
+        assert!(!file.contains("DROP CONSTRAINT"), "{file}");
+        let drop_child = pos(&file, "DROP TABLE IF EXISTS \"main\".\"child\";");
+        let drop_parent = pos(&file, "DROP TABLE IF EXISTS \"main\".\"parent\";");
+        assert!(drop_child < drop_parent, "{file}");
+        assert!(drop_parent < pos(&file, "CREATE "), "{file}");
+        assert!(
+            file.contains(
+                "CREATE SEQUENCE IF NOT EXISTS \"main\".\"ids\"
+  INCREMENT BY 2
+  START WITH 9;"
+            ),
+            "{file}"
+        );
+        // Without the rows, the counter has nothing to clear.
+        let opts = DumpOptions {
+            data: false,
+            ..Default::default()
+        };
+        let file = file_of(&plan(&s, "shop", &all(&s), opts, d));
+        assert!(file.contains("START WITH 5;"), "{file}");
+        assert_eq!(drop_hint(d), DropHint::UpFrontNoGrants);
+        assert_eq!(drop_hint(SqlDialect::MsSql), DropHint::UpFront);
+    }
+
+    #[test]
+    fn only_sql_server_writes_a_key_drop_and_only_duckdb_restarts_by_start() {
+        assert_eq!(
+            drop_key_if_present_sql(SqlDialect::MsSql, "fk", Some("dbo"), "[dbo].[c]").as_deref(),
+            Some(
+                "IF OBJECT_ID(N'[dbo].[fk]', N'F') IS NOT NULL ALTER TABLE [dbo].[c] DROP CONSTRAINT [fk];"
+            )
+        );
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::DuckDb,
+        ] {
+            assert_eq!(drop_key_if_present_sql(d, "fk", None, "c"), None, "{d:?}");
+        }
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            assert!(!counter_restarts_as_start(d), "{d:?}");
+        }
+        assert!(counter_restarts_as_start(SqlDialect::DuckDb));
+    }
+
+    /// A DuckDB table's indexes wait for its rows, under their own heading.
+    #[test]
+    fn a_duckdb_dump_builds_indexes_after_the_rows() {
+        let mut t = table("t");
+        t.schema = Some("main".to_string());
+        t.create_sql = Some("CREATE TABLE t(id INTEGER);".to_string());
+        t.indexes.push(crate::schema::IndexInfo {
+            name: "t_id".to_string(),
+            create_sql: Some("CREATE INDEX t_id ON t(id);".to_string()),
+            ..Default::default()
+        });
+        let s = schema_of(vec![t]);
+        let p = plan(
+            &s,
+            "db",
+            &all(&s),
+            DumpOptions::default(),
+            SqlDialect::DuckDb,
+        );
+        let rows = p
+            .steps
+            .iter()
+            .position(|st| matches!(st, DumpStep::Rows { .. }))
+            .expect("a rows step");
+        let index = p
+            .steps
+            .iter()
+            .position(|st| st == &DumpStep::Text("CREATE INDEX t_id ON t(id);".to_string()))
+            .expect("the index");
+        assert!(rows < index, "{:?}", p.steps);
+        assert_eq!(p.steps[index - 1], DumpStep::Text("-- Indexes".to_string()));
     }
 
     #[test]

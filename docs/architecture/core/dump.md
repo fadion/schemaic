@@ -447,7 +447,8 @@ file does not carry (`a_materialized_view_is_dropped_as_one`; live,
 **SQL Server has neither answer**, so it drops everything the file
 recreates up front (`drops_up_front`, computed from the two: no guard and no `CASCADE`): a
 `-- Dropped first` section before any `CREATE` drops each key between the dumped tables that
-is there (`IF OBJECT_ID(…, N'F') IS NOT NULL ALTER TABLE … DROP CONSTRAINT`), then everything
+is there (`drop_key_if_present_sql`: `IF OBJECT_ID(…, N'F') IS NOT NULL ALTER TABLE … DROP
+CONSTRAINT`), then everything
 else in the exact mirror of the file's creation order — the trailing routines first, then each
 view and table children-first with the functions `creation_order` moved in ahead of it dropped
 straight after it (`DROP FUNCTION`/`DROP PROCEDURE IF EXISTS`) — and the per-table `DROP`
@@ -470,6 +471,38 @@ every `CREATE` still below the failure. With *One transaction* off each table an
 dropped beside its own `CREATE`, as on the other engines, and no key or routine is dropped, so
 a failure has dropped only what was already put back
 (`without_one_transaction_a_sql_server_file_drops_each_table_beside_its_create`).
+**DuckDB has neither answer either, and takes the same path without the key drops.** It has no
+`ALTER TABLE … DROP CONSTRAINT` (2.0: *not implemented*), so `drop_key_if_present_sql` — where
+SQL Server's guarded drop moved out of `plan` — answers `None` there, and the mirror order does
+the work alone: every referencing table is dropped before the table it references, and its keys
+go with it. Before that function existed DuckDB's file opened its section with SQL Server's
+`IF OBJECT_ID` guard and failed at its first line. A key from a table outside the file still
+refuses its target's drop, loudly, inside the transaction. Without *One transaction* the tables
+drop beside their `CREATE`s, as SQL Server's do, so a replay onto the source stops at the first
+table a key points at — its `DROP` meets the referencing table still standing — before dropping
+it, the tables ahead of it in the file already replaced whole, each with its rows; and no macro
+is dropped, so one still standing stops it too. **The hint says so in its own words**:
+`drop_hint` answers `DropHint::UpFrontNoGrants` where the file drops up front and a drop takes no
+owner or grant (`access::drop_resets_table_access`), because `UpFront`'s promise to put owners
+and permissions back at the end is SQL Server's. **A sequence is not among the up-front drops**
+— its position is state, and a table outside the file may draw from it — so where the file
+drops up front, with Structure and *Drop before create* on, the objects loop writes it `CREATE
+SEQUENCE IF NOT EXISTS` and a replay meets it standing, counter kept. **And a counter can only go
+back as its start**: DuckDB has no `setval` and no `ALTER SEQUENCE … RESTART`, so where
+`counter_restarts_as_start` says so and the file carries rows, the sequence is created from
+`SequenceInfo::continued()` — its start moved to the value the source hands out next, wrapping
+where it cycles, and a used-up one that does not cycle keeping its last, whose collision then
+refuses loudly as the source's exhausted sequence does. Created at its declared start, a
+`nextval` default after a restore handed out a key the rows already held and the first insert
+failed on the primary key. Without the rows it keeps its declared start, having nothing to clear.
+A DuckDB table's captured `CREATE TABLE` carries its keys, so it skips the closing constraints
+section as SQLite's does (`needs_fk_section`), and its indexes are `create_ddl_holding`'s held
+half, built after every table's rows in the section SQL Server's checks use, headed
+`-- Indexes` there rather than `-- Checks`
+(`a_duckdb_dump_drops_children_first_and_continues_its_sequences`,
+`only_sql_server_writes_a_key_drop_and_only_duckdb_restarts_by_start`,
+`a_duckdb_dump_builds_indexes_after_the_rows`; the real round trip is `db::duckdb`'s, under
+`duckdb.rs`).
 **Nor does a replay ever drop what the file cannot put back as it is** (`dump::Hold`,
 `table_hold`, `routine_hold`): a graph edge, whose rows are not in the file; a graph node
 while an edge exists anywhere, whose rows come back under new node ids; a table carrying an

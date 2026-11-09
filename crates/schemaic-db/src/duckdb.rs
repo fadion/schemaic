@@ -51,9 +51,9 @@
 //! `rowid` is never a key — a checkpoint renumbers it.
 //!
 //! **What the roadmap's phase 2 has not reached yet**, refused rather than
-//! faked: Manual tabs (`tx::supports_manual_mode`), the dump
-//! (`dump::supports_dump`) and the designer (`ddl::duckdb_supports`). DDL
-//! plans, `.sql` scripts and imports run.
+//! faked: Manual tabs (`tx::supports_manual_mode`) and the designer
+//! (`ddl::duckdb_supports`). DDL plans, `.sql` scripts, imports and the dump
+//! run.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -3222,5 +3222,207 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(schemaic_core::duckdb_builtins::DUCKDB_RESERVED, words);
+    }
+
+    /// A dump of every table in `db`, as the app's writer writes it.
+    fn dump_file(db: &Db, opts: schemaic_core::dump::DumpOptions) -> String {
+        use schemaic_core::dump::{DumpStep, plan, render_rows};
+        let rt = rt();
+        let schema = rt
+            .block_on(fetch_schema(db, CancellationToken::new()))
+            .unwrap();
+        let chosen: Vec<String> = schema
+            .tables
+            .iter()
+            .map(|t| schemaic_core::schema::display_name(t.schema.as_deref(), &t.name))
+            .collect();
+        let database = schema.database.clone().unwrap_or_default();
+        let dump = plan(&schema, &database, &chosen, opts, D);
+        let mut file = String::new();
+        for step in dump.steps {
+            match step {
+                DumpStep::Text(sql) => {
+                    file.push_str(&sql);
+                    file.push_str("\n\n");
+                }
+                DumpStep::Rows {
+                    database,
+                    insert_database,
+                    schema,
+                    table,
+                    select,
+                    server,
+                } => {
+                    let rs = rt
+                        .block_on(db.fetch_query(
+                            Some(&database),
+                            &select,
+                            10_000,
+                            CancellationToken::new(),
+                        ))
+                        .unwrap();
+                    let order: Vec<usize> = (0..rs.row_count()).collect();
+                    let mut out = Vec::new();
+                    render_rows(
+                        &mut out,
+                        &mut schemaic_core::export::OneChunk::new(&rs, &order),
+                        (&insert_database, schema.as_deref(), &table),
+                        &server,
+                        D,
+                    )
+                    .unwrap();
+                    file.push_str(&String::from_utf8(out).unwrap());
+                    file.push('\n');
+                }
+            }
+        }
+        file
+    }
+
+    /// Run `file` into `db` the way Run file does: the splitter, then
+    /// `run_script` on one connection.
+    fn restore_file(db: &Db, file: &str) -> schemaic_core::script::ExecEnd {
+        let mut splitter = schemaic_core::script::Splitter::new(D);
+        let mut stmts = splitter.push_str(file);
+        stmts.extend(splitter.finish());
+        let rt = rt();
+        rt.block_on(async {
+            let (tx, rx) = tokio::sync::mpsc::channel(stmts.len().max(1));
+            for s in stmts {
+                tx.send(s).await.unwrap();
+            }
+            drop(tx);
+            run_script(db, rx, CancellationToken::new()).await.0
+        })
+    }
+
+    const DUMP_FIXTURE: &str = "
+        CREATE SCHEMA other;
+        CREATE SEQUENCE seq_id START 5 INCREMENT BY 2;
+        CREATE SEQUENCE other.oseq START 100;
+        CREATE TABLE parent(id INTEGER PRIMARY KEY DEFAULT nextval('seq_id'), name VARCHAR NOT NULL UNIQUE, CHECK (length(name) > 0));
+        CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id), note VARCHAR);
+        CREATE TABLE other.o(id BIGINT DEFAULT nextval('other.oseq'), v DOUBLE, d DATE, j JSON, l INTEGER[], s STRUCT(a INT, b VARCHAR));
+        CREATE INDEX child_note ON child(note);
+        CREATE UNIQUE INDEX o_v ON other.o(v);
+        CREATE VIEW pc AS SELECT p.name, c.note FROM parent p JOIN child c ON c.parent_id = p.id;
+        CREATE MACRO other.twice(x) AS x * 2;
+        COMMENT ON TABLE parent IS 'the parent''s table';
+        COMMENT ON COLUMN child.note IS 'free text';
+        INSERT INTO parent(name) VALUES ('a'), ('b');
+        INSERT INTO child VALUES (1, 5, 'x'), (2, 7, NULL);
+        INSERT INTO other.o(v, d, j, l, s) VALUES (1.5, DATE '2026-01-02', '{\"k\": 1}', [1, 2], {'a': 1, 'b': 'it''s'});
+    ";
+
+    /// What a restore has to reproduce: every table's statement, comment and
+    /// rows, each column's comment, every index, and what each view reads.
+    fn fingerprint(db: &Db) -> Vec<String> {
+        let (_i, c) = connect(db).unwrap();
+        let strings = |sql: &str| -> Vec<String> {
+            let mut st = c.prepare(sql).unwrap();
+            st.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let mut out = strings(
+            "SELECT schema_name || '.' || table_name || ' ' || sql || ' -- ' || \
+                    coalesce(comment, '') FROM duckdb_tables() ORDER BY ALL",
+        );
+        out.extend(strings(
+            "SELECT table_name || '.' || column_name || ' -- ' || comment FROM duckdb_columns() \
+              WHERE comment IS NOT NULL AND comment <> '' ORDER BY ALL",
+        ));
+        out.extend(strings("SELECT sql FROM duckdb_indexes() ORDER BY ALL"));
+        let names = strings(
+            "SELECT schema_name || '.' || table_name FROM duckdb_tables() \
+             UNION ALL SELECT schema_name || '.' || view_name FROM duckdb_views() \
+               WHERE NOT internal ORDER BY ALL",
+        );
+        for n in names {
+            out.push(format!("{n}:"));
+            out.extend(strings(&format!(
+                "SELECT CAST(t AS VARCHAR) FROM {n} t ORDER BY ALL"
+            )));
+        }
+        out
+    }
+
+    fn next_key(db: &Db) -> (i64, i64) {
+        let (_i, c) = connect(db).unwrap();
+        c.query_row("SELECT nextval('seq_id'), nextval('other.oseq')", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+    }
+
+    /// **A default dump restores into an empty database as the source was** —
+    /// keys, checks and indexes, comments, every row of every type, views
+    /// and macros — and each sequence goes on from where the source's was,
+    /// so the next key a default draws is not one the rows already hold.
+    #[test]
+    fn a_dump_restores_into_an_empty_database_as_it_was() {
+        use schemaic_core::script::ExecEnd;
+        let src = mem("dump-src");
+        seed(&src, DUMP_FIXTURE);
+        let file = dump_file(&src, schemaic_core::dump::DumpOptions::default());
+        let seen = fingerprint(&src).join("\n");
+        for part in ["CREATE INDEX child_note", "free text", "it\\'s", "[1, 2]"] {
+            assert!(seen.contains(part), "the fingerprint misses {part}: {seen}");
+        }
+        let dst = mem("dump-dst");
+        assert_eq!(restore_file(&dst, &file), ExecEnd::Done, "{file}");
+        assert_eq!(fingerprint(&dst), fingerprint(&src), "{file}");
+        assert_eq!(next_key(&dst), (9, 101), "{file}");
+        let (_i, c) = connect(&dst).unwrap();
+        let twice: i64 = c
+            .query_row("SELECT other.twice(21)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(twice, 42);
+        c.execute_batch("INSERT INTO parent(name) VALUES ('c')")
+            .expect("a default key clears the restored rows");
+    }
+
+    /// **A replay onto the database the dump came from** puts back exactly
+    /// what was there — no row doubled, no counter rewound. DuckDB cannot
+    /// drop a foreign key, so the file drops each referencing table before
+    /// the one it references.
+    #[test]
+    fn a_dump_replays_onto_its_source() {
+        use schemaic_core::script::ExecEnd;
+        let src = mem("dump-replay");
+        seed(&src, DUMP_FIXTURE);
+        let before = fingerprint(&src);
+        let file = dump_file(&src, schemaic_core::dump::DumpOptions::default());
+        assert_eq!(restore_file(&src, &file), ExecEnd::Done, "{file}");
+        assert_eq!(fingerprint(&src), before, "{file}");
+        assert_eq!(next_key(&src), (9, 101), "{file}");
+    }
+
+    /// **Without One transaction a replay stops at the first table a key
+    /// points at, before dropping it** — the drop beside its `CREATE` meets
+    /// the referencing table still standing — and leaves that table as it
+    /// was, which is what the toggle's hint says.
+    #[test]
+    fn a_replay_without_a_transaction_stops_at_a_referenced_table() {
+        use schemaic_core::script::ExecEnd;
+        let src = mem("dump-replay-no-tx");
+        seed(&src, DUMP_FIXTURE);
+        let before = fingerprint(&src);
+        let opts = schemaic_core::dump::DumpOptions {
+            wrap_transaction: false,
+            ..Default::default()
+        };
+        let file = dump_file(&src, opts);
+        match restore_file(&src, &file) {
+            ExecEnd::Failed { sql, .. } => {
+                assert!(
+                    sql.contains("DROP TABLE IF EXISTS \"main\".\"parent\""),
+                    "{sql}"
+                );
+            }
+            other => panic!("{other:?}\n{file}"),
+        }
+        assert_eq!(fingerprint(&src), before);
     }
 }

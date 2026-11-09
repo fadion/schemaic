@@ -1386,6 +1386,7 @@ fn drop_hint_text(hint: schemaic_core::dump::DropHint) -> String {
     use schemaic_core::dump::DropHint;
     match hint {
         DropHint::UpFront => tr!("dump-drop-hint-up-front"),
+        DropHint::UpFrontNoGrants => tr!("dump-drop-hint-up-front-no-grants"),
         DropHint::RoutinesInPlace => tr!("dump-drop-hint-routines-in-place"),
         DropHint::RoutinesDroppedFirst => tr!("dump-drop-hint-routines-dropped-first"),
         DropHint::TablesOnly => tr!("dump-drop-hint-tables-only"),
@@ -1601,6 +1602,7 @@ mod core_words_tests {
         use schemaic_core::dump::{DropHint, FkHint};
         for hint in [
             DropHint::UpFront,
+            DropHint::UpFrontNoGrants,
             DropHint::RoutinesInPlace,
             DropHint::RoutinesDroppedFirst,
             DropHint::TablesOnly,

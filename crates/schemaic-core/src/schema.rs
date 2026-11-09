@@ -5255,6 +5255,31 @@ impl SequenceInfo {
         out
     }
 
+    /// This sequence with its start moved to **the value it hands out next**
+    /// — for an engine whose only way to put a counter back is the `START WITH`
+    /// it is created with ([`crate::dump::counter_restarts_as_start`]).
+    /// Unchanged where it has never been used.
+    ///
+    /// Past its bound it wraps where it cycles. One that is used up and does
+    /// not cycle has no next value to start at, and keeps its last: the copy
+    /// hands that out once more, and the key it collides with refuses it
+    /// loudly, as the source's exhausted sequence refuses every call.
+    pub fn continued(&self) -> SequenceInfo {
+        let Some(last) = self.last_value else {
+            return self.clone();
+        };
+        let start = match last.checked_add(self.increment) {
+            Some(n) if (self.min_value..=self.max_value).contains(&n) => n,
+            _ if self.cycle && self.increment > 0 => self.min_value,
+            _ if self.cycle => self.max_value,
+            _ => last,
+        };
+        SequenceInfo {
+            start,
+            ..self.clone()
+        }
+    }
+
     /// `CREATE SEQUENCE …`, naming only what isn't the server's default, plus the
     /// `OWNED BY` and `COMMENT ON` that follow it.
     ///
@@ -5982,12 +6007,17 @@ impl TableInfo {
                     .collect::<Vec<_>>()
                     .join("\n");
             }
-            // DuckDB tables carry their engine's own `CREATE` text
-            // (`create_sql`, from `duckdb_tables().sql`), which wins below.
+            crate::intel::SqlDialect::DuckDb => {
+                if let Some((table, after)) = self.duckdb_create_parts() {
+                    return std::iter::once(table)
+                        .chain(after)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                }
+            }
             crate::intel::SqlDialect::MySql
             | crate::intel::SqlDialect::Postgres
-            | crate::intel::SqlDialect::Sqlite
-            | crate::intel::SqlDialect::DuckDb => {}
+            | crate::intel::SqlDialect::Sqlite => {}
         }
         let pg = dialect == crate::intel::SqlDialect::Postgres;
         // Delegated, not inlined. This was a fifth copy of the identifier
@@ -6245,6 +6275,11 @@ impl TableInfo {
     /// joined; elsewhere it keeps the check inline, a script with no rows.
     pub fn create_ddl_holding(&self, dialect: crate::intel::SqlDialect) -> (String, Vec<String>) {
         use crate::intel::SqlDialect as D;
+        // A DuckDB table's indexes are built once its rows are in, which is
+        // the cheaper order; nothing between needs them.
+        if let (D::DuckDb, Some(parts)) = (dialect, self.duckdb_create_parts()) {
+            return parts;
+        }
         if !unvalidated_check_waits_for_rows(dialect) {
             return (self.create_ddl(dialect), Vec::new());
         }
@@ -6290,6 +6325,63 @@ impl TableInfo {
             changes: held,
         }
         .emit()
+    }
+
+    /// A DuckDB table's DDL in two halves — its engine's own `CREATE TABLE`
+    /// text (`duckdb_tables().sql`) with the comments it does not carry, and
+    /// the `CREATE INDEX` statements it does not carry either — or `None` for
+    /// a view or a table with no captured text.
+    ///
+    /// **The text holds neither.** `CREATE INDEX` is a statement of its own
+    /// there, kept in `duckdb_indexes().sql` ([`IndexInfo::create_sql`]), and
+    /// `COMMENT ON` is in none of the catalogue's statements, so *Copy DDL*
+    /// and a dump restored a table with no index and no comment. A key or a
+    /// unique constraint is in the text, and has no statement here.
+    fn duckdb_create_parts(&self) -> Option<(String, Vec<String>)> {
+        let d = crate::intel::SqlDialect::DuckDb;
+        if self.is_view {
+            return None;
+        }
+        let text = self
+            .create_sql
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let mut table = text.to_string();
+        if !table.ends_with(';') {
+            table.push(';');
+        }
+        let qname = qualified_ident(&self.name, self.schema.as_deref(), d);
+        if let Some(c) = self.comment.as_deref().filter(|c| !c.is_empty()) {
+            table.push_str(&format!(
+                "\nCOMMENT ON TABLE {qname} IS {};",
+                ddl_string(c, d)
+            ));
+        }
+        for col in &self.columns {
+            if let Some(c) = col.comment.as_deref().filter(|c| !c.is_empty()) {
+                table.push_str(&format!(
+                    "\nCOMMENT ON COLUMN {qname}.{} IS {};",
+                    ddl_ident_in(&col.name, d),
+                    ddl_string(c, d)
+                ));
+            }
+        }
+        let indexes = self
+            .indexes
+            .iter()
+            .filter_map(|ix| {
+                let sql = ix.create_sql.as_deref().map(str::trim)?;
+                (!sql.is_empty() && ix.constraint.is_none()).then(|| {
+                    if sql.ends_with(';') {
+                        sql.to_string()
+                    } else {
+                        format!("{sql};")
+                    }
+                })
+            })
+            .collect();
+        Some((table, indexes))
     }
 
     /// [`Self::create_ddl`] for SQL Server — what its own tools call *Script
@@ -13926,6 +14018,89 @@ mod tests {
         assert_eq!(
             d.create_sql(Postgres),
             "CREATE DOMAIN \"positive\" AS integer;"
+        );
+    }
+
+    /// A continued sequence starts at the value the source hands out next —
+    /// wrapping where it cycles, and staying at its last where it is used up.
+    #[test]
+    fn a_continued_sequence_starts_where_the_source_goes_on() {
+        let s = |start, increment, last, cycle| SequenceInfo {
+            start,
+            increment,
+            last_value: last,
+            cycle,
+            min_value: if increment > 0 { 1 } else { -10 },
+            max_value: if increment > 0 { 10 } else { -1 },
+            ..Default::default()
+        };
+        assert_eq!(s(5, 2, None, false).continued().start, 5, "never used");
+        assert_eq!(s(5, 2, Some(7), false).continued().start, 9);
+        assert_eq!(s(1, 3, Some(9), true).continued().start, 1, "wraps up");
+        assert_eq!(
+            s(-1, -3, Some(-9), true).continued().start,
+            -1,
+            "wraps down"
+        );
+        assert_eq!(s(1, 3, Some(9), false).continued().start, 9, "used up");
+        let far = SequenceInfo {
+            last_value: Some(i64::MAX),
+            ..SequenceInfo::default()
+        };
+        assert_eq!(far.continued().start, i64::MAX, "no overflow");
+    }
+
+    /// **A DuckDB table's DDL carries what its captured text does not**:
+    /// its comments with the table, its `CREATE INDEX` statements after it
+    /// (held for the rows by `create_ddl_holding`), and no statement for an
+    /// index a constraint makes.
+    #[test]
+    fn a_duckdb_tables_ddl_carries_its_indexes_and_comments() {
+        let d = crate::intel::SqlDialect::DuckDb;
+        let t = TableInfo {
+            name: "t".to_string(),
+            schema: Some("main".to_string()),
+            comment: Some("it's t".to_string()),
+            create_sql: Some("CREATE TABLE t(id INTEGER PRIMARY KEY, n VARCHAR)".to_string()),
+            columns: vec![
+                ColumnInfo {
+                    name: "id".to_string(),
+                    ..Default::default()
+                },
+                ColumnInfo {
+                    name: "n".to_string(),
+                    comment: Some("a name".to_string()),
+                    ..Default::default()
+                },
+            ],
+            indexes: vec![
+                IndexInfo {
+                    name: "PRIMARY".to_string(),
+                    unique: true,
+                    constraint: Some("t_pkey".to_string()),
+                    ..Default::default()
+                },
+                IndexInfo {
+                    name: "t_n".to_string(),
+                    create_sql: Some("CREATE INDEX t_n ON t(n)".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let table = "CREATE TABLE t(id INTEGER PRIMARY KEY, n VARCHAR);\n\
+                     COMMENT ON TABLE \"main\".\"t\" IS 'it''s t';\n\
+                     COMMENT ON COLUMN \"main\".\"t\".\"n\" IS 'a name';";
+        assert_eq!(
+            t.create_ddl_holding(d),
+            (
+                table.to_string(),
+                vec!["CREATE INDEX t_n ON t(n);".to_string()]
+            )
+        );
+        assert_eq!(
+            t.create_ddl(d),
+            format!("{table}\nCREATE INDEX t_n ON t(n);")
         );
     }
 

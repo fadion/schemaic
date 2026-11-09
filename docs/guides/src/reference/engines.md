@@ -96,6 +96,10 @@ A DuckDB connection is a database file on this machine, like SQLite's; see
 - exporting results, and query plans, with **Analyze**;
 - **Server variables**, which lists DuckDB's settings;
 - **Back up**, which writes a new `.duckdb` file;
+- a SQL dump under **Export** — tables with their indexes and comments, views, sequences (which
+  carry on from the source's counter) and macros. A type made with `CREATE TYPE` isn't in the
+  file as a type: DuckDB writes it into each column, so tables load, but a view or macro that
+  names the type won't;
 - the `duckdb` command-line client in the terminal panel, when it's installed.
 
 *Not yet:*
@@ -103,7 +107,7 @@ A DuckDB connection is a database file on this machine, like SQLite's; see
 - **Manual** transactions — a tab always runs in **Auto-commit**;
 - the table designer and the view and macro editors, so structure changes are SQL you write and run
   yourself;
-- a SQL dump under **Export**, and **Restore from file**.
+- **Restore from file**.
 
 There are no users to manage, as on SQLite. The AI assistant and the command line read only the
 database's own tables: DuckDB's readers for files on your computer, such as `read_csv`, are

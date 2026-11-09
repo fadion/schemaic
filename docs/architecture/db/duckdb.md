@@ -4,7 +4,7 @@
 with the `parquet` and `json` extensions linked statically), phase 1 and the first part of phase 2
 of the roadmap's *DuckDB as a fifth engine*: it connects, reads, introspects, validates, runs
 batches, scripts and DDL plans, plans a query, lists its settings, backs a file up, writes grid
-edits back and imports a file into a table. It is **embedded, as SQLite is**, so most
+edits back, imports a file into a table and dumps to a `.sql` file. It is **embedded, as SQLite is**, so most
 of `sqlite.rs`'s first paragraph holds here unchanged — there is no server, a connection is a
 file (`Db::file`, `connection::is_file_backed`), host/port/user/password/SSH are inert, the one
 database is the file's own catalog (`current_database()`, named after the file), and the driver
@@ -88,7 +88,13 @@ constraints/indexes/sequences/functions()`, each scoped to `current_database()` 
 function has the column, `NOT internal` — so an `ATTACH`ed database, which lives only as long as
 the connection that ran it, is never part of the tree. **Each object's stored `CREATE` text is
 kept** (`TableInfo::create_sql`, `IndexInfo::create_sql`), so *Copy DDL* is the engine's own words
-rather than a reconstruction; a view's definition is the text after the stored statement's first
+rather than a reconstruction — **with what a table's text leaves out put back**: `duckdb_tables().sql`
+carries neither the table's `CREATE INDEX`es nor any `COMMENT ON`, so *Copy DDL* and a dump both
+restored a table with no index and no comment. `TableInfo::create_ddl`'s DuckDB arm
+(`duckdb_create_parts`) now appends `COMMENT ON TABLE`/`COMMENT ON COLUMN` and each
+non-constraint index's `IndexInfo::create_sql` (`duckdb_indexes().sql`), and
+`create_ddl_holding` hands the indexes back as its held half, for the dump to build after the
+rows; a key or unique constraint is in the text already. A view's definition is the text after the stored statement's first
 top-level `AS` (`view_body`, over `sql::skip_noncode`). The primary key marks its columns and is
 the `PRIMARY` index the model reads keys from, a `UNIQUE` constraint is a unique index of its
 name, checks and foreign keys are themselves, and a column defaulting to `nextval(…)` is read as
@@ -201,9 +207,33 @@ A file's cells arrive as text and DuckDB casts each literal to its column's type
 booleans, timestamps and lists included (`an_import_loads_every_batch_in_one_transaction`,
 `a_failed_import_leaves_the_table_as_it_was`, a duplicate key in the second batch leaving nothing
 of the first, and `an_import_runs_on_a_current_thread_runtime`).
+**A `.sql` dump restores into an empty database, and replays onto its source**
+(`dump::supports_dump`; the file is `core::dump`'s plan, whose entry has DuckDB's half of each
+rule). The engine has neither a session switch for foreign keys nor `DROP … CASCADE`, so the file
+drops everything up front as SQL Server's does — but with no key drops, DuckDB having no `ALTER
+TABLE … DROP CONSTRAINT`: the referencing table is dropped before the one it references, and its
+keys go with it. Each table's captured text, comments and keys inline, is created and filled in
+turn, its indexes are built after every table's rows, a schema other than `main` is created if
+missing, and a sequence restarts at the value the source hands out next, DuckDB having no
+`setval` to move it on with. The round trip is tested for real on in-memory instances, through
+`plan`, `render_rows`, the script splitter and `run_script` as *Export* and *Run SQL file* run
+them: a fixture of two schemas, two sequences behind key defaults, a check, a unique constraint,
+a foreign key, two indexes, a view, a macro, table and column comments and `DATE`, `JSON`, list
+and struct values restores into an empty database with every table's statement and comment, every
+column comment, every index and every table's and view's rows equal, the next keys continuing
+from the source's (9 and 101), the macro callable and a default key clearing the restored rows
+(`a_dump_restores_into_an_empty_database_as_it_was`); replayed onto its source it leaves the same
+fingerprint and the counters unmoved (`a_dump_replays_onto_its_source`); and without *One
+transaction* that replay stops at `DROP TABLE … "parent"`, the first table a key points at,
+leaving the source as it was (`a_replay_without_a_transaction_stops_at_a_referenced_table`).
+**What the file does not carry**, measured by the change's author: a user type — `CREATE TYPE
+mood AS ENUM …`, a `STRUCT` alias — is inlined into each column in `duckdb_tables().sql` (`m
+ENUM('ok', 'sad')`), so the table restores without the named type, and the type itself is not
+carried, none being read into the model; a view or macro naming the type would fail its restore.
+A view's or a macro's comment is not carried either — only a table's and its columns' are — nor a
+macro parameter's default, for the reason above.
 **What is not written yet is refused, never faked**: `Session::open` refuses a pinned session
-(`DuckDbNoManual`) and `tx::supports_manual_mode` keeps the segment off;
-`dump::supports_dump` says no, and
+(`DuckDbNoManual`) and `tx::supports_manual_mode` keeps the segment off, and
 `ddl::duckdb_supports` keeps the designer and the view, trigger and routine editors off. For
 when the session lands, `session::tx_engine_of` already maps DuckDB to PostgreSQL's model — it
 aborts a transaction on a failed statement and rolls DDL back, measured on 2.0.
