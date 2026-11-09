@@ -5228,4 +5228,49 @@ mod tests {
         assert_eq!(restore_file(&src, &file), ExecEnd::Done, "{file}");
         assert_eq!(type_fingerprint(&src), before, "{file}");
     }
+
+    /// The sequence form's two plans on DuckDB: a sequence created from the
+    /// blank draft, and then its comment — the one thing of a made sequence
+    /// DuckDB changes — edited; the definition reads back as drafted.
+    #[test]
+    fn a_sequence_is_created_from_the_form_and_its_comment_edited() {
+        use schemaic_core::ddl::{ObjectDraft, ObjectKind};
+        use schemaic_core::schema::ObjectItem;
+        let db = mem("sequence_form");
+        let Some(ObjectDraft::Sequence(mut draft)) =
+            ObjectDraft::blank(ObjectKind::Sequence, "s", Some("main".into()), D)
+        else {
+            panic!("no blank sequence on DuckDB");
+        };
+        draft.info.increment = 5;
+        draft.info.start = 10;
+        draft.info.min_value = 10;
+        draft.info.cycle = true;
+        draft.info.max_value = 100;
+        applied(
+            &db,
+            &ObjectDraft::Sequence(draft.clone()).change_set(None, &[], D),
+        );
+        let read = || {
+            rt().block_on(fetch_schema(&db, CancellationToken::new()))
+                .unwrap()
+                .sequences
+                .into_iter()
+                .find(|s| s.name == "s")
+                .unwrap()
+        };
+        let s = read();
+        assert_eq!(
+            (s.increment, s.start, s.max_value, s.cycle),
+            (5, 10, 100, true)
+        );
+        let mut edit = schemaic_core::ddl::SequenceDraft::from_info(&s);
+        edit.info.comment = Some("counts".into());
+        let stmts = applied(
+            &db,
+            &ObjectDraft::Sequence(edit).change_set(Some(&ObjectItem::Sequence(s)), &[], D),
+        );
+        assert_eq!(stmts, ["COMMENT ON SEQUENCE \"main\".\"s\" IS 'counts';"]);
+        assert_eq!(read().comment.as_deref(), Some("counts"));
+    }
 }

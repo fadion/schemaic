@@ -1855,6 +1855,7 @@ object-problem-synonym-no-target = A synonym needs the object it stands for.
 object-problem-alias-no-base = An alias type needs a base type.
 object-editor-cycle = Cycle
 object-editor-cycle-hint = Wrap around to the other end of the range instead of failing when the sequence runs out.
+object-editor-sequence-fixed = This engine cannot change a sequence once it is made, only its comment. To change the rest, drop the sequence and create it again.
 # $last is the value the sequence last handed out.
 object-editor-restart-at = Restart at — the counter last handed out { $last }
 object-editor-restart-at-unused = Restart at — the counter has not been used

@@ -2003,6 +2003,7 @@ object-problem-synonym-no-target = Ein Synonym braucht das Objekt, für das es s
 object-problem-alias-no-base = Ein Aliastyp braucht einen Basistyp.
 object-editor-cycle = Zyklisch
 object-editor-cycle-hint = Am anderen Ende des Bereichs neu beginnen, statt fehlzuschlagen, wenn die Sequenz erschöpft ist.
+object-editor-sequence-fixed = Diese Engine kann eine Sequenz nach dem Anlegen nicht mehr ändern, nur ihren Kommentar. Um den Rest zu ändern, löschen Sie die Sequenz und legen Sie sie neu an.
 object-editor-restart-at = Neu starten bei – der Zähler hat zuletzt { $last } ausgegeben
 object-editor-restart-at-unused = Neu starten bei – der Zähler wurde noch nicht verwendet
 object-editor-restart-not-whole = „Neu starten bei“ muss eine ganze Zahl sein.

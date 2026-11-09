@@ -71,11 +71,10 @@ come after DuckDB.
 - **Decided — one instance per file, shared while operations overlap:** done in phase 1, and
   stated in the invariants. A Manual tab's session holds the instance — and with it the file's
   lock — for as long as the tab stays in Manual mode, and the connection form's hint says so.
-- **Loose ends:** a sequence editor shaped for DuckDB: its plans create, comment and drop one,
-  but the tree offers no *Create* for it, PostgreSQL's form having a type, a cache and a restart
-  DuckDB's `CREATE SEQUENCE` lacks — and nothing alters one there (`ALTER SEQUENCE` refuses
-  every option on 2.0.0), so a compare that finds a sequence changed has no statement for it; a
-  re-create would have to drop it, which DuckDB refuses while a column default uses it. The read-only half of the seal (`AccessMode::ReadOnly`) has no test, the
+- **Loose ends:** nothing alters a DuckDB sequence once made (`ALTER SEQUENCE` refuses every
+  option on 2.0.0), so a compare that finds one changed has no statement for it, and its form
+  edits only the comment; a re-create would have to drop it, which DuckDB refuses while a column
+  default uses it. The read-only half of the seal (`AccessMode::ReadOnly`) has no test, the
   suites' in-memory instance having no file to open read-only. A file named
   `main.duckdb` makes `main.t` both a schema and a catalog, and its results are not attributed;
   accept the reading where both resolve to the same table, if anyone hits it. A user type is read

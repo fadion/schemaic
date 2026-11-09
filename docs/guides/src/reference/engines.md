@@ -113,7 +113,9 @@ A DuckDB connection is a database file on this machine, like SQLite's; see
   migration in one transaction; see [Comparing schemas](../schema/compare.md#limits) for what it
   leaves out;
 - new schemas from **Create** › **Schema**, and **Drop** on a schema's row, which DuckDB refuses
-  while the schema still holds anything. There's no **Create** entry for a sequence;
+  while the schema still holds anything;
+- new sequences from **Create** › **Sequence**. DuckDB can't change a sequence once it's made,
+  so editing one changes only its comment — drop it and create it again to change the rest;
 - the view editor: **Edit view**, a new view from **Create** › **View** or the query editor's
   **Create view**, renaming a view in its name field, and **Drop**. An edit keeps the view's
   **Column names** and its comment, which Schemaic sets again after the replace, since DuckDB's

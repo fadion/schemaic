@@ -1604,6 +1604,7 @@ object-problem-synonym-no-target = Un sinónimo necesita el objeto al que repres
 object-problem-alias-no-base = Un tipo alias necesita un tipo base.
 object-editor-cycle = Cíclica
 object-editor-cycle-hint = Vuelve al otro extremo del rango en lugar de fallar cuando la secuencia se agota.
+object-editor-sequence-fixed = Este motor no puede cambiar una secuencia una vez creada, solo su comentario. Para cambiar el resto, elimine la secuencia y vuelva a crearla.
 object-editor-restart-at = Reiniciar en (el último valor entregado por el contador fue { $last })
 object-editor-restart-at-unused = Reiniciar en (el contador no se ha usado)
 object-editor-restart-not-whole = Reiniciar en tiene que ser un número entero.

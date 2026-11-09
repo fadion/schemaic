@@ -4092,17 +4092,15 @@ impl ObjectDraft {
         match (kind, dialect) {
             (ObjectKind::Enum, _) => Some(ObjectDraft::Enum(EnumDraft::blank(name, schema))),
             (ObjectKind::Domain, _) => Some(ObjectDraft::Domain(DomainDraft::blank(name, schema))),
+            // DuckDB's is PostgreSQL's draft too, its form leaving out what
+            // DuckDB's grammar lacks ([`sequence_takes_type`],
+            // [`sequence_takes_cache`], [`supports_sequence_restart`],
+            // [`sequence_alters_in_place`]). Named here rather than left to the
+            // arm below, which would hand it SQL Server's draft.
             (
                 ObjectKind::Sequence,
-                SqlDialect::Postgres | SqlDialect::MySql | SqlDialect::Sqlite,
+                SqlDialect::Postgres | SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb,
             ) => Some(ObjectDraft::Sequence(SequenceDraft::blank(name, schema))),
-            // **No blank form on DuckDB, deliberately.** Its plans create a
-            // sequence (`duckdb_supports`), which schema compare needs, but
-            // PostgreSQL's form offers a type, a cache and a restart, none of
-            // which DuckDB's grammar has — so the folder's *Create* entry stays
-            // off until a form shaped for DuckDB exists. Named here rather than
-            // left to the arm below, which would hand it SQL Server's draft.
-            (ObjectKind::Sequence, SqlDialect::DuckDb) => None,
             (
                 ObjectKind::Sequence
                 | ObjectKind::Synonym
@@ -15086,6 +15084,75 @@ pub fn supports_event_editing(dialect: SqlDialect) -> bool {
             },
         )
         && supports_change(dialect, &Change::DropEvent(Box::default()))
+}
+
+/// A blank sequence's definition, the probes below change one field of.
+fn probe_sequence() -> SequenceInfo {
+    SequenceInfo {
+        name: "probe".into(),
+        ..Default::default()
+    }
+}
+
+/// Does `dialect`'s `CREATE SEQUENCE` take a storage type (`AS integer`)?
+/// The sequence form shows its *Stores* picker where this is true. Computed
+/// from [`supports_change`], as the predicates AGENTS.md lists are, so the
+/// form and the plan cannot disagree: DuckDB's every sequence is a `BIGINT`.
+pub fn sequence_takes_type(dialect: SqlDialect) -> bool {
+    supports_change(
+        dialect,
+        &Change::CreateSequence(Box::new(SequenceInfo {
+            data_type: "integer".into(),
+            ..probe_sequence()
+        })),
+    )
+}
+
+/// Does `dialect`'s `CREATE SEQUENCE` take a `CACHE`? The form's *Cache*
+/// field, as [`sequence_takes_type`] decides the picker.
+pub fn sequence_takes_cache(dialect: SqlDialect) -> bool {
+    supports_change(
+        dialect,
+        &Change::CreateSequence(Box::new(SequenceInfo {
+            cache: 20,
+            ..probe_sequence()
+        })),
+    )
+}
+
+/// Can `dialect` move a sequence's counter (`RESTART WITH`)? The form's
+/// *Position* section, which DuckDB has no statement for.
+pub fn supports_sequence_restart(dialect: SqlDialect) -> bool {
+    supports_change(dialect, &Change::RestartSequence { to: 1 })
+}
+
+/// Can `dialect` change a sequence's definition **once it is made**? DuckDB
+/// cannot — `ALTER SEQUENCE` refuses every option (2.0.0, measured) — so its
+/// form shows an existing sequence's numbers read-only and leaves only the
+/// comment to edit.
+pub fn sequence_alters_in_place(dialect: SqlDialect) -> bool {
+    let s = probe_sequence();
+    supports_change(
+        dialect,
+        &Change::AlterSequence {
+            to: Box::new(SequenceInfo {
+                increment: 2,
+                ..s.clone()
+            }),
+            from: Box::new(s),
+        },
+    )
+}
+
+/// Can `dialect` rename a sequence? DuckDB answers *not yet supported*.
+pub fn supports_sequence_rename(dialect: SqlDialect) -> bool {
+    supports_change(
+        dialect,
+        &Change::RenameObject {
+            kind: ObjectKind::Sequence,
+            to: "probe2".into(),
+        },
+    )
 }
 
 /// Can `dialect` **create** a standalone object of `kind` from the object
@@ -29577,10 +29644,22 @@ mod tests {
             drop_object(ObjectKind::Sequence, "s", Some("main"), d).emit(),
             ["DROP SEQUENCE \"main\".\"s\";"]
         );
-        // The plans create one; the folder's form, PostgreSQL's, is not
-        // offered, its type, cache and restart being clauses DuckDB lacks.
-        assert!(ObjectDraft::blank(ObjectKind::Sequence, "s", None, d).is_none());
-        assert!(!supports_object_creation(d, ObjectKind::Sequence));
+        // The form is PostgreSQL's draft with the clauses DuckDB lacks left
+        // out: no type, no cache, no restart, and nothing of one already
+        // made changes but its comment.
+        assert!(ObjectDraft::blank(ObjectKind::Sequence, "s", None, d).is_some());
+        assert!(supports_object_creation(d, ObjectKind::Sequence));
+        assert!(!sequence_takes_type(d));
+        assert!(!sequence_takes_cache(d));
+        assert!(!supports_sequence_restart(d));
+        assert!(!sequence_alters_in_place(d));
+        assert!(!supports_sequence_rename(d));
+        // PostgreSQL's form keeps every one of them.
+        assert!(sequence_takes_type(Postgres));
+        assert!(sequence_takes_cache(Postgres));
+        assert!(supports_sequence_restart(Postgres));
+        assert!(sequence_alters_in_place(Postgres));
+        assert!(supports_sequence_rename(Postgres));
     }
 
     /// A scripted copy restates a DuckDB view's and macro's comment after

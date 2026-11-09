@@ -1651,6 +1651,7 @@ object-problem-synonym-no-target = Un sinonim are nevoie de obiectul pe care îl
 object-problem-alias-no-base = Un tip alias are nevoie de un tip de bază.
 object-editor-cycle = Ciclic
 object-editor-cycle-hint = Revine la celălalt capăt al intervalului în loc să eșueze când secvența se epuizează.
+object-editor-sequence-fixed = Acest motor nu poate modifica o secvență după ce a fost creată, doar comentariul ei. Pentru a schimba restul, ștergeți secvența și creați-o din nou.
 object-editor-restart-at = Repornește la — contorul a distribuit ultima dată { $last }
 object-editor-restart-at-unused = Repornește la — contorul nu a fost folosit
 object-editor-restart-not-whole = Repornește la trebuie să fie un număr întreg.

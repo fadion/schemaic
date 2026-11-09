@@ -1610,6 +1610,7 @@ object-problem-synonym-no-target = Een synoniem heeft het object nodig waarvoor 
 object-problem-alias-no-base = Een aliastype heeft een basistype nodig.
 object-editor-cycle = Cyclisch
 object-editor-cycle-hint = Doorlopen naar het andere eind van het bereik in plaats van te mislukken wanneer de reeks op is.
+object-editor-sequence-fixed = Deze engine kan een reeks niet meer wijzigen nadat die is aangemaakt, alleen de opmerking. Verwijder de reeks en maak die opnieuw aan om de rest te wijzigen.
 object-editor-restart-at = Herstarten op — de teller gaf als laatste { $last } uit
 object-editor-restart-at-unused = Herstarten op — de teller is nog niet gebruikt
 object-editor-restart-not-whole = Herstarten op moet een geheel getal zijn.

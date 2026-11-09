@@ -382,8 +382,10 @@ admits, and two kinds of statement were missing: **schemas** — `CREATE SCHEMA`
 here (*not implemented*) — and **sequences**, created, commented and dropped and never altered,
 every fact measured on 2.0.0 under `ddl.rs`. Admitting the schema pair turned
 `supports_namespace_editing` true with no edit of its own, so the tree's Create menu offers
-*Schema* and a namespace row offers **Drop** (`overlays::duckdb_is_offered_what_it_emits`); the
-sequence form is still not offered (`ObjectDraft::blank`, under `ddl.rs`). A sequence a column
+*Schema* and a namespace row offers **Drop** (`overlays::duckdb_is_offered_what_it_emits`), and
+*Sequence* opens PostgreSQL's sequence form less the type, cache and restart DuckDB lacks — a
+made one showing its numbers read-only and leaving its comment to edit (`ObjectDraft::blank` and
+the `sequence_*` capabilities, under `ddl.rs`). A sequence a column
 default uses can be neither dropped nor replaced — DuckDB says so itself (*Dependency Error*),
 inside the plan's one transaction — and a sequence whose options differ between the files is
 disclosed with the generic *no statement for the difference it found*, its `AlterSequence`

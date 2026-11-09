@@ -312,12 +312,14 @@ fn bound_field(
 /// withdrawn as soon as the text parses. One message per field, its text the
 /// key — it names the field — so two bad fields report two problems and neither
 /// erases the other.
+#[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
 fn num_field(
     ui: DdlUi,
     label: String,
     initial: String,
     ring: FocusRing,
     tabindex: u32,
+    read_only: bool,
     apply: impl Fn(&mut SequenceDraft, &str) -> Result<(), ()> + 'static,
 ) -> AnyView {
     let draft = ui.object_draft;
@@ -351,6 +353,7 @@ fn num_field(
         FieldCfg {
             placeholder: "",
             focus: Some((ring, tabindex)),
+            read_only,
             ..Default::default()
         },
     )
@@ -899,13 +902,23 @@ fn restart_label(last: Option<impl std::fmt::Display>) -> String {
     }
 }
 
+/// The sequence form — PostgreSQL's clauses, less what `dialect` lacks: no
+/// *Stores* picker where [`ddl::sequence_takes_type`] is false, no *Cache*
+/// where [`ddl::sequence_takes_cache`] is, no *Position* where
+/// [`ddl::supports_sequence_restart`] is. And where a made sequence cannot be
+/// changed ([`ddl::sequence_alters_in_place`] — DuckDB), an `existing` one
+/// shows its numbers read-only, says why, and leaves its comment to edit: a
+/// field that took the edit would only raise a change the plan withholds.
 fn sequence_form(
     ui: DdlUi,
     d: &SequenceDraft,
     orig_owner: Option<SequenceOwner>,
+    dialect: schemaic_core::intel::SqlDialect,
+    existing: bool,
     ring: FocusRing,
 ) -> AnyView {
     let draft = ui.object_draft;
+    let fixed = existing && !ddl::sequence_alters_in_place(dialect);
     let name = form_setting(
         tr!("object-editor-name"),
         bound_field(
@@ -914,6 +927,7 @@ fn sequence_form(
             FieldCfg {
                 placeholder: "sequence_name",
                 focus: Some((ring.clone(), 10)),
+                read_only: existing && !ddl::supports_sequence_rename(dialect),
                 ..Default::default()
             },
             |d, v| {
@@ -926,7 +940,9 @@ fn sequence_form(
     );
     // The bounds are clamped to the storage type, so changing it re-checks them
     // — `SequenceDraft::validate` is what reports a range that no longer fits.
-    let data_type = {
+    let data_type = if !ddl::sequence_takes_type(dialect) {
+        crate::widgets::nothing()
+    } else {
         let sig = floem::reactive::create_rw_signal(d.info.data_type.clone());
         form_setting(
             tr!("object-editor-stores"),
@@ -951,6 +967,7 @@ fn sequence_form(
                 },
             ),
         )
+        .into_any()
     };
     // Each number gets exactly its field's width, so the row's `gap` is the gap
     // that lands on screen. `form_setting` is `width_full`, which in a flex row
@@ -961,6 +978,23 @@ fn sequence_form(
     let num_col = |label: String, field: AnyView| {
         form_setting(label, field).style(|s| s.width(num_w()).flex_shrink(0.0_f32))
     };
+    let cache: AnyView = if ddl::sequence_takes_cache(dialect) {
+        num_col(
+            tr!("object-editor-cache"),
+            num_field(
+                ui,
+                tr!("object-editor-cache"),
+                d.info.cache.to_string(),
+                ring.clone(),
+                50,
+                fixed,
+                |s, t| t.parse().map(|n| s.info.cache = n).map_err(|_| ()),
+            ),
+        )
+        .into_any()
+    } else {
+        crate::widgets::nothing()
+    };
     let numbers = h_stack((
         num_col(
             tr!("object-editor-increment"),
@@ -970,6 +1004,7 @@ fn sequence_form(
                 d.info.increment.to_string(),
                 ring.clone(),
                 30,
+                fixed,
                 |s, t| t.parse().map(|n| s.info.increment = n).map_err(|_| ()),
             ),
         ),
@@ -981,20 +1016,11 @@ fn sequence_form(
                 d.info.start.to_string(),
                 ring.clone(),
                 40,
+                fixed,
                 |s, t| t.parse().map(|n| s.info.start = n).map_err(|_| ()),
             ),
         ),
-        num_col(
-            tr!("object-editor-cache"),
-            num_field(
-                ui,
-                tr!("object-editor-cache"),
-                d.info.cache.to_string(),
-                ring.clone(),
-                50,
-                |s, t| t.parse().map(|n| s.info.cache = n).map_err(|_| ()),
-            ),
-        ),
+        cache,
     ))
     .style(|s| s.flex_row().gap(num_gap()).width_full());
     let bounds = h_stack((
@@ -1006,6 +1032,7 @@ fn sequence_form(
                 d.info.min_value.to_string(),
                 ring.clone(),
                 60,
+                fixed,
                 |s, t| t.parse().map(|n| s.info.min_value = n).map_err(|_| ()),
             ),
         ),
@@ -1017,71 +1044,109 @@ fn sequence_form(
                 d.info.max_value.to_string(),
                 ring.clone(),
                 70,
+                fixed,
                 |s, t| t.parse().map(|n| s.info.max_value = n).map_err(|_| ()),
             ),
         ),
     ))
     .style(|s| s.flex_row().gap(num_gap()).width_full());
-    let cycle = bound_toggle(
-        ui,
-        tr!("object-editor-cycle"),
-        tr!("object-editor-cycle-hint"),
-        d.info.cycle,
-        ring.clone(),
-        80,
-        |d, v| {
-            if let ObjectDraft::Sequence(s) = d {
-                s.info.cycle = v;
-            }
-        },
-    );
+    // A fixed sequence's cycling is shown, not offered: the toggle has no
+    // read-only state, and one that moved would only raise a withheld change.
+    let cycle: AnyView = if fixed {
+        form_setting_owned(
+            tr!("object-editor-cycle"),
+            text(if d.info.cycle {
+                tr!("users-attr-yes")
+            } else {
+                tr!("users-attr-no")
+            })
+            .style(|s| s.color(theme::text_dim()).font_size(theme::font_body())),
+        )
+        .into_any()
+    } else {
+        bound_toggle(
+            ui,
+            tr!("object-editor-cycle"),
+            tr!("object-editor-cycle-hint"),
+            d.info.cycle,
+            ring.clone(),
+            80,
+            |d, v| {
+                if let ObjectDraft::Sequence(s) = d {
+                    s.info.cycle = v;
+                }
+            },
+        )
+    };
+    let fixed_hint: AnyView = if fixed {
+        crate::widgets::form_hint(tr!("object-editor-sequence-fixed"))
+            .style(|s| s.width_full())
+            .into_any()
+    } else {
+        crate::widgets::nothing()
+    };
 
     // Where the counter is, and where it could be moved to. `RESTART` is an
     // action rather than a state, so this box is empty on open however many
     // times the editor is *opened* — which `SequenceDraft::from_info`'s
     // `restart: None` is what actually says, and is why seeding from the draft
     // keeps that property (see [`restart_seed`]).
-    let position = form_setting_owned(restart_label(d.info.last_value), {
-        let errs = ui.object_errors;
-        let sig = floem::reactive::create_rw_signal(restart_seed(d.restart));
-        create_effect(move |prev: Option<String>| {
-            let v = sig.get();
-            if prev.is_some_and(|p| p != v) {
-                let msg = tr!("object-editor-restart-not-whole");
-                let t = v.trim();
-                let parsed = if t.is_empty() {
-                    Some(None)
-                } else {
-                    t.parse::<i64>().ok().map(Some)
-                };
-                match parsed {
-                    Some(r) => {
-                        errs.update(|e| e.retain(|m| m != &msg));
-                        draft.update(|d| {
-                            if let ObjectDraft::Sequence(s) = d {
-                                s.restart = r;
-                            }
-                        });
-                    }
-                    None => errs.update(|e| {
-                        if !e.contains(&msg) {
-                            e.push(msg.clone());
+    // None where the engine cannot move a counter (DuckDB has no `RESTART`).
+    let restarts = ddl::supports_sequence_restart(dialect);
+    let position: AnyView = if !restarts {
+        crate::widgets::nothing()
+    } else {
+        form_setting_owned(restart_label(d.info.last_value), {
+            let errs = ui.object_errors;
+            let sig = floem::reactive::create_rw_signal(restart_seed(d.restart));
+            create_effect(move |prev: Option<String>| {
+                let v = sig.get();
+                if prev.is_some_and(|p| p != v) {
+                    let msg = tr!("object-editor-restart-not-whole");
+                    let t = v.trim();
+                    let parsed = if t.is_empty() {
+                        Some(None)
+                    } else {
+                        t.parse::<i64>().ok().map(Some)
+                    };
+                    match parsed {
+                        Some(r) => {
+                            errs.update(|e| e.retain(|m| m != &msg));
+                            draft.update(|d| {
+                                if let ObjectDraft::Sequence(s) = d {
+                                    s.restart = r;
+                                }
+                            });
                         }
-                    }),
+                        None => errs.update(|e| {
+                            if !e.contains(&msg) {
+                                e.push(msg.clone());
+                            }
+                        }),
+                    }
                 }
-            }
-            v
-        });
-        edit_field(
-            sig,
-            FieldCfg {
-                placeholder_of: Some(Rc::new(|| tr!("object-editor-restart-placeholder"))),
-                focus: Some((ring.clone(), 100)),
-                ..Default::default()
-            },
-        )
-        .style(|s| s.width(field_w()))
-    });
+                v
+            });
+            edit_field(
+                sig,
+                FieldCfg {
+                    placeholder_of: Some(Rc::new(|| tr!("object-editor-restart-placeholder"))),
+                    focus: Some((ring.clone(), 100)),
+                    ..Default::default()
+                },
+            )
+            .style(|s| s.width(field_w()))
+        })
+        .into_any()
+    };
+    // Its heading goes with it, unless an owner still sits under it.
+    let position_heading: AnyView = if restarts || orig_owner.is_some() {
+        form_section(tr!("object-editor-section-position"))
+            .style(|s| s.margin_top(theme::scaled(4.0)))
+            .into_any()
+    } else {
+        crate::widgets::nothing()
+    };
 
     // The owner is context, and detaching is the one change to it worth a
     // control: re-pointing a sequence at a different column needs a table and a
@@ -1148,9 +1213,9 @@ fn sequence_form(
         numbers,
         bounds,
         cycle,
+        fixed_hint,
         comment,
-        form_section(tr!("object-editor-section-position"))
-            .style(|s| s.margin_top(theme::scaled(4.0))),
+        position_heading,
         position,
         owner,
     ))
@@ -1646,6 +1711,8 @@ fn form(ui: DdlUi, overlay: OverlayUi, target: &ObjectTarget, ring: FocusRing) -
             ui,
             d,
             target_sequence(target).and_then(|s| s.owned_by.clone()),
+            target.dialect,
+            target.current.is_some(),
             ring,
         ),
         ObjectDraft::Tsql(d) => tsql_form(ui, d, ring),

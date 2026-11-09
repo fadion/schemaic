@@ -1610,6 +1610,7 @@ object-problem-synonym-no-target = Një sinonim ka nevojë për objektin për t�
 object-problem-alias-no-base = Një tip alias ka nevojë për një tip bazë.
 object-editor-cycle = Cikël
 object-editor-cycle-hint = Kalo në skajin tjetër të intervalit në vend që të dështojë kur sekuenca shteron.
+object-editor-sequence-fixed = Ky motor nuk mund ta ndryshojë një sekuencë pasi është krijuar, vetëm komentin e saj. Për të ndryshuar pjesën tjetër, fshijeni sekuencën dhe krijojeni përsëri.
 object-editor-restart-at = Rinis në — numëruesi dha së fundi { $last }
 object-editor-restart-at-unused = Rinis në — numëruesi nuk është përdorur
 object-editor-restart-not-whole = “Rinis në” duhet të jetë numër i plotë.

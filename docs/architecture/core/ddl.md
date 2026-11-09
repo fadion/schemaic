@@ -2292,8 +2292,9 @@ restart and applies with one at 600, and a sequence restarted on one side compar
 `ObjectDraft::Tsql` wires
 it into the editor: `from_item` answers it for `ObjectItem::Tsql`, and `kind`, `name`,
 `problems` (and so `validate`, its English) and `change_set` route to it. **`ObjectDraft::blank` takes the dialect now, because
-a sequence's draft depends on it** — PostgreSQL's `SequenceDraft` on PostgreSQL, MySQL and
-SQLite, a `TsqlObjectDraft` on SQL Server, and **none on DuckDB**, named in its own arm. The form
+a sequence's draft depends on it** — PostgreSQL's `SequenceDraft` on PostgreSQL, MySQL,
+SQLite and DuckDB (named, so DuckDB does not fall to the arm below), and a `TsqlObjectDraft` on
+SQL Server. The form
 and the plan follow the draft, so the wrong
 one would offer PostgreSQL's clauses and emit its grammar. DuckDB had no arm and fell through to
 the one below, SQL Server's draft; its plans now create a sequence (`duckdb_supports`, for schema
@@ -2301,10 +2302,16 @@ compare), but only a `BIGINT` with no cache and no `OWNED BY` — its `CREATE SE
 neither `AS` nor `CACHE` — and nothing alters one once made: `ALTER SEQUENCE` refuses every
 option (*not yet supported*), `RESTART` does not parse and a rename is *not yet supported*, all
 measured on 2.0.0, so `AlterSequence`, `RestartSequence` and a sequence's `RenameObject` stay
-refused while its `DropObject` and `SetObjectComment` are admitted. PostgreSQL's form offers a
-type, a cache and a restart, so the blank is `None` and **the Sequences folder's Create stays off
-until a form shaped for DuckDB exists** (`duckdb_creates_comments_and_drops_sequences_and_alters_none`,
-which also pins `CREATE SEQUENCE "main"."s" INCREMENT BY 2;` and `DROP SEQUENCE`). A synonym, alias type or collection
+refused while its `DropObject` and `SetObjectComment` are admitted. **The form leaves out what
+the engine's plans refuse**, each a capability computed from `supports_change` on a probe
+sequence: `sequence_takes_type` (the *Stores* picker), `sequence_takes_cache` (*Cache*),
+`supports_sequence_restart` (the *Position* section), and, for a sequence already made,
+`sequence_alters_in_place` and `supports_sequence_rename` — where those are false its name and
+numbers are read-only, its cycling shown as text, and `object-editor-sequence-fixed` says only
+the comment can change (`object_editor::sequence_form`;
+`duckdb_creates_comments_and_drops_sequences_and_alters_none`, which also pins `CREATE SEQUENCE
+"main"."s" INCREMENT BY 2;` and `DROP SEQUENCE`; on an instance,
+`a_sequence_is_created_from_the_form_and_its_comment_edited`). A synonym, alias type or collection
 gets a `TsqlObjectDraft` whatever the dialect; the capability below is what keeps one from being
 offered where its plan would be refused. The comparison asks this same differ of two readings
 of one object, so a schema compare and the editor cannot disagree about what a change to one is
@@ -2321,11 +2328,11 @@ capability alone answers the same for both kinds
 PostgreSQL and SQL Server to both entries). It began because SQL Server's Sequences
 folder would have opened PostgreSQL's sequence form, whose `CREATE SEQUENCE` `tsql_supports`
 refuses. It answers Sequence, Synonym, Alias type and XML schema collection on SQL Server and
-not Type or Domain; Type, Domain and Sequence on PostgreSQL; and nothing on MySQL, SQLite or
-DuckDB, whose sequence has no form (above)
+not Type or Domain; Type, Domain and Sequence on PostgreSQL; Sequence on DuckDB; and nothing
+on MySQL or SQLite
 (`a_folder_offers_create_where_the_engine_takes_the_form`; for the menu,
 `create_menu_tests::mysql_offers_only_what_it_has`, `sql_server_is_offered_what_it_emits` and
-`duckdb_is_offered_what_it_emits` — Table, View, Function, Schema).
+`duckdb_is_offered_what_it_emits` — Table, View, Sequence, Function, Schema).
 **It used to be sound only behind a folder that exists**: MySQL inherited `supports_change`'s
 blanket yes for PostgreSQL's three creates, so the predicate said yes to a MySQL sequence, and
 `overlays::create_children` kept a `dialect == Postgres` for Type, Domain and Sequence rather
