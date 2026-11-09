@@ -10,8 +10,9 @@ files' schemas (*Schema compare*, below), and opens a CSV, Parquet or JSON file 
 throwaway in-memory session (*Open data file*, below). It is **embedded, as SQLite is**, so most
 of `sqlite.rs`'s first paragraph holds here unchanged — there is no server, a connection is a
 file (`Db::file`, `connection::is_file_backed`), host/port/user/password/SSH are inert, the one
-database is the file's own catalog (`current_database()`, named after the file), and the driver
-is blocking, so every call runs on Tokio's blocking pool. What makes it more than a second SQLite
+database is the file's own catalog (`current_database()`, named after the file — up to its
+first dot, which `connection::duckdb_catalog_name` reads off the path without an open), and the
+driver is blocking, so every call runs on Tokio's blocking pool. What makes it more than a second SQLite
 is the things below, and the module doc names the same ones.
 **One database instance per file, per process.** DuckDB locks a file per *instance*, and a
 second instance on the same file in the same process is refused outright — measured on 2.0, *The

@@ -105,8 +105,9 @@ there's no panel on the other end.
 both databases' structure and hands back the script, with what in it is destructive and what it
 leaves out. It runs nothing. Both databases must be the same engine, and a `tables` argument
 narrows it to the tables you name. Reading two whole schemas can take a while, so it has two
-minutes, as `schemaic compare` does. On SQLite each side is its file's `main` database, whatever
-name the call gives, so it compares only across two [served connections](#serving-several-connections).
+minutes, as `schemaic compare` does. On SQLite and DuckDB each side is its file's one database
+(`main` on SQLite, the file's name on DuckDB), whatever name the call gives, so it compares only
+across two [served connections](#serving-several-connections).
 
 **Only what I attach**, the default, gives an outside agent no rows at all: it has no way to attach
 any. `run_query` and `explain` pass the same read-only check as

@@ -592,15 +592,19 @@ impl Engine {
 
     /// [`Db::implied_database`]'s answer, asked of the engine alone — for a
     /// caller holding a saved connection and no handle yet: the CLI resolves
-    /// its `-d` before it connects.
-    pub fn implied_database(self) -> Option<&'static str> {
+    /// its `-d` before it connects. `file` is the connection's file, which
+    /// names DuckDB's database.
+    pub fn implied_database(self, file: &str) -> Option<&str> {
         match self {
             Engine::Sqlite => Some(sqlite::MAIN),
+            // The catalogue is named after the file
+            // (`connection::duckdb_catalog_name`, measured). It was `None`,
+            // "only an open can confirm", so `schemaic exec` refused a DuckDB
+            // connection for want of a database its form has no field for.
+            Engine::DuckDb => schemaic_core::connection::duckdb_catalog_name(file),
             // A SQL Server login lands in its default database, which is the
             // server's to name — `DB_NAME()` — not ours to assume.
-            // The file's catalog is named after the file, which only an
-            // open can confirm (`duckdb::fetch_databases`).
-            Engine::MySql | Engine::Postgres | Engine::MsSql | Engine::DuckDb => None,
+            Engine::MySql | Engine::Postgres | Engine::MsSql => None,
         }
     }
 
@@ -1002,14 +1006,14 @@ impl Db {
 
     /// The database an engine is in by construction, where it has exactly one
     /// to be in — SQLite's [`sqlite::MAIN`], since each operation opens its own
-    /// connection and nothing is ever attached — or `None` where the connection
-    /// has to be told.
+    /// connection and nothing is ever attached, and a DuckDB file's catalogue,
+    /// named after the file — or `None` where the connection has to be told.
     ///
     /// For a caller with no schema tree to have picked one: `schemaic mcp`'s
     /// `describe_table` asked for a `database` on a SQLite file that has one.
     /// Exhaustive, so a fourth engine answers here rather than defaulting.
-    pub fn implied_database(&self) -> Option<&'static str> {
-        self.engine.implied_database()
+    pub fn implied_database(&self) -> Option<&str> {
+        self.engine.implied_database(&self.file)
     }
 
     /// Attach a default database to a handle built by [`Self::from_parts`] —

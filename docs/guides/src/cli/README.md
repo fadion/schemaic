@@ -54,6 +54,8 @@ Every command that reaches a server takes `-c` (`--connection`) and, where it ru
   rename the connection.
 - `-d` defaults to the connection's own database. `schemaic databases -c prod` lists the names
   it takes.
+- A file database needs no `-d`, and ignores one: the file is its only database. On SQLite that's
+  `main`; on DuckDB it's named after the file, up to the first dot — `shop.duckdb` is `shop`.
 - `SCHEMAIC_CONNECTION` and `SCHEMAIC_DATABASE` stand in for `-c` and `-d` when set.
 
 Where there is no keyring to read — over SSH, in a container — `--password-stdin` reads the

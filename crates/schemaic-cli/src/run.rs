@@ -3353,7 +3353,7 @@ fn database_for(target: &Target, conn: &Connection) -> Option<String> {
 /// demand a `-d` of a SQLite file that any value satisfied.
 fn default_database(flag: Option<&str>, conn: &Connection) -> Option<String> {
     schemaic_db::Engine::from_db_type(&conn.db_type)
-        .implied_database()
+        .implied_database(&conn.file)
         .or(flag)
         .or_else(|| conn.default_database())
         .map(str::to_string)
@@ -4765,6 +4765,21 @@ mod tests {
         assert_eq!(
             database_for(&target(Some("other")), &lite).as_deref(),
             Some("main")
+        );
+    }
+
+    /// **A DuckDB file is its database too**, named after the file — `exec`
+    /// refused one with "No database selected" and a hint to pick a default
+    /// the DuckDB form has no field for, while `query` on it ran.
+    #[test]
+    fn a_duckdb_file_defaults_to_the_catalogue_its_file_names() {
+        let mut duck = conn("");
+        duck.db_type = "DuckDB".to_string();
+        duck.file = r"C:\data\shop.duckdb".to_string();
+        assert_eq!(database_for(&target(None), &duck).as_deref(), Some("shop"));
+        assert_eq!(
+            database_for(&target(Some("other")), &duck).as_deref(),
+            Some("shop")
         );
     }
 

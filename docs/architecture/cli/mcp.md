@@ -65,12 +65,13 @@ an agent on a connection whose owner was never asked
 system prompt to budget and `cli_access` already publishing the catalogue through `schemaic
 tables` and `describe`. `hidden` is empty: the SCHEMA eye is the app's view state rather than
 anything saved on the connection, and `schemaic databases` lists every database too. And
-`database` is `Db::implied_database()` first — `main` on SQLite, `None` on the two server
-engines, an exhaustive match — because the panel always passed the tree's selection and
+`database` is `Db::implied_database()` first — `main` on SQLite, the catalogue its file names on
+DuckDB (`connection::duckdb_catalog_name`), `None` on the three server engines, an exhaustive
+match — because the panel always passed the tree's selection and
 standalone there is no tree: `describe_table {"table": "orders"}` on a SQLite file answered that
 the connection had no default, about a file that has exactly one
 (`a_standalone_endpoint_defaults_to_the_engines_only_database`). *First*, not a fallback: on
-SQLite a `-d` or an inherited `SCHEMAIC_DATABASE` is ignored, `catalog.rs`'s rule for its reason
+SQLite — and on DuckDB, since its arm stopped answering `None` (`cli/run.md`) — a `-d` or an inherited `SCHEMAIC_DATABASE` is ignored, `catalog.rs`'s rule for its reason
 — every operation opens its own connection, so nothing else is ever attached, and a variable
 exported for another engine would point every tool at a database that cannot exist. A server
 engine with no default stays `None`, where the model has to pick and `list_schema` shows it the
@@ -530,8 +531,8 @@ subpartitioned by …)` (`database_schema_names_a_mysql_subpartition_clause`).
 **`compare_schemas {database?, source_database?, source_connection?, tables?}` is `schemaic
 compare` as a tool, and like the CLI it runs nothing.** `database` is the one the script would
 change and `source_database` the one it should come to match, **each side resolved as `schemaic
-compare` resolves it**: the side's `Db::implied_database()` first (SQLite's `main`), then the
-argument, then that side's endpoint default. It took the argument raw, so on SQLite
+compare` resolves it**: the side's `Db::implied_database()` first (SQLite's `main`, the
+catalogue a DuckDB file names), then the argument, then that side's endpoint default. It took the argument raw, so on SQLite
 `source_database: "staging"` read `main` twice — `fetch_schema` reads `main` whatever it is
 called — and answered that `main` already matched a database that does not exist (release review
 S6-L1-01). The source is the same

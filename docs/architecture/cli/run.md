@@ -162,7 +162,7 @@ Schemaic, no `--all` advice — because the old single hint told a user with no 
 turn CLI access on (`list_counts_what_it_hid`, `list_is_quiet_when_it_hid_nothing`,
 `an_empty_list_says_whether_anything_is_saved`). stdout stays the rows alone. `database_for` is
 the engine's implied database first (`schemaic_db::Engine::implied_database`, `main` on
-SQLite), then the flag, then the connection's own through `Connection::default_database`, else
+SQLite, the catalogue the file names on DuckDB), then the flag, then the connection's own through `Connection::default_database`, else
 `None` — an empty string there would read as a real database name to the guard's `no_database`
 arm, which is why the saved name is read blank-as-none (`a_blank_saved_database_is_none`).
 *First*, not a fallback, is `mcp::Endpoint::standalone`'s rule for its reason: a SQLite file has
@@ -170,10 +170,17 @@ exactly one database, so a `-d` there names nothing else. It was the flag, else 
 `conn.database`, so `dump` and `compare` on a SQLite file demanded a `-d` that any value
 satisfied. `Engine::implied_database` is `Db::implied_database`'s answer asked of the engine
 alone, and the `Db` method now delegates to it, because the CLI resolves its database before it
-has connected. The rule itself is `default_database(flag, conn)`, factored out for `mcp` and
-`compare`, whose `-d` is not in a `Target` (`mcp_defaults_to_the_connections_database`, which
-covers the flag and the saved name; `a_sqlite_file_defaults_to_main` pins the implied-first
-half, a `-d` and a stale saved name both losing to `main`).
+has connected. **It takes the connection's `file`**, because on DuckDB that is what names the
+database — `connection::duckdb_catalog_name`, the file's name up to its first dot. DuckDB's arm
+answered `None`, on the reasoning that only an open could confirm the catalogue's name, so
+`schemaic exec`, `exec --script`, `dump` and `compare` on a saved DuckDB connection refused with
+*No database selected* and a hint to pick a default in Schemaic — a field the DuckDB form does
+not have — while `schemaic query`, which needs none, worked. The rule itself is
+`default_database(flag, conn)`, factored out for `mcp` and `compare`, whose `-d` is not in a
+`Target` (`mcp_defaults_to_the_connections_database`, which covers the flag and the saved name;
+`a_sqlite_file_defaults_to_main` pins the implied-first half, a `-d` and a stale saved name both
+losing to `main`, and `a_duckdb_file_defaults_to_the_catalogue_its_file_names` the same on
+DuckDB, a `-d other` losing to `shop`).
 **`version` is answered at the top of `dispatch`, before `load_connections_readonly` runs**: it
 needs no saved connection, and a damaged `connections.json` must not stop anyone learning which
 build they have — the first thing asked of someone reporting it damaged. Checked by hand with a

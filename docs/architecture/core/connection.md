@@ -50,6 +50,16 @@ session this process holds, reaches that session's database — but the form say
 form shows `db-refused-duckdb-not-a-file` under the path in place of the hint. `db::duckdb::open_target`
 asks the same function for the spellings it refuses at a connect, a `memory:` target there being a
 session's own (`a_duckdb_path_names_a_file_unless_it_names_memory_or_motherduck`).
+**`duckdb_catalog_name` is the catalogue a DuckDB file opens as** — the one database every
+operation on it runs in: the file's name up to its **first** dot, after either path separator
+(a saved path may be Windows' on any machine), trimmed, case kept, and `None` where
+`duckdb_names_a_file` says no or the name would be empty (`.duckdb`). The rule is DuckDB's and was
+measured on 2.0.0 through `schemaic databases` — `a.b.duckdb` opens as `a`, `noext` as `noext`,
+`x.db` as `x`, `My File.duckdb` as `My File`, `UPPER.DuckDB` as `UPPER`, `dash-name.duckdb` and
+`1lead.duckdb` as themselves (`a_duckdb_files_catalogue_is_its_name_up_to_the_first_dot`). It is
+what `schemaic_db::Engine::implied_database` answers for DuckDB, which had answered `None` on
+the reasoning that only an open could confirm the name, and so left `schemaic exec` asking for a
+default database the DuckDB form has no field for (`cli/run.md`).
 **`sql_server_address` is the one reading of a SQL Server Host field**, as Microsoft's clients
 read it: a leading `tcp:` (any case) is the protocol and goes, `.` and `(local)` are
 `localhost`, a trailing `,port` is the port — a non-zero `u16`, or the text stays in `server`

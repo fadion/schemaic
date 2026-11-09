@@ -2524,6 +2524,25 @@ pub fn duckdb_names_a_file(file: &str) -> bool {
         || f.starts_with("motherduck:"))
 }
 
+/// The catalogue a DuckDB `file` opens as — the database every operation on
+/// it runs in, which the schema tree shows as the connection's one database.
+/// `None` where `file` names no file ([`duckdb_names_a_file`]) or the name
+/// would be empty.
+///
+/// DuckDB's rule, measured on 2.0.0: the file's name **up to its first dot**
+/// — `a.b.duckdb` opens as `a`, `noext` as `noext` — case kept. Either
+/// separator ends a folder, since a saved path may be Windows' on any
+/// machine. A slice of `file`, so a caller holding the path can lend it.
+pub fn duckdb_catalog_name(file: &str) -> Option<&str> {
+    let f = file.trim();
+    if f.is_empty() || !duckdb_names_a_file(f) {
+        return None;
+    }
+    let name = f.rsplit(['/', '\\']).next().unwrap_or(f);
+    let stem = name.split('.').next().unwrap_or(name);
+    (!stem.is_empty()).then_some(stem)
+}
+
 /// Is this engine's whole target **a file on this machine** rather than a
 /// server — SQLite and DuckDB?
 ///
@@ -4706,6 +4725,40 @@ mod tests {
             "",
         ] {
             assert!(duckdb_names_a_file(f), "{f}");
+        }
+    }
+
+    /// **DuckDB names a file's catalogue after its name up to the first
+    /// dot**, every row measured on 2.0.0 (`schemaic databases` on a file of
+    /// each name): `a.b.duckdb` is `a`, not `a.b`. A path's folders, dotted
+    /// or not, and either separator, are not part of it.
+    #[test]
+    fn a_duckdb_files_catalogue_is_its_name_up_to_the_first_dot() {
+        for (file, name) in [
+            (r"C:\data\shop.duckdb", "shop"),
+            (r"C:\data\a.b.duckdb", "a"),
+            (r"C:\data\noext", "noext"),
+            (r"C:\data\x.db", "x"),
+            (r"C:\my files\My File.duckdb", "My File"),
+            (r"C:\data\UPPER.DuckDB", "UPPER"),
+            (r"C:\data\dash-name.duckdb", "dash-name"),
+            (r"C:\data\1lead.duckdb", "1lead"),
+            (r"C:\some.dir\f.duckdb", "f"),
+            ("/home/a/sales.duckdb", "sales"),
+            ("sales.duckdb", "sales"),
+            (" sales.duckdb ", "sales"),
+        ] {
+            assert_eq!(duckdb_catalog_name(file), Some(name), "{file}");
+        }
+        for file in [
+            "",
+            "memory:session-1",
+            ":memory:",
+            "md:x",
+            r"C:\data\.duckdb",
+            r"C:\data\",
+        ] {
+            assert_eq!(duckdb_catalog_name(file), None, "{file}");
         }
     }
 
