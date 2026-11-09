@@ -1245,7 +1245,10 @@ impl DatabaseDraft {
                 SqlDialect::MsSql if is_collation_name(coll) => {
                     out.push_str(&format!(" COLLATE {coll}"))
                 }
-                SqlDialect::MsSql | SqlDialect::Postgres | SqlDialect::Sqlite => {}
+                SqlDialect::MsSql
+                | SqlDialect::Postgres
+                | SqlDialect::Sqlite
+                | SqlDialect::DuckDb => {}
             }
         }
         // An owner *is* a role identifier, so this one is quoted as one.
@@ -1463,7 +1466,7 @@ pub fn pg_replaceable(current: &[String], select: &str, dialect: SqlDialect) -> 
 pub fn foreign_keys_create_their_index(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -1984,6 +1987,9 @@ impl TriggerDraft {
                     _ => {}
                 }
             }
+            // DuckDB has no triggers; `supports_trigger_editing` is false for
+            // it, so a draft never reaches here to be judged.
+            SqlDialect::DuckDb => {}
             SqlDialect::MsSql => {
                 // T-SQL's grammar, each rule the server's own: `AFTER` (or its
                 // synonym `FOR`) and `INSTEAD OF` are the only timings, `INSTEAD OF`
@@ -2604,7 +2610,7 @@ impl RoutineDraft {
                     });
                 }
             }
-            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {}
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {}
         }
         // Not a syntax error — it creates fine and then fails on every write.
         if f.is_trigger_function() && !f.arguments.trim().is_empty() {
@@ -4642,6 +4648,8 @@ pub fn namespace_comes_with_every_database(
             "db_denydatawriter",
         ],
         SqlDialect::Postgres => &["public", "pg_catalog", "information_schema"],
+        // Measured on 2.0: `duckdb_schemas()` lists these three in a new file.
+        SqlDialect::DuckDb => &["main", "pg_catalog", "information_schema"],
         SqlDialect::MySql | SqlDialect::Sqlite => &[],
     };
     builtin
@@ -4799,7 +4807,7 @@ fn view_drop_cost(dialect: SqlDialect, restored: bool) -> ViewCost {
         // view, and goes with it; its indexes, if it is an indexed view, are
         // the plan's to put back (`view_indexes_rebuilt`).
         SqlDialect::MsSql => ViewCostEngine::MsSql,
-        SqlDialect::MySql | SqlDialect::Postgres => ViewCostEngine::Other,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::DuckDb => ViewCostEngine::Other,
     };
     ViewCost { engine, restored }
 }
@@ -7133,7 +7141,10 @@ impl Change {
                 name: r.current.name.clone(),
                 tsql: match dialect {
                     SqlDialect::MsSql => true,
-                    SqlDialect::Sqlite | SqlDialect::MySql | SqlDialect::Postgres => false,
+                    SqlDialect::Sqlite
+                    | SqlDialect::MySql
+                    | SqlDialect::Postgres
+                    | SqlDialect::DuckDb => false,
                 },
             }],
             Change::DropTable => vec![Risk::DropTable],
@@ -7195,7 +7206,9 @@ impl Change {
                 let why = match dialect {
                     SqlDialect::Sqlite => RecreateViewWhy::Sqlite,
                     SqlDialect::MsSql => RecreateViewWhy::MsSql,
-                    SqlDialect::MySql | SqlDialect::Postgres => RecreateViewWhy::Postgres,
+                    SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::DuckDb => {
+                        RecreateViewWhy::Postgres
+                    }
                 };
                 let mut out = vec![Risk::RecreateView {
                     name: draft.name.clone(),
@@ -7674,9 +7687,10 @@ impl Change {
                 let who = c.account.display();
                 vec![match dialect {
                     SqlDialect::MsSql => Risk::GrantServerWide { privileges, who },
-                    SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
-                        Risk::GrantEveryDatabase { privileges, who }
-                    }
+                    SqlDialect::MySql
+                    | SqlDialect::Postgres
+                    | SqlDialect::Sqlite
+                    | SqlDialect::DuckDb => Risk::GrantEveryDatabase { privileges, who },
                 }]
             }
             // **A table grant that would lift a column's `DENY`**, where the
@@ -8136,7 +8150,10 @@ impl ChangeSet {
                 SqlDialect::MsSql => tsql_rebuild_refusals(&r.current, &r.draft),
                 // `diff` raises a rebuild only where `rebuilds_tables`, so the
                 // other two never reach here.
-                SqlDialect::Sqlite | SqlDialect::MySql | SqlDialect::Postgres => r
+                SqlDialect::Sqlite
+                | SqlDialect::MySql
+                | SqlDialect::Postgres
+                | SqlDialect::DuckDb => r
                     .draft
                     .indexes
                     .iter()
@@ -8174,6 +8191,11 @@ impl ChangeSet {
             SqlDialect::Sqlite => self.emit_sqlite(),
             SqlDialect::MsSql => self.emit_mssql(),
             SqlDialect::MySql => self.emit_mysql(),
+            // Unreachable until DuckDB's changes are written: `duckdb_supports`
+            // refuses every one, so no plan holds a DuckDB change to emit.
+            // PostgreSQL's emitter is the closest grammar, and is where the
+            // DuckDB phase of the roadmap starts from.
+            SqlDialect::DuckDb => self.emit_postgres(),
         }
     }
 
@@ -9455,7 +9477,7 @@ impl ChangeSet {
                 // Guarded as its siblings are, so a refused one writes nothing
                 // rather than reaching the arms below that cannot be reached.
                 Change::RenameView { to } if supports_change(d, c) => match d {
-                    SqlDialect::Postgres => out.push(format!(
+                    SqlDialect::Postgres | SqlDialect::DuckDb => out.push(format!(
                         "ALTER VIEW {} RENAME TO {};",
                         self.qname(),
                         ddl_ident_in(to, d)
@@ -9512,10 +9534,12 @@ impl ChangeSet {
                 ),
                 // T-SQL's DML trigger is a schema object too, dropped by its
                 // qualified name alone.
-                SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => format!(
-                    "DROP TRIGGER {};",
-                    qualified(name, self.schema.as_deref(), d)
-                ),
+                SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => {
+                    format!(
+                        "DROP TRIGGER {};",
+                        qualified(name, self.schema.as_deref(), d)
+                    )
+                }
             }
         };
         // **All the drops, then all the creates** — not each replace's pair
@@ -10454,7 +10478,9 @@ fn create_view_sql(v: &ViewDraft, name: &str, dialect: SqlDialect, replace: bool
     if replace && supports_or_replace_view(dialect) {
         sql.push_str(match dialect {
             SqlDialect::MsSql => "OR ALTER ",
-            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => "OR REPLACE ",
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+                "OR REPLACE "
+            }
         });
     }
     if my {
@@ -10857,7 +10883,7 @@ fn qualified(name: &str, schema: Option<&str>, dialect: SqlDialect) -> String {
 pub fn bare_reference_is_own_namespace(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Sqlite => true,
-        SqlDialect::Postgres | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -10967,7 +10993,11 @@ pub(crate) fn create_index_sql(ix: &IndexInfo, qtable: &str, dialect: SqlDialect
     // T-SQL's default is `NONCLUSTERED`, so only the other is written.
     let cluster = match dialect {
         SqlDialect::MsSql if ix.clustered == Some(true) => "CLUSTERED ",
-        SqlDialect::MsSql | SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => "",
+        SqlDialect::MsSql
+        | SqlDialect::MySql
+        | SqlDialect::Postgres
+        | SqlDialect::Sqlite
+        | SqlDialect::DuckDb => "",
     };
     let using = match &ix.method {
         Some(m) if writes_index_method(dialect) => format!(" USING {m}"),
@@ -11673,7 +11703,7 @@ fn tsql_in_place_guard(q: &str, changes: &[&Change]) -> Option<String> {
 fn inlines_indexes(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -11683,7 +11713,7 @@ fn inlines_indexes(dialect: SqlDialect) -> bool {
 pub fn takes_table_options(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -11694,7 +11724,7 @@ pub fn takes_table_options(dialect: SqlDialect) -> bool {
 pub fn supports_column_on_update(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -11706,7 +11736,7 @@ pub fn supports_column_on_update(dialect: SqlDialect) -> bool {
 pub fn supports_unenforced_check(dialect: SqlDialect, flavour: ServerFlavour) -> bool {
     match dialect {
         SqlDialect::MySql => flavour == ServerFlavour::MySql,
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -11716,7 +11746,7 @@ pub fn supports_unenforced_check(dialect: SqlDialect, flavour: ServerFlavour) ->
 fn writes_index_method(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
-        SqlDialect::MsSql => false,
+        SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -11727,7 +11757,11 @@ fn writes_index_method(dialect: SqlDialect) -> bool {
 pub(crate) fn key_clustering(clustered: Option<bool>, dialect: SqlDialect) -> &'static str {
     match dialect {
         SqlDialect::MsSql if clustered == Some(false) => " NONCLUSTERED",
-        SqlDialect::MsSql | SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => "",
+        SqlDialect::MsSql
+        | SqlDialect::MySql
+        | SqlDialect::Postgres
+        | SqlDialect::Sqlite
+        | SqlDialect::DuckDb => "",
     }
 }
 
@@ -11914,7 +11948,8 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
     // MySQL's went into `COMMENT=` above, and SQLite has none.
     match dialect {
         SqlDialect::MySql | SqlDialect::Sqlite => {}
-        SqlDialect::Postgres => {
+        // DuckDB takes PostgreSQL's `COMMENT ON`.
+        SqlDialect::Postgres | SqlDialect::DuckDb => {
             if let Some(c) = d.comment.as_deref().filter(|c| !c.is_empty()) {
                 out.push(format!(
                     "COMMENT ON TABLE {qname} IS {};",
@@ -12163,7 +12198,7 @@ pub fn fk_actions(dialect: SqlDialect) -> &'static [Option<&'static str>] {
 /// use is `Incorrect syntax near 'RESTRICT'`.
 pub fn supports_fk_restrict(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => true,
         SqlDialect::MsSql => false,
     }
 }
@@ -12175,7 +12210,7 @@ pub fn supports_fk_restrict(dialect: SqlDialect) -> bool {
 /// the engine has one.
 pub fn supports_drop_schema_cascade(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::Postgres => true,
+        SqlDialect::Postgres | SqlDialect::DuckDb => true,
         SqlDialect::MsSql | SqlDialect::MySql | SqlDialect::Sqlite => false,
     }
 }
@@ -12191,7 +12226,7 @@ pub fn supports_drop_schema_cascade(dialect: SqlDialect) -> bool {
 /// re-pointed. PostgreSQL, SQLite and SQL Server all perform it.
 pub fn supports_fk_set_default(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql => false,
+        SqlDialect::MySql | SqlDialect::DuckDb => false,
         SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
     }
 }
@@ -12201,7 +12236,7 @@ pub fn supports_fk_set_default(dialect: SqlDialect) -> bool {
 pub fn supports_index_prefix(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -12213,7 +12248,7 @@ pub fn supports_index_prefix(dialect: SqlDialect) -> bool {
 pub fn supports_partial_index(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
-        SqlDialect::MySql => false,
+        SqlDialect::MySql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -12225,7 +12260,7 @@ pub fn supports_partial_index(dialect: SqlDialect) -> bool {
 pub fn supports_index_method(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -12449,7 +12484,7 @@ impl IndexStorage {
 pub fn supports_xml_and_spatial_indexes(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -12459,7 +12494,7 @@ pub fn supports_xml_and_spatial_indexes(dialect: SqlDialect) -> bool {
 pub fn supports_columnstore(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -12472,7 +12507,9 @@ pub fn supports_columnstore_order(dialect: SqlDialect) -> bool {
     supports_columnstore(dialect)
         && match dialect {
             SqlDialect::MsSql => true,
-            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+                false
+            }
         }
 }
 
@@ -12483,7 +12520,7 @@ pub fn supports_columnstore_order(dialect: SqlDialect) -> bool {
 pub fn supports_index_include(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql | SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -12497,7 +12534,7 @@ pub fn supports_index_include(dialect: SqlDialect) -> bool {
 pub fn constraint_takes_include(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MsSql | SqlDialect::MySql | SqlDialect::Sqlite => false,
+        SqlDialect::MsSql | SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -12510,7 +12547,7 @@ pub fn constraint_takes_include(dialect: SqlDialect) -> bool {
 pub fn key_clusters_by_default(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -12551,7 +12588,7 @@ pub fn index_takes_filter(ix: &IndexInfo, dialect: SqlDialect) -> bool {
 pub fn constraint_takes_filter(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres | SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -12563,7 +12600,7 @@ pub fn constraint_takes_filter(dialect: SqlDialect) -> bool {
 /// extended property, a statement of its own (`TsqlComment`).
 pub fn supports_comments(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb => true,
         SqlDialect::Sqlite => false,
     }
 }
@@ -12577,6 +12614,11 @@ pub fn identity_wording(dialect: SqlDialect) -> (&'static str, &'static str) {
             "The server assigns the value (GENERATED BY DEFAULT AS IDENTITY).",
         ),
         SqlDialect::MsSql => ("Identity", "The server assigns the value (IDENTITY(1,1))."),
+        // DuckDB has no identity clause: a key counts from a sequence.
+        SqlDialect::DuckDb => (
+            "Sequence default",
+            "The value comes from a sequence (DEFAULT nextval('…')).",
+        ),
         SqlDialect::MySql | SqlDialect::Sqlite => (
             "Auto-increment",
             "The server assigns the value (AUTO_INCREMENT).",
@@ -12625,6 +12667,27 @@ pub fn common_types(dialect: SqlDialect) -> &'static [&'static str] {
             "BOOLEAN",
             "DATE",
             "DATETIME",
+        ],
+        // DuckDB's own names, as `duckdb_columns().data_type` spells them —
+        // so a column picked here reads back the same.
+        SqlDialect::DuckDb => &[
+            "INTEGER",
+            "BIGINT",
+            "SMALLINT",
+            "HUGEINT",
+            "DECIMAL(18,3)",
+            "DOUBLE",
+            "FLOAT",
+            "BOOLEAN",
+            "VARCHAR",
+            "DATE",
+            "TIME",
+            "TIMESTAMP",
+            "TIMESTAMP WITH TIME ZONE",
+            "INTERVAL",
+            "UUID",
+            "BLOB",
+            "JSON",
         ],
         SqlDialect::MySql => &[
             "int",
@@ -12729,7 +12792,7 @@ pub fn database_collations(dialect: SqlDialect) -> &'static [&'static str] {
     match dialect {
         SqlDialect::MySql => &MYSQL_COLLATIONS,
         SqlDialect::MsSql => &MSSQL_COLLATIONS,
-        SqlDialect::Postgres | SqlDialect::Sqlite => &[],
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => &[],
     }
 }
 
@@ -12814,7 +12877,7 @@ impl TypeAliasing {
             // varying`), but its catalogue answers with the canonical name, and
             // no draft is compared against one yet (`supports_change`), so
             // nothing here has earned a table.
-            SqlDialect::MsSql => TypeAliasing::Verbatim,
+            SqlDialect::MsSql | SqlDialect::DuckDb => TypeAliasing::Verbatim,
         }
     }
 }
@@ -13085,7 +13148,9 @@ fn routine_follow_ups(f: &RoutineInfo, before: Option<&RoutineInfo>, d: SqlDiale
             };
             vec![on.set(comment)]
         }
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => Vec::new(),
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+            Vec::new()
+        }
     }
 }
 
@@ -13113,7 +13178,7 @@ fn trigger_create_statements(
                 .collect(),
             t.tsql_rank_statements(),
         ),
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
             (session_wrapped_create(t, d), Vec::new())
         }
     }
@@ -13241,7 +13306,7 @@ pub(crate) fn routine_create_statements(
                 script && !r.tsql.hidden,
             )
         }
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
             session_wrapped(None, head, r, d)
         }
     }
@@ -13294,14 +13359,16 @@ pub(crate) fn session_wrapped(
         // SQL Server's creation-time settings are its own two, not MySQL's
         // three — `tsql_settings_wrapped`.
         SqlDialect::MsSql => tsql_settings_wrapped(lead, create, &r.tsql.module),
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => session_wrapped_with(
-            lead,
-            create,
-            r.sql_mode.as_deref(),
-            r.charset_client.as_deref(),
-            r.collation_connection.as_deref(),
-            d,
-        ),
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+            session_wrapped_with(
+                lead,
+                create,
+                r.sql_mode.as_deref(),
+                r.charset_client.as_deref(),
+                r.collation_connection.as_deref(),
+                d,
+            )
+        }
     }
 }
 
@@ -13778,6 +13845,8 @@ fn repoint_check_columns(
         SqlDialect::Postgres => &[(b'"', b'"')],
         SqlDialect::MySql => &[(b'`', b'`')],
         SqlDialect::Sqlite => &[(b'"', b'"'), (b'`', b'`'), (b'[', b']')],
+        // `[` is a list on DuckDB, never a name.
+        SqlDialect::DuckDb => &[(b'"', b'"'), (b'`', b'`')],
         SqlDialect::MsSql => &[(b'[', b']'), (b'"', b'"')],
     };
     let target = |s: &str| {
@@ -14017,7 +14086,7 @@ pub fn supports_namespace_editing(dialect: SqlDialect) -> bool {
 pub fn supports_owners(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14037,7 +14106,7 @@ pub fn supports_owners(dialect: SqlDialect) -> bool {
 pub fn supports_database_charset(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14053,7 +14122,7 @@ pub fn supports_database_charset(dialect: SqlDialect) -> bool {
 pub fn supports_database_collation(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::MsSql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14082,7 +14151,7 @@ pub fn is_collation_name(name: &str) -> bool {
 /// ([`crate::schema::ViewOptions::attributes`]).
 pub fn supports_or_replace_view(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb => true,
         SqlDialect::Sqlite => false,
     }
 }
@@ -14097,7 +14166,7 @@ pub fn supports_or_replace_view(dialect: SqlDialect) -> bool {
 pub fn supports_view_check_option(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Postgres => true,
-        SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14109,7 +14178,7 @@ pub fn supports_view_check_option(dialect: SqlDialect) -> bool {
 pub fn supports_view_security(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14125,7 +14194,7 @@ pub fn supports_view_security(dialect: SqlDialect) -> bool {
 pub fn view_replace_can_refuse(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14137,7 +14206,7 @@ pub fn view_replace_can_refuse(dialect: SqlDialect) -> bool {
 /// report. Where it is kept it is restated, and the editor shows it.
 pub fn view_keeps_column_list(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => true,
         SqlDialect::MySql | SqlDialect::Postgres => false,
     }
 }
@@ -14155,7 +14224,7 @@ pub fn view_keeps_column_list(dialect: SqlDialect) -> bool {
 pub fn renames_indexes_in_place(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14175,7 +14244,7 @@ pub fn renames_indexes_in_place(dialect: SqlDialect) -> bool {
 /// An exhaustive `match`, for the reason [`supports_owners`] gives.
 pub fn publishes_index_ddl(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => true,
         // No per-index accessor either: SSMS scripts an index from
         // `sys.indexes` and `sys.index_columns`, as the model does.
         SqlDialect::MySql | SqlDialect::MsSql => false,
@@ -14210,7 +14279,7 @@ pub fn ref_schema_is_database(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
         // A real schema inside the database, as on PostgreSQL.
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14234,7 +14303,7 @@ pub fn view_definition_is_qualified(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
         // `sys.sql_modules.definition` is the statement as it was written.
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14259,7 +14328,7 @@ pub fn view_definition_is_qualified(dialect: SqlDialect) -> bool {
 pub fn body_qualifier_is_database(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Sqlite => true,
-        SqlDialect::Postgres | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14301,6 +14370,9 @@ pub fn rename_follows(dialect: SqlDialect, kind: crate::used_by::DependentKind) 
         (SqlDialect::Postgres, K::Routine | K::Event) => false,
         (SqlDialect::Sqlite, K::View | K::Trigger) => true,
         (SqlDialect::Sqlite, K::Routine | K::Event | K::Expression) => false,
+        // DuckDB refuses to rename a table anything depends on, so nothing
+        // has to follow the name.
+        (SqlDialect::DuckDb, _) => false,
         (
             SqlDialect::MySql | SqlDialect::MsSql,
             K::View | K::Routine | K::Trigger | K::Event | K::Expression,
@@ -14421,7 +14493,7 @@ pub fn refresh_view_change(t: &crate::schema::TableInfo) -> Option<Change> {
 /// arm [`diff_view`] takes, as [`supports_routine_rename`] does for a routine.
 pub fn supports_view_rename(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::DuckDb => true,
         SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
 }
@@ -14441,6 +14513,8 @@ pub fn trigger_timings(dialect: SqlDialect, host: TriggerHost) -> Vec<TriggerTim
         SqlDialect::MsSql if view => vec![InsteadOf],
         // None: MySQL takes no trigger on a view (`supports_view_triggers`).
         SqlDialect::MySql if view => Vec::new(),
+        // DuckDB has no triggers at all.
+        SqlDialect::DuckDb => Vec::new(),
         SqlDialect::MsSql => vec![After, InsteadOf],
         SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MySql => vec![Before, After],
     }
@@ -14451,7 +14525,9 @@ pub fn trigger_events(dialect: SqlDialect) -> &'static [TriggerEvent] {
     use TriggerEvent::{Delete, Insert, Truncate, Update};
     match dialect {
         SqlDialect::Postgres => &[Insert, Update, Delete, Truncate],
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => &[Insert, Update, Delete],
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => {
+            &[Insert, Update, Delete]
+        }
     }
 }
 
@@ -14462,7 +14538,7 @@ pub fn trigger_events(dialect: SqlDialect) -> &'static [TriggerEvent] {
 pub fn trigger_fires_on_several_events(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres | SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14471,7 +14547,7 @@ pub fn trigger_fires_on_several_events(dialect: SqlDialect) -> bool {
 pub fn supports_trigger_not_for_replication(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14482,7 +14558,7 @@ pub fn supports_trigger_not_for_replication(dialect: SqlDialect) -> bool {
 pub fn supports_trigger_execute_as(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14493,7 +14569,7 @@ pub fn supports_trigger_execute_as(dialect: SqlDialect) -> bool {
 pub fn supports_trigger_firing_rank(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14508,7 +14584,7 @@ pub fn supports_trigger_firing_rank(dialect: SqlDialect) -> bool {
 pub fn catalogue_body_is_unescaped(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14520,7 +14596,7 @@ pub fn catalogue_body_is_unescaped(dialect: SqlDialect) -> bool {
 pub fn supports_view_triggers(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
-        SqlDialect::MySql => false,
+        SqlDialect::MySql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14530,7 +14606,7 @@ pub fn supports_view_triggers(dialect: SqlDialect) -> bool {
 pub fn trigger_runs_function(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14541,7 +14617,7 @@ pub fn trigger_runs_function(dialect: SqlDialect) -> bool {
 pub fn supports_trigger_level_choice(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14551,7 +14627,7 @@ pub fn supports_trigger_level_choice(dialect: SqlDialect) -> bool {
 pub fn supports_trigger_when(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres | SqlDialect::Sqlite => true,
-        SqlDialect::MySql | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14562,7 +14638,7 @@ pub fn supports_trigger_when(dialect: SqlDialect) -> bool {
 pub fn supports_trigger_update_of(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres | SqlDialect::Sqlite => true,
-        SqlDialect::MySql | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14578,7 +14654,7 @@ pub fn supports_trigger_update_of(dialect: SqlDialect) -> bool {
 pub fn supports_trigger_alter_in_place(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14612,7 +14688,7 @@ fn trigger_alters_in_place(draft: &TriggerDraft, dialect: SqlDialect) -> bool {
 pub fn ddl_is_transactional(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => false,
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => true,
     }
 }
 
@@ -14624,7 +14700,7 @@ pub fn ddl_is_transactional(dialect: SqlDialect) -> bool {
 fn recreate_restates_routine_comment(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::MsSql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14694,7 +14770,7 @@ pub fn supports_trigger_editing(dialect: SqlDialect) -> bool {
 pub fn trigger_names_are_schema_scoped(dialect: SqlDialect) -> bool {
     match dialect {
         // A T-SQL trigger is an object of its schema, in `sys.objects`.
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => true,
         SqlDialect::Postgres => false,
     }
 }
@@ -14802,7 +14878,7 @@ pub fn supports_object_creation(dialect: SqlDialect, kind: ObjectKind) -> bool {
 /// answers for it.
 pub fn supports_or_replace_routine(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::Postgres | SqlDialect::MsSql => true,
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb => true,
         SqlDialect::MySql | SqlDialect::Sqlite => false,
     }
 }
@@ -14822,7 +14898,7 @@ pub fn supports_or_replace_routine(dialect: SqlDialect) -> bool {
 pub fn replay_replaces_routine_in_place(dialect: SqlDialect, flavour: ServerFlavour) -> bool {
     match dialect {
         SqlDialect::MySql => flavour.is_mariadb(),
-        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite => {
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite | SqlDialect::DuckDb => {
             supports_or_replace_routine(dialect)
         }
     }
@@ -14836,7 +14912,7 @@ pub fn replay_replaces_routine_in_place(dialect: SqlDialect, flavour: ServerFlav
 pub fn routine_takes_language(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14855,7 +14931,7 @@ pub fn routine_takes_language(dialect: SqlDialect) -> bool {
 pub fn supports_routine_rename(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14877,7 +14953,7 @@ pub fn supports_routine_rename(dialect: SqlDialect) -> bool {
 pub fn overloads_routines(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14945,6 +15021,7 @@ pub fn default_new_column_type(dialect: SqlDialect) -> &'static str {
     match dialect {
         SqlDialect::MySql | SqlDialect::Sqlite => "varchar(255)",
         SqlDialect::Postgres => "text",
+        SqlDialect::DuckDb => "VARCHAR",
         // `nvarchar`, not `varchar`: the latter holds only the database's code
         // page, and anything outside it is stored as `?`.
         SqlDialect::MsSql => "nvarchar(255)",
@@ -14970,7 +15047,7 @@ pub fn default_new_column_type(dialect: SqlDialect) -> &'static str {
 pub fn supports_column_reorder(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => true,
-        SqlDialect::Postgres => false,
+        SqlDialect::Postgres | SqlDialect::DuckDb => false,
     }
 }
 
@@ -14983,7 +15060,7 @@ pub fn supports_column_reorder(dialect: SqlDialect) -> bool {
 pub fn rebuilds_tables(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Sqlite | SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::DuckDb => false,
     }
 }
 
@@ -15010,7 +15087,7 @@ pub fn enforces_declared_byte_length(dialect: SqlDialect) -> bool {
         // SQL Server enforces `varbinary(n)` too ("String or binary data would
         // be truncated"), but [`crate::blob::column_byte_cap`] reads MySQL's
         // type names, so it is not asked there until it reads SQL Server's.
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -15034,7 +15111,7 @@ pub fn enforces_declared_byte_length(dialect: SqlDialect) -> bool {
 pub fn schema_body_is_emittable(dialect: SqlDialect) -> bool {
     match dialect {
         // SQL Server's `sys.sql_modules.definition` is the statement verbatim.
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => true,
         SqlDialect::MySql => false,
     }
 }
@@ -15065,7 +15142,7 @@ pub fn ddl_rolls_back_as_a_whole(dialect: SqlDialect) -> bool {
     match dialect {
         // T-SQL DDL is transactional, and `mssql::run_ddl` wraps the plan in
         // one transaction.
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => true,
         SqlDialect::MySql => false,
     }
 }
@@ -15089,7 +15166,7 @@ pub fn supports_sequence_resync(dialect: SqlDialect) -> bool {
         SqlDialect::Postgres => true,
         // An `IDENTITY` column moves its current value up to the largest one
         // inserted explicitly, so it follows the data as MySQL's does.
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -16202,7 +16279,7 @@ fn partial_index_replay<'a>(
 pub fn alter_column_disturbs_checks(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::MsSql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -16219,7 +16296,7 @@ pub fn alter_column_disturbs_checks(dialect: SqlDialect) -> bool {
 pub fn alter_column_disturbs_dependents(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -16484,7 +16561,7 @@ fn repair_tsql_dependents(
 /// nullable column (Msg 8111), so [`diff`] makes the columns `NOT NULL` itself.
 pub fn primary_key_implies_not_null(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => true,
         SqlDialect::MsSql => false,
     }
 }
@@ -17243,7 +17320,7 @@ fn tsql_moves_columns<'a>(changes: impl IntoIterator<Item = &'a Change>) -> bool
 pub fn refreshes_star_dependents(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -18258,6 +18335,7 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     // which side of this it is on.
     match dialect {
         SqlDialect::MsSql => return tsql_supports(change),
+        SqlDialect::DuckDb => return duckdb_supports(change),
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {}
     }
     // SQL Server's repair alone (`repair_tsql_dependents`): the other engines
@@ -18266,7 +18344,9 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     if matches!(change, Change::RebuildComputedColumn { .. }) {
         return match dialect {
             SqlDialect::MsSql => true,
-            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+                false
+            }
         };
     }
     // An index renamed in place: `diff` writes one only where the engine
@@ -18286,7 +18366,9 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     ) {
         return match dialect {
             SqlDialect::MySql => true,
-            SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+            SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => {
+                false
+            }
         };
     }
     // **A namespace inside a database is PostgreSQL's and SQL Server's.** MySQL
@@ -18302,7 +18384,7 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     ) {
         return match dialect {
             SqlDialect::Postgres | SqlDialect::MsSql => true,
-            SqlDialect::MySql | SqlDialect::Sqlite => false,
+            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
         };
     }
     // **PostgreSQL's types, domains and sequences are PostgreSQL's.** Their
@@ -18331,7 +18413,9 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     ) {
         return match dialect {
             SqlDialect::Postgres => true,
-            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => {
+                false
+            }
         };
     }
     // **SQL Server's own objects are SQL Server's.** Their changes carry its
@@ -18345,7 +18429,9 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     ) {
         return match dialect {
             SqlDialect::MsSql => true,
-            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+                false
+            }
         };
     }
     // **A materialized view is PostgreSQL's alone, and so is the statement that
@@ -18357,7 +18443,9 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     if matches!(change, Change::RefreshView { .. }) {
         return match dialect {
             SqlDialect::Postgres => true,
-            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => {
+                false
+            }
         };
     }
     // **An extension has no rename on any engine** — PostgreSQL's `ALTER
@@ -18392,7 +18480,9 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     ) {
         return match dialect {
             SqlDialect::Postgres => true,
-            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => {
+                false
+            }
         };
     }
     // **An account is a server's, and SQLite has no server.** Asked through the
@@ -18411,7 +18501,7 @@ pub fn supports_change(dialect: SqlDialect, change: &Change) -> bool {
     if is_server_level(change) {
         return match dialect {
             SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => true,
-            SqlDialect::Sqlite => false,
+            SqlDialect::Sqlite | SqlDialect::DuckDb => false,
         };
     }
     // **MySQL cannot move a generated column between `VIRTUAL` and `STORED`**,
@@ -18693,6 +18783,20 @@ fn tsql_supports(change: &Change) -> bool {
         }
         _ => false,
     }
+}
+
+/// What [`supports_change`] answers on DuckDB: **nothing yet**.
+///
+/// DuckDB's DDL is close to PostgreSQL's but not the same — no `ALTER TABLE
+/// … ADD CONSTRAINT` for a key or a foreign key once the table exists, no
+/// index rename, no `ALTER INDEX`, a table that anything depends on cannot be
+/// renamed or retyped — and its emitter is the table designer's work (roadmap,
+/// DuckDB phase 2). Until each change is written and run against the engine it
+/// is refused here, which is what keeps the designer, the view, trigger and
+/// routine editors and *Apply* off DuckDB connections: every `supports_*`
+/// editing gate computes from this rather than answering on its own.
+fn duckdb_supports(_change: &Change) -> bool {
+    false
 }
 
 /// Everything that has to happen to turn `current` into `draft`.
@@ -20075,7 +20179,7 @@ pub fn routine_signature_changed(
 ) -> bool {
     match dialect {
         SqlDialect::MsSql => current.tsql_shape() != draft.tsql_shape(),
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
             routine_identity_args(&draft.arguments, dialect)
                 != routine_identity_args(&current.arguments, dialect)
                 || routine_identity_args(&draft.returns, dialect)
@@ -20784,7 +20888,7 @@ pub fn accounts(subject: &str, dialect: SqlDialect, changes: Vec<Change>) -> Cha
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intel::SqlDialect::{MsSql, MySql, Postgres, Sqlite};
+    use crate::intel::SqlDialect::{DuckDb, MsSql, MySql, Postgres, Sqlite};
     use crate::schema::{IndexColumn, TriggerEnabled};
 
     fn col(name: &str, ty: &str) -> ColumnInfo {
@@ -26719,7 +26823,8 @@ mod tests {
                 (MySql, true),
                 (Postgres, false),
                 (Sqlite, false),
-                (MsSql, false)
+                (MsSql, false),
+                (DuckDb, false)
             ]
         );
         assert_eq!(
@@ -26728,7 +26833,8 @@ mod tests {
                 (MySql, false),
                 (Postgres, true),
                 (Sqlite, false),
-                (MsSql, false)
+                (MsSql, false),
+                (DuckDb, false)
             ]
         );
     }
@@ -26903,6 +27009,7 @@ mod tests {
             (Postgres, false),
             (Sqlite, false),
             (MsSql, false),
+            (DuckDb, false),
         ];
         assert_eq!(table(takes_table_options), mysql_only);
         assert_eq!(table(supports_column_on_update), mysql_only);
@@ -26931,7 +27038,8 @@ mod tests {
                 (MySql, true),
                 (Postgres, false),
                 (Sqlite, false),
-                (MsSql, false)
+                (MsSql, false),
+                (DuckDb, false)
             ]
         );
         assert_eq!(
@@ -26940,7 +27048,8 @@ mod tests {
                 (MySql, false),
                 (Postgres, true),
                 (Sqlite, false),
-                (MsSql, false)
+                (MsSql, false),
+                (DuckDb, false)
             ]
         );
         assert_eq!(
@@ -26949,7 +27058,8 @@ mod tests {
                 (MySql, false),
                 (Postgres, true),
                 (Sqlite, true),
-                (MsSql, true)
+                (MsSql, true),
+                (DuckDb, false)
             ]
         );
         assert_eq!(
@@ -26958,7 +27068,8 @@ mod tests {
                 (MySql, false),
                 (Postgres, true),
                 (Sqlite, false),
-                (MsSql, false)
+                (MsSql, false),
+                (DuckDb, false)
             ]
         );
         assert_eq!(
@@ -26967,7 +27078,8 @@ mod tests {
                 (MySql, false),
                 (Postgres, true),
                 (Sqlite, false),
-                (MsSql, false)
+                (MsSql, false),
+                (DuckDb, false)
             ]
         );
         assert_eq!(
@@ -26976,7 +27088,8 @@ mod tests {
                 (MySql, false),
                 (Postgres, true),
                 (Sqlite, true),
-                (MsSql, false)
+                (MsSql, false),
+                (DuckDb, false)
             ]
         );
         assert_eq!(
@@ -26985,7 +27098,8 @@ mod tests {
                 (MySql, false),
                 (Postgres, true),
                 (Sqlite, true),
-                (MsSql, false)
+                (MsSql, false),
+                (DuckDb, false)
             ]
         );
     }

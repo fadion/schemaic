@@ -1,7 +1,7 @@
 # Schemaic guide
 
-Schemaic is a native SQL editor for MySQL, MariaDB, PostgreSQL, SQLite and SQL Server. This guide
-covers the parts where people most often need a hand: finding your way round a database, changing
+Schemaic is a native SQL editor for MySQL, MariaDB, PostgreSQL, SQLite, SQL Server and DuckDB. This
+guide covers the parts where people most often need a hand: finding your way round a database, changing
 its structure, and the tools built on top of that. It is not a reference to every control — the
 interface is meant to explain itself, and the guide picks up where it doesn't.
 
@@ -17,7 +17,9 @@ interface is meant to explain itself, and the guide picks up where it doesn't.
 ## Engines are not all equal
 
 MySQL/MariaDB, PostgreSQL and SQL Server are fully supported. SQLite reads, writes, imports and
-edits tables, views and triggers, but has no manual-transaction mode and no users to manage. Where
+edits tables, views and triggers, but has no manual-transaction mode and no users to manage. DuckDB
+is new: you can query it, browse it, see plans and back it up, but its results are read-only and
+Schemaic doesn't change its structure for you yet. Where
 an engine can't do something, Schemaic leaves the entry out rather than showing it greyed out — a
 greyed-out entry usually means the connection is marked read-only.
 

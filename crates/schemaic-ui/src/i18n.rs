@@ -1263,6 +1263,15 @@ pub fn db_refusal_text(r: &schemaic_core::model::DbRefusal) -> String {
         DbRefusal::KeyringUnreadable(error) => {
             tr!("db-refused-keyring-unreadable", error = error.as_str())
         }
+        DbRefusal::DuckDbNoManual => tr!("db-refused-duckdb-no-manual"),
+        DbRefusal::DuckDbNotYet => tr!("db-refused-duckdb-not-yet"),
+        DbRefusal::DuckDbNoFile => tr!("db-refused-duckdb-no-file"),
+        DbRefusal::DuckDbNotAFile(name) => {
+            tr!("db-refused-duckdb-not-a-file", name = name.as_str())
+        }
+        DbRefusal::DuckDbMissing(path) => tr!("db-refused-duckdb-missing", path = path.as_str()),
+        DbRefusal::DuckDbSealedElsewhere => tr!("db-refused-duckdb-sealed-elsewhere"),
+        DbRefusal::DuckDbWorker(e) => tr!("db-refused-duckdb-worker", error = e.as_str()),
     }
 }
 
@@ -1895,6 +1904,13 @@ mod tests {
                 file: 3 * 1024 * 1024 * 1024,
             },
             DbRefusal::KeyringUnreadable(s("keyring locked")),
+            DbRefusal::DuckDbNoManual,
+            DbRefusal::DuckDbNotYet,
+            DbRefusal::DuckDbNoFile,
+            DbRefusal::DuckDbNotAFile(s(":memory:")),
+            DbRefusal::DuckDbMissing(s("C:/data/x.duckdb")),
+            DbRefusal::DuckDbSealedElsewhere,
+            DbRefusal::DuckDbWorker(s("task 7 panicked")),
         ];
         for auth in [
             AuthMode::Password,

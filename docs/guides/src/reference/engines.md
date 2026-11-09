@@ -1,10 +1,11 @@
 # Engine differences
 
-Schemaic works with four engines, and they don't all do the same things. Where an engine can't do
+Schemaic works with five engines, and they don't all do the same things. Where an engine can't do
 something, Schemaic leaves the menu entry or field out rather than showing it greyed — so if you
 can't find an option, check here first.
 
-MySQL and MariaDB are treated as one engine below; where they differ, the note says so.
+MySQL and MariaDB are treated as one engine below; where they differ, the note says so. DuckDB,
+the newest, has [a section of its own](#duckdb) at the end.
 
 ## At a glance
 
@@ -75,3 +76,31 @@ is done on the server with SQL Server's own tools. See
 *Compare.* Both sides must be the same engine; MySQL and MariaDB count as one. On MySQL and
 MariaDB, a trigger, routine or event that differs is shown but can't be ticked for the migration.
 See [Schema](../schema/README.md).
+
+## DuckDB
+
+A DuckDB connection is a database file on this machine, like SQLite's; see
+[DuckDB files](../connections/README.md#duckdb-files) for what that means in practice.
+
+*What works:*
+
+- running statements and scripts, including `.sql` files;
+- the schema tree — schemas, tables and views with their columns, keys and indexes, sequences, and
+  macros — and each object's DDL, which is DuckDB's own stored `CREATE` statement;
+- exporting results, and query plans, with **Analyze**;
+- **Server variables**, which lists DuckDB's settings;
+- **Back up**, which writes a new `.duckdb` file;
+- the `duckdb` command-line client in the terminal panel, when it's installed.
+
+*Not yet:*
+
+- editing results in the grid — every result is read-only;
+- **Import** into a table;
+- **Manual** transactions — a tab always runs in **Auto-commit**;
+- the table designer and the view and macro editors, so structure changes are SQL you write and run
+  yourself;
+- a SQL dump under **Export**, and **Restore from file**.
+
+There are no users to manage, as on SQLite. The AI assistant and the command line read only the
+database's own tables: DuckDB's readers for files on your computer, such as `read_csv`, are
+refused there. See [Data access](../ai/data-access.md).

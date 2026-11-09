@@ -103,6 +103,19 @@ pub fn tables_sql(dialect: SqlDialect, database: Option<&str>) -> Option<String>
                 ty = q("type"),
             )
         }
+        // The file's own catalog, schemas inside it as on PostgreSQL. Like
+        // SQLite's the file always is one, so `database` is not needed.
+        SqlDialect::DuckDb => format!(
+            "SELECT schema_name AS {schema}, table_name AS {name}, 'table' AS {ty} \
+             FROM duckdb_tables() WHERE database_name = current_database() AND NOT internal \
+             UNION ALL \
+             SELECT schema_name, view_name, 'view' \
+             FROM duckdb_views() WHERE database_name = current_database() AND NOT internal \
+             ORDER BY 1, 2",
+            schema = q("schema"),
+            name = q("name"),
+            ty = q("type"),
+        ),
     })
 }
 
@@ -231,6 +244,35 @@ pub fn describe_sql(dialect: SqlDialect, database: Option<&str>, table: &str) ->
                 table = lit(table),
             )
         }
+        // `duckdb_columns()` over the file's catalog. DuckDB matches a name
+        // whatever its case, so the comparison does too; `schema.table` names
+        // a schema, and a bare name is the session's current one. `PRI` and
+        // `UNI` from `duckdb_constraints()`, as on PostgreSQL.
+        SqlDialect::DuckDb => {
+            let (schema, name) = match table.split_once('.') {
+                Some((s, t)) => (lit(s), lit(t)),
+                None => ("current_schema()".to_string(), lit(table)),
+            };
+            format!(
+                "SELECT c.column_name AS {column}, c.data_type AS {ty}, \
+                 CASE WHEN c.is_nullable THEN 'YES' ELSE 'NO' END AS {nullable}, \
+                 c.column_default AS {default}, \
+                 CASE WHEN EXISTS (SELECT 1 FROM duckdb_constraints() k \
+                   WHERE k.database_name = c.database_name AND k.schema_name = c.schema_name \
+                   AND k.table_name = c.table_name AND k.constraint_type = 'PRIMARY KEY' \
+                   AND list_contains(k.constraint_column_names, c.column_name)) THEN 'PRI' \
+                 WHEN EXISTS (SELECT 1 FROM duckdb_constraints() k \
+                   WHERE k.database_name = c.database_name AND k.schema_name = c.schema_name \
+                   AND k.table_name = c.table_name AND k.constraint_type = 'UNIQUE' \
+                   AND k.constraint_column_names = [c.column_name]) THEN 'UNI' \
+                 ELSE '' END AS {key} \
+                 FROM duckdb_columns() c \
+                 WHERE c.database_name = current_database() \
+                 AND lower(c.schema_name) = lower({schema}) \
+                 AND lower(c.table_name) = lower({name}) \
+                 ORDER BY c.column_index",
+            )
+        }
     })
 }
 
@@ -238,7 +280,7 @@ pub fn describe_sql(dialect: SqlDialect, database: Option<&str>, table: &str) ->
 mod tests {
     use super::*;
 
-    const ALL: [SqlDialect; 4] = SqlDialect::ALL;
+    const ALL: [SqlDialect; 5] = SqlDialect::ALL;
 
     /// **What these run is a read the gate lets through**, on every engine —
     /// the same gate a typed `query` meets, so a canned statement it refused

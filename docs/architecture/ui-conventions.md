@@ -362,7 +362,7 @@
   - **What stays English on purpose**, so a sweep for capitalised literals does not "fix" it: SQL
     and its sentinels (`WHERE`, `<null>`, `<default>`, `SQL VALUES`/`UPDATE`/`WHERE IN`, the
     parameter chip's `abc`/`123`/`NULL`/`SQL`); the export formats' names; persisted keys and file
-    names; font names; `pg_builtins.rs` and `mssql_builtins.rs`, which quote the servers' own
+    names; font names; `pg_builtins.rs`, `mssql_builtins.rs` and `duckdb_builtins.rs`, which quote the servers' own
     text; the terminal's escape sequences; the find options' glyphs `Aa`, `W` and
     `.*`; product names (the agents', *Microsoft Entra*, *AWS IAM*, *Google Cloud IAM* and the CLIs
     the sign-in picker names); **everything sent to an AI model** — the

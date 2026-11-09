@@ -12,12 +12,13 @@ like — sit in folders after the tables. A folder only appears if it has someth
 
 What you see depends on the engine:
 
-- *Schemas* appear as their own level on PostgreSQL and SQL Server, but only when there's more
-  than one, or the only one isn't the default (`public`, `dbo`). MySQL, MariaDB and SQLite have no
-  schema level.
+- *Schemas* appear as their own level on PostgreSQL, SQL Server and DuckDB, but only when there's
+  more than one, or the only one isn't the default (`public`, `dbo`, `main`). MySQL, MariaDB and
+  SQLite have no schema level.
 - *Folders* follow what the engine has: **Events** on MySQL; **Sequences** on PostgreSQL, SQL
-  Server and MariaDB; **Types**, **Domains** and **Extensions** on PostgreSQL; **Alias types**,
-  **XML schema collections** and **Synonyms** on SQL Server. SQLite has only tables and views.
+  Server, MariaDB and DuckDB; **Types**, **Domains** and **Extensions** on PostgreSQL; **Alias
+  types**, **XML schema collections** and **Synonyms** on SQL Server. SQLite has only tables and
+  views. DuckDB's macros are listed under **Functions**.
 - *Partitions* nest under their table on PostgreSQL. On MySQL and SQL Server they're listed after
   the table's keys.
 - *Triggers* have no row of their own. Reach them from their table's **Triggers** entry, or by

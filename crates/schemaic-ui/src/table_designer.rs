@@ -1364,6 +1364,14 @@ fn identity_wording(dialect: SqlDialect) -> (String, String) {
         SqlDialect::MySql | SqlDialect::Sqlite => {
             (tr!("designer-auto-increment"), "AUTO_INCREMENT")
         }
+        // DuckDB counts a key from a sequence, which its words say; the
+        // designer is not offered on it yet (`ddl::supports_table_design`).
+        SqlDialect::DuckDb => {
+            return (
+                tr!("designer-sequence-default"),
+                tr!("designer-sequence-hint", keyword = "DEFAULT nextval('…')"),
+            );
+        }
     };
     (label, tr!("designer-identity-hint", keyword = keyword))
 }

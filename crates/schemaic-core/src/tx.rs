@@ -46,7 +46,10 @@ pub fn supports_manual_mode(dialect: crate::intel::SqlDialect) -> bool {
     use crate::intel::SqlDialect;
     match dialect {
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => true,
-        SqlDialect::Sqlite => false,
+        // DuckDB holds transactions, read-only ones included, but its pinned
+        // `Session` is not written yet (roadmap, DuckDB phase 2) — the answer
+        // is about this app, not the engine, and changes with that phase.
+        SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -60,7 +63,8 @@ pub fn supports_manual_mode(dialect: crate::intel::SqlDialect) -> bool {
 pub fn offers_manual_mode(dialect: crate::intel::SqlDialect, read_only: bool) -> bool {
     use crate::intel::SqlDialect;
     let holds_read_only_transaction = match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres => true,
+        // DuckDB's `BEGIN TRANSACTION READ ONLY` refuses writes by effect.
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::DuckDb => true,
         SqlDialect::MsSql | SqlDialect::Sqlite => false,
     };
     supports_manual_mode(dialect) && (!read_only || holds_read_only_transaction)

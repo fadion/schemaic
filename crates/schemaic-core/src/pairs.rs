@@ -733,7 +733,7 @@ struct BlockWord {
 pub(crate) fn names_its_block_ends(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 

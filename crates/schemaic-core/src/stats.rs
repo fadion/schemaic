@@ -727,7 +727,10 @@ pub fn count_rows_sql(schema: Option<&str>, table: &str, dialect: SqlDialect) ->
     // `COUNT(*)` is an `int` on SQL Server and fails (Msg 8115) past
     // 2,147,483,647 rows — exactly the tables someone asks this about.
     let count = match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => "COUNT(*)",
+        // DuckDB's `COUNT(*)` is a `BIGINT`.
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+            "COUNT(*)"
+        }
         SqlDialect::MsSql => "COUNT_BIG(*)",
     };
     format!("SELECT {count} FROM {name}")
@@ -757,8 +760,9 @@ pub fn catalogue_key(
 ) -> Option<(String, Option<String>)> {
     match dialect {
         SqlDialect::MySql => Some((qualifier.or(result_db)?.to_string(), None)),
-        // In one database with schemas inside it, as on PostgreSQL.
-        SqlDialect::Postgres | SqlDialect::MsSql => {
+        // In one database with schemas inside it, as on PostgreSQL. DuckDB's
+        // catalog is the file, with schemas inside it.
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb => {
             Some((result_db?.to_string(), qualifier.map(str::to_string)))
         }
         SqlDialect::Sqlite => None,

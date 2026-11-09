@@ -836,7 +836,10 @@ pub fn sql_literal(v: &Value, dialect: SqlDialect) -> String {
             // SQLite is standard-conforming like Postgres and has no
             // backslash escape at all, so doubling one would corrupt the
             // value exactly as it would there.
-            SqlDialect::Postgres | SqlDialect::Sqlite => format!("'{}'", s.replace('\'', "''")),
+            // DuckDB too: measured, `'a\'` is the two characters `a\`.
+            SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+                format!("'{}'", s.replace('\'', "''"))
+            }
             // No backslash escape either, and **`N`-prefixed**: an unprefixed
             // literal is `varchar`, converted to the database's code page on
             // the way in, so any character outside it arrives as `?`.
@@ -908,7 +911,7 @@ pub fn script_literal(v: &Value, type_name: &str, dialect: SqlDialect) -> String
 pub fn client_substitutes_variables(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -923,7 +926,7 @@ pub fn reads_dates_by_language(type_name: &str, dialect: SqlDialect) -> bool {
             type_name.eq_ignore_ascii_case("datetime")
                 || type_name.eq_ignore_ascii_case("smalldatetime")
         }
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -1019,7 +1022,8 @@ fn float_literal(f: f64) -> String {
 pub fn ident_sql(name: &str, dialect: SqlDialect) -> String {
     match dialect {
         SqlDialect::MySql => format!("`{}`", name.replace('`', "``")),
-        SqlDialect::Postgres | SqlDialect::Sqlite => {
+        // DuckDB reads `` `x` `` too (measured), but `"` is its own form.
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
             format!("\"{}\"", name.replace('"', "\"\""))
         }
         SqlDialect::MsSql => format!("[{}]", name.replace(']', "]]")),
@@ -1081,7 +1085,9 @@ pub fn literal_mode_sql(dialect: SqlDialect) -> Option<&'static str> {
         SqlDialect::MySql => Some(MYSQL_LITERAL_MODE_SQL),
         // SQL Server, like SQLite, has no backslash escape and no setting that
         // would give it one.
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => None,
+        // DuckDB neither: a plain literal has no escape, and `E'…'` is the
+        // only way to ask for one.
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => None,
     }
 }
 
@@ -1106,7 +1112,7 @@ pub const MYSQL_IMPORT_MODE_SQL: &str = "SET SESSION sql_mode = CONCAT_WS(',', N
 pub fn import_mode_sql(dialect: SqlDialect) -> Option<&'static str> {
     match dialect {
         SqlDialect::MySql => Some(MYSQL_IMPORT_MODE_SQL),
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => None,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => None,
     }
 }
 
@@ -1126,7 +1132,9 @@ pub fn import_mode_sql(dialect: SqlDialect) -> Option<&'static str> {
 pub fn rows_session_sql(dialect: SqlDialect) -> Option<&'static str> {
     match dialect {
         SqlDialect::MySql => Some("SET time_zone = '+00:00'"),
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => None,
+        // DuckDB's `TIMESTAMPTZ` is an instant, and this build links no ICU,
+        // so it is read and written in UTC whatever the session says.
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => None,
     }
 }
 
@@ -1172,7 +1180,9 @@ pub fn ident_pattern_sql(name: &str, dialect: SqlDialect) -> String {
             format!("`{}`", pattern.replace('`', "``"))
         }
         // T-SQL's `GRANT … ON` names one securable exactly.
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => ident_sql(name, dialect),
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => {
+            ident_sql(name, dialect)
+        }
     }
 }
 
@@ -2577,6 +2587,12 @@ pub fn qualified_table(
             Some(ns) => format!("{}.{}", q(ns), q(table)),
             None => q(table),
         },
+        // The same on DuckDB: a two-part name is `schema.table`, and the
+        // catalog — the file — is the operation's own, so it is never named.
+        SqlDialect::DuckDb => match schema {
+            Some(ns) => format!("{}.{}", q(ns), q(table)),
+            None => q(table),
+        },
     }
 }
 
@@ -2605,9 +2621,13 @@ pub fn qualified_row_target(
             schema.map(|s| ident_sql(s, dialect)).unwrap_or_default(),
             ident_sql(table, dialect)
         ),
-        SqlDialect::MsSql | SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
-            qualified_table(database, schema, table, dialect)
-        }
+        // DuckDB's operation is bound to its file's catalog, as a PostgreSQL
+        // connection is to its database.
+        SqlDialect::MsSql
+        | SqlDialect::MySql
+        | SqlDialect::Postgres
+        | SqlDialect::Sqlite
+        | SqlDialect::DuckDb => qualified_table(database, schema, table, dialect),
     }
 }
 

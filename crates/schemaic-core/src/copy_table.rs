@@ -297,6 +297,11 @@ pub fn read_form_with(
             None => (col, CellForm::Value),
         },
         SqlDialect::Sqlite => (format!("quote({col}) AS {col}"), CellForm::Quoted),
+        // DuckDB's `hex` takes a blob and answers its bytes in hex.
+        SqlDialect::DuckDb if head == "blob" || head == "bytea" || head == "varbinary" => {
+            (format!("hex({col}) AS {col}"), CellForm::Hex)
+        }
+        SqlDialect::DuckDb => (col, CellForm::Value),
         SqlDialect::MySql | SqlDialect::Postgres => (col, CellForm::Value),
     }
 }
@@ -422,7 +427,9 @@ impl CopyStop {
 pub fn counter_follows_written_values(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::MsSql | SqlDialect::Sqlite => true,
-        SqlDialect::Postgres => false,
+        // An auto-numbered DuckDB column is a sequence's `nextval` default, as
+        // a PostgreSQL `serial` is, and a written value does not move it.
+        SqlDialect::Postgres | SqlDialect::DuckDb => false,
     }
 }
 

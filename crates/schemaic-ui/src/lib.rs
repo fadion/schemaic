@@ -4184,13 +4184,9 @@ mod engine_comparison_gate {
         // answer. What these entries are for is the other half: an emitter that
         // makes a grammar decision inline, where a named capability would let
         // the two crates that already ask this question stop re-deriving it.
-        (
-            "schemaic-core/activity.rs",
-            1,
-            "`supports_activity` — a capability definition. SQLite has no \
-             server and so no session list; CLAUDE.md names this family as the \
-             shape a caller is supposed to ask instead of comparing.",
-        ),
+        // `schemaic-core/activity.rs` left the census when `supports_activity`
+        // became an exhaustive `match`: its `!matches!(… Sqlite)` sorted DuckDB
+        // onto "has sessions" in silence.
         (
             "schemaic-core/celledit.rs",
             5,
@@ -4253,8 +4249,11 @@ mod engine_comparison_gate {
         ),
         (
             "schemaic-core/sql.rs",
-            18,
-            "Fourteen are the [`SqlDialect`] capability table itself — \
+            16,
+            "Twelve are the [`SqlDialect`] capability table itself (two more, \
+             `backtick_ident` and `nested_block_comments`, name three engines \
+             since DuckDB, and rustfmt spreads each over lines this count reads \
+             one at a time) — \
              `backtick_ident`, `double_quote_is_ident`, `dollar_quoted`, \
              `nested_block_comments`, `e_string_backslash`, `prefixed_names`, \
              `read_only_is_a_rollback`, `if_is_control_flow` and the rest — which \

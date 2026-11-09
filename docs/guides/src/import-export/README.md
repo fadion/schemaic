@@ -59,13 +59,15 @@ but nothing translates a type or option one has and the other lacks.
 ## What differs between engines
 
 - *Back up* writes a `.sql` script on MySQL and MariaDB, a custom-format `.dump` on PostgreSQL,
-  and a copy of the database file on SQLite. On SQL Server the server writes a `.bak` into its
-  own backup folder.
+  a copy of the database file on SQLite, and a new `.duckdb` file on DuckDB. On SQL Server the
+  server writes a `.bak` into its own backup folder.
 - *Restore from file* is offered on MySQL, MariaDB and PostgreSQL only.
 - *Disable foreign-key checks* in a SQL export exists on MySQL, MariaDB and SQLite; elsewhere the
   file adds the foreign keys after the data instead.
-- *Import into a table* works on all four engines. On a MySQL table whose storage engine isn't
-  transactional (MyISAM, for one), a failed import can't be undone.
+- *Import into a table* works on every engine but DuckDB, which has no SQL format under **Export**
+  yet either. Running a `.sql` file with **Import** on a DuckDB database does work. On a MySQL
+  table whose storage engine isn't transactional (MyISAM, for one), a failed import can't be
+  undone.
 
 ## In this section
 

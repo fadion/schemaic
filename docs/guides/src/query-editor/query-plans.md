@@ -10,8 +10,8 @@ Right-click a statement in the editor and choose **Plan**. The **Query plan** wi
 statement with its `:name` parameters filled in, the way a run would send it.
 
 The table is the server's own plan, laid out as the engine returns it — `EXPLAIN` rows on MySQL
-and MariaDB, `EXPLAIN QUERY PLAN` on SQLite, the indented plan on PostgreSQL, and on SQL Server
-one row per operator with its estimated rows and cost.
+and MariaDB, `EXPLAIN QUERY PLAN` on SQLite, the indented plan on PostgreSQL, the plan tree as text on
+DuckDB, and on SQL Server one row per operator with its estimated rows and cost.
 
 ## Analyze
 

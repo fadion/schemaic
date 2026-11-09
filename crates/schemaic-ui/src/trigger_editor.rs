@@ -434,6 +434,8 @@ fn blank_trigger(
         },
         SqlDialect::Sqlite => TriggerAction::Body(NEW_BODY_SQLITE.to_string()),
         SqlDialect::MySql => TriggerAction::Body(NEW_BODY.to_string()),
+        // DuckDB has no triggers; the editor is never opened on it.
+        SqlDialect::DuckDb => TriggerAction::Body(String::new()),
         SqlDialect::MsSql => {
             // T-SQL has no `BEFORE` — the model's default — and fires once
             // per statement, with the rows in `inserted` and `deleted`.
@@ -1017,6 +1019,8 @@ fn form(
                         SqlDialect::Postgres | SqlDialect::MySql | SqlDialect::MsSql => {
                             "new.total > 0"
                         }
+                        // No triggers on DuckDB: the editor never opens there.
+                        SqlDialect::DuckDb => "new.total > 0",
                     },
                     mono: true,
                     focus: Some((ring.clone(), 50)),

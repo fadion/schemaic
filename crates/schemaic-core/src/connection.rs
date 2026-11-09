@@ -803,7 +803,8 @@ pub fn verify_ca_checks_host_name(db_type: &str) -> bool {
         crate::intel::SqlDialect::MySql => true,
         crate::intel::SqlDialect::Postgres
         | crate::intel::SqlDialect::Sqlite
-        | crate::intel::SqlDialect::MsSql => false,
+        | crate::intel::SqlDialect::MsSql
+        | crate::intel::SqlDialect::DuckDb => false,
     }
 }
 
@@ -1017,7 +1018,7 @@ impl AuthMode {
                 modes.push(AuthMode::Windows);
             }
             modes.push(AuthMode::AzureCli);
-        } else if !is_sqlite(db_type) {
+        } else if is_networked(db_type) {
             // PostgreSQL and the MySQL family: what RDS and Cloud SQL run.
             modes.extend([AuthMode::AwsIam, AuthMode::GcpIam]);
         }
@@ -1480,7 +1481,7 @@ impl Connection {
     /// it does not use: SQL Server Browser answers with the port
     /// ([`sql_server_instance`]).
     pub fn endpoint(&self) -> String {
-        if is_sqlite(&self.db_type) {
+        if is_file_backed(&self.db_type) {
             return file_name(&self.file).to_string();
         }
         if is_mssql(&self.db_type)
@@ -1522,7 +1523,7 @@ impl Connection {
     ///
     /// A no-op on every other engine.
     pub fn sanitized(mut self) -> Connection {
-        if is_sqlite(&self.db_type) {
+        if is_file_backed(&self.db_type) {
             self.host = String::new();
             self.port = 0;
             self.user = String::new();
@@ -1637,7 +1638,7 @@ impl Connection {
     /// typo, and offering it to the driver turns a correctable mistake into a
     /// refusal naming a database with no name.
     pub fn default_database(&self) -> Option<&str> {
-        if is_sqlite(&self.db_type) {
+        if is_file_backed(&self.db_type) {
             return None;
         }
         let name = self.database.trim();
@@ -1705,7 +1706,7 @@ impl Connection {
     /// For a tooltip or a form, where [`Self::endpoint`]'s short name isn't enough
     /// to tell two files of the same name apart.
     pub fn file_label(&self) -> &str {
-        if is_sqlite(&self.db_type) {
+        if is_file_backed(&self.db_type) {
             &self.file
         } else {
             ""
@@ -2444,6 +2445,27 @@ pub fn is_sqlite(db_type: &str) -> bool {
     t.eq_ignore_ascii_case("sqlite") || t.eq_ignore_ascii_case("sqlite3")
 }
 
+/// Is this saved `db_type` label DuckDB?
+///
+/// **The one answer**, on the same terms as [`is_postgres`] and [`is_sqlite`].
+/// DuckDB is the second engine with no server behind it, which is why most of
+/// the app asks [`is_file_backed`] rather than this.
+pub fn is_duckdb(db_type: &str) -> bool {
+    db_type.trim().eq_ignore_ascii_case("duckdb")
+}
+
+/// Is this engine's whole target **a file on this machine** rather than a
+/// server — SQLite and DuckDB?
+///
+/// The question behind every `host`/`port`/`user`/`password`/`ssh`-is-inert
+/// decision this module's opening paragraph states for SQLite: [`Connection::file`]
+/// is the target, nothing reaches the keyring, no tunnel opens. It is a
+/// predicate rather than `is_sqlite(…) || is_duckdb(…)` at each site so a third
+/// embedded engine joins every one of those decisions by being named here.
+pub fn is_file_backed(db_type: &str) -> bool {
+    is_sqlite(db_type) || is_duckdb(db_type)
+}
+
 /// What a **Read-only** connection does not guarantee on this engine, where
 /// that is worth a sentence under the switch — or `None` where the server
 /// itself refuses the writes.
@@ -2487,7 +2509,10 @@ pub fn is_mssql(db_type: &str) -> bool {
 /// names the previous engine, on a load it already names the new one. Only the
 /// first should rewrite the label or offer the new engine's default port.
 pub fn same_engine(a: &str, b: &str) -> bool {
-    is_postgres(a) == is_postgres(b) && is_sqlite(a) == is_sqlite(b) && is_mssql(a) == is_mssql(b)
+    is_postgres(a) == is_postgres(b)
+        && is_sqlite(a) == is_sqlite(b)
+        && is_mssql(a) == is_mssql(b)
+        && is_duckdb(a) == is_duckdb(b)
 }
 
 /// How to name a connection's engine on screen.
@@ -2505,6 +2530,9 @@ pub fn engine_label(db_type: &str) -> String {
     }
     if is_mssql(db_type) {
         return "SQL Server".to_string();
+    }
+    if is_duckdb(db_type) {
+        return "DuckDB".to_string();
     }
     match db_type.trim() {
         "" => "MySQL".to_string(),
@@ -2601,8 +2629,8 @@ pub fn label_of(list: &[Connection], id: u64) -> String {
 /// Is this engine reached **over the network** — i.e. does a host, a port, a
 /// user, a password or an SSH tunnel mean anything for it?
 ///
-/// SQLite is the one that answers `false`, and it is a predicate rather than an
-/// `is_sqlite(…)` at each site because the *question* is what the callers
+/// SQLite and DuckDB answer `false` ([`is_file_backed`]), and it is a predicate
+/// rather than an `is_file_backed(…)` at each site because the *question* is what the callers
 /// actually have: whether to open a tunnel, whether to show a port field,
 /// whether a credential is worth keyring space.
 ///
@@ -2611,7 +2639,7 @@ pub fn label_of(list: &[Connection], id: u64) -> String {
 /// while the two agreed, having two is what let the *third* consumer, the tunnel
 /// decision, quietly not ask at all. Both now delegate here.
 pub fn is_networked(db_type: &str) -> bool {
-    !is_sqlite(db_type)
+    !is_file_backed(db_type)
 }
 
 /// The default TCP port for a `db_type` label.
@@ -2625,7 +2653,7 @@ pub fn is_networked(db_type: &str) -> bool {
 /// server to reach, so any real number here would be a coordinate the app might
 /// later show or try. The form doesn't build a port field for SQLite at all.
 pub fn default_port(db_type: &str) -> u16 {
-    if is_sqlite(db_type) {
+    if is_file_backed(db_type) {
         return 0;
     }
     if is_postgres(db_type) {
@@ -4521,6 +4549,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn duckdb_is_recognised_and_is_a_file() {
+        for label in ["DuckDB", "duckdb", "  DUCKDB "] {
+            assert!(is_duckdb(label), "{label}");
+            assert!(!is_sqlite(label), "{label}");
+            assert!(!is_postgres(label), "{label}");
+            assert!(!is_mssql(label), "{label}");
+            assert!(is_file_backed(label), "{label}");
+            assert!(!is_networked(label), "{label}");
+            assert_eq!(engine_label(label), "DuckDB", "{label}");
+            assert_eq!(default_port(label), 0, "{label}");
+        }
+        for label in ["MySQL", "PostgreSQL", "SQL Server", "", "duck"] {
+            assert!(!is_duckdb(label), "{label}");
+        }
+        // Only the two embedded engines are files.
+        assert!(is_file_backed("SQLite"));
+        for label in ["MySQL", "MariaDB", "PostgreSQL", "SQL Server", ""] {
+            assert!(!is_file_backed(label), "{label}");
+        }
+    }
+
+    /// A DuckDB connection is a file, so everything the SQLite paragraph at the
+    /// top of the module promises holds for it too: the file is the endpoint,
+    /// nothing reaches the keyring, no tunnel, no default database, and no
+    /// cloud sign-in is offered.
+    #[test]
+    fn a_duckdb_connection_keeps_only_its_file() {
+        let mut c = conn();
+        c.db_type = "DuckDB".into();
+        c.file = r"C:\data\warehouse.duckdb".into();
+        c.ssh.enabled = true;
+        c.database = "analytics".into();
+        assert_eq!(c.endpoint(), "warehouse.duckdb");
+        assert_eq!(c.file_label(), r"C:\data\warehouse.duckdb");
+        assert!(!c.uses_tunnel());
+        assert_eq!(c.default_database(), None);
+        assert_eq!(AuthMode::offered("DuckDB"), [AuthMode::Password]);
+        let saved = c.sanitized();
+        assert_eq!(saved.file, r"C:\data\warehouse.duckdb");
+        assert!(saved.host.is_empty() && saved.user.is_empty() && saved.password.is_empty());
+        assert_eq!(saved.port, 0);
+        assert_eq!(saved.ssh, SshTunnel::default());
+        assert!(saved.database.is_empty());
+    }
+
     /// Only the engine with no read-only session needs the sentence.
     #[test]
     fn only_sql_server_qualifies_what_read_only_means() {
@@ -4566,6 +4640,8 @@ mod tests {
             "  SQLITE ",
             "SQL Server",
             "mssql",
+            "DuckDB",
+            " duckdb ",
             "something else",
         ] {
             let by_predicate = if is_postgres(label) {
@@ -4574,6 +4650,8 @@ mod tests {
                 SqlDialect::Sqlite
             } else if is_mssql(label) {
                 SqlDialect::MsSql
+            } else if is_duckdb(label) {
+                SqlDialect::DuckDb
             } else {
                 SqlDialect::MySql
             };
@@ -4747,13 +4825,16 @@ mod tests {
             "sqlite3",
             "SQL Server",
             "mssql",
+            "DuckDB",
+            "duckdb",
             "something else",
         ];
         for a in labels {
             for b in labels {
                 let by_predicate = is_postgres(a) == is_postgres(b)
                     && is_sqlite(a) == is_sqlite(b)
-                    && is_mssql(a) == is_mssql(b);
+                    && is_mssql(a) == is_mssql(b)
+                    && is_duckdb(a) == is_duckdb(b);
                 assert_eq!(same_engine(a, b), by_predicate, "{a} vs {b}");
             }
         }

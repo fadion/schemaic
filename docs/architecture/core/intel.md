@@ -2,7 +2,11 @@
 
 `intel.rs` — the **SQL intelligence** layer (structure-aware, dialect-pluggable). Parses a
 *complete* statement with a real per-dialect AST (`sqlparser`; `SqlDialect` seam — MySQL,
-PostgreSQL and SQLite all wired) and answers what a token stream can't: `statement_scope`
+PostgreSQL, SQLite, SQL Server and DuckDB all wired, `SqlDialect::ALL` the five, DuckDB on
+sqlparser's `DuckDbDialect`, whose grammar lacks DuckDB's own `SUMMARIZE`, `PIVOT`/`UNPIVOT`,
+`EXPORT`/`IMPORT`, `CHECKPOINT`, `FORCE` and `VACUUM`, so `parser_lacks_statement` leaves those
+unchecked rather than red — `duckdb_statements_the_parser_lacks` fails when sqlparser learns one,
+as it already had a leading `FROM`) and answers what a token stream can't: `statement_scope`
 (the tables and aliases of every query around the caret and the statement's CTE names,
 AST-backed with a `skip_noncode` lexer fallback for mid-edit, and a trigger's `NEW`/`OLD` as
 its table — below), `clause_context`/`clause_continuation` (caret context + expected-token model for
@@ -786,7 +790,7 @@ other engines' keywords that run also flagged (`ZORDER`, `ILIKE` on MySQL) stay 
 **The typo checker runs only where the app holds the engine's own catalog** — `builtin_catalog`
 answers that with one exhaustive `match` **returning the catalog itself**: `FUNCTIONS` for
 MySQL, `SQLITE_FUNCTIONS` for SQLite, `PG_FUNCTIONS` for PostgreSQL, `MSSQL_FUNCTIONS` for SQL
-Server, and `is_known_function` and
+Server, `DUCKDB_FUNCTIONS` for DuckDB, and `is_known_function` and
 `is_probable_function_typo` take it as a parameter — as the `CatalogIndex` built from it rather
 than as the slice itself, which is the same catalog reached one hop further on. Reaching for the
 module-level `FUNCTIONS`
@@ -825,7 +829,8 @@ whole, and `is_offered_builtin(dialect, flavour, name)` is what `rank`'s `Clause
 filters it through before the popup sees it. MySQL's, SQLite's and SQL Server's
 catalogs were transcribed from their manuals and each already *is* the list a person would type,
 so SQLite's and SQL Server's arms are `true` outright and MySQL's is `true` but for the flavour
-split below;
+split below; DuckDB's is `true` too, its catalog generated from a function list that carries no
+plumbing worth cutting;
 PostgreSQL's was read out of `pg_catalog`, so it carries the engine's
 own plumbing — `int4in`, `btint4cmp`, `texteq` — which the checker must keep knowing and the
 popup must not spend its forty rows on, and that arm asks `pg_builtins::is_suggested`.
@@ -848,9 +853,11 @@ reintroduces the original false positives for whatever it omits — `to_date` sq
 `to_char` made the list. SQLite could be written out by hand because its builtins are a small
 closed set its documentation enumerates; PostgreSQL's are not, and the honest source for them is
 `pg_catalog` on a real server, which is what `pg_builtins.rs` below was *generated* from. **The
-`Option` outlives that**: all four engines answer `Some` today, and the `None` arm stays for a
-*fifth*, which has to land on it rather than inherit whichever list is nearest — the original
-bug, one engine further on. **SQL Server was the fourth, and it landed on `None` first**: no
+`Option` outlives that**: all five engines answer `Some` today, and the `None` arm stays for a
+*sixth*, which has to land on it rather than inherit whichever list is nearest — the original
+bug, one engine further on. DuckDB, the fifth, arrived with its catalog (`duckdb_builtins.rs`
+below), generated from and checked against the engine this build links, so it never sat on
+`None`. **SQL Server was the fourth, and it landed on `None` first**: no
 completion builtins, no signature help and no misspelled-function checker until a catalog could
 be checked against a server as PostgreSQL's is. `mssql_builtins.rs` below is that catalog, and
 what it is checked against is the server's parser, since T-SQL's builtins are in no catalog view

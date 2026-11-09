@@ -792,12 +792,14 @@ pub fn coerce(
 
 /// Can a file be imported into a table on `dialect`?
 ///
-/// All four, SQL Server since `db::mssql::import_rows` was written. The table
-/// menu's *Import* entry asks this, so an engine without one has the entry
-/// absent rather than a wizard whose last step is a refusal.
+/// Four of the five, SQL Server since `db::mssql::import_rows` was written.
+/// The table menu's *Import* entry asks this, so an engine without one has the
+/// entry absent rather than a wizard whose last step is a refusal — DuckDB's
+/// `import_rows` is the roadmap's DuckDB phase 2, and refuses until then.
 pub fn supports_import(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        SqlDialect::DuckDb => false,
     }
 }
 
@@ -820,7 +822,8 @@ pub fn supports_import(dialect: SqlDialect) -> bool {
 fn bool_literal_is_integer(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => true,
-        SqlDialect::Postgres => false,
+        // DuckDB's `BOOLEAN` is a real type and reads `'true'`/`'false'`.
+        SqlDialect::Postgres | SqlDialect::DuckDb => false,
     }
 }
 
@@ -2982,7 +2985,7 @@ pub enum CellForm {
 pub fn overriding_clause(dialect: SqlDialect) -> Option<&'static str> {
     match dialect {
         SqlDialect::Postgres => Some("OVERRIDING SYSTEM VALUE"),
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => None,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => None,
     }
 }
 
@@ -3057,6 +3060,7 @@ fn cell_literal(v: &Value, form: CellForm, dialect: SqlDialect) -> Option<String
                 // session's `standard_conforming_strings`.
                 SqlDialect::Postgres => format!("decode('{text}', 'hex')"),
                 SqlDialect::MsSql => format!("0x{text}"),
+                SqlDialect::DuckDb => format!("from_hex('{text}')"),
             })
         }
         CellForm::Server(f) => crate::export::server_literal(f, text),
@@ -3108,7 +3112,8 @@ pub fn import_literal(v: &Value, dialect: SqlDialect) -> String {
 /// `NaN`. MySQL and SQL Server keep neither.
 fn keeps_non_finite(f: f64, dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::Postgres => true,
+        // DuckDB's `DOUBLE` keeps both infinities and `NaN`.
+        SqlDialect::Postgres | SqlDialect::DuckDb => true,
         SqlDialect::Sqlite => !f.is_nan(),
         SqlDialect::MySql | SqlDialect::MsSql => false,
     }
@@ -3139,6 +3144,16 @@ pub fn non_finite_literal(f: f64, dialect: SqlDialect) -> Option<String> {
                 "9e999"
             } else {
                 "-9e999"
+            }
+            .to_string(),
+        ),
+        SqlDialect::DuckDb => Some(
+            if f.is_nan() {
+                "'NaN'::DOUBLE"
+            } else if f > 0.0 {
+                "'Infinity'::DOUBLE"
+            } else {
+                "'-Infinity'::DOUBLE"
             }
             .to_string(),
         ),

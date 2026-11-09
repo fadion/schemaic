@@ -2232,6 +2232,11 @@ fn occupied_names(
         SqlDialect::Sqlite => {
             out.extend(t.indexes.iter().map(|ix| qualify(&ix.name)));
         }
+        // DuckDB keys an index name to its schema, beside the tables; its
+        // constraints carry no names of their own.
+        SqlDialect::DuckDb => {
+            out.extend(t.indexes.iter().map(|ix| qualify(&ix.name)));
+        }
         // A T-SQL constraint is an object of its schema (`sys.objects`),
         // whichever clause declared it — so a foreign key, a check (on its
         // column or on the table), a primary key and a unique constraint each
@@ -2314,6 +2319,9 @@ impl NameClash {
             // promise: one `BEGIN TRANSACTION` around the plan, rolled back
             // whole on a refusal.
             SqlDialect::MsSql => ClashCost::RollsBack,
+            // DuckDB's DDL is transactional, and its `run_ddl` holds the plan
+            // in one transaction.
+            SqlDialect::DuckDb => ClashCost::RollsBack,
         };
         ClashNote {
             holder: strip(&self.freed_by),

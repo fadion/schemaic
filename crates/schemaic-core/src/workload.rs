@@ -45,7 +45,8 @@ pub fn statement_limit(asked: Option<usize>) -> usize {
 pub fn supports_statement_stats(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => true,
-        SqlDialect::Sqlite => false,
+        // Embedded, so no server keeps a statement history.
+        SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -56,7 +57,7 @@ pub fn supports_statement_stats(dialect: SqlDialect) -> bool {
 pub fn supports_missing_index_hints(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 

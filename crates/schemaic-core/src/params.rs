@@ -311,7 +311,7 @@ fn sqlcmd_line_end(b: &[u8], i: usize, dialect: SqlDialect) -> Option<usize> {
 fn has_sqlcmd_commands(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 

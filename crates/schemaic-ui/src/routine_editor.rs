@@ -536,6 +536,9 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                         SqlDialect::Postgres => "a integer, b text DEFAULT ''",
                         SqlDialect::MsSql => "@sku varchar(20), @n int = 0 OUTPUT",
                         SqlDialect::MySql | SqlDialect::Sqlite => "IN sku VARCHAR(20), OUT n INT",
+                        // A macro's parameters are names alone. Unreachable
+                        // until DuckDB's routines are edited (roadmap).
+                        SqlDialect::DuckDb => "a, b := 0",
                     },
                     mono: true,
                     focus: Some((ring.clone(), TAB_ARGS)),
@@ -563,6 +566,7 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                         SqlDialect::Postgres => "integer".to_string(),
                         SqlDialect::MsSql => tr!("routine-editor-returns-placeholder-mssql"),
                         SqlDialect::MySql | SqlDialect::Sqlite => "INT".to_string(),
+                        SqlDialect::DuckDb => String::new(),
                     })),
                     mono: true,
                     focus: Some((ring.clone(), TAB_RETURNS)),
@@ -620,6 +624,8 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                     SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => {
                         "BEGIN\n    SELECT 1;\nEND"
                     }
+                    // A macro's body is one expression or one query.
+                    SqlDialect::DuckDb => "a + b",
                 },
                 mono: true,
                 sql: Some(target.dialect),
@@ -828,7 +834,7 @@ fn routine_form(ui: DdlUi, target: &RoutineTarget, ring: FocusRing) -> AnyView {
                 .into_any(),
             );
         }
-        SqlDialect::MySql | SqlDialect::Sqlite => {
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => {
             options.push(bound_toggle(
                 d,
                 tr!("routine-editor-deterministic"),

@@ -33,6 +33,7 @@ thiserror = { workspace = true }
 mysql_async = { workspace = true }
 tokio-postgres = { workspace = true }
 rusqlite = { workspace = true }
+duckdb = { workspace = true }
 tiberius = { workspace = true }
 encoding_rs = { workspace = true }
 futures-util = { workspace = true }
@@ -49,6 +50,8 @@ webpki-roots = { workspace = true }
 tokio-postgres-rustls = { workspace = true }
 ssh-key = { workspace = true }
 tracing = { workspace = true }
+# `db::duckdb` writes a DuckDB date or timestamp as its text.
+chrono = { workspace = true }
 
 # **Windows sign-in to SQL Server** (`AuthMode::Windows`): tiberius's
 # `winauth` is SSPI through the OS, pure Rust bindings and no system library,

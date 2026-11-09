@@ -125,6 +125,17 @@ rusqlite = { version = "0.40", features = [
     "column_decltype",
     "column_metadata",
 ] }
+# DuckDB (fifth engine). Embedded like SQLite, and for the same reason
+# `bundled`: the amalgamation is compiled in, so no packager ships a library
+# file beside the binary and the version is the one we tested against. `parquet`
+# and `json` compile those two extensions in statically — the build has
+# extension auto-install and auto-load switched off at every open
+# (`db::duckdb`), so an extension that is not linked in here is one the app
+# cannot reach, and nothing is fetched from the network behind a query. MIT.
+#
+# The price is build time: the amalgamation is a large C++ translation unit on
+# every CI leg's cold build.
+duckdb = { version = "=1.20000.1", features = ["bundled", "parquet", "json"] }
 # TLS for the two networked engines. One stack for both, so `verify-ca` and
 # `verify-full` mean the same thing whichever engine is behind them — the
 # alternative is two verifiers with two sets of edge cases and one test-bed that

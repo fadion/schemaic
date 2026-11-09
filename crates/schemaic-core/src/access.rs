@@ -73,7 +73,8 @@ impl ReplayAccess {
 pub fn drop_resets_table_access(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres | SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Sqlite => false,
+        // DuckDB, like SQLite, has no grants: an embedded file has no accounts.
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -184,7 +185,7 @@ impl TableAccess {
         let pg = match dialect {
             SqlDialect::Postgres => true,
             SqlDialect::MsSql => false,
-            SqlDialect::MySql | SqlDialect::Sqlite => return Vec::new(),
+            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => return Vec::new(),
         };
         let role = |r: &Option<String>| match r {
             Some(r) => crate::export::ident_sql(r, dialect),
@@ -326,7 +327,9 @@ impl RoutineGrant {
     pub fn grant_sql(&self, dialect: SqlDialect) -> Option<String> {
         match dialect {
             SqlDialect::MySql => {}
-            SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => return None,
+            SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => {
+                return None;
+            }
         }
         let held = |p: &str| self.privileges.iter().any(|h| h.eq_ignore_ascii_case(p));
         let grantable = held("Grant");

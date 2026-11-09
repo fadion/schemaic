@@ -48,7 +48,12 @@ pub enum VarKind {
 /// fifth engine has to answer it.
 pub fn supports_server_vars(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite => true,
+        // DuckDB's are `duckdb_settings()`.
+        SqlDialect::MySql
+        | SqlDialect::Postgres
+        | SqlDialect::MsSql
+        | SqlDialect::Sqlite
+        | SqlDialect::DuckDb => true,
     }
 }
 
@@ -62,7 +67,7 @@ pub fn supports_server_vars(dialect: SqlDialect) -> bool {
 pub fn supports_status(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite => false,
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 

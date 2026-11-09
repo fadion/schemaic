@@ -70,6 +70,27 @@ pub const SQLITE_PRAGMAS: &[&str] = &[
     "MMAP_SIZE",
 ];
 
+/// The DuckDB settings an init may make: resources, name resolution and
+/// ordering. Not here, on purpose: everything the unattended paths' seal rests
+/// on (`enable_external_access`, `allow_*`, the extension `autoinstall_*`/
+/// `autoload_*` switches, `custom_extension_repository`, `lock_configuration`),
+/// `access_mode`, where files land (`temp_directory`), and anything else nobody
+/// has weighed yet.
+const DUCKDB_SETTINGS: &[&str] = &[
+    "THREADS",
+    "WORKER_THREADS",
+    "MEMORY_LIMIT",
+    "MAX_MEMORY",
+    "SEARCH_PATH",
+    "SCHEMA",
+    "DEFAULT_ORDER",
+    "DEFAULT_NULL_ORDER",
+    "NULL_ORDER",
+    "PRESERVE_INSERTION_ORDER",
+    "DEFAULT_COLLATION",
+    "MAX_EXPRESSION_DEPTH",
+];
+
 /// The MySQL/MariaDB session variables an init may set: time zone, locale,
 /// timeouts, buffer sizes, optimiser knobs, an isolation level (which cannot
 /// lift `SET SESSION TRANSACTION READ ONLY`). Not here, on purpose:
@@ -246,6 +267,7 @@ pub fn check(sql: &str, dialect: SqlDialect) -> Result<Vec<String>, InitRefusal>
             SqlDialect::MySql => mysql(rest, dialect),
             SqlDialect::Postgres => postgres(rest, dialect),
             SqlDialect::MsSql => mssql(rest, dialect),
+            SqlDialect::DuckDb => duckdb(rest),
         };
         verdict.map_err(refused)?;
         out.push(stmt.to_string());
@@ -349,7 +371,7 @@ impl std::fmt::Display for InitRefusal {
 pub fn settings_are_pragmas(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Sqlite => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -653,6 +675,29 @@ fn postgres(rest: &[Tok], dialect: SqlDialect) -> Result<(), InitWhy> {
     }
 }
 
+/// A DuckDB `SET` (after the head): `[SESSION|LOCAL] name {TO|=} …`, the name
+/// on [`DUCKDB_SETTINGS`]. `GLOBAL` is refused: on DuckDB it is the whole
+/// database instance's setting rather than this operation's, and the instance
+/// is shared by every operation open on the file at that moment (`db::duckdb`).
+fn duckdb(rest: &[Tok]) -> Result<(), InitWhy> {
+    if is_word(rest.first(), "GLOBAL") && rest.len() > 1 {
+        return Err(InitWhy::ServerScope("global".to_string()));
+    }
+    let mut i = 0;
+    if (is_word(rest.first(), "SESSION") || is_word(rest.first(), "LOCAL")) && rest.len() > 1 {
+        i = 1;
+    }
+    let name = name_of(rest.get(i))?;
+    if rest.get(i + 1) == Some(&Tok::Punct(b'.')) {
+        return Err(not_listed(name));
+    }
+    if DUCKDB_SETTINGS.contains(&name) {
+        Ok(())
+    } else {
+        Err(not_listed(name))
+    }
+}
+
 /// A SQL Server `SET` (after the head): a value setting
 /// ([`MSSQL_VALUE_SETTINGS`]), `TRANSACTION ISOLATION LEVEL …`, or a comma
 /// list of switches and one `ON`/`OFF` for them all — each on
@@ -725,6 +770,37 @@ mod tests {
             2
         );
         assert_eq!(check("PRAGMA foreign_keys = ON", LITE).unwrap().len(), 1);
+    }
+
+    /// DuckDB's init takes its resource and resolution settings, and never one
+    /// the unattended paths' seal rests on, nor a `GLOBAL` one — the instance
+    /// is shared by every operation open on the file.
+    #[test]
+    fn duckdb_takes_its_listed_settings_and_nothing_that_lifts_a_seal() {
+        let d = SqlDialect::DuckDb;
+        assert_eq!(
+            check(
+                "SET threads = 4; SET SESSION memory_limit = '2GB'; SET schema TO 'app'",
+                d
+            )
+            .unwrap()
+            .len(),
+            3
+        );
+        for refused in [
+            "SET enable_external_access = true",
+            "SET autoinstall_known_extensions = true",
+            "SET autoload_known_extensions = true",
+            "SET allow_unsigned_extensions = true",
+            "SET access_mode = 'READ_WRITE'",
+            "SET GLOBAL threads = 4",
+            "SET temp_directory = 'C:/x'",
+            "PRAGMA threads = 4",
+            "INSTALL httpfs",
+            "SET threads = (SELECT 4)",
+        ] {
+            assert!(check(refused, d).is_err(), "{refused} passed");
+        }
     }
 
     #[test]

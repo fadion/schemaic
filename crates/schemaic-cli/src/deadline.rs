@@ -241,8 +241,9 @@ mod tests {
         let mut offenders = Vec::new();
         // **Every awaited `db.` call, not one family of them.** The needle was
         // `db.fetch_`, which a switch to `db.run_batch` or a new `db.ping()`
-        // would have walked straight past. `engine()` is the one accessor that
-        // does no I/O.
+        // would have walked straight past. `engine()` and `clone()` are the
+        // two calls that do no I/O — the second is how the read paths take a
+        // sealed copy of the handle (`Db::sealed`) before reading.
         let needle = format!("{}.", "db");
         for (name, body) in sources {
             let mut from = 0usize;
@@ -262,7 +263,7 @@ mod tests {
                     .chars()
                     .take_while(|c| c.is_alphanumeric() || *c == '_')
                     .collect();
-                if method.is_empty() || method == "engine" {
+                if method.is_empty() || method == "engine" || method == "clone" {
                     continue;
                 }
                 checked += 1;

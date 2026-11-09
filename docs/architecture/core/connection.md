@@ -14,7 +14,13 @@ consequences are written down where they are easy to get wrong — `endpoint()` 
 **both** platforms' separators since `connections.json` is portable and `std::path` on Linux
 returns a whole Windows path as its own file name, and `targets_same_server` counts the file,
 because pointing a connection at another `.db` reaches an entirely different set of tables and
-is reached the same way a repointed host is. `is_sqlite`/`is_postgres`/`is_mssql` are the one
+is reached the same way a repointed host is. **DuckDB is the second engine with no server**, and
+every one of those decisions asks `is_file_backed` — SQLite or DuckDB — rather than `is_sqlite`:
+`is_networked` is its negation, and `default_port`, `endpoint`, `sanitized`, `default_database`,
+`file_label` and `AuthMode::offered` (one mode, the password, on a file) read it, so a third
+embedded engine joins all of them by being named in that one predicate
+(`a_duckdb_connection_keeps_only_its_file`). Its one database is the file's own catalog, named
+after the file, rather than SQLite's `main`. `is_sqlite`/`is_postgres`/`is_mssql`/`is_duckdb` are the one
 answer to which engine a label names — `schemaic_db::Engine::from_db_type`, the form's picker and
 `SqlDialect::from_db_type` all delegate, the last of which used to re-spell the aliases itself.
 `is_mssql` takes `SQL Server`/`sqlserver`/`mssql` as **whole labels only**, never a substring:

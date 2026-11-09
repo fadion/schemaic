@@ -24,7 +24,11 @@ use crate::model::ResultSet;
 pub fn supports_plan(dialect: crate::intel::SqlDialect) -> bool {
     use crate::intel::SqlDialect;
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        SqlDialect::MySql
+        | SqlDialect::Postgres
+        | SqlDialect::Sqlite
+        | SqlDialect::MsSql
+        | SqlDialect::DuckDb => true,
     }
 }
 

@@ -25,7 +25,16 @@ in-memory SQLite has no statement that passes its gate and writes. So
 `mcp.rs` instead (and `dump.rs`, whose generated reads meet no text gate at all) — forbidding
 plain `.fetch_query(` and `.stream_query(` in each, and requiring
 `Enforce::ReadOnly` inside the argument list of every `.fetch_query_enforced(` and
-`.stream_query_enforced(` call, both needles counted toward its floor. A **locking read** (`FOR UPDATE`, `FOR NO KEY
+`.stream_query_enforced(` call, both needles counted toward its floor. **On DuckDB the session
+does not stop a read of a file**, and a DuckDB read can open any file on the machine — `FROM
+'secrets.csv'` is a string in table position, which no deny list can name. So
+`read_only_query`, `read_only_export` and `read_only_explain` each run on `db.clone().sealed()`:
+on DuckDB the file opens read-only with external access off and its configuration locked
+(`db::duckdb`), and on every other engine the flag is inert. `read_only_explain` needs it as
+much as the others, DuckDB's planner opening a file it is asked to scan to read its shape.
+The MCP server seals every handle it serves as well (`mcp::serve`). Nothing pins the calls — no
+source gate reads them, and no test here reaches a DuckDB file.
+A **locking read** (`FOR UPDATE`, `FOR NO KEY
 UPDATE`, `LOCK IN SHARE MODE`, and the shared `FOR SHARE`/`FOR KEY SHARE` no deny-list word
 catches, which a MySQL 8 read-only session runs, locks held) is refused by naming the clause and
 the lock (`sql::locking_clause`, `shared_locks`); it used to answer "`UPDATE` is not permitted",
@@ -45,8 +54,9 @@ open on a path where a schema holds what PostgreSQL could pick in a builtin's pl
 allowlist will not run, a sign-in the transport cannot carry, a MySQL session whose character set
 or `sql_mode` cannot be made safe and a plan MySQL will not make read-only are others.
 `NoRows::from_db` sorts every such one into `NoRows::DbRefused`, carrying the refusal's own
-sentence, and every other `DbError` into `Failed` — the two refusals that do not stand, the SQLite
-worker failing and a report on a `COMMIT` that was sent, included
+sentence, and every other `DbError` into `Failed` — the refusals that do not stand, a SQLite or
+DuckDB worker failing, a DuckDB file open for the other kind of run and a report on a `COMMIT`
+that was sent, included
 (`a_standing_refusal_is_a_refusal_and_everything_else_a_failure`). It was `NoRows::SessionRefused`
 and took `ShadowedBuiltin` alone, so a refused `sql_mode`, init SQL or transport reached a script
 as exit 4 — "retrying may work" — over a statement that never ran and a retry that met the same

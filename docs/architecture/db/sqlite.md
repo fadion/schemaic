@@ -24,7 +24,8 @@ delegate to; it had two, and the third consumer not asking at all is what this c
   and `conn_import::needs_password` read `is_networked(&db_type)` where each spelled `!is_sqlite`
   for itself, thirty lines from the predicate whose own doc already said the tunnel decision was
   not asking. Nothing changes today — the hand-spelling was the same boolean — and what the
-  delegation buys is that a fifth engine with no server is **one** edit;
+  delegation buys is that a fifth engine with no server is **one** edit — DuckDB was that engine,
+  and `is_networked` is now the negation of `connection::is_file_backed`, SQLite or DuckDB;
   `a_server_less_engine_reaches_no_server_by_any_route` fails if a site goes back to deciding for
   itself, and `a_networked_engine_still_reaches_its_server` is its floor, so the predicate cannot
   pass by refusing everything. `SslMode::caveat` is deliberately **not** among them: its

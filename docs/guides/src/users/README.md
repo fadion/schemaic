@@ -14,7 +14,7 @@ The database still matters: the browser reads the one your active query tab is o
 keeps schema and table privileges in each database separately, and a SQL Server user belongs to
 one database, so open a tab on the right database first.
 
-SQLite has no user accounts, so there is no such entry on a SQLite connection.
+SQLite and DuckDB have no user accounts, so there is no such entry on their connections.
 
 ## Reading an account
 

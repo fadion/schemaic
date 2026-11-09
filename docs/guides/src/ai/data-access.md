@@ -63,6 +63,9 @@ The assistant's queries are refused if they could write, whatever the connection
 - SQL Server has no read-only session, so there the query runs inside a transaction that's always
   rolled back. A procedure that reaches outside the database, such as sending mail, can still
   have that effect. For a hard guarantee there, connect with a login that can only read.
+- On DuckDB the assistant reads the database's own tables and nothing else. DuckDB can query files
+  on your computer directly, so `read_csv`, `read_parquet` and the other file readers are refused,
+  and so is a file name in `FROM`.
 
 This guards against mistakes and keeps the assistant from writing. It isn't a defence against a
 database whose owner is out to trick you: table names, comments and values are text someone else

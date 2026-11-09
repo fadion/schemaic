@@ -296,6 +296,11 @@ impl Session {
             Engine::Sqlite => {
                 return Err(DbError::Refused(crate::DbRefusal::SqliteNoManual));
             }
+            // Not yet: DuckDB holds transactions, read-only ones included, and
+            // its pinned session is the roadmap's DuckDB phase 2.
+            Engine::DuckDb => {
+                return Err(DbError::Refused(crate::DbRefusal::DuckDbNoManual));
+            }
             // **SQL Server holds no read-only transaction**, so a read-only
             // connection is refused a pinned session rather than given an
             // unguarded one. Its fresh-connection guard is a transaction that
@@ -1366,7 +1371,9 @@ impl Session {
 /// session disagree about the transaction model.
 pub fn tx_engine_of(engine: Engine) -> tx::TxEngine {
     match engine {
-        Engine::Postgres => tx::TxEngine::Postgres,
+        // DuckDB, like PostgreSQL, aborts a transaction on a failed statement
+        // and rolls DDL back — measured on 2.0.
+        Engine::Postgres | Engine::DuckDb => tx::TxEngine::Postgres,
         // Its own: DDL that does not commit, and a transaction state the
         // session reads from the server — see `tx::TxEngine::MsSql`.
         Engine::MsSql => tx::TxEngine::MsSql,

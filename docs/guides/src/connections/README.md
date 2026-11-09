@@ -1,7 +1,7 @@
 # Connections
 
-A connection is one saved server — or, for SQLite, one database file. You add and change them in
-**Manage connections**, and switch between them from the header.
+A connection is one saved server — or, for SQLite and DuckDB, one database file. You add and change
+them in **Manage connections**, and switch between them from the header.
 
 ## Managing connections
 
@@ -40,9 +40,27 @@ The **Database** section changes with **Type**:
 - *SQLite* — just a **Database file**. There's no server, so no host, password, tunnel or TLS, and
   the **Network** section goes away. SQLite statements commit as they're sent: there's no manual
   transaction mode.
+- *DuckDB* — the same: just a **Database file**, with no **Network** section. See
+  [DuckDB files](#duckdb-files) below.
 
 Where an engine offers more than a password, an **Authentication** picker appears above **User**.
 See [Signing in and TLS](sign-in.md).
+
+## DuckDB files
+
+Type the path in **Database file**, or press **Browse…** inside the field to pick it.
+
+- *The file must already exist.* Schemaic never creates a DuckDB database, so a mistyped path is
+  refused rather than turned into an empty one. Create the file with DuckDB first. An in-memory
+  database (`:memory:`) and a MotherDuck name (`md:…`) are refused too.
+- *The file is open only while something runs.* Between statements Schemaic lets go of it, so
+  another program, such as the `duckdb` command-line client, can open it. While that program
+  holds it, Schemaic's own statements fail with DuckDB's error that the file is in use; close the
+  other program and run again.
+- *Nothing is downloaded.* DuckDB extensions are never installed or loaded behind a query. Parquet
+  and JSON support are built in; any other extension isn't available.
+- *Not yet:* editing results in the grid, importing files, **Manual** transactions, designing
+  tables, and editing views and macros. See [Engine differences](../reference/engines.md#duckdb).
 
 ## Switching connections
 

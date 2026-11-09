@@ -578,7 +578,11 @@ pub fn analyze_edit(
 /// refuse — the exhaustive match makes that engine say which side it is on.
 pub fn supports_grid_writes(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        SqlDialect::MySql
+        | SqlDialect::Postgres
+        | SqlDialect::Sqlite
+        | SqlDialect::MsSql
+        | SqlDialect::DuckDb => true,
     }
 }
 
@@ -804,7 +808,11 @@ pub fn staged_sql(write: &crate::model::GridWrite, rs: &ResultSet, dialect: SqlD
             }),
             (
                 _,
-                SqlDialect::MsSql | SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite,
+                SqlDialect::MsSql
+                | SqlDialect::MySql
+                | SqlDialect::Postgres
+                | SqlDialect::Sqlite
+                | SqlDialect::DuckDb,
             ) => false,
         };
         if identity {
@@ -825,7 +833,10 @@ pub fn staged_sql(write: &crate::model::GridWrite, rs: &ResultSet, dialect: SqlD
             // engines disagree on how to say so.
             WriteStep::Insert(i) if i.cols.is_empty() => match dialect {
                 SqlDialect::MySql => format!("INSERT INTO {target} () VALUES ();"),
-                SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => {
+                SqlDialect::Postgres
+                | SqlDialect::Sqlite
+                | SqlDialect::MsSql
+                | SqlDialect::DuckDb => {
                     format!("INSERT INTO {target} DEFAULT VALUES;")
                 }
             },

@@ -511,7 +511,12 @@ impl Endpoint {
 /// **Its one connection is named after the saved one** (`audit_as`), so a
 /// model that names the active connection — the panel's prompt says which —
 /// reaches it rather than a refusal listing nothing.
-pub async fn serve(endpoint: Endpoint) {
+pub async fn serve(mut endpoint: Endpoint) {
+    // Every tool here runs with nobody at the keyboard and none writes, so the
+    // handle is sealed for all of them — `sample_rows` and `describe_table`'s
+    // samples included, which read through a view a body may have aimed at a
+    // file (`Db::sealed`).
+    endpoint.db = endpoint.db.sealed();
     let name = sole_name(&endpoint);
     serve_on(
         &[Named {
@@ -531,7 +536,11 @@ fn sole_name(endpoint: &Endpoint) -> String {
 
 /// [`serve`] for several connections, each under its name; the first is the
 /// default for a call that names none ([`listing`]).
-pub async fn serve_many(endpoints: Vec<(String, Endpoint)>) {
+pub async fn serve_many(mut endpoints: Vec<(String, Endpoint)>) {
+    // Sealed, as `serve` seals its one.
+    for (_, e) in &mut endpoints {
+        e.db = e.db.clone().sealed();
+    }
     let named: Vec<Named<'_>> = endpoints
         .iter()
         .map(|(name, endpoint)| Named { name, endpoint })
@@ -1671,6 +1680,7 @@ fn statement_source(dialect: SqlDialect) -> &'static str {
         SqlDialect::MySql => "performance_schema's statement digests",
         SqlDialect::MsSql => "the database's Query Store",
         SqlDialect::Sqlite => "nowhere: SQLite keeps no statement statistics",
+        SqlDialect::DuckDb => "nowhere: DuckDB keeps no statement statistics",
     }
 }
 

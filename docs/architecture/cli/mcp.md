@@ -576,7 +576,10 @@ advertised on every engine and answer for an absent source rather than being wit
 `top_statements` says the engine keeps no statement statistics and `current_locks` that it has no
 server sessions (`activity::supports_activity`, asked before the read), while `index_health` and
 `table_sizes` do answer there, from `dbstat`'s sizes and with no usage counts, which the usage note
-says. `top_statements {order?, limit?, database?}` is `Db::fetch_top_statements`; an `order` other
+says. DuckDB's `top_statements` says what SQLite's does (`statement_source` names *nowhere* for
+both), and its `current_locks` answers as SQLite's: `supports_activity` says no for both. Every
+handle the server serves is sealed (`serve`, `Db::sealed`): none of its tools writes, and on
+DuckDB a read through a view may otherwise open a file. `top_statements {order?, limit?, database?}` is `Db::fetch_top_statements`; an `order` other
 than `total`, `mean` or `calls` is refused, and **an absent source is an answer, not an error** —
 `is_error` false, `perf::unavailable_text`'s reason and one-statement fix — because the model's
 next move is to tell the user, not to retry; a source that is on and has recorded nothing says so,

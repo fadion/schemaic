@@ -429,6 +429,7 @@ fn layout_cache_key(editor_gen: u64, ui_gen: u64, px: f32, dialect: SqlDialect) 
         SqlDialect::Postgres => 1,
         SqlDialect::Sqlite => 2,
         SqlDialect::MsSql => 3,
+        SqlDialect::DuckDb => 4,
     };
     (editor_gen.wrapping_add(ui_gen) << 11) | (engine << 8) | (px.round() as u64 & 0xFF)
 }

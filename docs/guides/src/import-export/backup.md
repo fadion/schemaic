@@ -14,6 +14,7 @@ The tools are looked up on your `PATH`. If one isn't found, the terminal panel s
 | PostgreSQL        | `pg_dump`                     | `pg_restore`, or `psql` for a `.sql` file |
 | SQL Server        | `sqlcmd`                      | not offered                              |
 | SQLite            | nothing — Schemaic copies the file itself | not offered                  |
+| DuckDB            | nothing — Schemaic copies the database itself | not offered              |
 
 The MariaDB names are tried first; on many Linux systems `mysqldump` and `mysql` are really
 MariaDB's tools under another name.
@@ -31,6 +32,9 @@ the database's name and the date and time.
   events.
 - *PostgreSQL* — a custom-format `.dump`, which `pg_restore` can restore from selectively.
 - *SQLite* — a copy of the database file, which you can open as a connection of its own.
+- *DuckDB* — a new `.duckdb` file holding every schema, table, view, sequence and macro, with the
+  rows. Open it as a connection of its own. The file you pick must not exist yet: Schemaic won't
+  write over one.
 - *SQL Server* — there's no file dialog. The server writes a `.bak` into its own default backup
   folder, as a copy-only backup that leaves your scheduled backup chain alone. A second backup
   of the same database within the same minute replaces the first. Since this one is written by

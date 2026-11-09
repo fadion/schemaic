@@ -703,9 +703,13 @@ impl ColumnInfo {
     pub fn definition_sql(&self, dialect: crate::intel::SqlDialect) -> String {
         match dialect {
             crate::intel::SqlDialect::MsSql => return self.tsql_definition(),
+            // DuckDB's column grammar is PostgreSQL's; which of this
+            // function's shared clauses it takes is the table designer's
+            // work (roadmap, DuckDB phase 2).
             crate::intel::SqlDialect::MySql
             | crate::intel::SqlDialect::Postgres
-            | crate::intel::SqlDialect::Sqlite => {}
+            | crate::intel::SqlDialect::Sqlite
+            | crate::intel::SqlDialect::DuckDb => {}
         }
         let pg = dialect == crate::intel::SqlDialect::Postgres;
         // SQLite shares MySQL's shape for the parts it has — `COLLATE`, the
@@ -1014,7 +1018,10 @@ pub(crate) fn default_grammar(dialect: crate::intel::SqlDialect) -> DefaultGramm
     match dialect {
         // A T-SQL `DEFAULT` takes any constant expression — the server stores
         // it parenthesised, `((0))` and `(getdate())`.
-        SqlDialect::Postgres | SqlDialect::MsSql => DefaultGrammar::AnyExpression,
+        // DuckDB's `DEFAULT` takes any expression, `nextval('s')` included.
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb => {
+            DefaultGrammar::AnyExpression
+        }
         SqlDialect::MySql => DefaultGrammar::MysqlKeywords,
         SqlDialect::Sqlite => DefaultGrammar::LiteralsOnly,
     }
@@ -1161,6 +1168,9 @@ pub const PG_DEFAULT_SCHEMA: &str = "public";
 /// someone made more.
 pub const MSSQL_DEFAULT_SCHEMA: &str = "dbo";
 
+/// DuckDB's default schema, in every catalog — the file's included.
+pub const DUCKDB_DEFAULT_SCHEMA: &str = "main";
+
 /// The namespace a database row in the tree stands for on `dialect`, or `None`
 /// on an engine with no level between database and table.
 ///
@@ -1174,6 +1184,7 @@ pub fn default_namespace(dialect: crate::intel::SqlDialect) -> Option<&'static s
     match dialect {
         SqlDialect::Postgres => Some(PG_DEFAULT_SCHEMA),
         SqlDialect::MsSql => Some(MSSQL_DEFAULT_SCHEMA),
+        SqlDialect::DuckDb => Some(DUCKDB_DEFAULT_SCHEMA),
         SqlDialect::MySql | SqlDialect::Sqlite => None,
     }
 }
@@ -1824,7 +1835,9 @@ pub fn restates_partitioning(dialect: crate::intel::SqlDialect) -> bool {
     use crate::intel::SqlDialect as D;
     match dialect {
         D::Postgres | D::MySql => true,
-        D::MsSql | D::Sqlite => false,
+        // DuckDB partitions files it writes (`PARTITION_BY` on `COPY`), not
+        // tables.
+        D::MsSql | D::Sqlite | D::DuckDb => false,
     }
 }
 
@@ -1864,7 +1877,7 @@ pub fn partitions_are_tables(dialect: crate::intel::SqlDialect) -> bool {
     use crate::intel::SqlDialect as D;
     match dialect {
         D::Postgres => true,
-        D::MySql | D::MsSql | D::Sqlite => false,
+        D::MySql | D::MsSql | D::Sqlite | D::DuckDb => false,
     }
 }
 
@@ -1960,7 +1973,9 @@ pub fn unvalidated_check_waits_for_rows(dialect: crate::intel::SqlDialect) -> bo
     use crate::intel::SqlDialect as D;
     match dialect {
         D::MsSql | D::Postgres => true,
-        D::MySql | D::Sqlite => false,
+        // DuckDB checks every constraint as it is added; there is no
+        // unvalidated state to hold.
+        D::MySql | D::Sqlite | D::DuckDb => false,
     }
 }
 
@@ -1973,7 +1988,7 @@ pub fn writes_not_valid(dialect: crate::intel::SqlDialect) -> bool {
     use crate::intel::SqlDialect as D;
     match dialect {
         D::Postgres => true,
-        D::MsSql | D::MySql | D::Sqlite => false,
+        D::MsSql | D::MySql | D::Sqlite | D::DuckDb => false,
     }
 }
 
@@ -2138,7 +2153,9 @@ impl CheckInfo {
             crate::intel::SqlDialect::MySql
             | crate::intel::SqlDialect::Postgres
             | crate::intel::SqlDialect::Sqlite => true,
-            crate::intel::SqlDialect::MsSql => false,
+            // DuckDB has no `NOT ENFORCED`: every constraint it holds is
+            // enforced, so an unenforced one cannot reach it to be written.
+            crate::intel::SqlDialect::MsSql | crate::intel::SqlDialect::DuckDb => false,
         }
     }
 
@@ -3315,7 +3332,8 @@ impl TriggerInfo {
             crate::intel::SqlDialect::MsSql => t.tsql_follow_ups(),
             crate::intel::SqlDialect::MySql
             | crate::intel::SqlDialect::Postgres
-            | crate::intel::SqlDialect::Sqlite => Vec::new(),
+            | crate::intel::SqlDialect::Sqlite
+            | crate::intel::SqlDialect::DuckDb => Vec::new(),
         };
         triggers
             .iter()
@@ -3361,9 +3379,11 @@ impl TriggerInfo {
                         ));
                         out
                     }
+                    // DuckDB has no triggers, so it has none to wrap.
                     crate::intel::SqlDialect::MySql
                     | crate::intel::SqlDialect::Postgres
-                    | crate::intel::SqlDialect::Sqlite => vec![create],
+                    | crate::intel::SqlDialect::Sqlite
+                    | crate::intel::SqlDialect::DuckDb => vec![create],
                 };
                 wrapped.into_iter().chain(follow_ups(t))
             })
@@ -3525,9 +3545,12 @@ impl TriggerInfo {
         // SQL Server's is rebuilt from its own parts — see `tsql_statement`.
         match dialect {
             crate::intel::SqlDialect::MsSql => return self.tsql_create_sql(),
+            // DuckDB has no triggers; `supports_trigger_editing` keeps it from
+            // reaching here.
             crate::intel::SqlDialect::MySql
             | crate::intel::SqlDialect::Postgres
-            | crate::intel::SqlDialect::Sqlite => {}
+            | crate::intel::SqlDialect::Sqlite
+            | crate::intel::SqlDialect::DuckDb => {}
         }
         let pg = dialect == crate::intel::SqlDialect::Postgres;
         // SQLite's shape is neither of the other two: it has PostgreSQL's
@@ -4107,9 +4130,11 @@ impl RoutineInfo {
             }
             // T-SQL has no overloading: a routine's name is unique in its
             // schema, and `DROP PROCEDURE p(...)` does not parse.
+            // A DuckDB macro is dropped by name, whatever its overloads.
             crate::intel::SqlDialect::MySql
             | crate::intel::SqlDialect::Sqlite
-            | crate::intel::SqlDialect::MsSql => name,
+            | crate::intel::SqlDialect::MsSql
+            | crate::intel::SqlDialect::DuckDb => name,
         }
     }
 
@@ -4133,7 +4158,8 @@ impl RoutineInfo {
             }
             crate::intel::SqlDialect::MySql
             | crate::intel::SqlDialect::Sqlite
-            | crate::intel::SqlDialect::MsSql => String::new(),
+            | crate::intel::SqlDialect::MsSql
+            | crate::intel::SqlDialect::DuckDb => String::new(),
         }
     }
 
@@ -4154,9 +4180,12 @@ impl RoutineInfo {
             // SQLite has no stored routines at all; it never reaches here
             // (`supports_routine_editing` is false for it), and MySQL's shape is
             // the closer of the two if it somehow does.
-            crate::intel::SqlDialect::MySql | crate::intel::SqlDialect::Sqlite => {
-                self.mysql_create_sql(dialect, replace)
-            }
+            // DuckDB's routines are macros, which nothing edits yet
+            // (`supports_routine_editing`, roadmap DuckDB phase 2); a
+            // macro's `CREATE` is read from the catalogue verbatim.
+            crate::intel::SqlDialect::MySql
+            | crate::intel::SqlDialect::Sqlite
+            | crate::intel::SqlDialect::DuckDb => self.mysql_create_sql(dialect, replace),
             // SQL Server's is rebuilt from the parts `mssql` read the stored
             // text into; `replace` is `CREATE OR ALTER`.
             crate::intel::SqlDialect::MsSql => self.tsql_create_sql(replace),
@@ -5928,9 +5957,12 @@ impl TableInfo {
                     .collect::<Vec<_>>()
                     .join("\n");
             }
+            // DuckDB tables carry their engine's own `CREATE` text
+            // (`create_sql`, from `duckdb_tables().sql`), which wins below.
             crate::intel::SqlDialect::MySql
             | crate::intel::SqlDialect::Postgres
-            | crate::intel::SqlDialect::Sqlite => {}
+            | crate::intel::SqlDialect::Sqlite
+            | crate::intel::SqlDialect::DuckDb => {}
         }
         let pg = dialect == crate::intel::SqlDialect::Postgres;
         // Delegated, not inlined. This was a fifth copy of the identifier
@@ -6193,7 +6225,7 @@ impl TableInfo {
         }
         match dialect {
             D::MsSql => (self.tsql_create_ddl(), self.held_checks(dialect)),
-            D::Postgres | D::MySql | D::Sqlite => {
+            D::Postgres | D::MySql | D::Sqlite | D::DuckDb => {
                 let kept = TableInfo {
                     check_constraints: self
                         .check_constraints

@@ -48,7 +48,14 @@ TIME ZONE`. SQL Server's is three: `MSSQL_VALUE_SETTINGS` (`LANGUAGE`, `DATEFORM
 pass only `ON`. A T-SQL `@x` is refused: a variable ends with its batch and sets nothing.
 `SQLITE_PRAGMAS` lists the per-connection pragmas, unqualified and with an `=` value or none,
 and leaves out what writes the file (`journal_mode`, `user_version`, `auto_vacuum`) or lifts
-the read-only guard (`query_only`, `writable_schema`). **Left off on purpose**, each list's doc
+the read-only guard (`query_only`, `writable_schema`). `DUCKDB_SETTINGS` is resources, name
+resolution and ordering — `threads`, `memory_limit`, `search_path`, `schema`, the default orders
+and collation — taking a `SESSION` or `LOCAL` scope and **refusing `GLOBAL`**, which on DuckDB is
+the whole instance's setting, and the instance is shared by every operation open on the file at
+that moment (`db::duckdb`). It leaves out everything the unattended paths' seal rests on —
+`enable_external_access`, the `allow_*` and extension `autoinstall_*`/`autoload_*` switches,
+`custom_extension_repository`, `lock_configuration` — and `access_mode` and `temp_directory`
+(`duckdb_takes_its_listed_settings_and_nothing_that_lifts_a_seal`). **Left off on purpose**, each list's doc
 comment saying which: the transaction characteristics and read-only flags, `autocommit`,
 `IMPLICIT_TRANSACTIONS`/`ANSI_DEFAULTS`, `NOCOUNT`/`ROWCOUNT` (the row counts the one-row
 safety net reads), `foreign_key_checks`, PostgreSQL's `session_replication_role` (it switches

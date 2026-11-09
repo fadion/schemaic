@@ -1,8 +1,8 @@
 # `schemaic-db`
 
 `schemaic-db` — MySQL/MariaDB (`mysql_async`) in `mysql.rs`, PostgreSQL in `pg.rs`,
-SQLite in `sqlite.rs`, SQL Server (`tiberius`, vendored) in `mssql.rs`, SSH tunnels in
-`ssh.rs`, and
+SQLite in `sqlite.rs`, SQL Server (`tiberius`, vendored) in `mssql.rs`, DuckDB (the `duckdb`
+crate, the engine compiled in) in `duckdb.rs`, SSH tunnels in `ssh.rs`, and
 the pinned manual-transaction connection in `session.rs`.
 **Three engines and three modules — the move is finished.** For most of the crate's life MySQL
 had no module: its bodies were inline in `lib.rs`, so `pg.rs` and `sqlite.rs` were peers of each
@@ -11,16 +11,17 @@ family of entry points each — account introspection; Server Activity and table
 `collect_schema` with everything it folds plus the four lazy `SHOW CREATE` reads; the wire
 decoders and the read paths; DDL, scripts, imports and write-back; and finally `run_script` with
 the convention flip — taking `lib.rs` from 9,590 lines to about 3,100 beside `mysql.rs`'s 7,055, and
-leaving no `Engine::MySql` arm in `lib.rs` that is not a call into `mysql::`. (The one dispatch
-arm in the file that still builds SQL is SQLite's inside `fetch_table`, which is not one of
-`ENGINE_ENTRY_POINTS` and so is outside the census below.) Both convention tests read
+leaving no `Engine::MySql` arm in `lib.rs` that is not a call into `mysql::`. (The dispatch arms
+in the file that still build SQL are SQLite's and DuckDB's inside `fetch_table` and inside
+`explain`, neither method one of `ENGINE_ENTRY_POINTS`, and so outside the census below.) Both convention tests read
 three engines now, and the second is renamed for it:
 `every_engine_module_answers_the_whole_interface` and
 `the_dispatcher_calls_every_engine_module_for_every_entry_point`. **`mssql.rs` is a fourth module
 and answers every name**, the unwritten ones with a refusal: it is in the first test's list and
 in `the_entry_point_list_is_what_the_dispatcher_actually_dispatches`'s intersection, whose
 listed-⊆-called half is what holds its dispatch arms, and the second test's own loop names all
-four modules.
+four modules. **`duckdb.rs` is a fifth and answers every name too — but none of the three tests
+lists it yet** (under `duckdb.rs`), so for that module the census is the compiler's alone.
 **Flipping them to three is what found the last three doors.** `commit_writes`, `refetch_rows`
 and `fetch_blob` existed in `mysql.rs` only as `write_on`, `refetch_on` and `blob_on` — the
 bodies `session.rs` calls directly — while the dispatcher's arm was still inline, so the interface
@@ -226,8 +227,8 @@ as `kill_session` is, for being the call made when somebody is looking at a serv
 when a dark one is likeliest, and a modal sitting on *Loading…* for the OS connect timeout is
 the failure the deadline exists to bound.
 **`fetch_table` also reads on a read-only session, on every connection, writable or not** —
-`Enforce::Generated` in all four arms: `pg::fetch_table` passes it down `pg::fetch_query`,
-`mysql::fetch_table`, `mssql::fetch_table` and SQLite's arm take `fetch_query_enforced`, and on
+`Enforce::Generated` in all five arms: `pg::fetch_table` passes it down `pg::fetch_query`,
+`mysql::fetch_table`, `mssql::fetch_table` and SQLite's and DuckDB's arms take `fetch_query_enforced`, and on
 SQL Server that is the always-rolled-back transaction (`fetch_query_enforced`, below). Its
 `SELECT * … LIMIT n` is generated, so no text gate ever reads it, and the name the monitor polls
 may be a view whose body calls a function that writes: on an ordinary session that write ran on
@@ -239,9 +240,11 @@ writes because somebody is watching it. **It was meant to be the only change the
 PostgreSQL path with a shadowed builtin's name on it, so a writable database with an ordinary
 `public.round(double precision, integer)` could no longer be monitored at all, and on MySQL it
 brought `enforce_session`'s `sql_mode` and character-set refusals with it. `Generated` is the same
-write refusal without those gate-only checks (below, beside the shadow check). Nothing pins the four arms' `Enforce` —
+write refusal without those gate-only checks (below, beside the shadow check). Nothing pins the five arms' `Enforce` —
 `every_reachability_path_is_bounded_by_a_timeout` reads this method for its deadline, not its
-session — so the `Read-only on every connection` comments at each arm are the only marker.
+session — so the `Read-only on every connection` comments at the three engine modules' arms and
+on `Db::fetch_table`'s own doc are the only marker; the SQLite and DuckDB arms inline in the
+dispatcher carry none.
 **`Db::fetch_locks` is Server Activity's *Locks* view**, gated on `supports_activity` like
 `fetch_sessions` and one query per engine. Each engine asks for `MAX_LOCKS + 1` rows ordered
 waits first, so the server's own cut keeps the waits, and each leaves out its own session; the
@@ -696,7 +699,9 @@ and passed through `Db::password` as it came), `explain_setup`'s
 read-only gate (`read_only_refusal(..).reason`), `kill_session`'s cancel, the blank-string and
 code-page checks, `sqlite::open_target`'s three refusals, SQLite's "the SQLite worker failed: …"
 (a `Query` once) at each of its six sites, its default-reset refusals and `table_stats`' size
-cap. It renders **as written**, `#[error("{0}")]` with no prefix — `DbRefusal`'s `Display`, its
+cap, and DuckDB's — `duckdb::open_target`'s three, a sealed or unsealed instance asked for the
+other kind (`DuckDbSealedElsewhere`), its worker failing, phase 1's `DuckDbNotYet` and
+`Session::open`'s `DuckDbNoManual` (under `duckdb.rs`). It renders **as written**, `#[error("{0}")]` with no prefix — `DbRefusal`'s `Display`, its
 English: each is already the whole sentence, and "query failed:" in front of "Commit cancelled
 — …" named a failure that was the user's own act. The window words it instead
 (`i18n::db_refusal_text`, from `db_error_shown`); the CLI, the MCP server and the logs keep
@@ -791,8 +796,8 @@ its two producers (`a_failed_begin_is_not_the_statements_failure`,
 `commit_writes`/`refetch_rows`/`prepare_check`
 (non-executing `PREPARE` for the editor's live validation)/`run_ddl`/`run_script`/`fetch_table_stats`/
 `count_rows`/`fetch_blob` are `Db` methods taking the target DB per call.
-`backup_to_file(target)` takes a *file* instead, and answers on SQLite alone
-(`sqlite::backup_to`); the three server engines get `DbError::Refused`, inline in the dispatcher,
+`backup_to_file(target)` takes a *file* instead, and answers on the two embedded engines alone
+(`sqlite::backup_to`, `duckdb::backup_to`); the three server engines get `DbError::Refused`, inline in the dispatcher,
 their backups being their own tools run in the terminal (`core::launch`).
 **`Db::fetch_blob` is the binary-cell panel's whole backend** — one connection, one `SELECT`, one
 row, like everything else here. `Ok(None)` means the cell is SQL `NULL` **or** the row is gone,

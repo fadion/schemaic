@@ -926,6 +926,14 @@ fn needs_quoting(name: &str, dialect: SqlDialect) -> bool {
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
         }
+        // DuckDB: letters, digits, `_`; no leading digit. It matches a name
+        // whatever its case (measured: `MixedCase` is reached as `mixedcase`)
+        // and keeps the case it was created with, so mixed case needs no
+        // quoting. No `$`: `$1` is a parameter there.
+        SqlDialect::DuckDb => {
+            !name.starts_with(|c: char| c.is_ascii_digit())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
     };
     // `must_quote_ident`, not `is_reserved_word`: this name goes into a statement
     // as a table or column, where SQLite refuses a few words it would accept as
@@ -1048,14 +1056,19 @@ pub fn qualified_table_name(
         // whose stock first entry is `"$user"` — so the bare form would read a
         // different table for a different user, while the tab's identity, and
         // every write from its grid, stayed the one it was opened on.
-        SqlDialect::Postgres | SqlDialect::MsSql => match schema.filter(|s| !s.is_empty()) {
-            Some(s) => format!(
-                "{}.{}",
-                quote_if_needed(s, dialect),
-                quote_if_needed(table, dialect)
-            ),
-            None => quote_if_needed(table, dialect),
-        },
+        // DuckDB's operation opens on its file's catalog, so the schema is
+        // the qualifier the name needs — `main` included, since `SET schema`
+        // in the init SQL moves where a bare name resolves.
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb => {
+            match schema.filter(|s| !s.is_empty()) {
+                Some(s) => format!(
+                    "{}.{}",
+                    quote_if_needed(s, dialect),
+                    quote_if_needed(table, dialect)
+                ),
+                None => quote_if_needed(table, dialect),
+            }
+        }
     }
 }
 
@@ -1071,6 +1084,7 @@ pub fn bare_name_reaches(dialect: SqlDialect, schema: Option<&str>) -> bool {
     let default = match dialect {
         SqlDialect::Postgres => "public",
         SqlDialect::MsSql => "dbo",
+        SqlDialect::DuckDb => "main",
         SqlDialect::MySql | SqlDialect::Sqlite => return true,
     };
     schema.is_none_or(|s| s.is_empty() || s.eq_ignore_ascii_case(default))
@@ -1097,7 +1111,9 @@ pub fn table_name_from(
             Some(format!("{}.{here}", quote_if_needed(database, dialect)))
         }
         SqlDialect::MsSql => Some(here),
-        SqlDialect::Postgres => (!another).then_some(here),
+        // One catalog per operation — the file's — as PostgreSQL's
+        // connection is one database.
+        SqlDialect::Postgres | SqlDialect::DuckDb => (!another).then_some(here),
     }
 }
 
@@ -1170,7 +1186,7 @@ mod tests {
         build_query(base, filter, &sort, d).unwrap()
     }
 
-    const EVERY_DIALECT: [SqlDialect; 4] = SqlDialect::ALL;
+    const EVERY_DIALECT: [SqlDialect; 5] = SqlDialect::ALL;
 
     // ── Paging ───────────────────────────────────────────────────────────────
 

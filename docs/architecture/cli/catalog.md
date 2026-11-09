@@ -8,8 +8,8 @@ the deadline and the cap are the one headless read path's, and `--format` means 
 everywhere. Only the SQL is per dialect, because the question is: PostgreSQL and SQLite have no
 `DESCRIBE`, and MySQL's `SHOW` names its columns after the database. So each builder is an
 exhaustive `match` over the three, and every engine answers under the **same column names** —
-`name`, `type` for `tables`, with `schema` first on PostgreSQL alone, the one engine whose
-database holds more than one namespace; `column`, `type`, `nullable`, `default`, `key` for
+`name`, `type` for `tables`, with `schema` first on the engines whose database holds more than
+one namespace — PostgreSQL, SQL Server and DuckDB; `column`, `type`, `nullable`, `default`, `key` for
 `describe` — so a script reading one engine's output reads the others'. They are aliased through
 `export::ident_sql`, since `default`, `key` and `column` are reserved words on at least one of
 them (`every_engine_answers_under_the_same_column_names`), and a type is spelled one way
@@ -31,7 +31,11 @@ A SQLite file always is a database, and it is always `main` — `"main".sqlite_m
 spliced in as the schema (`"shop".sqlite_master`), which fails with exit 4 — "retry may work" —
 on a command line that never could, and a `SCHEMAIC_DATABASE` exported for another engine did
 the same. Every CLI operation opens its own connection, so nothing but `main` is ever attached
-for a name to mean (`a_sqlite_listing_ignores_the_database_it_is_given`).
+for a name to mean (`a_sqlite_listing_ignores_the_database_it_is_given`). **A DuckDB file is
+one database too**, and needs none named: its listing is `duckdb_tables()` and `duckdb_views()`
+held to `current_database()` and `NOT internal`, and its `describe` reads `duckdb_columns()`,
+comparing the name in any case (DuckDB matches one so), a bare name in `current_schema()` and
+`schema.table` in that schema, with `PRI` and a single-column `UNI` from `duckdb_constraints()`.
 **PostgreSQL's listing reads `pg_class`, not `information_schema.tables`**, which has no
 materialized views: relkinds `r`/`p`/`v`/`m`/`f`, partitions left out (`NOT relispartition` —
 their parent is the table; the GUI's tree lists them, nested under it, under `schema_tree.rs`),

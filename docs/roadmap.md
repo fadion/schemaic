@@ -48,9 +48,10 @@ settle before work starts, and the traps are the ones known today.
 They ship in this order, one release each. The headless and performance releases before them
 have landed.
 
-1. **Data and editor:** *Compare and sync table data* and the two chart kinds.
-2. **DuckDB**, alone. A new engine answers every capability predicate and needs its own read-only
-   allowlist, so it gets a release with nothing else in it.
+1. **DuckDB**, alone. A new engine answers every capability predicate and needs its own read-only
+   allowlist, so it gets a release with nothing else in it. Moved ahead of the data and editor
+   release by the user on 2026-11-09.
+2. **Data and editor:** *Compare and sync table data* and the two chart kinds.
 
 ## Desktop app
 
@@ -62,17 +63,47 @@ Each of these is a one-session change.
 
 ### DuckDB as a fifth engine
 
-DuckDB is embedded like SQLite, sqlparser has a DuckDB dialect, and it queries CSV and Parquet
-files directly. That brings "open a Parquet file", plus Parquet import and export, almost for free.
-It is far cheaper than Oracle. ClickHouse would come after DuckDB.
+Phase 1 has landed: the engine reads, runs scripts and DDL plans, introspects, exports, plans,
+backs up and opens its CLI, behind its own read-only gate (`docs/architecture/db/duckdb.md`). What
+is left is below. ClickHouse would come after DuckDB.
 
-- **Trap:** a new engine has to answer every capability predicate listed in `AGENTS.md`. Answer
-  each from what DuckDB actually does, never by putting it on SQLite's side of an `== Sqlite`
-  check.
-- **Trap:** the read-only gate is an allowlist per dialect. DuckDB's file-reading functions
-  (`read_csv`, `read_parquet`, `COPY … TO`) read and write the *client's* filesystem, so they need
-  their own entries. `COPY … TO` is a write.
-- **Open:** a file-backed database only, or also in-memory sessions over loose files?
+- **Decided — the unattended paths cannot read files:** done in phase 1 (`Db::sealed`, called by
+  `cli::query`). The editor reads files as normal.
+- **Decided — linked in, extensions off:** done in phase 1.
+- **Decided — one instance per file, shared while operations overlap:** done in phase 1, and
+  stated in the invariants. A Manual tab's session will hold the instance — and with it the file's
+  lock — for as long as the tab is pinned, which is the one thing phase 2 must say in the UI.
+- **Phase 2 — writes:**
+  - **Grid write-back.** Column provenance first: DuckDB has no `column_metadata`, so a result's
+    columns have to be attributed from the statement (`intel::provenance_sources`, as SQLite's
+    were before rusqlite 0.40), refusing anything it cannot verify. Then `commit_writes`,
+    `refetch_rows` and `fetch_blob`. `rowid` is DuckDB's implicit column
+    (`intel::implicit_columns`); **measure whether it survives a delete and a checkpoint** before
+    it is let near an edit key — a key that moves writes the wrong row.
+  - **Import** (`import_rows`, then `import::supports_import`), the **dump** (`dump::supports_dump`;
+    every arm already answers), and **Manual tabs** (`Session` for DuckDB, then
+    `tx::supports_manual_mode`; `BEGIN TRANSACTION READ ONLY` is the read-only session).
+  - **The table designer and the view and macro editors.** `ddl::duckdb_supports` refuses every
+    change today. **Trap:** `schema.rs`'s and `ddl.rs`'s DDL emitters branch on
+    `dialect == Postgres` in many places, so DuckDB falls onto the MySQL shape wherever a `pg`
+    flag decides — audit each one, turning it into a capability, before turning a change on. DuckDB
+    also has no `ALTER TABLE … ADD CONSTRAINT` for a key or a foreign key, no index rename, and
+    refuses to rename or retype a column anything depends on, so several changes need a rebuild.
+  - **Open data file:** a CSV, Parquet or JSON file opened in a throwaway in-memory session —
+    which the test-only `memory:` target in `db::duckdb` already models. **Trap:** an in-memory
+    instance is its data, so it must be held for as long as the session is open, not closed with
+    its last operation as a file's is.
+  - **Schema compare** between two DuckDB files.
+- **Loose ends from phase 1:** `duckdb::run_ddl` checks its token only before it starts — hand
+  it an interrupt handle as `run_script` has, before a plan can reach it; the read-only half of the
+  seal (`AccessMode::ReadOnly`) has no test, the suites' in-memory instance having no file to open
+  read-only; `db::ident_duckdb` is not in the test that binds the engine quoters (`mysql.rs`); and
+  *Compare with* / *Copy to* are offered on a DuckDB connection with every change refused behind
+  them — gate the entries, or land the designer first.
+- **Phase 3:** translate the new strings (`db-refused-duckdb-*`, `connections-duckdb-*`,
+  `backup-kind-duckdb` are English in every catalogue but `en-GB`); measure
+  `intel::select_list_subquery_sees_earlier_aliases` (answered `false` unmeasured); the full CI
+  bar on every leg, which builds the amalgamation cold (about five minutes on this machine).
 
 ### Compare and sync table data
 

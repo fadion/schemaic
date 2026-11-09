@@ -7,7 +7,7 @@ connection form shows an **Authentication** picker above **User**.
 
 | Method                            | Engines                     | What it needs                                    |
 |-----------------------------------|-----------------------------|--------------------------------------------------|
-| **User and password**             | All but SQLite              | **User** and **Password**                        |
+| **User and password**             | All but SQLite and DuckDB   | **User** and **Password**                        |
 | **Windows (this account)**        | SQL Server, on Windows only | Nothing — the account Schemaic runs as           |
 | **Microsoft Entra (Azure CLI)**   | SQL Server                  | The Azure CLI, signed in with `az login`         |
 | **AWS IAM (AWS CLI)**             | MySQL, MariaDB, PostgreSQL  | **User**, and the AWS CLI signed in              |

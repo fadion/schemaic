@@ -17,7 +17,9 @@
 //! cover the instant, catalog-only cases (unknown table/column); dialect-exact
 //! validation via PREPARE/EXPLAIN is a later, additive tier.
 
-use sqlparser::dialect::{Dialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{
+    Dialect, DuckDbDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect,
+};
 
 use crate::schema::ServerFlavour;
 use crate::sql::skip_noncode;
@@ -36,6 +38,8 @@ pub enum SqlDialect {
     Sqlite,
     /// Microsoft SQL Server and Azure SQL (T-SQL).
     MsSql,
+    /// DuckDB — embedded like SQLite, PostgreSQL's grammar at heart.
+    DuckDb,
 }
 
 impl SqlDialect {
@@ -43,11 +47,12 @@ impl SqlDialect {
     /// depend on the dialect loops over this, so a new engine joins every such
     /// test by being added here. There were four copies of this list, in four
     /// test modules, each three long.
-    pub const ALL: [SqlDialect; 4] = [
+    pub const ALL: [SqlDialect; 5] = [
         SqlDialect::MySql,
         SqlDialect::Postgres,
         SqlDialect::Sqlite,
         SqlDialect::MsSql,
+        SqlDialect::DuckDb,
     ];
 
     /// The `sqlparser` dialect backing this connection kind.
@@ -57,6 +62,7 @@ impl SqlDialect {
             SqlDialect::Postgres => Box::new(PostgreSqlDialect {}),
             SqlDialect::Sqlite => Box::new(SQLiteDialect {}),
             SqlDialect::MsSql => Box::new(MsSqlDialect {}),
+            SqlDialect::DuckDb => Box::new(DuckDbDialect {}),
         }
     }
 
@@ -72,6 +78,7 @@ impl SqlDialect {
             SqlDialect::Postgres => "PostgreSQL",
             SqlDialect::Sqlite => "SQLite",
             SqlDialect::MsSql => "Microsoft SQL Server (T-SQL)",
+            SqlDialect::DuckDb => "DuckDB",
         }
     }
 
@@ -91,6 +98,8 @@ impl SqlDialect {
             SqlDialect::Sqlite
         } else if crate::connection::is_mssql(db_type) {
             SqlDialect::MsSql
+        } else if crate::connection::is_duckdb(db_type) {
+            SqlDialect::DuckDb
         } else {
             SqlDialect::MySql
         }
@@ -126,6 +135,8 @@ impl SqlDialect {
             // row-GUID columns, but begin with a byte no name scan here reads
             // as part of a word, so there is nothing to list.
             SqlDialect::MsSql => &[],
+            // Every DuckDB table has a `rowid` pseudo-column (measured).
+            SqlDialect::DuckDb => &["rowid"],
         }
     }
 
@@ -141,7 +152,11 @@ impl SqlDialect {
     pub fn folds_unquoted_names(self) -> bool {
         match self {
             SqlDialect::Postgres => true,
-            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+            // DuckDB matches a name whatever its case and keeps the case it
+            // was created with (measured: `MixedCase` reached as `mixedcase`).
+            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => {
+                false
+            }
         }
     }
 
@@ -157,7 +172,7 @@ impl SqlDialect {
     pub fn names_fold_unicode_case(self) -> bool {
         match self {
             SqlDialect::MySql | SqlDialect::MsSql => true,
-            SqlDialect::Postgres | SqlDialect::Sqlite => false,
+            SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
         }
     }
 
@@ -3023,6 +3038,7 @@ pub(crate) fn builtin_catalog(dialect: SqlDialect) -> Option<&'static [SqlFuncti
         // Hand-written — T-SQL's intrinsics are in no catalog view — and
         // checked against the server's parser by `live::mssql`.
         SqlDialect::MsSql => Some(crate::mssql_builtins::MSSQL_FUNCTIONS),
+        SqlDialect::DuckDb => Some(crate::duckdb_builtins::DUCKDB_FUNCTIONS),
     }
 }
 
@@ -3033,13 +3049,14 @@ pub(crate) fn builtin_catalog(dialect: SqlDialect) -> Option<&'static [SqlFuncti
 /// the column resolver a function, which it reported as ``Column
 /// `system_user` not found``. Built once per dialect.
 fn niladic_builtins(dialect: SqlDialect) -> &'static HashSet<String> {
-    static SETS: [std::sync::OnceLock<HashSet<String>>; 4] =
-        [const { std::sync::OnceLock::new() }; 4];
+    static SETS: [std::sync::OnceLock<HashSet<String>>; 5] =
+        [const { std::sync::OnceLock::new() }; 5];
     let slot = match dialect {
         SqlDialect::MySql => 0,
         SqlDialect::Postgres => 1,
         SqlDialect::Sqlite => 2,
         SqlDialect::MsSql => 3,
+        SqlDialect::DuckDb => 4,
     };
     SETS[slot].get_or_init(|| {
         builtin_catalog(dialect)
@@ -3108,6 +3125,20 @@ fn bare_called_builtins(dialect: SqlDialect) -> &'static [&'static str] {
             "SYSTEM_USER",
             "USER",
         ],
+        // DuckDB's, measured: each answers bare on 2.0.
+        SqlDialect::DuckDb => &[
+            "CURRENT_CATALOG",
+            "CURRENT_DATE",
+            "CURRENT_ROLE",
+            "CURRENT_SCHEMA",
+            "CURRENT_TIME",
+            "CURRENT_TIMESTAMP",
+            "CURRENT_USER",
+            "LOCALTIME",
+            "LOCALTIMESTAMP",
+            "SESSION_USER",
+            "USER",
+        ],
         SqlDialect::Sqlite | SqlDialect::MsSql => &[],
     }
 }
@@ -3118,7 +3149,8 @@ fn bare_called_builtins(dialect: SqlDialect) -> &'static [&'static str] {
 /// column `u`. The other three have no such reference.
 fn names_whole_rows(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::Postgres => true,
+        // DuckDB's `SELECT t FROM t` is the row as a `STRUCT`.
+        SqlDialect::Postgres | SqlDialect::DuckDb => true,
         SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
 }
@@ -3128,7 +3160,8 @@ fn names_whole_rows(dialect: SqlDialect) -> bool {
 /// MySQL, PostgreSQL and SQL Server answer that the column does not exist.
 fn select_alias_in_where(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::Sqlite => true,
+        // DuckDB reads a select-list alias in `WHERE` (measured).
+        SqlDialect::Sqlite | SqlDialect::DuckDb => true,
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => false,
     }
 }
@@ -3141,7 +3174,7 @@ fn select_alias_in_where(dialect: SqlDialect) -> bool {
 fn select_alias_in_join_on(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Sqlite => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -3151,7 +3184,7 @@ fn select_alias_in_join_on(dialect: SqlDialect) -> bool {
 /// anything.
 fn select_alias_in_having(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Sqlite => true,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => true,
         SqlDialect::Postgres | SqlDialect::MsSql => false,
     }
 }
@@ -3166,7 +3199,7 @@ fn select_alias_in_having(dialect: SqlDialect) -> bool {
 /// ([`select_list_subquery_sees_earlier_aliases`]).
 fn subquery_sees_output_aliases(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Sqlite => true,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => true,
         SqlDialect::Postgres | SqlDialect::MsSql => false,
     }
 }
@@ -3179,7 +3212,7 @@ fn subquery_sees_output_aliases(dialect: SqlDialect) -> bool {
 fn select_list_subquery_sees_earlier_aliases(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite => false,
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -3199,7 +3232,9 @@ fn window_sees_output_aliases(
             ServerFlavour::MySql => Some(false),
             ServerFlavour::Unknown => None,
         },
-        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite => Some(false),
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+            Some(false)
+        }
     }
 }
 
@@ -3212,7 +3247,8 @@ fn window_sees_output_aliases(
 /// the grammar knows (`EXTRACT(DAY FROM …)`).
 fn datepart_functions(dialect: SqlDialect) -> &'static [&'static str] {
     match dialect {
-        SqlDialect::Postgres | SqlDialect::Sqlite => &[],
+        // DuckDB names the part in a string: `date_part('year', d)`.
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => &[],
         SqlDialect::MySql => &["TIMESTAMPDIFF", "TIMESTAMPADD"],
         SqlDialect::MsSql => &[
             "DATEADD",
@@ -3423,11 +3459,13 @@ fn catalog_index(dialect: SqlDialect) -> Option<&'static CatalogIndex> {
     static SQLITE: std::sync::OnceLock<CatalogIndex> = std::sync::OnceLock::new();
     static POSTGRES: std::sync::OnceLock<CatalogIndex> = std::sync::OnceLock::new();
     static MSSQL: std::sync::OnceLock<CatalogIndex> = std::sync::OnceLock::new();
+    static DUCKDB: std::sync::OnceLock<CatalogIndex> = std::sync::OnceLock::new();
     let cell = match dialect {
         SqlDialect::MySql => &MYSQL,
         SqlDialect::Sqlite => &SQLITE,
         SqlDialect::Postgres => &POSTGRES,
         SqlDialect::MsSql => &MSSQL,
+        SqlDialect::DuckDb => &DUCKDB,
     };
     let catalog = builtin_catalog(dialect)?;
     Some(cell.get_or_init(|| CatalogIndex::build(dialect, catalog)))
@@ -3489,7 +3527,9 @@ pub(crate) fn offered_builtins(
 pub(crate) fn is_offered_builtin(dialect: SqlDialect, flavour: ServerFlavour, name: &str) -> bool {
     match dialect {
         // Both transcribed from a reference, which carries no plumbing to cut.
-        SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        // DuckDB's is generated from the engine this build links, which
+        // keeps no internal plumbing in its function list worth cutting.
+        SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => true,
         SqlDialect::Postgres => crate::pg_builtins::is_suggested(name),
         SqlDialect::MySql => {
             let up = name.to_ascii_uppercase();
@@ -3554,11 +3594,14 @@ fn static_words(dialect: SqlDialect) -> &'static std::collections::HashSet<Strin
         std::sync::OnceLock::new();
     static MSSQL: std::sync::OnceLock<std::collections::HashSet<String>> =
         std::sync::OnceLock::new();
+    static DUCKDB: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
     let cell = match dialect {
         SqlDialect::MySql => &MYSQL,
         SqlDialect::Sqlite => &SQLITE,
         SqlDialect::Postgres => &POSTGRES,
         SqlDialect::MsSql => &MSSQL,
+        SqlDialect::DuckDb => &DUCKDB,
     };
     cell.get_or_init(|| {
         SQL_KEYWORDS
@@ -3632,6 +3675,9 @@ fn keywords_not_taken(dialect: SqlDialect) -> &'static [&'static str] {
             "EXPLAIN",
             "REPLACE",
         ],
+        // DuckDB keys with a sequence's `nextval`, and has no `REPLACE`
+        // statement (`INSERT OR REPLACE` is spelt with the `INSERT`).
+        SqlDialect::DuckDb => &["AUTO_INCREMENT", "REPLACE", "TRUNCATE"],
     }
 }
 
@@ -3688,6 +3734,23 @@ pub fn engine_keywords(
         SqlDialect::MsSql => &[
             "TOP", "APPLY", "OUTPUT", "MERGE", "MATCHED", "FETCH", "NEXT", "ONLY",
         ],
+        SqlDialect::DuckDb => &[
+            "RECURSIVE",
+            "LATERAL",
+            "RETURNING",
+            "FILTER",
+            "ILIKE",
+            "CONFLICT",
+            "NOTHING",
+            "QUALIFY",
+            "EXCLUDE",
+            "PIVOT",
+            "UNPIVOT",
+            "SUMMARIZE",
+            "ASOF",
+            "POSITIONAL",
+            "SAMPLE",
+        ],
     };
     SHARED.iter().chain(own).copied()
 }
@@ -3728,7 +3791,9 @@ pub fn cast_target_types(
                 .map(|t| t.to_string())
                 .collect()
         }
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => column_types(dialect),
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => {
+            column_types(dialect)
+        }
     }
 }
 
@@ -3848,6 +3913,8 @@ pub(crate) fn ident_quote(dialect: SqlDialect, open: u8) -> Option<(u8, bool)> {
         // T-SQL doubles the `]` — `[a]]b]` is the name `a]b`.
         (SqlDialect::MsSql, b'[') => Some((b']', true)),
         (SqlDialect::MsSql, b'"') => Some((b'"', true)),
+        (SqlDialect::DuckDb, b'"') => Some((b'"', true)),
+        (SqlDialect::DuckDb, b'`') => Some((b'`', true)),
         _ => None,
     }
 }
@@ -4084,6 +4151,8 @@ fn rejects_ungrouped_columns(dialect: SqlDialect, flavour: crate::schema::Server
     match dialect {
         SqlDialect::Postgres | SqlDialect::MsSql => true,
         SqlDialect::MySql => flavour == crate::schema::ServerFlavour::MySql,
+        // DuckDB refuses an ungrouped column (measured).
+        SqlDialect::DuckDb => true,
         SqlDialect::Sqlite => false,
     }
 }
@@ -4094,7 +4163,7 @@ fn rejects_ungrouped_columns(dialect: SqlDialect, flavour: crate::schema::Server
 fn unique_key_determines_row(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite => false,
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -4102,7 +4171,7 @@ fn unique_key_determines_row(dialect: SqlDialect) -> bool {
 /// SQL Server's `GROUP BY` sees only the input columns.
 fn group_by_sees_output_aliases(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => true,
         SqlDialect::MsSql => false,
     }
 }
@@ -4172,7 +4241,8 @@ pub fn word_class(line: &str, lo: usize, hi: usize, dialect: SqlDialect) -> Opti
 fn names_a_column_type(upper: &str, dialect: SqlDialect) -> bool {
     use std::collections::HashSet;
     use std::sync::OnceLock;
-    static SETS: [OnceLock<HashSet<String>>; 4] = [
+    static SETS: [OnceLock<HashSet<String>>; 5] = [
+        OnceLock::new(),
         OnceLock::new(),
         OnceLock::new(),
         OnceLock::new(),
@@ -4183,6 +4253,7 @@ fn names_a_column_type(upper: &str, dialect: SqlDialect) -> bool {
         SqlDialect::Postgres => 1,
         SqlDialect::Sqlite => 2,
         SqlDialect::MsSql => 3,
+        SqlDialect::DuckDb => 4,
     };
     SETS[slot]
         .get_or_init(|| column_types(dialect).into_iter().collect())
@@ -4194,7 +4265,7 @@ fn names_a_column_type(upper: &str, dialect: SqlDialect) -> bool {
 /// procedure accepted from the list inserts after its name.
 pub fn procedure_args_in_parens(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => true,
         SqlDialect::MsSql => false,
     }
 }
@@ -4206,7 +4277,7 @@ pub fn procedure_args_in_parens(dialect: SqlDialect) -> bool {
 pub fn user_function_call_needs_schema(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -4226,7 +4297,7 @@ fn routine_slot(toks: &[Token], dialect: SqlDialect) -> bool {
         return false;
     };
     let runs: &[&str] = match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres => &["CALL"],
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::DuckDb => &["CALL"],
         SqlDialect::MsSql => &["EXEC", "EXECUTE"],
         SqlDialect::Sqlite => &[],
     };
@@ -4337,14 +4408,14 @@ fn defines_no_column(word: &str) -> bool {
 fn convert_takes_type_first(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
 /// Does the engine spell a cast `x::type`? PostgreSQL's alone.
 fn casts_with_double_colon(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::Postgres => true,
+        SqlDialect::Postgres | SqlDialect::DuckDb => true,
         SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
 }
@@ -5173,7 +5244,8 @@ pub fn scope_levels(
 /// `deleted` tables ([`pseudo_tables`]), and it has no `NEW`.
 fn trigger_rows_are_records(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        // DuckDB has no triggers; the answer is never asked of it.
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => true,
         SqlDialect::MsSql => false,
     }
 }
@@ -5250,7 +5322,8 @@ fn upsert_row_alias(toks: &[Token], dialect: SqlDialect) -> Option<TableRef> {
         .collect();
     let top = |kw: &str| at_depth.iter().position(|&(d, t)| d == 0 && keyword(t, kw));
     let alias = match dialect {
-        SqlDialect::Postgres | SqlDialect::Sqlite => {
+        // DuckDB's upsert is PostgreSQL's (measured).
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
             top("CONFLICT").map(|_| "excluded".to_string())
         }
         SqlDialect::MySql => {
@@ -7722,7 +7795,7 @@ fn table_hints(dialect: SqlDialect) -> Option<&'static [&'static str]> {
             "UPDLOCK",
             "XLOCK",
         ]),
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => None,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => None,
     }
 }
 
@@ -8153,7 +8226,7 @@ enum UnitKind {
 /// are two statements. Every other engine here needs the terminator.
 fn statements_need_no_terminator(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
         SqlDialect::MsSql => true,
     }
 }
@@ -9228,7 +9301,9 @@ fn grammar_gap_masks(
     dialect: SqlDialect,
 ) -> Vec<Mask> {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => Vec::new(),
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+            Vec::new()
+        }
         SqlDialect::MsSql => tsql_gap_masks(sql, lo, hi, toks),
     }
 }
@@ -9772,7 +9847,7 @@ fn tsql_gap_masks(sql: &str, lo: usize, hi: usize, toks: &[Token]) -> Vec<Mask> 
 /// ended and the next begun.
 fn numbered_procedures(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
         SqlDialect::MsSql => true,
     }
 }
@@ -10708,7 +10783,7 @@ pub fn is_reserved_word_on(
             ServerFlavour::MariaDb => (mysql() && !freed()) || MARIADB_ADDS.contains(&up.as_str()),
             ServerFlavour::Unknown => mysql() && !freed(),
         },
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => {
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => {
             is_reserved_word(word, dialect)
         }
     }
@@ -10726,7 +10801,7 @@ fn reserved_anywhere(word: &str, dialect: SqlDialect) -> bool {
                 || MARIADB_ADDS.contains(&up.as_str())
                 || RESERVED_BY_SOME_VERSION.contains(&up.as_str())
         }
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => {
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => {
             is_reserved_word(word, dialect)
         }
     }
@@ -10743,6 +10818,7 @@ fn reserved_words(dialect: SqlDialect) -> &'static [&'static str] {
         SqlDialect::Postgres => PG_RESERVED,
         SqlDialect::Sqlite => SQLITE_RESERVED,
         SqlDialect::MsSql => MSSQL_RESERVED,
+        SqlDialect::DuckDb => crate::duckdb_builtins::DUCKDB_RESERVED,
     }
 }
 
@@ -10803,7 +10879,7 @@ const NON_RESERVED_KEYWORDS: &[&str] = &[
 /// start refusing it.
 fn alias_ok_but_unquotable(dialect: SqlDialect) -> &'static [&'static str] {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres => &[],
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::DuckDb => &[],
         SqlDialect::MsSql => &[
             "DISK",
             "DUMP",
@@ -10921,7 +10997,7 @@ fn is_table_ref_continuation(word: &str) -> bool {
 /// table alias, plus the statements it has no grammar for.
 fn unterminated_statement_heads(dialect: SqlDialect) -> &'static [&'static str] {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => &[],
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => &[],
         SqlDialect::MsSql => &[
             "SELECT",
             "INSERT",
@@ -11099,7 +11175,8 @@ fn cursor_verbs(dialect: SqlDialect) -> &'static [&'static str] {
     match dialect {
         SqlDialect::Postgres => &["FETCH", "MOVE"],
         SqlDialect::MySql | SqlDialect::MsSql => &["FETCH"],
-        SqlDialect::Sqlite => &[],
+        // No cursors on either embedded engine.
+        SqlDialect::Sqlite | SqlDialect::DuckDb => &[],
     }
 }
 
@@ -11247,7 +11324,7 @@ fn is_routine_statement(toks: &[Token]) -> bool {
 fn routine_header_requires_as(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -11384,6 +11461,23 @@ fn as_declares_a_type(toks: &[Token], declaring: &[bool], i: usize, dialect: Sql
 fn parser_lacks_statement(sql: &str, toks: &[Token], dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Sqlite => false,
+        // DuckDB's own statements that sqlparser's DuckDB grammar does not
+        // carry — each pinned by `duckdb_statements_the_parser_lacks`.
+        SqlDialect::DuckDb => matches!(
+            head_words(toks, 1).first().map(String::as_str),
+            Some(
+                "SUMMARIZE"
+                    | "PIVOT"
+                    | "UNPIVOT"
+                    | "PIVOT_WIDER"
+                    | "PIVOT_LONGER"
+                    | "EXPORT"
+                    | "IMPORT"
+                    | "CHECKPOINT"
+                    | "FORCE"
+                    | "VACUUM"
+            )
+        ),
         SqlDialect::Postgres => match toks.first() {
             Some(t)
                 if !t.quoted
@@ -11597,7 +11691,7 @@ fn alias_checks(
     // PostgreSQL's advice too, and neither accepts them.
     let quote = match dialect {
         SqlDialect::MySql => AliasQuote::Backticks,
-        SqlDialect::Postgres | SqlDialect::Sqlite => AliasQuote::DoubleQuotes,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => AliasQuote::DoubleQuotes,
         SqlDialect::MsSql => AliasQuote::Brackets,
     };
     let calls = enclosing_calls(&toks);
@@ -11724,7 +11818,7 @@ fn alias_checks(
 /// records rather than tables, where `inserted` is a table like any other.
 fn pseudo_tables(dialect: SqlDialect) -> &'static [&'static str] {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => &[],
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => &[],
         SqlDialect::MsSql => &["inserted", "deleted"],
     }
 }
@@ -11749,7 +11843,7 @@ fn is_session_source(r: &TableRef, dialect: SqlDialect) -> bool {
 /// like an alias is still one to look up.
 fn write_target_may_name_an_alias(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
         SqlDialect::MsSql => true,
     }
 }
@@ -16180,7 +16274,9 @@ mod lints {
     pub(super) fn short_row_takes_defaults(dialect: SqlDialect) -> bool {
         match dialect {
             SqlDialect::Postgres => true,
-            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => {
+                false
+            }
         }
     }
 
@@ -16208,7 +16304,7 @@ mod lints {
         match dialect {
             SqlDialect::MsSql => Some(ImplicitSkip::Assigned),
             SqlDialect::Sqlite => Some(ImplicitSkip::Refused),
-            SqlDialect::MySql | SqlDialect::Postgres => None,
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::DuckDb => None,
         }
     }
 
@@ -17314,7 +17410,7 @@ fn join_takes_a_condition(before: &[Token], dialect: SqlDialect) -> bool {
 fn cross_join_takes_on(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Sqlite => true,
-        SqlDialect::Postgres | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -20199,7 +20295,7 @@ fn caret_noncode(
 fn has_apply_joins(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -20238,7 +20334,7 @@ fn in_join_position(sql: &str, lo: usize, at: usize, dialect: SqlDialect) -> boo
 fn update_takes_joins(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -20247,7 +20343,7 @@ fn update_takes_joins(dialect: SqlDialect) -> bool {
 fn insert_into_is_optional(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::MsSql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -20410,7 +20506,7 @@ fn declares_a_partitioning(toks: &[Token]) -> bool {
 fn has_full_joins(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => false,
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => true,
     }
 }
 
@@ -20607,7 +20703,7 @@ const NAMES_AN_OBJECT: &[&str] = &[
 fn ranks_hypothetically(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::MsSql | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::MsSql | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -20721,7 +20817,8 @@ fn clause_partner(
 fn takes_within_group(function: &str, dialect: SqlDialect) -> bool {
     let percentile = matches!(function, "PERCENTILE_CONT" | "PERCENTILE_DISC");
     match dialect {
-        SqlDialect::Postgres => percentile || function == "MODE",
+        // DuckDB takes `mode() WITHIN GROUP` too (measured).
+        SqlDialect::Postgres | SqlDialect::DuckDb => percentile || function == "MODE",
         SqlDialect::MsSql | SqlDialect::MySql => percentile,
         SqlDialect::Sqlite => false,
     }
@@ -20733,7 +20830,7 @@ fn takes_within_group(function: &str, dialect: SqlDialect) -> bool {
 fn offset_takes_rows(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -20744,7 +20841,8 @@ fn offset_takes_rows(dialect: SqlDialect) -> bool {
 fn fetch_rows_tail(dialect: SqlDialect) -> Option<&'static str> {
     match dialect {
         SqlDialect::MsSql => Some("ROWS ONLY"),
-        SqlDialect::Postgres | SqlDialect::MySql => Some("ROWS "),
+        // DuckDB takes `FETCH NEXT n ROWS ONLY` (measured on 2.0).
+        SqlDialect::Postgres | SqlDialect::MySql | SqlDialect::DuckDb => Some("ROWS "),
         SqlDialect::Sqlite => None,
     }
 }
@@ -21214,7 +21312,7 @@ fn declares_a_column(toks: &[Token]) -> bool {
 fn unique_index_names_its_kind(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -21222,7 +21320,7 @@ fn unique_index_names_its_kind(dialect: SqlDialect) -> bool {
 /// none at all on SQLite, which has neither form.
 fn create_or_spelling(dialect: SqlDialect) -> Option<&'static str> {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres => Some("REPLACE "),
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::DuckDb => Some("REPLACE "),
         SqlDialect::MsSql => Some("ALTER "),
         SqlDialect::Sqlite => None,
     }
@@ -21547,7 +21645,8 @@ pub fn created_tables(sql: &str, dialect: SqlDialect) -> Vec<(Option<String>, St
     };
     let into_makes_a_table = match dialect {
         SqlDialect::MsSql | SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite => false,
+        // DuckDB has no `SELECT … INTO` (measured).
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     };
     let mut out = Vec::new();
     for (lo, hi) in crate::sql::statement_ranges(sql, dialect) {
@@ -21809,7 +21908,8 @@ pub fn ctes_at(sql: &str, lo: usize, caret: usize, dialect: SqlDialect) -> Vec<L
 pub fn has_at_variables(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::MsSql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        // DuckDB's variables are `getvariable('x')`, no sigil.
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -22025,7 +22125,7 @@ pub fn output_aliases_at(
 /// them on all four.
 fn having_sees_output_aliases(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Sqlite => true,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => true,
         SqlDialect::Postgres | SqlDialect::MsSql => false,
     }
 }
@@ -22038,7 +22138,7 @@ fn having_sees_output_aliases(dialect: SqlDialect) -> bool {
 /// 'doubled'*. Standing alone (`ORDER BY doubled`) all four take it.
 fn order_by_expression_sees_output_aliases(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Sqlite => true,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => true,
         SqlDialect::Postgres | SqlDialect::MsSql => false,
     }
 }
@@ -25621,7 +25721,7 @@ mod tests {
     use super::*;
     use sqlparser::parser::Parser;
 
-    const DIALECTS: [SqlDialect; 4] = SqlDialect::ALL;
+    const DIALECTS: [SqlDialect; 5] = SqlDialect::ALL;
 
     /// **[`ident_quote`] and `SqlDialect`'s three predicates are two tables for
     /// one fact, and nothing said they agreed.**
@@ -26965,7 +27065,8 @@ mod tests {
     /// PostgreSQL and SQL Server resolve an output name in `ORDER BY` only as
     /// a whole sort item; inside an expression (`1 + doubled`, a `CASE`) it is
     /// *column does not exist* / *Invalid column name* there, while MySQL,
-    /// MariaDB and SQLite take it anywhere (S8.5-L1-07).
+    /// MariaDB and SQLite take it anywhere (S8.5-L1-07) — and so does DuckDB
+    /// (measured on 2.0: `ORDER BY k + 1` sorts by the alias).
     #[test]
     fn an_order_by_expression_sees_aliases_only_where_the_engine_resolves_them() {
         let inside = [
@@ -26974,7 +27075,10 @@ mod tests {
             "SELECT total * 2 AS doubled FROM orders ORDER BY doubled DESC, 1 + dou",
         ];
         for d in SqlDialect::ALL {
-            let sees = matches!(d, SqlDialect::MySql | SqlDialect::Sqlite);
+            let sees = matches!(
+                d,
+                SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb
+            );
             for sql in inside {
                 assert_eq!(!aliases(sql, d).is_empty(), sees, "{d:?}: {sql}");
             }
@@ -29160,9 +29264,10 @@ mod tests {
             // names nothing and is flagged (S4-L1-02).
             let want: &[&str] = match d {
                 SqlDialect::MsSql => &[],
-                SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
-                    &["id@1", "Name@'a'", "at@2"]
-                }
+                SqlDialect::MySql
+                | SqlDialect::Postgres
+                | SqlDialect::Sqlite
+                | SqlDialect::DuckDb => &["id@1", "Name@'a'", "at@2"],
             };
             assert_eq!(
                 hints("INSERT INTO events VALUES (1, 'a', 2);", &cat, d),
@@ -29179,7 +29284,7 @@ mod tests {
             let want: &[&str] = match d {
                 SqlDialect::MsSql => &["Name@'a'", "at@2"],
                 SqlDialect::Postgres => &["id@'a'", "Name@2"],
-                SqlDialect::MySql | SqlDialect::Sqlite => &[],
+                SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => &[],
             };
             assert_eq!(
                 hints("INSERT INTO events VALUES ('a', 2);", &cat, d),
@@ -32901,6 +33006,38 @@ mod tests {
             d.iter().any(|x| x.message().starts_with("Syntax error")),
             "{d:?}"
         );
+    }
+
+    /// **DuckDB's own statements that sqlparser's DuckDB grammar lacks** draw
+    /// no syntax error — each of these runs on DuckDB 2.0 — and the list in
+    /// `parser_lacks_statement` holds only heads the parser really refuses, so
+    /// none of them hides an error it could have reported.
+    #[test]
+    fn duckdb_statements_the_parser_lacks() {
+        use sqlparser::parser::Parser;
+        for sql in [
+            "SUMMARIZE t",
+            "PIVOT t ON k USING sum(v)",
+            "UNPIVOT t ON a, b INTO NAME k VALUE v",
+            "EXPORT DATABASE 'dir'",
+            "IMPORT DATABASE 'dir'",
+            "CHECKPOINT",
+            "FORCE CHECKPOINT",
+            "VACUUM",
+        ] {
+            let d = diag_d(sql, SqlDialect::DuckDb);
+            assert!(
+                !d.iter().any(|x| x.message().starts_with("Syntax error")),
+                "{sql}: {d:?}"
+            );
+            let dialect = SqlDialect::DuckDb.parser();
+            if sql != "VACUUM" && sql != "CHECKPOINT" {
+                assert!(
+                    Parser::parse_sql(&*dialect, sql).is_err(),
+                    "{sql} parses now: drop its head from the list"
+                );
+            }
+        }
     }
 
     /// **Only a T-SQL write's target may name an alias its own `FROM`

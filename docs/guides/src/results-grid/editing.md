@@ -10,7 +10,8 @@ is — the table's primary key, or a unique key with no NULLs, has to be in the 
 table with no key is edited through its hidden `rowid`.
 
 - *Not editable:* computed columns (`price * qty`, `COUNT(*)`), a table with no usable key, any
-  result on a connection marked read-only, and a pinned result.
+  result on a connection marked read-only, and a pinned result. On DuckDB no result can be edited
+  yet.
 - *A join* can be edited cell by cell when each table's key is in the result. Adding, cloning and
   deleting rows needs a result from a single table.
 

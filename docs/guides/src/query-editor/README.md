@@ -86,6 +86,7 @@ A few things the server decides, not Schemaic:
   *Tx aborted — rollback to continue*.
 - *SQLite* has no Manual mode in Schemaic, so the switch isn't shown: every statement commits as it
   runs. Nor does a read-only SQL Server connection.
+- *DuckDB* has no Manual mode in Schemaic yet, so the switch isn't shown there either.
 
 ## Panels beside the editor
 
@@ -95,8 +96,9 @@ the **AI assistant** ([AI assistant](../ai/README.md)), **Server activity**, and
 
 The **Terminal** (<kbd>Ctrl</kbd>+<kbd>&#96;</kbd>) is a shell of your choice — pick it under
 Settings › **Terminal**. Its database button opens the connection's own command-line client
-(`mysql`, `psql`, `sqlite3`, `sqlcmd`) already signed in. It isn't offered on a read-only
-connection, since the client wouldn't be read-only.
+(`mysql`, `psql`, `sqlite3`, `sqlcmd`, `duckdb`) already signed in. It isn't offered on a read-only
+connection, since the client wouldn't be read-only. `duckdb` holds its file for as long as it
+runs, so on a DuckDB connection Schemaic's own statements fail until you quit it.
 
 **Server activity** lists the server's sessions and locks. Right-click a row for **Cancel query**
 or **Kill session**, each confirmed before it runs. From the keyboard, click in the list or

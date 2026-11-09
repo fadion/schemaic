@@ -151,6 +151,9 @@ pub enum BoolWire {
     OneZero,
     /// `t` / `f` — PostgreSQL.
     Letter,
+    /// `true` / `false` — DuckDB, whose `BOOLEAN` is a real type that reads
+    /// back as the words.
+    Word,
 }
 
 impl BoolWire {
@@ -161,6 +164,8 @@ impl BoolWire {
             (BoolWire::OneZero, false) => "0",
             (BoolWire::Letter, true) => "t",
             (BoolWire::Letter, false) => "f",
+            (BoolWire::Word, true) => "true",
+            (BoolWire::Word, false) => "false",
         }
     }
 
@@ -168,6 +173,7 @@ impl BoolWire {
     pub fn of(dialect: SqlDialect) -> BoolWire {
         match dialect {
             SqlDialect::Postgres => BoolWire::Letter,
+            SqlDialect::DuckDb => BoolWire::Word,
             // SQL Server's `bit` reads back as the integers.
             SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => BoolWire::OneZero,
         }
@@ -267,7 +273,8 @@ pub fn editor_for_type(declared: &str, dialect: SqlDialect) -> CellEditor {
 fn bit_is_boolean(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        // DuckDB's `BIT` is a bit *string* (`'0101'`), not a flag.
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -687,6 +694,12 @@ mod tests {
         assert_eq!(BoolWire::of(Sqlite).text(true), "1");
         assert_eq!(BoolWire::of(Postgres).text(true), "t");
         assert_eq!(BoolWire::of(Postgres).text(false), "f");
+        // DuckDB's `BOOLEAN` reads back as its own words, which `db::duckdb`
+        // passes through, so a toggle writes what the re-fetch will show.
+        assert_eq!(BoolWire::of(SqlDialect::DuckDb).text(true), "true");
+        assert_eq!(BoolWire::of(SqlDialect::DuckDb).text(false), "false");
+        assert_eq!(read_bool("true"), Some(true));
+        assert_eq!(read_bool("false"), Some(false));
     }
 
     #[test]

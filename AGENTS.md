@@ -3,13 +3,16 @@
 A native SQL editor (Rust + [Floem](https://github.com/lapce/floem) 0.2.0), MySQL/MariaDB-first,
 Zed-inspired, aiming to replace DataGrip. Workspace crates: `schemaic-core` (models + the pure,
 unit-tested SQL/edit/export/DDL logic), `schemaic-db` (MySQL/MariaDB + PostgreSQL + SQLite + SQL
-Server + SSH tunnels), `schemaic-conn` (saved connections hydrated from the OS keyring — the seam a non-GUI
+Server + DuckDB + SSH tunnels), `schemaic-conn` (saved connections hydrated from the OS keyring — the seam a non-GUI
 front end loads a connection through), `schemaic-cli` (the headless `schemaic query`/`exec` and their
 siblings, and the MCP server both `schemaic mcp` and the AI panel run; no Floem), `schemaic-ai`,
 `schemaic-term`, `schemaic-ui` (the Floem views), `schemaic-app` (signal wiring, the panel's
 `--mcp-serve` branch, the CLI's argv branch).
 
-**Four engines, and they are not equal.** MySQL/MariaDB, PostgreSQL and SQL Server are full;
+**Five engines, and they are not equal.** MySQL/MariaDB, PostgreSQL and SQL Server are full;
+**DuckDB** (`db::duckdb`, embedded like SQLite) is phase 1 of its roadmap entry — it reads, runs
+scripts and DDL plans, introspects, exports, plans and backs up, and refuses grid writes, import,
+the designer and Manual tabs until phase 2, through the same capability predicates.
 SQLite reads, writes, imports and edits **tables** (through the twelve-step rebuild —
 `ddl::sqlite_rebuild_sql`), **views** and **triggers**, but has **no manual-transaction mode** — a
 statement about SQLite rather than unfinished work (`db::session::Session::open` carries the
@@ -140,7 +143,9 @@ substitute for the statement, and none of these is a style preference.
   `script_verdict` as the app's file request is, `--yes` standing where its script panel stands.
   `read_only_reason` has no request: it is enforced inside `cli::query::read_only_query`, the one
   headless read path, which both front ends call — inside its streaming sibling `read_only_export`
-  behind `schemaic export`, on `stream_query_enforced(…, Enforce::ReadOnly)` — and inside its plan sibling
+  behind `schemaic export`, on `stream_query_enforced(…, Enforce::ReadOnly)`, all three on a
+  **sealed** handle (`Db::sealed` — on DuckDB, a read-only instance with external access off, since
+  a DuckDB read can open any file on this machine) — and inside its plan sibling
   `read_only_explain`, behind the MCP server's `explain` and `schemaic explain`, whose plain `EXPLAIN` also runs on a
   read-only session, since planning can run a function that writes. That shape is the invariant, not a detail of
   it: the guard being a
@@ -159,7 +164,11 @@ substitute for the statement, and none of these is a style preference.
 - **One connection per operation** — every `Db` method connects, runs, disconnects. **Two**
   exceptions, both because their statements are not independent: a `TxMode::Manual` tab's pinned
   `Session`, and `Db::run_script`, which holds one connection for a whole `.sql` file (a dump's
-  `SET FOREIGN_KEY_CHECKS`, its own `BEGIN`, its `DELIMITER` — all session state).
+  `SET FOREIGN_KEY_CHECKS`, its own `BEGIN`, its `DELIMITER` — all session state). **DuckDB
+  keeps the rule with one difference underneath it**: each operation still takes its own
+  connection, but on a database *instance* shared per file while operations overlap
+  (`db::duckdb::instance`), because DuckDB refuses a second instance on one file in one process.
+  The instance closes, and the file's lock goes, when the last operation ends.
 - **Connection identity is the `Db` handle / `conn_id`**, never a `mysql://user:pass@host` URL. No
   credential in a URL, argv or log.
 - **Connection secrets persist to the OS keyring**, not `connections.json` — saves route through
@@ -241,7 +250,8 @@ start with a failing test, then the code that makes it pass.
 - **Keep the suite green + fast.** `cargo test --workspace` must pass before any commit; tests stay
   pure (no live DB / network / filesystem — model those at the boundary). **In-memory SQLite is
   allowed** and is not an exception to that rule: it needs no server, touches no file and is
-  deterministic, which is why `db::sqlite` is the one backend whose DB layer is tested directly.
+  deterministic, which is why `db::sqlite` and `db::duckdb` are the backends whose DB layer is
+  tested directly — DuckDB's through a `memory:<name>` target only a `cfg(test)` build accepts.
   Use SQLite's shared-cache memory URI (`file:name?mode=memory&cache=shared`, unique name per test)
   where several connections must reach one database, as the write paths do — a plain `:memory:` is
   private to one connection, and a temp file would break the rule for real. **Exactly one function

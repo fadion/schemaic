@@ -251,9 +251,11 @@ claimed otherwise. Its *Browse…* sits **inside** the field (`FieldCfg::button`
 `lib.rs`), where beside it it had stood shorter than the field (GitHub #19). SQLite's *Database
 file* is a `path_field` too since then, where `sqlite_fields` had carried a hand-copied
 duplicate of its layout; its Browse went from tabindex 62 to 61 in the move, the order
-unchanged.
+unchanged. That block is **`file_fields`** now, built for SQLite and for DuckDB (`DbKind::DuckDb`)
+alike — a file and nothing else — with the dialog title and the hint passed in as each engine's
+own words (`connections-duckdb-file-dialog`, `connections-duckdb-hint`).
 **An *Authentication* picker appears only on an engine offering more than one mode** — SQL
-Server, PostgreSQL and the MySQL family, through `AuthMode::offered`; SQLite has none — between Database and the credentials, at tabindex 68 in
+Server, PostgreSQL and the MySQL family, through `AuthMode::offered`; SQLite and DuckDB have none — between Database and the credentials, at tabindex 68 in
 the gap the surrounding indices were spaced to leave. `DraftSignals::auth` is threaded through
 create, load, reset and `to_connection` like the rest. The list is read once, untracked, because
 `server_fields` is rebuilt when the engine changes. What follows the dropdown is keyed on the

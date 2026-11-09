@@ -594,7 +594,8 @@ pub fn same_database(dialect: SqlDialect, a: &str, b: &str) -> bool {
 /// Does this engine treat database names alike that differ only in case?
 fn database_names_ignore_case(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MsSql | SqlDialect::Sqlite => true,
+        // DuckDB resolves a catalog name whatever its case, as it does any name.
+        SqlDialect::MsSql | SqlDialect::Sqlite | SqlDialect::DuckDb => true,
         SqlDialect::Postgres | SqlDialect::MySql => false,
     }
 }

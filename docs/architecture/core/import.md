@@ -89,8 +89,9 @@ SQLite stores as `NULL` anyway — while MySQL and SQL Server, which cannot hold
 `NULL` (`a_non_finite_float_is_written_as_the_engines_own_literal`; SQLite's
 `a_copy_keeps_an_infinite_real`). **Two capabilities decide what reaches it, and both are exhaustive `match`es.**
 `supports_import` is the table menu's *Import* entry, so an engine without a load has the entry
-absent rather than a wizard whose last step is a refusal; it answers yes for all four since
-`db::mssql::import_rows` was written. `bool_literal_is_integer` is whether a coerced boolean
+absent rather than a wizard whose last step is a refusal; it answers yes for four of the five
+since `db::mssql::import_rows` was written, and no for DuckDB, whose `import_rows` refuses until
+the roadmap's later DuckDB phase writes it. `bool_literal_is_integer` is whether a coerced boolean
 goes in as the integer `1`/`0` or the quoted `'true'`/`'false'`, and it was `MySql => integer,
 _ => quoted`, written when the default arm meant PostgreSQL — which sorted SQLite onto the
 wrong side: its `BOOLEAN` is a declared type with NUMERIC affinity, so `'true'` is kept as TEXT,

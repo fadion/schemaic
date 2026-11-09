@@ -1,7 +1,13 @@
 # `core/tx.rs`
 
 `tx.rs` — the **manual-transaction** state machine behind `TxMode::Manual` (no DB, no UI).
-Three engines of the four: **SQLite has no manual mode**, so the status-bar segment offering it
+Three engines of the five: **SQLite and DuckDB have no manual mode**. DuckDB's is about this app
+rather than the engine — it holds transactions, read-only ones included, and its pinned
+`Session` is the roadmap's later DuckDB phase, so `Session::open` refuses it
+(`DbRefusal::DuckDbNoManual`) and `tx_engine_of` already maps it to PostgreSQL's model (a failed
+statement aborts the transaction; DDL rolls back — measured on 2.0); `offers_manual_mode`'s
+read-only-transaction answer for it is yes, `BEGIN TRANSACTION READ ONLY` refusing writes by
+their effect, for when the session lands. On SQLite the status-bar segment offering it
 is hidden on such a connection and `Session::open` refuses one — not because SQLite lacks
 transactions but because a pinned `rusqlite::Connection` is blocking and `!Sync`, needing a
 thread of its own and a channel, which is worth building deliberately rather than as a side

@@ -160,6 +160,11 @@ pub async fn read_only_query(
     // Gated in the connection's own dialect, so a PostgreSQL `#` operator is not
     // mistaken for a comment on the way in.
     let stmt = gate(sql, db.engine().dialect())?;
+    // **Sealed**, for an engine whose queries can read this machine's files:
+    // DuckDB opens read-only with external access off (`db::duckdb`), so
+    // `FROM 'secrets.csv'` — a string, which the text gate cannot name — reads
+    // nothing. Inert on every other engine.
+    let db = &db.clone().sealed();
     let token = CancellationToken::new();
     // **Read-only at the session too, because the gate reads only the text.**
     // `SELECT setval(…)`, `SELECT lo_unlink(…)` and a `SELECT` of a function
@@ -208,6 +213,8 @@ pub async fn read_only_export(
     timeout: Duration,
 ) -> Result<Exported, NoRows> {
     let stmt = gate(sql, db.engine().dialect())?;
+    // Sealed, as `read_only_query` is.
+    let db = &db.clone().sealed();
     let token = CancellationToken::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<schemaic_db::ExportChunk>(2);
     let part = schemaic_core::export::part_file(path);
@@ -384,6 +391,9 @@ pub async fn read_only_explain(
     timeout: Duration,
 ) -> Result<schemaic_core::plan::QueryPlan, NoRows> {
     let stmt = gate(sql, db.engine().dialect())?;
+    // Sealed, as `read_only_query` is: DuckDB's planner opens a file it is
+    // asked to scan, to read its shape.
+    let db = &db.clone().sealed();
     let token = CancellationToken::new();
     match crate::deadline::with_deadline(
         db.explain(database, stmt, false, true, token.clone()),

@@ -58,6 +58,10 @@ The check isn't only about the text. The statement also runs on a session the se
 read-only, so a function that writes is refused when it tries. SQL Server has no such session;
 there the read runs inside a transaction that is always rolled back.
 
+On DuckDB a read reaches only the database's own tables. DuckDB can query files on your computer
+directly, so `read_csv`, `read_parquet` and the other file readers are refused, and so is a file
+name in `FROM`.
+
 ## `query`
 
 Prints the rows, 200 at most unless you raise `--limit`. When the limit cuts the result short, a

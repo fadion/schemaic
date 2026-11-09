@@ -616,7 +616,9 @@ fn is_table_hint(code: &[(Kind, &str)], open: usize, dialect: SqlDialect) -> boo
     ];
     match dialect {
         SqlDialect::MsSql => {}
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => return false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+            return false;
+        }
     }
     close_of(code, open) == Some(open + 2) && HINTS.iter().any(|h| word_is(code, open + 1, h))
 }
@@ -702,7 +704,8 @@ fn type_position(
 fn alter_column_takes_a_type(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        // DuckDB spells it PostgreSQL's way, `ALTER COLUMN c TYPE t`.
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -746,7 +749,7 @@ fn declares_variables(code: &[(Kind, &str)], i: usize, was: bool, verb: Option<&
 fn variables_are_typed_by_name(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -939,6 +942,67 @@ fn is_builtin_type(word: &str, dialect: SqlDialect) -> bool {
             "GEOMETRY",
             "HIERARCHYID",
         ],
+        // DuckDB's built-in type names and their aliases, from
+        // `duckdb_types()` on 2.0.
+        SqlDialect::DuckDb => &[
+            "BIGINT",
+            "INT8",
+            "LONG",
+            "BIT",
+            "BITSTRING",
+            "BLOB",
+            "BYTEA",
+            "BINARY",
+            "VARBINARY",
+            "BOOLEAN",
+            "BOOL",
+            "LOGICAL",
+            "DATE",
+            "DECIMAL",
+            "NUMERIC",
+            "DOUBLE",
+            "FLOAT8",
+            "FLOAT",
+            "FLOAT4",
+            "REAL",
+            "HUGEINT",
+            "UHUGEINT",
+            "INTEGER",
+            "INT4",
+            "INT",
+            "SIGNED",
+            "INTERVAL",
+            "SMALLINT",
+            "INT2",
+            "SHORT",
+            "TIME",
+            "TIMETZ",
+            "TIMESTAMP",
+            "DATETIME",
+            "TIMESTAMPTZ",
+            "TIMESTAMP_S",
+            "TIMESTAMP_MS",
+            "TIMESTAMP_NS",
+            "TINYINT",
+            "INT1",
+            "UBIGINT",
+            "UINTEGER",
+            "USMALLINT",
+            "UTINYINT",
+            "UUID",
+            "VARCHAR",
+            "CHAR",
+            "BPCHAR",
+            "TEXT",
+            "STRING",
+            "JSON",
+            "VARINT",
+            "BIGNUM",
+            "LIST",
+            "MAP",
+            "STRUCT",
+            "UNION",
+        ],
     };
     list.iter().any(|t| word.eq_ignore_ascii_case(t))
 }
@@ -1028,7 +1092,8 @@ fn apply_keyword_case_under(
 fn names_may_be_case_sensitive(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::MsSql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        // DuckDB matches every name whatever its case, quoted or not.
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -1439,6 +1504,13 @@ fn ops(dialect: SqlDialect) -> &'static [&'static str] {
             ">=", "<=", "<>", "!=", "!<", "!>", "+=", "-=", "*=", "/=", "%=", "&=", "^=", "|=",
             "::", "||",
         ],
+        // DuckDB's set is fixed (no `CREATE OPERATOR`): casts, JSON arrows,
+        // `==`, integer division and power, the list and pattern operators,
+        // and `:=` for a named argument.
+        SqlDialect::DuckDb => &[
+            "!~~*", "~~*", "!~~", "->>", "::", "->", ">=", "<=", "<>", "!=", "==", "||", "<<",
+            ">>", "**", "//", "^@", "@>", "<@", "&&", "~~", ":=",
+        ],
     }
 }
 
@@ -1456,7 +1528,7 @@ fn ops(dialect: SqlDialect) -> &'static [&'static str] {
 fn operators_are_composable(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -1470,6 +1542,9 @@ fn operators_are_composable(dialect: SqlDialect) -> bool {
 pub(crate) fn newline_continues_strings(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => true,
+        // DuckDB's scanner is PostgreSQL's (`libpg_query`), and joins them
+        // the same way — measured.
+        SqlDialect::DuckDb => true,
         SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
     }
 }
@@ -1560,7 +1635,7 @@ fn sigil_len(b: &[u8], i: usize, dialect: SqlDialect) -> usize {
         Some(b'$') if word_at(i + 1) => 1,
         Some(b'?') if b.get(i + 1).is_some_and(u8::is_ascii_digit) => match dialect {
             SqlDialect::Sqlite => 1,
-            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => 0,
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb => 0,
         },
         Some(b'@') => match dialect {
             SqlDialect::MySql => {
@@ -1569,7 +1644,7 @@ fn sigil_len(b: &[u8], i: usize, dialect: SqlDialect) -> usize {
                 if word_at(i + len) || quoted { len } else { 0 }
             }
             SqlDialect::Sqlite => usize::from(word_at(i + 1)),
-            SqlDialect::Postgres | SqlDialect::MsSql => 0,
+            SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb => 0,
         },
         _ => 0,
     }
@@ -2031,7 +2106,7 @@ fn is_keyword(w: &str) -> bool {
 fn has_output_clause(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 

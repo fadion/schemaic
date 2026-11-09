@@ -826,6 +826,19 @@ fn sqlite_shell(
     sqlite_shell_config(launcher, conn).map_err(refusal_text)
 }
 
+/// The DuckDB client: `duckdb <file>`, native only for `sqlite_shell`'s
+/// reason — under WSL a Windows path would open (and create) another file.
+fn duckdb_shell(
+    conn: &schemaic_core::connection::Connection,
+) -> Result<schemaic_term::ShellConfig, String> {
+    let launcher = resolve_native_cli("duckdb")
+        .map_err(|e| e.said(|| tr!("cli-no-client-on-path", client = "duckdb")))?;
+    // `sqlite_shell_config`'s argv is the file alone, behind the same
+    // leading-dash refusal (`launch::sqlite_target`), and `duckdb` reads its
+    // argv the same way.
+    sqlite_shell_config(launcher, conn).map_err(refusal_text)
+}
+
 /// Which database `psql` should open.
 ///
 /// Unlike the MySQL client, psql cannot start a session with no database: given
@@ -15143,6 +15156,10 @@ fn app_view(
                 // `db` is ignored: a SQLite connection's one database is the file
                 // itself, which the config already names.
                 schemaic_db::Engine::Sqlite => sqlite_shell(&conn),
+                // The `duckdb` CLI on the file, as `sqlite3` is for SQLite. It
+                // takes the file's lock for as long as it runs, which Schemaic's
+                // own operations on the file then wait out with a refusal.
+                schemaic_db::Engine::DuckDb => duckdb_shell(&conn),
                 schemaic_db::Engine::MySql => mysql_shell(&conn, db.as_deref()),
                 // `sqlcmd`, through `core::launch::sqlcmd_args` — see there
                 // for how the database and the TLS rung reach its flags.
@@ -15245,6 +15262,9 @@ fn app_view(
                     ("dump", &["dump"], tr_static!("backup-kind-pg-dump"))
                 }
                 schemaic_db::Engine::MySql => ("sql", &["sql"], tr_static!("backup-kind-sql")),
+                schemaic_db::Engine::DuckDb => {
+                    ("duckdb", &["duckdb"], tr_static!("backup-kind-duckdb"))
+                }
                 _ => ("db", &["db"], tr_static!("backup-kind-sqlite")),
             };
             let name = schemaic_core::launch::backup_file_name(&db, &stamp, ext);
@@ -15268,7 +15288,9 @@ fn app_view(
                 };
                 let path = path.display().to_string();
                 match engine {
-                    schemaic_db::Engine::Sqlite => {
+                    // Both embedded engines copy the file in-process
+                    // (`Db::backup_to_file`): there is no server tool to run.
+                    schemaic_db::Engine::Sqlite | schemaic_db::Engine::DuckDb => {
                         let handle_db = match db_for(conn.id) {
                             Ok(d) => d,
                             Err(e) => {
@@ -15385,7 +15407,8 @@ fn app_view(
                                             mysql_restore_shell(&c, &db_c, &path_c)
                                         }
                                         schemaic_db::Engine::MsSql
-                                        | schemaic_db::Engine::Sqlite => {
+                                        | schemaic_db::Engine::Sqlite
+                                        | schemaic_db::Engine::DuckDb => {
                                             Err(tr!("restore-engine-not-here"))
                                         }
                                     }

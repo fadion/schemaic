@@ -154,7 +154,7 @@ its objects went, not its address (under `schema.rs`). `object_group_nodes` take
 level's folders (`the_extensions_folder_hangs_off_the_database`, which also searches for one).
 **Whether there is a level is `schema_groups(schema, dialect)`**: none when the only
 namespace `schemas()` returns is the engine's default (`schema::default_namespace` — PostgreSQL's
-`public`, SQL Server's `dbo`; MySQL has none at all), one row per namespace otherwise —
+`public`, SQL Server's `dbo`, DuckDB's `main`; MySQL has none at all), one row per namespace otherwise —
 **including a lone namespace that is not the default**. That case was flattened like `public`,
 as "no choice to present", which hid the namespace's name and left its Drop no row to hang
 from: a SQL Server database whose only objects live in `sales` listed them straight under the

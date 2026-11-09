@@ -518,7 +518,7 @@ pub fn copies_from_stdin(stmt: &str, dialect: SqlDialect) -> bool {
             words.first().is_some_and(|w| w == "COPY")
                 && words.windows(2).any(|w| w[0] == "FROM" && w[1] == "STDIN")
         }
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -1352,7 +1352,7 @@ fn switch_commands(dialect: SqlDialect) -> &'static [&'static str] {
     match dialect {
         SqlDialect::Postgres => &["c", "connect"],
         SqlDialect::MySql => &["u", "r"],
-        SqlDialect::Sqlite | SqlDialect::MsSql => &[],
+        SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => &[],
     }
 }
 
@@ -1451,7 +1451,9 @@ fn statement_switches(sql: &str, line: u64, dialect: SqlDialect) -> Vec<Database
 /// Does `USE <name>` switch the database on `dialect`?
 fn uses_databases(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::MsSql => true,
+        // DuckDB's `USE` moves the session to another catalog (or schema),
+        // which on the one connection a script holds is a switch.
+        SqlDialect::MySql | SqlDialect::MsSql | SqlDialect::DuckDb => true,
         SqlDialect::Postgres | SqlDialect::Sqlite => false,
     }
 }
@@ -1461,7 +1463,7 @@ fn uses_databases(dialect: SqlDialect) -> bool {
 fn client_connect_is_a_command(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -1469,7 +1471,7 @@ fn client_connect_is_a_command(dialect: SqlDialect) -> bool {
 fn schema_is_database(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 

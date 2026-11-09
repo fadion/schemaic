@@ -38,8 +38,16 @@ use crate::text_ops::contains_ignore_ascii_case;
 /// So a SQLite connection gets the panel's one-line explanation instead of an
 /// empty list, and its footer toggle is inert — an empty list would read as
 /// "quiet server" when the truth is "wrong question".
+///
+/// **DuckDB answers no for SQLite's reason** — embedded, one process, nothing to
+/// list — and the answer is an exhaustive `match` because the `!matches!(…
+/// Sqlite)` it replaced sorted DuckDB onto "has sessions" in silence, offering a
+/// panel whose every poll failed.
 pub fn supports_activity(dialect: SqlDialect) -> bool {
-    !matches!(dialect, SqlDialect::Sqlite)
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => true,
+        SqlDialect::Sqlite | SqlDialect::DuckDb => false,
+    }
 }
 
 /// Can a session be cancelled or terminated from here?
@@ -69,7 +77,10 @@ pub fn supports_kill_kind(dialect: SqlDialect, kind: KillKind) -> bool {
     match (dialect, kind) {
         (_, KillKind::Session) => true,
         (SqlDialect::MsSql, KillKind::Query) => false,
-        (SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite, KillKind::Query) => true,
+        (
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb,
+            KillKind::Query,
+        ) => true,
     }
 }
 
@@ -1932,7 +1943,9 @@ fn cancel_transaction_note(dialect: SqlDialect) -> &'static str {
              which rolls it back."
         }
         // Open, but poisoned: `ERROR 25P02` on everything until a rollback.
-        SqlDialect::Postgres => {
+        // DuckDB the same — measured, the next statement in the transaction
+        // reads "Current transaction is aborted (please ROLLBACK)".
+        SqlDialect::Postgres | SqlDialect::DuckDb => {
             "Any open transaction is left aborted — the client has to roll it back, \
              so its uncommitted work is lost either way."
         }
@@ -2014,6 +2027,9 @@ mod tests {
     fn sqlite_has_no_sessions_and_nothing_to_kill() {
         assert!(!supports_activity(SqlDialect::Sqlite));
         assert!(!supports_kill(SqlDialect::Sqlite));
+        // Nor DuckDB, embedded for the same reason.
+        assert!(!supports_activity(SqlDialect::DuckDb));
+        assert!(!supports_kill(SqlDialect::DuckDb));
         for d in [SqlDialect::MySql, SqlDialect::Postgres] {
             assert!(supports_activity(d), "{d:?} publishes sessions");
             assert!(supports_kill(d), "{d:?} can kill one");

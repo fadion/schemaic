@@ -8,7 +8,15 @@ have since gone true everywhere too. They stay because the question is per *obje
 menus ask it per object, and each **computes** its answer out of `supports_change` instead of
 stating it: a predicate that discards its `SqlDialect` and returns `true` is the constant the
 *"ask a capability"* rule exists to prevent, wearing the name of the fix for it, and it answers
-for a fourth engine as confidently as for these three. Two more join them.
+for a fourth engine as confidently as for these three. **DuckDB is the engine that computation
+answers no for**, and without an edit to any of them: `supports_change` sends it to
+`duckdb_supports`, which refuses every change until the roadmap's later DuckDB phase writes and
+runs each one — DuckDB's DDL is close to PostgreSQL's but not the same (no `ADD CONSTRAINT` for a
+key or a foreign key once a table exists, no index rename, no `ALTER INDEX`, a table something
+depends on cannot be renamed or retyped) — so the designer, the view, trigger and routine
+editors and *Apply* are all off on a DuckDB connection because every `supports_*` editing gate
+computes from it. `emit`'s DuckDB arm is `emit_postgres`, the closest grammar and unreachable
+while no plan can hold a DuckDB change. Two more join them.
 `supports_table_design` is what the tree's **Edit table**, **Edit column** and **Edit index**
 entries ask — three literal `true`s until it existed — and its probe is a column retype, since
 that is the designer's own edit: expressible in place on MySQL, PostgreSQL and SQL Server

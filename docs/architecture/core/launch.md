@@ -283,7 +283,9 @@ same minute replaces the first. `backup_stamp_now` is the local time as `%Y%m%d-
 **`restore_offered(dialect)` is an exhaustive capability**, so a fifth engine answers it: MySQL
 and PostgreSQL yes; SQL Server no, its `RESTORE` reading a file *on the server* and needing the
 database to itself; SQLite no, a backup there being a database file one opens as a connection
-(`restore_is_offered_where_a_client_restores_a_local_file`). `backup_writes_server(dialect)` is
+(`restore_is_offered_where_a_client_restores_a_local_file`), and DuckDB no on the same terms, its
+backup (`db::duckdb::backup_to`) being a new `.duckdb` file. The DuckDB *Open in CLI* takes
+`sqlite_target`'s leading-dash refusal too, its argv being the file alone as `sqlite3`'s is. `backup_writes_server(dialect)` is
 the other exhaustive capability on this path: true for SQL Server alone, whose backup is a
 `BACKUP DATABASE` the server runs and writes — a file in its own folder, replaced by `INIT`, and
 history rows in `msdb` — and false where the tool reads the server into a file on this machine

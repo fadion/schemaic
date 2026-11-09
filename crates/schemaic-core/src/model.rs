@@ -1560,6 +1560,21 @@ pub enum DbRefusal {
     /// The OS keyring would not give a saved connection's secret at connect
     /// time; the backend's own message. Nothing was deleted.
     KeyringUnreadable(String),
+    /// DuckDB has no Manual transaction mode here yet.
+    DuckDbNoManual,
+    /// An operation not yet written for DuckDB connections (roadmap, DuckDB).
+    DuckDbNotYet,
+    /// A DuckDB connection with no file.
+    DuckDbNoFile,
+    /// `:memory:` or a MotherDuck name as a DuckDB file.
+    DuckDbNotAFile(String),
+    /// No file at the DuckDB connection's path — never created.
+    DuckDbMissing(String),
+    /// The file is open in this process for the other kind of run, sealed or
+    /// not (`db::duckdb`).
+    DuckDbSealedElsewhere,
+    /// DuckDB's worker thread failed, with the runtime's own words.
+    DuckDbWorker(String),
 }
 
 impl DbRefusal {
@@ -1574,7 +1589,11 @@ impl DbRefusal {
     /// sent. Matched without a wildcard, so a new refusal has to be placed.
     pub fn stands(&self) -> bool {
         match self {
-            DbRefusal::SqliteWorker(_) | DbRefusal::CommitAborted => false,
+            DbRefusal::SqliteWorker(_) | DbRefusal::DuckDbWorker(_) | DbRefusal::CommitAborted => {
+                false
+            }
+            // The file is free again once the other run ends.
+            DbRefusal::DuckDbSealedElsewhere => false,
             DbRefusal::InitSql(_)
             | DbRefusal::Transport(_)
             | DbRefusal::BackupInTerminal
@@ -1596,7 +1615,12 @@ impl DbRefusal {
             | DbRefusal::SqliteNoColumn { .. }
             | DbRefusal::SqliteGenerated(_)
             | DbRefusal::SqliteSizesTooLarge { .. }
-            | DbRefusal::KeyringUnreadable(_) => true,
+            | DbRefusal::KeyringUnreadable(_)
+            | DbRefusal::DuckDbNoManual
+            | DbRefusal::DuckDbNotYet
+            | DbRefusal::DuckDbNoFile
+            | DbRefusal::DuckDbNotAFile(_)
+            | DbRefusal::DuckDbMissing(_) => true,
         }
     }
 
@@ -1743,6 +1767,25 @@ impl DbRefusal {
                 "Schemaic could not read the saved credentials for this connection from the OS \
                  keyring ({error}). Nothing was deleted: unlock the keyring and try again."
             ),
+            DbRefusal::DuckDbNoManual => "DuckDB connections don't support manual transaction \
+                                          mode yet — statements run and commit as they are sent"
+                .to_string(),
+            DbRefusal::DuckDbNotYet => {
+                "This isn't available on DuckDB connections yet.".to_string()
+            }
+            DbRefusal::DuckDbNoFile => "no database file is set".to_string(),
+            DbRefusal::DuckDbNotAFile(name) => format!(
+                "{name} is not a database file — a DuckDB connection opens a file on this \
+                 computer. Give the path to a .duckdb file."
+            ),
+            DbRefusal::DuckDbMissing(path) => format!(
+                "There is no file at {path}. Schemaic opens an existing DuckDB database and \
+                 never creates one, so a mistyped path cannot become an empty database."
+            ),
+            DbRefusal::DuckDbSealedElsewhere => "This DuckDB file is open in Schemaic for \
+                                                 another kind of run. Try again when it finishes."
+                .to_string(),
+            DbRefusal::DuckDbWorker(e) => format!("the DuckDB worker failed: {e}"),
         }
     }
 }

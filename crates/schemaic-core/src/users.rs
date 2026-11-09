@@ -51,7 +51,10 @@ use crate::text_ops::contains_ignore_ascii_case;
 pub fn supports_users(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => true,
-        SqlDialect::Sqlite => false,
+        // An embedded file has no accounts: whoever can open it can do anything
+        // to it. That is DuckDB's answer for the reason it is SQLite's, and every
+        // arm below that names the two together is unreachable behind this.
+        SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -107,7 +110,7 @@ pub fn account_kinds(dialect: SqlDialect, scope: AccountScope) -> &'static [Prin
             PrincipalKind::User,
             PrincipalKind::Role,
         ],
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
             &[PrincipalKind::User, PrincipalKind::Role]
         }
     }
@@ -1068,7 +1071,7 @@ pub struct AccountScope {
 pub fn supports_entra_users(dialect: SqlDialect, scope: AccountScope) -> bool {
     match dialect {
         SqlDialect::MsSql => scope.entra_users,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -1497,7 +1500,10 @@ impl GrantLevel {
         match self {
             GrantLevel::Global => match dialect {
                 SqlDialect::MsSql => String::new(),
-                SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => "*.*".to_string(),
+                SqlDialect::MySql
+                | SqlDialect::Postgres
+                | SqlDialect::Sqlite
+                | SqlDialect::DuckDb => "*.*".to_string(),
             },
             // **Every dialect named**, not `_ =>`. This is the file's only
             // dialect match, and a catch-all here answers for an engine nobody
@@ -1517,19 +1523,24 @@ impl GrantLevel {
                 SqlDialect::MySql => {
                     format!("{}.*", crate::export::ident_pattern_sql(d, dialect))
                 }
-                SqlDialect::Postgres | SqlDialect::Sqlite => format!("DATABASE {}", q(d)),
+                SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+                    format!("DATABASE {}", q(d))
+                }
                 // T-SQL names a securable by its class: `ON DATABASE::[d]`.
                 SqlDialect::MsSql => format!("DATABASE::{}", q(d)),
             },
             GrantLevel::Schema(s) => match dialect {
                 SqlDialect::MsSql => format!("SCHEMA::{}", q(s)),
-                SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+                SqlDialect::MySql
+                | SqlDialect::Postgres
+                | SqlDialect::Sqlite
+                | SqlDialect::DuckDb => {
                     format!("SCHEMA {}", q(s))
                 }
             },
             GrantLevel::Table { qualifier, name } => match dialect {
                 SqlDialect::MySql => format!("{}.{}", q(qualifier), q(name)),
-                SqlDialect::Postgres | SqlDialect::Sqlite => {
+                SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
                     format!("TABLE {}.{}", q(qualifier), q(name))
                 }
                 SqlDialect::MsSql => format!("OBJECT::{}.{}", q(qualifier), q(name)),
@@ -1568,7 +1579,7 @@ pub fn levels_for(dialect: SqlDialect) -> &'static [GrantLevelKind] {
         // Unreachable through the UI — `supports_user_admin` is the gate — and an
         // empty list rather than a panic, so a caller that skipped the gate gets
         // a picker with nothing in it instead of a crash.
-        SqlDialect::Sqlite => &[],
+        SqlDialect::Sqlite | SqlDialect::DuckDb => &[],
     }
 }
 
@@ -1592,7 +1603,9 @@ pub fn levels_for_account(dialect: SqlDialect, p: &Principal) -> &'static [Grant
                 GrantLevelKind::Table,
             ],
         },
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => levels_for(dialect),
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+            levels_for(dialect)
+        }
     }
 }
 
@@ -1820,7 +1833,7 @@ pub fn privilege_sql(c: &PrivilegeChange, dialect: SqlDialect, revoke: bool) -> 
 pub fn revoke_cascades(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -1834,7 +1847,7 @@ pub fn revoke_cascades(dialect: SqlDialect) -> bool {
 pub fn supports_deny(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -1850,7 +1863,7 @@ pub fn supports_deny(dialect: SqlDialect) -> bool {
 pub fn table_grant_lifts_column_denies(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -1889,7 +1902,7 @@ pub fn column_permissions_kept(c: &PrivilegeChange, dialect: SqlDialect) -> Vec<
 pub fn table_revoke_clears_columns(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -2146,7 +2159,7 @@ pub fn role_sql(c: &RoleChange, dialect: SqlDialect, revoke: bool) -> String {
             };
             return format!("ALTER {noun} {role} {verb} MEMBER {member}");
         }
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {}
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {}
     }
     if revoke {
         format!("REVOKE {role} FROM {member}")
@@ -2427,7 +2440,7 @@ pub fn account_draft_sql(d: &AccountDraft, dialect: SqlDialect) -> Option<String
     }
     match dialect {
         SqlDialect::MsSql => return Some(tsql_account_draft_sql(d)),
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {}
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {}
     }
     let who = account_sql(&d.principal(dialect), dialect);
     let keyword = match d.kind {
@@ -2445,7 +2458,7 @@ pub fn account_draft_sql(d: &AccountDraft, dialect: SqlDialect) -> Option<String
                 match dialect {
                     // PostgreSQL's `CREATE USER` already implies LOGIN; the
                     // password clause is a bare `PASSWORD`.
-                    SqlDialect::Postgres | SqlDialect::Sqlite => "PASSWORD",
+                    SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => "PASSWORD",
                     SqlDialect::MySql => "IDENTIFIED BY",
                     // Unreachable: SQL Server returned above, through
                     // `tsql_account_draft_sql`, whose statements are its own.
@@ -2501,7 +2514,7 @@ pub fn supports_password_verifier(dialect: SqlDialect) -> bool {
         SqlDialect::Postgres => true,
         // SQL Server takes a hashed password only for a login
         // (`WITH PASSWORD = 0x… HASHED`), in a format of its own.
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb | SqlDialect::MsSql => false,
     }
 }
 
@@ -2703,7 +2716,7 @@ pub fn supports_password_reset(dialect: SqlDialect, p: &Principal) -> bool {
                     || (p.kind == PrincipalKind::User
                         && (p.login.is_some() || p.database_password)))
         }
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
             p.kind == PrincipalKind::User && !p.role_ambiguous
         }
     }
@@ -2746,7 +2759,9 @@ pub fn set_password_sql(r: &PasswordReset, dialect: SqlDialect) -> Option<String
     };
     let (verb, clause) = match dialect {
         SqlDialect::MySql => ("ALTER USER", "IDENTIFIED BY"),
-        SqlDialect::Postgres | SqlDialect::Sqlite => ("ALTER ROLE", "PASSWORD"),
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+            ("ALTER ROLE", "PASSWORD")
+        }
         SqlDialect::MsSql if r.account.kind == PrincipalKind::User && r.account.login.is_none() => {
             ("ALTER USER", "WITH PASSWORD =")
         }
@@ -2814,7 +2829,7 @@ pub fn takes_password(dialect: SqlDialect, kind: PrincipalKind, contained: bool)
         SqlDialect::MsSql => {
             kind == PrincipalKind::Login || (kind == PrincipalKind::User && contained)
         }
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
             kind == PrincipalKind::User
         }
     }
@@ -2835,7 +2850,7 @@ pub fn takes_password(dialect: SqlDialect, kind: PrincipalKind, contained: bool)
 pub fn blank_password_signs_in(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Postgres => true,
-        SqlDialect::MsSql | SqlDialect::Sqlite => false,
+        SqlDialect::MsSql | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -2851,7 +2866,7 @@ pub fn blank_password_signs_in(dialect: SqlDialect) -> bool {
 pub fn drop_user_cuts_off_sessions(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -2870,7 +2885,7 @@ pub fn drop_user_cuts_off_sessions(dialect: SqlDialect) -> bool {
 pub fn accounts_have_hosts(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite => false,
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -2902,7 +2917,7 @@ pub fn blank_account_draft(dialect: SqlDialect, scope: AccountScope) -> AccountD
 pub fn companion_user_draft(d: &AccountDraft, dialect: SqlDialect) -> Option<AccountDraft> {
     let wanted = match dialect {
         SqlDialect::MsSql => d.kind == PrincipalKind::Login && d.also_user,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     };
     (wanted && !d.name.trim().is_empty()).then(|| AccountDraft {
         name: d.name.trim().to_string(),
@@ -2948,7 +2963,7 @@ pub fn role_suggestions(
 ) -> Vec<String> {
     let server_roles = match dialect {
         SqlDialect::MsSql => account.kind == PrincipalKind::Login,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     };
     if server_roles {
         return MSSQL_FIXED_SERVER_ROLES
@@ -2967,7 +2982,7 @@ pub fn role_suggestions(
 /// Server, whose membership is `ALTER ROLE … ADD MEMBER` and nothing more.
 pub fn supports_role_admin_option(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => true,
         SqlDialect::MsSql => false,
     }
 }

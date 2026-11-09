@@ -33,7 +33,7 @@ use crate::text_ops::contains_ignore_ascii_case;
 /// [`crate::search_history::ObjectTag`] states in full. `snippets.json` is
 /// rewritten whole on every change, so a bare `#[serde(other)]` unit variant
 /// would mean that merely running this build once rewrote a newer build's
-/// `"duckdb"` scope as the literal `"unknown"`, and going back would no longer
+/// `"clickhouse"` scope as the literal `"unknown"`, and going back would no longer
 /// recognise its own snippet. Degrading the *file* is the point; degrading the
 /// *value* is a different thing that looks like it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +57,7 @@ impl Scope {
             Scope::Dialect(SqlDialect::Postgres) => "postgres".to_string(),
             Scope::Dialect(SqlDialect::Sqlite) => "sqlite".to_string(),
             Scope::Dialect(SqlDialect::MsSql) => "mssql".to_string(),
+            Scope::Dialect(SqlDialect::DuckDb) => "duckdb".to_string(),
             Scope::Conn(id) => format!("conn:{id}"),
             Scope::Unknown(s) => s.clone(),
         }
@@ -78,6 +79,7 @@ impl<'de> Deserialize<'de> for Scope {
             "postgres" => Scope::Dialect(SqlDialect::Postgres),
             "sqlite" => Scope::Dialect(SqlDialect::Sqlite),
             "mssql" => Scope::Dialect(SqlDialect::MsSql),
+            "duckdb" => Scope::Dialect(SqlDialect::DuckDb),
             other => match other.strip_prefix("conn:").map(str::parse::<u64>) {
                 Some(Ok(id)) => Scope::Conn(id),
                 // Includes `conn:` followed by something that isn't a number —
@@ -434,6 +436,40 @@ pub fn builtins(dialect: SqlDialect) -> Vec<Snippet> {
                 "Unused indexes",
                 "unused",
                 "SELECT OBJECT_SCHEMA_NAME(i.object_id) AS schema_name,\n       OBJECT_NAME(i.object_id) AS table_name,\n       i.name AS index_name,\n       ISNULL(u.user_seeks + u.user_scans + u.user_lookups, 0) AS reads,\n       ISNULL(u.user_updates, 0) AS writes\nFROM sys.indexes i\nLEFT JOIN sys.dm_db_index_usage_stats u\n  ON u.object_id = i.object_id AND u.index_id = i.index_id AND u.database_id = DB_ID()\nWHERE OBJECTPROPERTY(i.object_id, 'IsUserTable') = 1\n  AND i.type_desc = 'NONCLUSTERED'\n  AND i.is_primary_key = 0 AND i.is_unique = 0\nORDER BY reads, writes DESC;",
+            ),
+        ],
+        // Each is run against the linked DuckDB by `db::duckdb`'s
+        // `every_builtin_snippet_runs`.
+        SqlDialect::DuckDb => &[
+            (
+                401,
+                "Tables at a glance",
+                "tables",
+                "SELECT schema_name, table_name, estimated_size AS approx_rows,\n       column_count, index_count\nFROM duckdb_tables()\nORDER BY schema_name, table_name;",
+            ),
+            (
+                402,
+                "Database size",
+                "size",
+                "SELECT database_name, database_size, block_size, total_blocks,\n       used_blocks, free_blocks, wal_size\nFROM pragma_database_size();",
+            ),
+            (
+                403,
+                "Settings",
+                "settings",
+                "SELECT name, value, description, input_type\nFROM duckdb_settings()\nORDER BY name;",
+            ),
+            (
+                404,
+                "Columns of a table",
+                "cols",
+                "SELECT column_name, data_type, is_nullable, column_default\nFROM duckdb_columns()\nWHERE table_name = :table_name\nORDER BY column_index;",
+            ),
+            (
+                405,
+                "Peek at a Parquet file",
+                "parquet",
+                "SELECT *\nFROM read_parquet(:path)\nLIMIT 100;",
             ),
         ],
     };
@@ -1017,7 +1053,11 @@ mod tests {
     /// it also must not be shown against an engine this build can't confirm.
     #[test]
     fn an_unknown_scope_applies_nowhere() {
-        let s = snip(1, "from the future", Scope::Unknown("duckdb".to_string()));
+        let s = snip(
+            1,
+            "from the future",
+            Scope::Unknown("clickhouse".to_string()),
+        );
         assert!(!applies(&s, MY, 1));
         assert!(!applies(&s, PG, 1));
     }
@@ -1031,6 +1071,7 @@ mod tests {
             Scope::Dialect(MY),
             Scope::Dialect(PG),
             Scope::Dialect(SqlDialect::Sqlite),
+            Scope::Dialect(SqlDialect::DuckDb),
             Scope::Conn(42),
         ] {
             let s = snip(1, "x", scope.clone());
@@ -1045,12 +1086,12 @@ mod tests {
     /// round trip **verbatim** or a rollback loses the snippet's meaning.
     #[test]
     fn a_scope_from_a_newer_build_is_written_back_unchanged() {
-        let json = r#"{"id":1,"name":"x","body":"SELECT 1","scope":"duckdb"}"#;
+        let json = r#"{"id":1,"name":"x","body":"SELECT 1","scope":"clickhouse"}"#;
         let s: Snippet = serde_json::from_str(json).expect("read");
-        assert_eq!(s.scope, Scope::Unknown("duckdb".to_string()));
+        assert_eq!(s.scope, Scope::Unknown("clickhouse".to_string()));
         let written = serde_json::to_string(&s).expect("write");
         assert!(
-            written.contains(r#""scope":"duckdb""#),
+            written.contains(r#""scope":"clickhouse""#),
             "the scope must go back as it came: {written}"
         );
     }
@@ -1194,7 +1235,7 @@ mod tests {
 
     // ── the built-in pack ───────────────────────────────────────────────────
 
-    const EVERY_DIALECT: [SqlDialect; 4] = SqlDialect::ALL;
+    const EVERY_DIALECT: [SqlDialect; 5] = SqlDialect::ALL;
 
     /// Every shipped statement has to *parse* in the dialect it is shipped for.
     /// It cannot be run from here — there is no server in a unit test — so this

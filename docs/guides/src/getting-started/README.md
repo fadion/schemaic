@@ -39,9 +39,9 @@ On first launch there's nothing to connect to yet, so the header shows **New con
 the connection switcher will go. Click it.
 
 1. Give the connection a **Name**, and pick its **Type**: MySQL (also for MariaDB), PostgreSQL,
-   SQLite or SQL Server.
+   SQLite, SQL Server or DuckDB.
 2. For a server, fill in **Host**, **Port**, **User** and **Password**. **Database** is optional.
-   For SQLite, pick the **Database file** instead.
+   For SQLite or DuckDB, pick the **Database file** instead.
 3. Press **Test** to check that Schemaic can reach the server, then **Save**.
 
 Saving connects. The **SCHEMA** panel on the left fills with the server's databases, and the

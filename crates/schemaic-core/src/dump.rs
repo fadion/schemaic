@@ -390,6 +390,9 @@ pub fn cancel_note(name: &str, partial: bool) -> String {
 pub fn supports_dump(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        // Not yet: the DuckDB dump lands with the engine's write paths
+        // (roadmap, DuckDB phase 2). Every arm below already answers for it.
+        SqlDialect::DuckDb => false,
     }
 }
 
@@ -409,7 +412,7 @@ pub fn identity_insert_sql(dialect: SqlDialect, table: &str) -> Option<(String, 
             format!("SET IDENTITY_INSERT {table} ON;"),
             format!("SET IDENTITY_INSERT {table} OFF;"),
         )),
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => None,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => None,
     }
 }
 
@@ -533,7 +536,9 @@ pub fn literal_select(
 ) -> Option<(String, crate::export::ServerLiteral)> {
     match dialect {
         SqlDialect::MsSql => {}
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => return None,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+            return None;
+        }
     }
     let col = ident_sql(&c.name, dialect);
     let type_name = aliases
@@ -641,7 +646,10 @@ pub fn exact_float_select(c: &crate::schema::ColumnInfo, dialect: SqlDialect) ->
                 format!("({col} + 0e0) AS {col}")
             })
         }
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => None,
+        // DuckDB's values reach the model through the driver's own types
+        // (`db::duckdb`), a `REAL` as the shortest text that reads back
+        // exactly, so nothing needs widening in the query.
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => None,
     }
 }
 
@@ -663,7 +671,9 @@ pub fn fk_guard_sql(dialect: SqlDialect) -> Option<(&'static str, &'static str)>
         // ALL`), and turning it back on with `CHECK` leaves every key marked
         // untrusted unless it is re-validated. Like PostgreSQL, the ordering
         // and the closing constraints section are the answer.
-        SqlDialect::Postgres | SqlDialect::MsSql => None,
+        // DuckDB has no switch for its foreign keys at all; the ordering and
+        // the closing constraints section are its answer too.
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb => None,
     }
 }
 
@@ -686,7 +696,8 @@ pub fn fk_guard_sql(dialect: SqlDialect) -> Option<(&'static str, &'static str)>
 pub fn drop_runs_referential_actions(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Sqlite => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => false,
+        // DuckDB's foreign keys take no `ON DELETE` action but the refusal.
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb => false,
     }
 }
 
@@ -753,7 +764,7 @@ pub fn literal_mode_guard_sql(dialect: SqlDialect) -> Option<(String, &'static s
 pub fn date_format_sql(dialect: SqlDialect) -> Option<&'static str> {
     match dialect {
         SqlDialect::MsSql => Some("SET DATEFORMAT ymd;"),
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => None,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => None,
     }
 }
 
@@ -769,7 +780,7 @@ pub fn date_format_sql(dialect: SqlDialect) -> Option<&'static str> {
 pub fn ansi_settings_sql(dialect: SqlDialect) -> &'static [&'static str] {
     match dialect {
         SqlDialect::MsSql => &["SET ANSI_NULLS ON;", "SET QUOTED_IDENTIFIER ON;"],
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => &[],
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => &[],
     }
 }
 
@@ -777,7 +788,7 @@ pub fn ansi_settings_sql(dialect: SqlDialect) -> &'static [&'static str] {
 pub fn transaction_sql(dialect: SqlDialect) -> (&'static str, &'static str) {
     match dialect {
         SqlDialect::MySql => ("START TRANSACTION;", "COMMIT;"),
-        SqlDialect::Postgres | SqlDialect::Sqlite => ("BEGIN;", "COMMIT;"),
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => ("BEGIN;", "COMMIT;"),
         // A bare `BEGIN` opens a block there, not a transaction.
         SqlDialect::MsSql => ("BEGIN TRANSACTION;", "COMMIT TRANSACTION;"),
     }
@@ -824,8 +835,8 @@ pub fn drop_cascade(dialect: SqlDialect) -> &'static str {
     match dialect {
         SqlDialect::Postgres => " CASCADE",
         // T-SQL's `DROP TABLE` has no `CASCADE`; `drops_up_front` is its
-        // answer.
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => "",
+        // answer. DuckDB's file is restored in dependency order instead.
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => "",
     }
 }
 
@@ -871,7 +882,7 @@ pub fn refuse_if_present_sql(dialect: SqlDialect, object: &str, why: &str) -> Op
             crate::schema::ddl_string(object, dialect),
             crate::schema::ddl_string(why, dialect),
         )),
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => None,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => None,
     }
 }
 
@@ -1129,6 +1140,13 @@ pub fn create_container_sql(
             .map(|ns| format!("CREATE SCHEMA IF NOT EXISTS {};", ident_sql(ns, dialect)))
             .collect(),
         SqlDialect::Sqlite => Vec::new(),
+        // DuckDB: PostgreSQL's statement, `main` being in every catalog.
+        SqlDialect::DuckDb => namespaces
+            .iter()
+            .filter_map(|ns| ns.as_deref())
+            .filter(|ns| *ns != crate::schema::DUCKDB_DEFAULT_SCHEMA)
+            .map(|ns| format!("CREATE SCHEMA IF NOT EXISTS {};", ident_sql(ns, dialect)))
+            .collect(),
         // No `IF NOT EXISTS`, and `CREATE SCHEMA` must be alone in its batch,
         // so it goes through `EXEC` behind a test. `dbo` is in every database.
         SqlDialect::MsSql => namespaces
@@ -1164,7 +1182,7 @@ pub fn target_database_sql(dialect: SqlDialect, database: &str) -> Option<String
     match dialect {
         SqlDialect::MySql => Some(format!("USE {};", ident_sql(database, dialect))),
         // SQL Server names the schema on both halves, as PostgreSQL does.
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => None,
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => None,
     }
 }
 
@@ -1509,7 +1527,7 @@ pub fn unless_present_sql(dialect: SqlDialect, present: Present<'_>, body: &str)
                 body.trim_end()
             ))
         }
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => None,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => None,
     }
 }
 
@@ -1674,7 +1692,7 @@ pub fn cascade_guard_sql(
             let tag = dollar_tag(&[&body]);
             Some(format!("DO {tag}\n{body}\n{tag};"))
         }
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => None,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => None,
     }
 }
 
@@ -1771,7 +1789,7 @@ pub fn cloned_triggers_held_sql(dialect: SqlDialect, table: &str) -> Option<(Str
                 format!("DO {tag}\n{body}\n{tag};"),
             ))
         }
-        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => None,
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => None,
     }
 }
 

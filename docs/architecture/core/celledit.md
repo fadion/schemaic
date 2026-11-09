@@ -21,7 +21,8 @@ say, so the exception stands and the cost is written down instead: a NULL cell a
 pending row are the common cases, a literal `''` in an `ENUM` is what a misconfigured server
 produced once. `BoolWire` is which
 two literals a boolean writes, and it is **the engine's own spelling, not the readable one**
-(`1`/`0` on MySQL and SQLite, `t`/`f` on PostgreSQL): every engine accepts several on the way
+(`1`/`0` on MySQL and SQLite, `t`/`f` on PostgreSQL, `true`/`false` on DuckDB — `BoolWire::Word`,
+its `BOOLEAN` reading back as the words `db::duckdb` passes through): every engine accepts several on the way
 in, so the round trip decides — a toggle back to what the column already reads back is
 recognised as a revert and un-stages, where `true` written over a `t` leaves a green cell whose
 `UPDATE` writes a value already there. **The row already *held* is the one exception, and writes

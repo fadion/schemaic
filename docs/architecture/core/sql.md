@@ -13,7 +13,12 @@ because the question stopped being binary. SQL Server filled in the table as a f
 `bracket_doubles`; SQLite's span ends at the first `]`, and ending T-SQL's there too would cut
 `SELECT [a]]; DROP TABLE t; --] FROM t` into statements the server reads as one name —
 `a_doubled_bracket_stays_inside_a_sql_server_name`), comments that nest (shared with
-PostgreSQL), and `batch_separator`, which is two rules. A `GO` line — `go_directive`, alone on its
+PostgreSQL), and `batch_separator`, which is two rules. **DuckDB is the fifth row, and needed
+no new predicate** — each answer measured on DuckDB 2.0: `E'…'` backslash strings, `$tag$`
+strings and nested block comments as on PostgreSQL, backtick names as on MySQL and SQLite
+(though it writes `"…"` itself), no `#` comment, `--` with no space after it, no backslash in a
+plain string — and **`[` is not a name**: `[1, 2]` is a list there, so `bracket_ident` answers
+no and a `;` after the `]` is a boundary (`duckdb_statement_boundaries_are_its_own`). A `GO` line — `go_directive`, alone on its
 line with an optional count and `--` comment — ends a batch and is the client's, never sent, so
 `is_delimiter_directive` answers for it beside MySQL's `DELIMITER` and one predicate lets every
 executing path drop both; the count is accepted and **not** honoured, a batch runs once. And
@@ -130,7 +135,10 @@ which `read_only_reason` both tests against and builds its rejection message fro
 `SELECT/SHOW/DESCRIBE/DESC/EXPLAIN/WITH` on MySQL, `SELECT/SHOW/EXPLAIN/WITH` on PostgreSQL
 (`SHOW search_path` is real SQL there, while `DESCRIBE` isn't — psql's `\d` is a client command
 rather than a statement), `SELECT/EXPLAIN/WITH` on SQLite, and `SELECT/WITH` on SQL Server,
-whose plan is `SET SHOWPLAN_XML ON` — session state, not a head. One shared list was wrong in both
+whose plan is `SET SHOWPLAN_XML ON` — session state, not a head; and on DuckDB
+`SELECT/WITH/FROM/VALUES/SHOW/DESCRIBE/SUMMARIZE/EXPLAIN`, since DuckDB reads with a leading
+`FROM` and `DESCRIBE` and `SUMMARIZE` are queries over a relation — its `EXPLAIN ANALYZE` runs
+the statement, and the shared deny list's `ANALYZE` refuses it. One shared list was wrong in both
 directions at once for a third engine: it waved `SHOW TABLES` through to SQLite, which has no
 such syntax, so the model got a raw parser error instead of being told the engine has no such
 thing, and a rejection named heads that connection couldn't use — which a model will keep
@@ -150,6 +158,19 @@ every word finds it there. `OPENROWSET`/`OPENQUERY`/`OPENDATASOURCE` are on it b
 a server file or send text to another server this gate cannot read. `WHILE` and `GOTO` are on it
 as T-SQL's `BENCHMARK`: a loop writes nothing for the rolled-back session to undo, and runs until
 it is stopped — on the unattended paths, by nobody (`a_sql_server_loop_is_not_a_read`).
+**DuckDB's deny list is mostly its file readers**, because a DuckDB read can open any path on
+this machine: `READ_CSV`/`READ_CSV_AUTO`/`SNIFF_CSV`, the `READ_PARQUET`/`PARQUET_*` and
+`READ_JSON*`/`READ_NDJSON*` families, `READ_TEXT`, `READ_BLOB` and `GLOB` — and beside them
+`COPY` and `EXPORT` (they write files), `ATTACH`/`DETACH` (another database by path),
+`INSTALL`/`FORCE` (fetch an extension), `PRAGMA`, `CHECKPOINT` and `VACUUM` (they act on the
+file), `QUERY`/`QUERY_TABLE` (they run SQL from a string this gate cannot read), `GETENV` (the
+process's environment), `NEXTVAL` and `SETSEED`, `DUCKDB_SECRETS`/`WHICH_SECRET`, and `BEGIN` and
+`ABORT`, its transaction words beyond the standard ones. **The list is not what stops a file
+read**: `FROM 'secrets.csv'` names a file as a string in table position, which no word scan can
+refuse, and a column that merely shares a reader's name is refused with the call
+(`duckdb_reads_its_own_way_and_not_through_a_file`). The unattended paths run on a *sealed*
+instance besides — external access off (`db::duckdb`) — and the list's job is that the refusal
+says what it refused.
 **`NEXT VALUE FOR` is a phrase, asked on every dialect** (`advances_a_sequence`): `NEXT` and `VALUE` are ordinary column
 names, so it cannot be a denied word, and no rollback returns a sequence — and MariaDB 10.3+
 takes the phrase too, so `SELECT NEXT VALUE FOR s` had been passing there as a read.
@@ -262,7 +283,10 @@ refused, and that is every extension function and every function the owner defin
 of its own* — the gate cannot read a body, and a function's `STABLE` is its author's claim; an
 owner's overload of a listed name is another matter (below). `read_call_policy` picks the list by an exhaustive match — `Some` for
 PostgreSQL and SQL Server, `None` for MySQL and SQLite, whose builtin sets are small and closed
-and keep their deny lists. SQL Server's builtins are closed too, but a user-defined function may
+and keep their deny lists, and `None` for DuckDB, whose set is large but closed *in this build*
+— an extension is linked in or unreachable, auto-install and auto-load being off and `INSTALL`
+and `LOAD` denied — and whose user functions are macros, an expression or a query, which cannot
+write; what acts is on its deny list, and the unattended session is sealed besides. SQL Server's builtins are closed too, but a user-defined function may
 call an extended stored procedure and a CLR one does whatever its assembly may, so a name the
 gate cannot vouch for is refused there as well. What differs between the two is a `CallPolicy`
 rather than a second scanner: the lists (`MSSQL_READ_FUNCTIONS` unqualified, and

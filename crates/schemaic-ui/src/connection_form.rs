@@ -69,14 +69,16 @@ enum DbKind {
     Postgres,
     Sqlite,
     MsSql,
+    DuckDb,
 }
 
 impl DbKind {
-    const ALL: [DbKind; 4] = [
+    const ALL: [DbKind; 5] = [
         DbKind::MySql,
         DbKind::Postgres,
         DbKind::Sqlite,
         DbKind::MsSql,
+        DbKind::DuckDb,
     ];
 
     fn label(self) -> &'static str {
@@ -85,6 +87,7 @@ impl DbKind {
             DbKind::Postgres => "PostgreSQL",
             DbKind::Sqlite => "SQLite",
             DbKind::MsSql => "SQL Server",
+            DbKind::DuckDb => "DuckDB",
         }
     }
 
@@ -116,6 +119,8 @@ impl DbKind {
             DbKind::Sqlite
         } else if schemaic_core::connection::is_mssql(s) {
             DbKind::MsSql
+        } else if schemaic_core::connection::is_duckdb(s) {
+            DbKind::DuckDb
         } else {
             DbKind::MySql
         }
@@ -1839,7 +1844,15 @@ fn windows_sign_in_hint_for(domain: Option<&str>, user: Option<&str>) -> String 
 ///
 /// It takes tab index 60, where the host field would be, so the order down the
 /// form is unchanged and the indices after it are untouched.
-fn sqlite_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
+///
+/// DuckDB's is the same block — a file and nothing else — with its own dialog
+/// title and hint, so `dialog` and `hint` are the engine's words.
+fn file_fields(
+    draft: DraftSignals,
+    ring: FocusRing,
+    dialog: String,
+    hint: String,
+) -> impl IntoView {
     // The SSH key's and TLS certificates' control: a path editable by hand, with
     // Browse inside it as its own stop right after the path (61). It was a
     // second copy of `path_field` until GitHub #19 moved the button in.
@@ -1847,11 +1860,11 @@ fn sqlite_fields(draft: DraftSignals, ring: FocusRing) -> impl IntoView {
         path_field(
             tr!("connections-database-file"),
             draft.file,
-            tr!("connections-database-file-dialog"),
+            dialog,
             ring,
             60,
         ),
-        form_hint(tr!("connections-sqlite-hint")).style(|s| s.width_full()),
+        form_hint(hint).style(|s| s.width_full()),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
 }
@@ -1980,7 +1993,20 @@ fn conn_form(
     let engine_block = dyn_container(
         move || engine.get(),
         move |k| match k {
-            DbKind::Sqlite => sqlite_fields(draft, ring_engine.clone()).into_any(),
+            DbKind::Sqlite => file_fields(
+                draft,
+                ring_engine.clone(),
+                tr!("connections-database-file-dialog"),
+                tr!("connections-sqlite-hint"),
+            )
+            .into_any(),
+            DbKind::DuckDb => file_fields(
+                draft,
+                ring_engine.clone(),
+                tr!("connections-duckdb-file-dialog"),
+                tr!("connections-duckdb-hint"),
+            )
+            .into_any(),
             _ => server_fields(draft, ring_engine.clone()).into_any(),
         },
     )

@@ -72,6 +72,7 @@
 //! table/column a result cell came from.
 
 mod cloud_iam;
+pub mod duckdb;
 mod entra;
 pub mod mssql;
 pub mod mysql;
@@ -535,7 +536,8 @@ pub(crate) const ENGINE_ENTRY_POINTS: &[&str] = &[
 /// Which database engine a [`Db`] speaks. Selected from the saved connection's
 /// `db_type` at [`Db::connect`] time; each public method dispatches to the
 /// engine-specific backend — one module each now, MySQL in [`mysql`], Postgres
-/// in [`pg`], SQLite in [`sqlite`]; MySQL's bodies were inline here until the
+/// in [`pg`], SQLite in [`sqlite`], SQL Server in [`mssql`], DuckDB in
+/// [`duckdb`]; MySQL's bodies were inline here until the
 /// extraction, which is what this line used to say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Engine {
@@ -545,6 +547,8 @@ pub enum Engine {
     Sqlite,
     /// Microsoft SQL Server and Azure SQL, in [`mssql`].
     MsSql,
+    /// DuckDB, embedded like SQLite, in [`duckdb`].
+    DuckDb,
 }
 
 impl Engine {
@@ -556,6 +560,7 @@ impl Engine {
             Engine::Postgres => schemaic_core::intel::SqlDialect::Postgres,
             Engine::Sqlite => schemaic_core::intel::SqlDialect::Sqlite,
             Engine::MsSql => schemaic_core::intel::SqlDialect::MsSql,
+            Engine::DuckDb => schemaic_core::intel::SqlDialect::DuckDb,
         }
     }
 
@@ -567,6 +572,7 @@ impl Engine {
             Engine::Postgres => "postgres",
             Engine::Sqlite => "sqlite",
             Engine::MsSql => "mssql",
+            Engine::DuckDb => "duckdb",
         }
     }
 
@@ -592,7 +598,9 @@ impl Engine {
             Engine::Sqlite => Some(sqlite::MAIN),
             // A SQL Server login lands in its default database, which is the
             // server's to name — `DB_NAME()` — not ours to assume.
-            Engine::MySql | Engine::Postgres | Engine::MsSql => None,
+            // The file's catalog is named after the file, which only an
+            // open can confirm (`duckdb::fetch_databases`).
+            Engine::MySql | Engine::Postgres | Engine::MsSql | Engine::DuckDb => None,
         }
     }
 
@@ -611,6 +619,8 @@ impl Engine {
             Engine::Sqlite
         } else if schemaic_core::connection::is_mssql(db_type) {
             Engine::MsSql
+        } else if schemaic_core::connection::is_duckdb(db_type) {
+            Engine::DuckDb
         } else {
             Engine::MySql
         }
@@ -669,6 +679,11 @@ pub struct Db {
     /// keyring read ([`Self::with_password_source`]). `None` means `pass` is
     /// the whole answer.
     pub(crate) pass_source: Option<PasswordSource>,
+    /// Open a DuckDB file **sealed** — read-only, external access off,
+    /// configuration locked ([`duckdb`]) — for the paths that run SQL with
+    /// nobody at the keyboard. Set by [`Self::sealed`]; inert on every other
+    /// engine, whose read-only guards are their own.
+    pub(crate) sealed: bool,
 }
 
 /// A password read **when a connect needs it**, rather than when the handle is
@@ -794,6 +809,7 @@ impl Db {
                     (host.to_string(), port)
                 }),
                 pass_source: None,
+                sealed: false,
             },
             None => Db {
                 engine,
@@ -808,6 +824,7 @@ impl Db {
                 init_sql,
                 signing: None,
                 pass_source: None,
+                sealed: false,
             },
         }
     }
@@ -840,7 +857,17 @@ impl Db {
             init_sql: String::new(),
             signing: None,
             pass_source: None,
+            sealed: false,
         }
+    }
+
+    /// This handle, sealed for an unattended read: on DuckDB the file opens
+    /// read-only with external access off, so no statement — whatever the text
+    /// gate missed — reaches a file the database does not hold. Called by the
+    /// one headless read path (`cli::query`), which both front ends use.
+    pub fn sealed(mut self) -> Db {
+        self.sealed = true;
+        self
     }
 
     /// Read the password from `source` at connect time when this handle was
@@ -1423,6 +1450,7 @@ impl Db {
             Engine::Sqlite => sqlite::fetch_query(self, sql, dest, cancel, enforce).await?,
             Engine::MySql => mysql::fetch_query(self, database, sql, dest, cancel, enforce).await?,
             Engine::MsSql => mssql::fetch_query(self, database, sql, dest, cancel, enforce).await?,
+            Engine::DuckDb => duckdb::fetch_query(self, sql, dest, cancel, enforce).await?,
         };
         // A SQLite connection has exactly one database and the caller passes none,
         // so the label comes from the engine rather than from a scope nobody set.
@@ -1495,6 +1523,25 @@ impl Db {
                 }
                 Engine::MySql => {
                     mysql::fetch_table(self, database, schema, table, order_by, limit, cancel).await
+                }
+                Engine::DuckDb => {
+                    let from = match schema.filter(|s| !s.is_empty()) {
+                        Some(s) => format!("{}.{}", ident_duckdb(s), ident_duckdb(table)),
+                        None => ident_duckdb(table),
+                    };
+                    let sql = format!(
+                        "SELECT * FROM {from}{} LIMIT {limit}",
+                        order_by_clause(order_by, ident_duckdb)
+                    );
+                    return self
+                        .fetch_query_enforced(
+                            Some(database),
+                            &sql,
+                            limit,
+                            cancel,
+                            Enforce::Generated,
+                        )
+                        .await;
                 }
                 Engine::MsSql => {
                     mssql::fetch_table(self, database, schema, table, order_by, limit, cancel).await
@@ -1594,6 +1641,34 @@ impl Db {
             }
             Engine::MySql => mysql::explain(self, database, sql, analyze, read_only, cancel).await,
             Engine::MsSql => mssql::explain(self, database, sql, analyze, read_only, cancel).await,
+            // DuckDB plans with `EXPLAIN` (a tree, as text) and times with
+            // `EXPLAIN ANALYZE`, which runs the statement — the caller gates the
+            // toggle on the statement being a read, and `read_only` holds it in a
+            // read-only transaction besides.
+            Engine::DuckDb => {
+                let stmt = sql.trim().trim_end_matches(';').trim_end();
+                let plan = if analyze {
+                    format!("EXPLAIN ANALYZE {stmt}")
+                } else {
+                    format!("EXPLAIN {stmt}")
+                };
+                match read_only {
+                    true => {
+                        self.fetch_query_enforced(
+                            database,
+                            &plan,
+                            EXPLAIN_ROW_CAP,
+                            cancel,
+                            Enforce::ReadOnly,
+                        )
+                        .await
+                    }
+                    false => {
+                        self.fetch_query(database, &plan, EXPLAIN_ROW_CAP, cancel)
+                            .await
+                    }
+                }
+            }
         }
     }
 
@@ -1626,7 +1701,7 @@ impl Db {
         match self.engine {
             Engine::Postgres => pg::trigger_functions(self, database).await,
             // A T-SQL trigger carries its own body, as MySQL's does.
-            Engine::MySql | Engine::Sqlite | Engine::MsSql => Ok(Vec::new()),
+            Engine::MySql | Engine::Sqlite | Engine::MsSql | Engine::DuckDb => Ok(Vec::new()),
         }
     }
 
@@ -1643,7 +1718,7 @@ impl Db {
             Engine::Postgres => pg::roles(self).await,
             // SQL Server's owners wait on its principals — see
             // `ddl::supports_owners`, which answers no for it.
-            Engine::MySql | Engine::Sqlite | Engine::MsSql => Ok(Vec::new()),
+            Engine::MySql | Engine::Sqlite | Engine::MsSql | Engine::DuckDb => Ok(Vec::new()),
         }
     }
 
@@ -1659,7 +1734,7 @@ impl Db {
     ) -> Result<Vec<schemaic_core::schema::AvailableExtension>, DbError> {
         match self.engine {
             Engine::Postgres => pg::available_extensions(self, database).await,
-            Engine::MySql | Engine::Sqlite | Engine::MsSql => Ok(Vec::new()),
+            Engine::MySql | Engine::Sqlite | Engine::MsSql | Engine::DuckDb => Ok(Vec::new()),
         }
     }
 
@@ -1796,6 +1871,7 @@ impl Db {
             Engine::Sqlite => sqlite::prepare_check(self, stmt).await,
             Engine::MySql => mysql::prepare_check(self, database, stmt).await,
             Engine::MsSql => mssql::prepare_check(self, database, stmt).await,
+            Engine::DuckDb => duckdb::prepare_check(self, stmt).await,
         }
     }
 }
@@ -1905,6 +1981,11 @@ impl Db {
                 )
                 .await;
             }
+            // One connection, as on every engine; DuckDB's `USE` lasts only as
+            // long as it, so `scope` has nothing to follow.
+            Engine::DuckDb => {
+                duckdb::run_batch(self, stmts, row_cap, cancel, on_result, enforce).await;
+            }
         }
     }
 }
@@ -1962,6 +2043,7 @@ impl Db {
     pub async fn backup_to_file(&self, target: &str) -> Result<(), DbError> {
         match self.engine {
             Engine::Sqlite => sqlite::backup_to(self, target.to_string()).await,
+            Engine::DuckDb => duckdb::backup_to(self, target.to_string()).await,
             Engine::MySql | Engine::Postgres | Engine::MsSql => {
                 Err(DbError::Refused(DbRefusal::BackupInTerminal))
             }
@@ -1985,6 +2067,12 @@ impl Db {
             // Bounded inside, like its two neighbours — see `mysql::ping`.
             Engine::MySql => mysql::ping(self, timeout).await,
             Engine::MsSql => mssql::ping(self, timeout).await,
+            // Bounded around the open, as SQLite's is: a file on a share that has
+            // gone away can block in it for as long as the OS lets it.
+            Engine::DuckDb => match tokio::time::timeout(timeout, duckdb::ping(self)).await {
+                Ok(r) => r,
+                Err(_) => Err(DbError::ConnectFailed(ConnectFailure::TimedOut)),
+            },
         }
     }
 
@@ -2006,6 +2094,7 @@ impl Db {
             Engine::Sqlite => sqlite::fetch_databases(self).await,
             Engine::MySql => mysql::fetch_databases(self).await,
             Engine::MsSql => mssql::fetch_databases(self).await,
+            Engine::DuckDb => duckdb::fetch_databases(self).await,
         }
     }
 
@@ -2060,6 +2149,7 @@ impl Db {
             Engine::Sqlite => sqlite::fetch_schema(self, cancel).await,
             Engine::MySql => mysql::fetch_schema(self, database, cancel).await,
             Engine::MsSql => mssql::fetch_schema(self, database, cancel).await,
+            Engine::DuckDb => duckdb::fetch_schema(self, cancel).await,
         }
     }
 
@@ -2093,7 +2183,7 @@ impl Db {
                 mysql::fetch_replay_access(self, database).await
             }
             Engine::MsSql => mssql::fetch_replay_access(self, database).await,
-            Engine::MySql | Engine::Sqlite => Ok(Default::default()),
+            Engine::MySql | Engine::Sqlite | Engine::DuckDb => Ok(Default::default()),
         }
     }
 
@@ -2116,6 +2206,7 @@ impl Db {
             Engine::Sqlite => sqlite::fetch_table_list(self).await,
             Engine::MySql => mysql::fetch_table_list(self, database).await,
             Engine::MsSql => mssql::fetch_table_list(self, database).await,
+            Engine::DuckDb => duckdb::fetch_table_list(self).await,
         }
     }
 
@@ -2141,6 +2232,7 @@ impl Db {
             Engine::Sqlite => sqlite::fetch_table_stats(self).await,
             Engine::MySql => mysql::fetch_table_stats(self, database).await,
             Engine::MsSql => mssql::fetch_table_stats(self, database).await,
+            Engine::DuckDb => duckdb::fetch_table_stats(self).await,
         }
     }
 
@@ -2245,6 +2337,7 @@ impl Db {
                 Engine::MsSql => mssql::fetch_sessions(self).await,
                 // Unreachable — `supports_activity` above is the gate.
                 Engine::Sqlite => Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
+                Engine::DuckDb => Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
             }
         };
         tokio::time::timeout(PING_TIMEOUT, poll)
@@ -2274,6 +2367,7 @@ impl Db {
                 Engine::MsSql => mssql::fetch_locks(self).await,
                 // Unreachable — `supports_activity` above is the gate.
                 Engine::Sqlite => Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
+                Engine::DuckDb => Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
             }
         };
         let mut list = tokio::time::timeout(PING_TIMEOUT, poll)
@@ -2323,6 +2417,7 @@ impl Db {
                 Engine::MsSql => mssql::fetch_top_statements(self, database, order, limit).await,
                 // Unreachable — `supports_statement_stats` above is the gate.
                 Engine::Sqlite => Ok(StatementReport::Unavailable(Unavailable::NotSupported)),
+                Engine::DuckDb => Ok(StatementReport::Unavailable(Unavailable::NotSupported)),
             }
         };
         tokio::time::timeout(WORKLOAD_TIMEOUT, read)
@@ -2353,7 +2448,9 @@ impl Db {
             match self.engine {
                 Engine::MsSql => mssql::fetch_missing_indexes(self, database, limit).await,
                 // Unreachable — `supports_missing_index_hints` above is the gate.
-                Engine::Postgres | Engine::MySql | Engine::Sqlite => Ok(Vec::new()),
+                Engine::Postgres | Engine::MySql | Engine::Sqlite | Engine::DuckDb => {
+                    Ok(Vec::new())
+                }
             }
         };
         tokio::time::timeout(WORKLOAD_TIMEOUT, read)
@@ -2397,6 +2494,7 @@ impl Db {
                 Engine::Postgres => pg::fetch_server_vars(self).await,
                 Engine::MsSql => mssql::fetch_server_vars(self).await,
                 Engine::Sqlite => sqlite::fetch_server_vars(self).await,
+                Engine::DuckDb => duckdb::fetch_server_vars(self).await,
             }
         };
         tokio::time::timeout(PING_TIMEOUT, fetch)
@@ -2439,6 +2537,7 @@ impl Db {
                 Engine::MsSql => mssql::kill_session(self, id, kind).await,
                 // Unreachable — `supports_kill` above is the gate.
                 Engine::Sqlite => Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
+                Engine::DuckDb => Err(DbError::Query(NO_SESSIONS_MSG.to_string())),
             }
         };
         tokio::time::timeout(CANCEL_TIMEOUT, kill)
@@ -2470,6 +2569,7 @@ impl Db {
             Engine::MsSql => mssql::fetch_principals(self, database).await,
             // Unreachable — `supports_users` above is the gate.
             Engine::Sqlite => Err(DbError::Query(NO_USERS_MSG.to_string())),
+            Engine::DuckDb => Err(DbError::Query(NO_USERS_MSG.to_string())),
         }
     }
 
@@ -2499,6 +2599,7 @@ impl Db {
             Engine::MsSql => mssql::fetch_grants(self, database, principal).await,
             // Unreachable — `supports_users` above is the gate.
             Engine::Sqlite => Err(DbError::Query(NO_USERS_MSG.to_string())),
+            Engine::DuckDb => Err(DbError::Query(NO_USERS_MSG.to_string())),
         }
     }
 }
@@ -2907,6 +3008,8 @@ fn lock_wait_sql(engine: Engine) -> String {
         Engine::MySql => format!("SET SESSION lock_wait_timeout = {DDL_LOCK_WAIT_SECS}"),
         Engine::Postgres => format!("SET lock_timeout = '{DDL_LOCK_WAIT_SECS}s'"),
         Engine::Sqlite => String::new(),
+        // DuckDB waits on no lock: a conflicting write fails at once.
+        Engine::DuckDb => String::new(),
         // In milliseconds, and `-1` (the default) waits forever.
         Engine::MsSql => format!("SET LOCK_TIMEOUT {}", DDL_LOCK_WAIT_SECS * 1000),
     }
@@ -2980,6 +3083,7 @@ impl Db {
             // enforcement for the transaction and checks it before committing;
             // the reason is in `sqlite::run_ddl`, and it is not an optimisation.
             Engine::Sqlite => sqlite::run_ddl(self, stmts, cancel).await,
+            Engine::DuckDb => duckdb::run_ddl(self, stmts, cancel).await,
             Engine::MySql => mysql::run_ddl(self, database, stmts, cancel, fail).await,
             // One transaction around the plan, as on PostgreSQL.
             Engine::MsSql => mssql::run_ddl(self, database, stmts, true, cancel).await,
@@ -3011,7 +3115,7 @@ impl Db {
         }
         match self.engine {
             Engine::MsSql => mssql::run_ddl(self, database, stmts, false, cancel).await,
-            Engine::Postgres | Engine::Sqlite | Engine::MySql => {
+            Engine::Postgres | Engine::Sqlite | Engine::MySql | Engine::DuckDb => {
                 self.run_ddl(database, stmts, cancel).await
             }
         }
@@ -3034,7 +3138,7 @@ impl Db {
     ) -> Result<Vec<schemaic_core::ddl::ElsewhereRefresh>, DbError> {
         match self.engine {
             Engine::MsSql => mssql::refresh_elsewhere(self, database, sql).await,
-            Engine::Postgres | Engine::Sqlite | Engine::MySql => Ok(Vec::new()),
+            Engine::Postgres | Engine::Sqlite | Engine::MySql | Engine::DuckDb => Ok(Vec::new()),
         }
     }
 
@@ -3081,6 +3185,12 @@ impl Db {
                 applied: 0,
             }),
             Engine::MySql => mysql::run_server_ddl(self, stmts, cancel, fail).await,
+            // One file, one catalog: there is no database to create or drop.
+            Engine::DuckDb => Err(DdlError {
+                cause: DdlCause::NoDatabases,
+                at: 0,
+                applied: 0,
+            }),
             Engine::MsSql => mssql::run_server_ddl(self, avoid, stmts, cancel).await,
         }
     }
@@ -3143,6 +3253,7 @@ impl Db {
             Engine::Sqlite => sqlite::run_script(self, rx, cancel).await,
             Engine::MySql => mysql::run_script(self, database, rx, cancel).await,
             Engine::MsSql => mssql::run_script(self, database, rx, cancel).await,
+            Engine::DuckDb => duckdb::run_script(self, rx, cancel).await,
         }
     }
 }
@@ -3248,6 +3359,7 @@ impl Db {
             Engine::Sqlite => sqlite::commit_writes(self, write, cancel).await,
             Engine::MySql => mysql::commit_writes(self, write, cancel).await,
             Engine::MsSql => mssql::commit_writes(self, write, cancel).await,
+            Engine::DuckDb => duckdb::commit_writes(self, write, cancel).await,
         }
     }
 }
@@ -3275,6 +3387,7 @@ impl Db {
             Engine::Sqlite => sqlite::refetch_rows(self, template, rows, cancel).await,
             Engine::MySql => mysql::refetch_rows(self, template, rows, cancel).await,
             Engine::MsSql => mssql::refetch_rows(self, template, rows, cancel).await,
+            Engine::DuckDb => duckdb::refetch_rows(self, template, rows, cancel).await,
         }
     }
 }
@@ -3319,6 +3432,7 @@ impl Db {
             Engine::Sqlite => sqlite::fetch_blob(self, r, cancel).await,
             Engine::MySql => mysql::fetch_blob(self, r, cancel).await,
             Engine::MsSql => mssql::fetch_blob(self, r, cancel).await,
+            Engine::DuckDb => duckdb::fetch_blob(self, r, cancel).await,
         }
     }
 }
@@ -3423,6 +3537,7 @@ impl Db {
             Engine::Sqlite => sqlite::import_rows(self, target, rows, cancel).await,
             Engine::MySql => mysql::import_rows(self, target, rows, cancel).await,
             Engine::MsSql => mssql::import_rows(self, target, rows, cancel).await,
+            Engine::DuckDb => duckdb::import_rows(self, target, rows, cancel).await,
         }
     }
 
@@ -3570,6 +3685,12 @@ pub(crate) fn order_by_clause(cols: Option<&[String]>, quote: fn(&str) -> String
         ),
         None => String::new(),
     }
+}
+
+/// A DuckDB identifier, quoted — `export::ident_sql` as a `fn` pointer, for
+/// [`order_by_clause`].
+fn ident_duckdb(name: &str) -> String {
+    schemaic_core::export::ident_sql(name, schemaic_core::intel::SqlDialect::DuckDb)
 }
 
 /// Pull the next batch **off the executor**. `Ok(None)` at the end.
@@ -3819,6 +3940,7 @@ mod tests {
             ("pg.rs", include_str!("pg.rs")),
             ("sqlite.rs", include_str!("sqlite.rs")),
             ("mssql.rs", include_str!("mssql.rs")),
+            ("duckdb.rs", include_str!("duckdb.rs")),
         ] {
             for f in ENGINE_ENTRY_POINTS {
                 let sync = format!("\npub(crate) fn {f}(");
@@ -3914,7 +4036,7 @@ mod tests {
     fn the_dispatcher_calls_every_engine_module_for_every_entry_point() {
         let me = dispatcher_code();
         for f in ENGINE_ENTRY_POINTS {
-            for module in ["mysql", "pg", "sqlite", "mssql"] {
+            for module in ["mysql", "pg", "sqlite", "mssql", "duckdb"] {
                 assert!(
                     me.contains(&format!("{module}::{f}(")),
                     "nothing in the dispatcher calls `{module}::{f}` — either the \
@@ -3974,6 +4096,9 @@ mod tests {
             .cloned()
             .collect::<HashSet<String>>()
             .intersection(&called("mssql"))
+            .cloned()
+            .collect::<HashSet<String>>()
+            .intersection(&called("duckdb"))
             .cloned()
             .collect();
         let listed: HashSet<String> = ENGINE_ENTRY_POINTS.iter().map(|s| s.to_string()).collect();

@@ -18,7 +18,7 @@ In the connection form's **Network** section, turn on **SSH tunnel** and fill in
 **Host** and **Port** in the **Database** section stay as the *SSH host* sees them. A database on
 the SSH host itself is usually `127.0.0.1`.
 
-SQLite has no tunnel, since there's no server to reach. A SQL Server named instance
+SQLite and DuckDB have no tunnel, since there's no server to reach. A SQL Server named instance
 (`server\instance`) can't be reached through a tunnel either, because SQL Server Browser answers
 over UDP; give the server's host and the instance's own port instead.
 

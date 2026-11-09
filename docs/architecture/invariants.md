@@ -327,6 +327,17 @@ Re-introducing the anti-patterns these guard against is a regression:
   `schemaic-db`'s entry for the `sql_mode` smuggle that closed). That session half is pinned by
   source, as the editor's is — `every_headless_read_runs_on_a_read_only_session` — since dropping
   it to `Enforce::None` kept every behavioural test green.
+  **On DuckDB neither half covers a file read, so the three read functions also seal the
+  handle.** A DuckDB read can open any file on this machine — `read_csv`, `read_parquet`, and
+  `FROM 'secrets.csv'`, a string in table position that no deny list can name — and a read-only
+  transaction refuses writes, not reads. So `read_only_query`, `read_only_export` and
+  `read_only_explain` run on `db.clone().sealed()`, which on DuckDB opens the file read-only with
+  external access off and the configuration locked (`db::duckdb`), and is inert on every other
+  engine. The text gate still names the readers first (`deny_keywords_for(DuckDb)`), so a refusal
+  says what it refused; the seal is what holds when a spelling slips past it. The MCP server seals
+  every handle it serves besides (`mcp::serve`), so its generated reads — `sample_rows`,
+  `describe_table`'s samples — are sealed too; the Live Monitor's is the editor's, attended. No
+  source gate reads the `.sealed()` calls the way this one reads the `Enforce`.
   **A generated read needs the session half more, not less, because it has no text half at all**
   (security review S8). The Live Monitor's `Db::fetch_table`, `schemaic dump` and the folder
   export (`cli/dump.rs`), and AI Fill's and Seed's `SELECT … LIMIT 20` sample in `main.rs` each
@@ -696,7 +707,9 @@ Re-introducing the anti-patterns these guard against is a regression:
   credential sets no variable and names none in `WSLENV`, which is not the same as passing an empty
   password. (It was `Option<(var, password)>` until the TLS settings had to travel the same road;
   see `core::launch`.) `mssql_shell` is the fourth arm, and takes the WSL fallback — a host and a
-  port again.
+  port again. `duckdb_shell` is the fifth, native only for SQLite's reason: the `duckdb` client on
+  the file, through `sqlite_shell_config`'s argv and its leading-dash refusal
+  (`launch::sqlite_target`).
   **The backup and restore tools split the same way, on their *file* rather than their database.**
   `native_tool` resolves `pg_dump`, `pg_restore`/`psql`, `mariadb-dump`/`mysqldump` and
   `mariadb`/`mysql` — MariaDB's names first, for `launch::MYSQL_DUMP_TOOLS`' reason — through
@@ -718,8 +731,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   copy rather than a shared one, `open_db_cli` still carrying its own; and `run_in_panel` reveals the
   terminal and installs the config or a `message_shell` of the refusal, never with an engine badge.
   `backup_db` asks no dialog on SQL Server (the bare `backup_file_name` goes straight to `sqlcmd`)
-  and a save dialog elsewhere, defaulting to `<db>_<stamp>.dump`, `.sql` or `.db`; SQLite's is the
-  one backup that runs in-process, `Db::backup_to_file` off the UI thread, its "Backed up to …" or
+  and a save dialog elsewhere, defaulting to `<db>_<stamp>.dump`, `.sql`, `.db` or `.duckdb`; the
+  two embedded engines' are the backups that run in-process, `Db::backup_to_file` off the UI thread, its "Backed up to …" or
   "The backup failed: …" shown as a message in the same panel. `restore_db` reads a script before
   its confirm (the write-guard invariant's restore paragraph) and logs the launch through
   `log_write` once the client's argv is built (`launch::restore_log_entry`).
@@ -882,7 +895,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   to the grammar's header and nothing more, and anything outside that shape answers `None`, which
   keeps the object listed and droppable but never rebuilt — so any may be widened only for a
   clause the model then restates, since a word it merely skipped would be dropped by the rebuild.
-- **One connection per operation — except a Manual-mode tab, and a running script.** Every `Db` method opens a fresh
+- **One connection per operation — except a Manual-mode tab, a running script, and a DuckDB file's instance.** Every `Db` method opens a fresh
   connection, runs, and disconnects; that statelessness is why a dropped connection is never a
   problem. The *first* exception is manual-transaction mode: a tab set to `TxMode::Manual` pins one
   connection (`schemaic_db::Session`, one `Conn`/`Client` behind a `tokio::Mutex`) for the life of
@@ -933,6 +946,18 @@ Re-introducing the anti-patterns these guard against is a regression:
   **SQLite has no exception at all** — every operation opens its own connection inside
   `spawn_blocking`, which is this invariant rather than a concession to a blocking driver, and
   `Session::open` refuses it (see `core::tx` above for why the pinned form needs its own design).
+  **DuckDB is the third exception, and the narrowest: the connection is still per operation, and
+  only the database underneath it is shared.** DuckDB locks a file per *instance* and refuses a
+  second instance on the same file in the same process outright (measured on 2.0), so SQLite's
+  "open the file per operation" would have two overlapping operations — a running query and the
+  health check — refuse each other. So `db::duckdb` keeps one instance per file in a registry of
+  `Weak` handles, each operation takes its own connection off it (`try_clone`), and the instance
+  closes, releasing the file's lock, the moment the last operation holding it ends — nothing is
+  cached past that. What is shared is therefore *instance* state, which is why a DuckDB init SQL
+  may not `SET GLOBAL` (`init_sql`), and why a sealed and an unsealed handle cannot both have the
+  file open at once (`DbRefusal::DuckDbSealedElsewhere`). A batch, a DDL plan and a script are each
+  one connection there as everywhere, and `Session::open` refuses a pinned session until the
+  roadmap's later DuckDB phase writes one.
   **But the unit is the *operation*, and an operation is not a statement.** A batch, a DDL plan, an
   import and a script are each **one** — which is why `run_ddl` and `import_rows` hold a connection
   across many statements (as does `run_server_ddl`, on the three engines that have databases to
@@ -1262,7 +1287,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   structs at 200k × 50, before a byte is compressed — which is exactly the size the streaming path
   exists for, so the bound is worth more than the purity. The file is created and removed inside the
   call, so a test of it is still deterministic and still needs no server; it is the same pragmatic
-  exception in-memory SQLite already is in `schemaic-db` and `cli::catalog`'s tests. Read it as the one case, not as licence
+  exception in-memory SQLite already is in `schemaic-db` and `cli::catalog`'s tests, and in-memory
+  DuckDB in `db::duckdb`'s (a `memory:<name>` target, which only `cfg(test)` accepts). Read it as the one case, not as licence
   for a second: anything else wanting a file still models it at the boundary.
 - **What the source knew is carried, never re-derived from the text it rendered into.** Two
   separate defects turned out to be one shape — a precise oracle two functions upstream, dropped by
@@ -1842,7 +1868,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   `qualified_table` names `schema.table`, never the database, since a two-part name there is
   schema-first — so an export can be retargeted. A statement that names **one row by key** must
   not be, and takes `export::qualified_row_target` instead, three-part on SQL Server and
-  `qualified_table` elsewhere: the write-back (`qname3`) and the grid's copies of it. Its literals double only the quote and are **`N`-prefixed** — an unprefixed one is
+  `qualified_table` elsewhere: the write-back (`qname3`) and the grid's copies of it. **DuckDB
+  emits `"x"`** and `qualified_table` names `schema.table` there too, never the catalog, which is
+  the file the operation opened rather than a name to carry; its literals take Postgres' arm, a
+  plain string having no backslash escape (measured). `db::ident_duckdb`, the Live Monitor's
+  quoter in `lib.rs`, is one more thin delegation, and the test that binds the other engine-fixed
+  ones does not name it. SQL Server's literals double only the quote and are **`N`-prefixed** — an unprefixed one is
   `varchar`, converted to the database's code page on the way in, so `'Ωμέγα'` can arrive as
   `'?????'` (`a_sql_server_string_literal_is_national_and_doubles_only_the_quote`). That is the
   literal's half only: `N'…'` carries the text as far as the column, and a `varchar` column still

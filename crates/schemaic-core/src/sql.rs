@@ -60,9 +60,10 @@ impl SqlDialect {
         matches!(self, SqlDialect::MySql)
     }
 
-    /// Does an `E'…'` prefix turn `\` escapes on? PostgreSQL only.
+    /// Does an `E'…'` prefix turn `\` escapes on? PostgreSQL and DuckDB
+    /// (measured on DuckDB 2.0: `E'a\nb'` is three characters).
     fn e_string_backslash(self) -> bool {
-        matches!(self, SqlDialect::Postgres)
+        matches!(self, SqlDialect::Postgres | SqlDialect::DuckDb)
     }
 
     /// Is `"…"` a quoted *identifier* rather than a string literal?
@@ -82,12 +83,19 @@ impl SqlDialect {
     /// not reach this, so it hand-spelled `dialect != SqlDialect::Postgres`
     /// twice. The two agreed for all three engines; what they could not survive
     /// is a fourth, or a change here, which would move one and not the other.
+    ///
+    /// DuckDB takes them too — measured, `` SELECT `x` FROM … `` reads the
+    /// column — though it writes `"…"` itself.
     pub(crate) fn backtick_ident(self) -> bool {
-        matches!(self, SqlDialect::MySql | SqlDialect::Sqlite)
+        matches!(
+            self,
+            SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb
+        )
     }
 
     /// Are `[…]` identifiers accepted? SQL Server's own syntax, which SQLite
-    /// also takes for compatibility. Whether a `]` can be written inside one is
+    /// also takes for compatibility. **Not DuckDB's**: there `[1, 2]` is a
+    /// list literal, so a `[` opens code, not a name. Whether a `]` can be written inside one is
     /// [`Self::bracket_doubles`].
     pub(crate) fn bracket_ident(self) -> bool {
         matches!(self, SqlDialect::Sqlite | SqlDialect::MsSql)
@@ -112,16 +120,22 @@ impl SqlDialect {
         matches!(self, SqlDialect::MySql)
     }
 
-    /// Are `$tag$ … $tag$` strings accepted? PostgreSQL only.
+    /// Are `$tag$ … $tag$` strings accepted? PostgreSQL and DuckDB (measured:
+    /// `$$a 'x'$$` and `$t$in $$ t$t$` are each one string there).
     fn dollar_quoted(self) -> bool {
-        matches!(self, SqlDialect::Postgres)
+        matches!(self, SqlDialect::Postgres | SqlDialect::DuckDb)
     }
 
     /// Do `/* … */` comments nest? PostgreSQL and SQL Server, as the SQL
     /// standard has it: `/* a /* b */ c */` is one comment there, and on MySQL
     /// and SQLite the first `*/` ends it.
+    ///
+    /// DuckDB too — measured, `1 /* a /* b */ c */` is the number one.
     fn nested_block_comments(self) -> bool {
-        matches!(self, SqlDialect::Postgres | SqlDialect::MsSql)
+        matches!(
+            self,
+            SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::DuckDb
+        )
     }
 
     /// Does the client honour a `DELIMITER` directive? MySQL only — see
@@ -171,7 +185,9 @@ impl SqlDialect {
     /// Exhaustive, so a fifth engine answers here rather than defaulting.
     pub fn has_limit_clause(self) -> bool {
         match self {
-            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => true,
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+                true
+            }
             SqlDialect::MsSql => false,
         }
     }
@@ -518,7 +534,10 @@ fn continues_dollar_name(b: u8) -> bool {
 pub fn continues_name(b: u8, dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MsSql => continues_dollar_name(b) || matches!(b, b'#' | b'@'),
-        SqlDialect::Postgres | SqlDialect::MySql | SqlDialect::Sqlite => continues_dollar_name(b),
+        // DuckDB's scanner is PostgreSQL's, and a `$` continues a name there.
+        SqlDialect::Postgres | SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+            continues_dollar_name(b)
+        }
     }
 }
 
@@ -3221,7 +3240,9 @@ fn leading_keyword_span(sql: &str, dialect: SqlDialect) -> Option<(usize, usize)
 pub fn use_target(sql: &str, dialect: SqlDialect) -> Option<String> {
     let has_use = match dialect {
         SqlDialect::MySql | SqlDialect::MsSql => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        // DuckDB has a `USE`, but every operation opens on its file afresh
+        // (`db::duckdb`), so one run alone moves nothing a tab carries.
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     };
     if !has_use || leading_keyword(sql, dialect)? != "USE" {
         return None;
@@ -3804,7 +3825,8 @@ pub fn needs_database(sql: &str, dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Postgres => {}
         SqlDialect::MsSql => return mssql_needs_database(sql),
-        SqlDialect::MySql | SqlDialect::Sqlite => return false,
+        // A DuckDB operation is always in its file's catalog.
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => return false,
     }
     let Some(kw) = leading_keyword(sql, dialect) else {
         return false; // empty, or comments only — nothing will run
@@ -4231,7 +4253,7 @@ pub fn no_database_failure(message: &str, dialect: SqlDialect) -> Option<NoDatab
             || message.contains(": relation \""))
             && message.contains("\" does not exist"))
         .then_some(NoDatabaseFailure::RanElsewhere),
-        SqlDialect::Sqlite => None,
+        SqlDialect::Sqlite | SqlDialect::DuckDb => None,
         // SQL Server never refuses either: an unscoped connection is in the
         // login's default database, and the failure is error 208 there. The
         // text is the server's, in English unless the login's language says
@@ -4551,6 +4573,54 @@ fn deny_keywords_for(dialect: SqlDialect) -> &'static [&'static str] {
             "SERIALIZABLE",
             "REPEATABLEREAD",
         ],
+        // DuckDB's own. Its file readers open any path on *this* machine —
+        // the unattended paths' session also runs with external access off
+        // (`db::duckdb`), and this names them first so the refusal says
+        // what it is. `COPY`/`EXPORT` write files, `ATTACH` opens another
+        // database by path, `INSTALL`/`FORCE` fetch extensions, `PRAGMA` and
+        // `CHECKPOINT` act on the file, `QUERY`/`QUERY_TABLE` run SQL from a
+        // string this gate cannot read, `GETENV` reads the process's
+        // environment, and `NEXTVAL` advances a sequence. `BEGIN` and
+        // `ABORT` are its transaction words beyond the standard ones.
+        SqlDialect::DuckDb => &[
+            "COPY",
+            "EXPORT",
+            "ATTACH",
+            "DETACH",
+            "INSTALL",
+            "FORCE",
+            "PRAGMA",
+            "CHECKPOINT",
+            "VACUUM",
+            "BEGIN",
+            "ABORT",
+            "QUERY",
+            "QUERY_TABLE",
+            "GETENV",
+            "NEXTVAL",
+            "SETSEED",
+            "READ_CSV",
+            "READ_CSV_AUTO",
+            "SNIFF_CSV",
+            "READ_PARQUET",
+            "PARQUET_SCAN",
+            "PARQUET_METADATA",
+            "PARQUET_SCHEMA",
+            "PARQUET_FILE_METADATA",
+            "PARQUET_KV_METADATA",
+            "READ_JSON",
+            "READ_JSON_AUTO",
+            "READ_JSON_OBJECTS",
+            "READ_JSON_OBJECTS_AUTO",
+            "READ_NDJSON",
+            "READ_NDJSON_AUTO",
+            "READ_NDJSON_OBJECTS",
+            "READ_TEXT",
+            "READ_BLOB",
+            "GLOB",
+            "DUCKDB_SECRETS",
+            "WHICH_SECRET",
+        ],
     }
 }
 
@@ -4580,7 +4650,9 @@ fn is_denied(word: &str, dialect: SqlDialect) -> bool {
 fn is_builtin_call(word: &str, dialect: SqlDialect) -> bool {
     let builtins: &[&str] = match dialect {
         SqlDialect::MySql => &["REPLACE", "INSERT", "TRUNCATE"],
-        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => &["REPLACE"],
+        SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => {
+            &["REPLACE"]
+        }
     };
     builtins.contains(&word)
 }
@@ -4617,7 +4689,13 @@ fn read_call_policy(dialect: SqlDialect) -> Option<CallPolicy> {
             double_colon_is_cast: false,
             quoted_names_a_builtin: false,
         }),
-        SqlDialect::MySql | SqlDialect::Sqlite => None,
+        // DuckDB's function set is closed in this build — extensions are
+        // linked in or unreachable (`db::duckdb` turns auto-install and
+        // auto-load off, and `INSTALL`/`LOAD` are denied), and a user's
+        // `MACRO` is an expression or a query, which cannot write. What acts
+        // is named on its deny list, and the unattended session runs on a
+        // read-only database with external access off besides.
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => None,
     }
 }
 
@@ -6074,6 +6152,19 @@ pub fn read_only_heads(dialect: SqlDialect) -> &'static [&'static str] {
         SqlDialect::Sqlite => &["SELECT", "EXPLAIN", "WITH"],
         // No `EXPLAIN`: a T-SQL plan is `SET SHOWPLAN_XML ON`, session state.
         SqlDialect::MsSql => &["SELECT", "WITH"],
+        // DuckDB reads with a leading `FROM` too, and `DESCRIBE`/`SUMMARIZE`
+        // are queries over a relation. `EXPLAIN ANALYZE` runs its statement,
+        // which the shared deny list's `ANALYZE` refuses.
+        SqlDialect::DuckDb => &[
+            "SELECT",
+            "WITH",
+            "FROM",
+            "VALUES",
+            "SHOW",
+            "DESCRIBE",
+            "SUMMARIZE",
+            "EXPLAIN",
+        ],
     }
 }
 
@@ -6478,7 +6569,7 @@ fn unterminated_write_words(dialect: SqlDialect) -> &'static [&'static str] {
 /// trailing form into a `format!`, which is a comparison no census finds.
 pub fn limited_select(dialect: SqlDialect, projection: &str, rest: &str, limit: usize) -> String {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
             format!("SELECT {projection} FROM {rest} LIMIT {limit}")
         }
         SqlDialect::MsSql => format!("SELECT TOP ({limit}) {projection} FROM {rest}"),
@@ -7209,7 +7300,7 @@ mod tests {
     use crate::intel::SqlDialect;
 
     /// Every engine this build ships — see [`SqlDialect::ALL`].
-    const EVERY_DIALECT: [SqlDialect; 4] = SqlDialect::ALL;
+    const EVERY_DIALECT: [SqlDialect; 5] = SqlDialect::ALL;
 
     /// **The test A2-L3-01 names, and it could not be compiled before.**
     ///
@@ -10642,6 +10733,83 @@ mod tests {
                 "{d:?}"
             );
         }
+    }
+
+    /// **DuckDB's file readers are refused unattended.** `read_csv` and its
+    /// siblings open any path on the machine running Schemaic, so the gate an
+    /// agent's query passes refuses them by name — the session it then runs on
+    /// has external access off besides (`db::duckdb`). What DuckDB reads with
+    /// that the others do not — a leading `FROM`, `SUMMARIZE`, `DESCRIBE` —
+    /// passes.
+    #[test]
+    fn duckdb_reads_its_own_way_and_not_through_a_file() {
+        use super::read_only_reason as gate;
+        let d = SqlDialect::DuckDb;
+        for ok in [
+            "SELECT 1",
+            "FROM t",
+            "FROM t SELECT a",
+            "SUMMARIZE t",
+            "DESCRIBE t",
+            "SHOW TABLES",
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+            "EXPLAIN SELECT * FROM t",
+            "SELECT [1, 2, 3] AS l",
+            "SELECT * EXCLUDE (secret) FROM t",
+        ] {
+            assert!(gate(ok, d).is_ok(), "{ok}: {:?}", gate(ok, d));
+        }
+        for refused in [
+            "SELECT * FROM read_csv('C:/Users/me/.ssh/id_rsa')",
+            "SELECT * FROM read_csv_auto('x.csv')",
+            "SELECT * FROM read_parquet('x.parquet')",
+            "SELECT * FROM parquet_scan('x.parquet')",
+            "SELECT * FROM read_json('x.json')",
+            "SELECT content FROM read_text('/etc/passwd')",
+            "SELECT * FROM read_blob('x')",
+            "SELECT * FROM glob('*')",
+            "SELECT getenv('AWS_SECRET_ACCESS_KEY')",
+            "SELECT nextval('s')",
+            "SELECT * FROM query('DELETE FROM t')",
+            "COPY t TO 'out.csv'",
+            "EXPORT DATABASE 'dir'",
+            "ATTACH 'other.duckdb'",
+            "INSTALL httpfs",
+            "LOAD httpfs",
+            "PRAGMA database_list",
+            "CHECKPOINT",
+            "EXPLAIN ANALYZE DELETE FROM t",
+            "SET enable_external_access = true",
+            "BEGIN TRANSACTION",
+        ] {
+            assert!(gate(refused, d).is_err(), "{refused} passed");
+        }
+        // A column that merely shares a reader's name is still refused — the
+        // gate over-blocks a name rather than under-block a call.
+        assert!(gate("SELECT read_csv FROM t", d).is_err());
+    }
+
+    /// DuckDB lexes like PostgreSQL in the ways the boundary scanner cares
+    /// about — each measured on 2.0 — with one difference that matters: `[`
+    /// opens a list, never a name.
+    #[test]
+    fn duckdb_statement_boundaries_are_its_own() {
+        let d = SqlDialect::DuckDb;
+        let n = |sql: &str| super::statement_ranges(sql, d).len();
+        // A `;` inside each of these is not a boundary.
+        assert_eq!(n("SELECT $$a;b$$; SELECT 2"), 2);
+        assert_eq!(n("SELECT $t$a;$$;b$t$; SELECT 2"), 2);
+        assert_eq!(n("SELECT 1 /* a /* b; */ c; */; SELECT 2"), 2);
+        assert_eq!(n("SELECT E'a\\';b'; SELECT 2"), 2);
+        assert_eq!(n("SELECT `a;b` FROM t; SELECT 2"), 2);
+        // A plain string has no backslash escape: `'a\'` ends at its second
+        // quote, so the `;` after it is a boundary.
+        assert_eq!(n("SELECT 'a\\'; SELECT 2"), 2);
+        // `--` opens a comment with no space after it.
+        assert_eq!(n("SELECT 1--; SELECT 2\n; SELECT 3"), 2);
+        // `[` is a list: the `;` after its `]` is a boundary, and one inside
+        // a string in it is not.
+        assert_eq!(n("SELECT [1, 2]; SELECT ['a;b']"), 2);
     }
 
     /// The allowed heads are the ones the *engine* has. `SHOW` and `DESCRIBE`

@@ -1063,7 +1063,7 @@ pub fn backup_writes_server(dialect: crate::intel::SqlDialect) -> bool {
     use crate::intel::SqlDialect;
     match dialect {
         SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -1082,7 +1082,9 @@ pub fn init_role(init_sql: &str, dialect: crate::intel::SqlDialect) -> Option<St
     use crate::intel::SqlDialect;
     match dialect {
         SqlDialect::Postgres => {}
-        SqlDialect::MySql | SqlDialect::MsSql | SqlDialect::Sqlite => return None,
+        SqlDialect::MySql | SqlDialect::MsSql | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+            return None;
+        }
     }
     let statements = crate::init_sql::check(init_sql, dialect).ok()?;
     let mut role = None;
@@ -1159,7 +1161,7 @@ pub fn restore_runs_a_script(file: &str, dialect: crate::intel::SqlDialect) -> b
     match dialect {
         SqlDialect::MySql => true,
         SqlDialect::Postgres => ends_with_ignore_ascii_case(file, ".sql"),
-        SqlDialect::MsSql | SqlDialect::Sqlite => false,
+        SqlDialect::MsSql | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -1183,7 +1185,9 @@ pub fn restore_offered(dialect: crate::intel::SqlDialect) -> bool {
     use crate::intel::SqlDialect;
     match dialect {
         SqlDialect::MySql | SqlDialect::Postgres => true,
-        SqlDialect::MsSql | SqlDialect::Sqlite => false,
+        // No restore client for an embedded file: a `.sql` dump is run as a
+        // script instead.
+        SqlDialect::MsSql | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
