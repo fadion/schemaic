@@ -5822,7 +5822,16 @@ impl ObjectItem {
             // call that leant on the certificate's rights fails on permissions.
             // A statement of its own, closed by its own `GO`: a comment in the
             // `CREATE`'s batch would be stored as part of the module.
-            ObjectItem::Routine(r) => Self::routine_script(r, dialect, false, None),
+            // Its comment after it, where the engine's is a statement of its
+            // own (`ddl::script_restates_object_comments`).
+            ObjectItem::Routine(r) => {
+                let mut sql = Self::routine_script(r, dialect, false, None);
+                for c in crate::ddl::routine_comment_sql(r, dialect) {
+                    sql.push('\n');
+                    sql.push_str(&c);
+                }
+                sql
+            }
             // Through `client_script` for the same reason a routine is: this
             // `CREATE` carries no terminator of its own (the apply path sends it
             // whole) and its body may be a `BEGIN … END` full of `;`.
@@ -6160,7 +6169,12 @@ impl TableInfo {
                     .as_deref()
                     .is_some_and(|d| !d.trim().is_empty())
             }) {
-                Some(sql) => sql,
+                // Its comment after it, where the engine's is a statement of
+                // its own (`ddl::script_restates_object_comments`).
+                Some(sql) => match crate::ddl::view_comment_sql(self, dialect) {
+                    Some(comment) => format!("{sql}\n{comment}"),
+                    None => sql,
+                },
                 None => format!(
                     "-- View definition for {cname} was not available.\nCREATE VIEW {qname} AS\nSELECT ...;"
                 ),
@@ -7017,6 +7031,45 @@ fn find_by_ns<'a, T>(
 /// an edit.** It comes from `information_schema`, which resolves the escapes;
 /// [`RoutineSource`] is the correct source and is read lazily when the editor
 /// opens, exactly as [`TriggerSource`] is.
+/// One DuckDB user type, as its `CREATE TYPE` restates it
+/// ([`DbSchema::user_types`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UserType {
+    pub name: String,
+    pub schema: Option<String>,
+    /// What follows `AS`, as DuckDB prints the type — `ENUM('sad', 'ok')`,
+    /// `STRUCT(x INTEGER, y INTEGER)`, `DECIMAL(12,2)` — read through
+    /// `typeof(CAST(NULL AS t))`, the one place the catalogue spells a
+    /// `STRUCT` or `DECIMAL` alias's definition (`duckdb_types()` names only
+    /// its logical type).
+    pub definition: String,
+    pub comment: Option<String>,
+}
+
+impl UserType {
+    /// `CREATE TYPE … AS …;` and its `COMMENT ON TYPE`.
+    pub fn create_sql(&self, dialect: crate::intel::SqlDialect) -> String {
+        let qname = qualified_ident(&self.name, self.schema.as_deref(), dialect);
+        let mut out = format!("CREATE TYPE {qname} AS {};", self.definition.trim());
+        if let Some(c) = self.comment.as_deref().filter(|c| !c.trim().is_empty()) {
+            out.push_str(&format!(
+                "\nCOMMENT ON TYPE {qname} IS {};",
+                ddl_string(c, dialect)
+            ));
+        }
+        out
+    }
+
+    /// `DROP TYPE IF EXISTS …;` — which a table typed with it does not stop,
+    /// the type being inlined into the column (measured on 2.0.0).
+    pub fn drop_sql(&self, dialect: crate::intel::SqlDialect) -> String {
+        format!(
+            "DROP TYPE IF EXISTS {};",
+            qualified_ident(&self.name, self.schema.as_deref(), dialect)
+        )
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DbSchema {
     pub tables: Vec<TableInfo>,
@@ -7036,6 +7089,12 @@ pub struct DbSchema {
     /// `Arc` for the reason `routines` is: an event carries a body, and the
     /// schema-tree walk turns these into [`ObjectItem`]s on every arrow key.
     pub events: Vec<std::sync::Arc<EventInfo>>,
+    /// DuckDB's user types — `CREATE TYPE … AS ENUM`, a `STRUCT` or a
+    /// `DECIMAL` alias — **read for the `.sql` dump alone**: a view or a macro
+    /// that names one fails its restore without it, though a table does not
+    /// (DuckDB inlines the type into each column). Not shown in the tree and
+    /// not compared; empty on every other engine. See [`UserType`].
+    pub user_types: Vec<UserType>,
     /// Which MySQL-family server this came from, when it came from one.
     ///
     /// `SqlDialect` deliberately has no MariaDB arm — the two speak one dialect
@@ -14172,6 +14231,28 @@ mod tests {
     /// its comments with the table, its `CREATE INDEX` statements after it
     /// (held for the rows by `create_ddl_holding`), and no statement for an
     /// index a constraint makes.
+    #[test]
+    fn a_duckdb_user_type_is_created_with_its_comment_and_dropped_if_there() {
+        let d = crate::intel::SqlDialect::DuckDb;
+        let t = UserType {
+            name: "mood".into(),
+            schema: Some("main".into()),
+            definition: "ENUM('sad', 'it''s ok')".into(),
+            comment: Some("feelings".into()),
+        };
+        assert_eq!(
+            t.create_sql(d),
+            "CREATE TYPE \"main\".\"mood\" AS ENUM('sad', 'it''s ok');\n\
+             COMMENT ON TYPE \"main\".\"mood\" IS 'feelings';"
+        );
+        assert_eq!(t.drop_sql(d), "DROP TYPE IF EXISTS \"main\".\"mood\";");
+        let bare = UserType {
+            comment: Some("  ".into()),
+            ..t
+        };
+        assert!(!bare.create_sql(d).contains("COMMENT"));
+    }
+
     #[test]
     fn a_duckdb_tables_ddl_carries_its_indexes_and_comments() {
         let d = crate::intel::SqlDialect::DuckDb;

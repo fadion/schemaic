@@ -14905,6 +14905,50 @@ pub fn replace_clears_comment(dialect: SqlDialect) -> bool {
     }
 }
 
+/// Does a **scripted copy** of a view or a routine — *Copy DDL*, the `.sql`
+/// dump — restate its comment after its `CREATE`?
+///
+/// DuckDB's does: a view's and a macro's comment is a `COMMENT ON` of its
+/// own, which no `CREATE` has a clause for, and the dump dropped both until
+/// it was written after them ([`view_comment_sql`], `routine_follow_ups`).
+/// **Not yet on PostgreSQL** (`COMMENT ON VIEW`, `COMMENT ON FUNCTION`) **or
+/// SQL Server** (`MS_Description`): their scripts drop a view's and a
+/// routine's comment today — a gap of theirs, on the roadmap, not an answer
+/// about them. MySQL's routine `CREATE` carries its `COMMENT` clause and its
+/// views have none; SQLite has no comments.
+///
+/// An exhaustive `match`, for the reason [`supports_owners`] gives.
+pub fn script_restates_object_comments(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::DuckDb => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// The `COMMENT ON VIEW` a scripted copy of view `t` ends with, where
+/// [`script_restates_object_comments`] and it has a comment.
+pub fn view_comment_sql(t: &TableInfo, dialect: SqlDialect) -> Option<String> {
+    let c = t.comment.as_deref().filter(|c| !c.trim().is_empty())?;
+    (t.is_view && script_restates_object_comments(dialect)).then(|| {
+        format!(
+            "COMMENT ON VIEW {} IS {};",
+            qualified(&t.name, t.schema.as_deref(), dialect),
+            ddl_string(c, dialect)
+        )
+    })
+}
+
+/// The statements a scripted copy of routine `f` ends with to restate its
+/// comment, where [`script_restates_object_comments`]: on DuckDB a macro's
+/// `COMMENT ON MACRO [TABLE]`, the same statement an edit writes.
+pub fn routine_comment_sql(f: &RoutineInfo, dialect: SqlDialect) -> Vec<String> {
+    if script_restates_object_comments(dialect) {
+        routine_follow_ups(f, None, dialect)
+    } else {
+        Vec::new()
+    }
+}
+
 /// Does a routine's drop-and-create on `dialect` **put its comment back**?
 /// MySQL's `CREATE` carries a `COMMENT` clause, and SQL Server's plan sets the
 /// `MS_Description` again after it (`routine_follow_ups`); PostgreSQL's
@@ -29537,6 +29581,46 @@ mod tests {
         // offered, its type, cache and restart being clauses DuckDB lacks.
         assert!(ObjectDraft::blank(ObjectKind::Sequence, "s", None, d).is_none());
         assert!(!supports_object_creation(d, ObjectKind::Sequence));
+    }
+
+    /// A scripted copy restates a DuckDB view's and macro's comment after
+    /// its `CREATE` — and, until their own gap is closed, no other engine's.
+    #[test]
+    fn a_duckdb_scripted_copy_restates_view_and_macro_comments() {
+        let v = TableInfo {
+            name: "v".into(),
+            schema: Some("main".into()),
+            is_view: true,
+            comment: Some("it's a view".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            view_comment_sql(&v, DuckDb).as_deref(),
+            Some("COMMENT ON VIEW \"main\".\"v\" IS 'it''s a view';")
+        );
+        let m = RoutineInfo {
+            comment: Some("doubles".into()),
+            ..duck_macro("m", "a", "", "a * 2")
+        };
+        assert_eq!(
+            routine_comment_sql(&m, DuckDb),
+            ["COMMENT ON MACRO \"main\".\"m\" IS 'doubles';"]
+        );
+        for d in [MySql, Postgres, Sqlite, MsSql] {
+            assert_eq!(view_comment_sql(&v, d), None, "{d:?}");
+            assert!(routine_comment_sql(&m, d).is_empty(), "{d:?}");
+        }
+        // No comment, or not a view: nothing.
+        let bare = TableInfo {
+            comment: None,
+            ..v.clone()
+        };
+        assert_eq!(view_comment_sql(&bare, DuckDb), None);
+        let table = TableInfo {
+            is_view: false,
+            ..v
+        };
+        assert_eq!(view_comment_sql(&table, DuckDb), None);
     }
 
     /// A DuckDB schema is created and dropped as PostgreSQL's is — never

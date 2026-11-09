@@ -500,6 +500,10 @@ failed on the primary key. Without the rows it keeps its declared start, having 
 IF EXISTS` its `RoutineKind` spells. That worked on a lone macro (measured on 2.0.0), so no
 shipped file was broken; the kind is what names the right one where a scalar and a table macro
 share a name, `DROP MACRO t` taking the scalar one when both exist.
+**DuckDB's user types join the types-and-sequences section** (`DbSchema::user_types`, each a
+`UserType::create_sql`), in a namespace the export carries, dropped up front with the routines'
+drops where the file drops and written `CREATE TYPE IF NOT EXISTS` where it does not — the one
+pass that reads `user_types`, every other engine's being empty (`db/duckdb.md`).
 A DuckDB table's captured `CREATE TABLE` carries its keys, so it skips the closing constraints
 section as SQLite's does (`needs_fk_section`), and its indexes are `create_ddl_holding`'s held
 half, built after every table's rows in the section SQL Server's checks use, headed

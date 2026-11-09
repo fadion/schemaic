@@ -45,6 +45,11 @@ have landed.
 Each of these is a one-session change.
 
 - **Charts:** add scatter and stacked bar.
+- **A view's and a routine's comment in *Copy DDL* and the dump, on PostgreSQL and SQL Server.**
+  Their scripts drop both today — `COMMENT ON VIEW` / `COMMENT ON FUNCTION`, and the
+  `MS_Description` property — while a table's is kept. DuckDB's are restated
+  (`ddl::script_restates_object_comments`); turn the predicate on per engine with the statement
+  its edits already write, and check each engine's dump tests.
 
 ### DuckDB as a fifth engine
 
@@ -73,11 +78,9 @@ come after DuckDB.
   re-create would have to drop it, which DuckDB refuses while a column default uses it. The read-only half of the seal (`AccessMode::ReadOnly`) has no test, the
   suites' in-memory instance having no file to open read-only. A file named
   `main.duckdb` makes `main.t` both a schema and a catalog, and its results are not attributed;
-  accept the reading where both resolve to the same table, if anyone hits it. The dump carries no
-  user type (`CREATE TYPE … AS ENUM`, a `STRUCT` alias): `duckdb_tables().sql` inlines it into each
-  column, so the table restores without it, but a view or macro naming the type fails its restore
-  — none is read into the model. Nor does it carry a view's or a macro's
-  comment (`docs/architecture/db/duckdb.md`). In a Manual tab, a read the user stops — the
+  accept the reading where both resolve to the same table, if anyone hits it. A user type is read
+  for the dump alone (`DbSchema::user_types`): the tree does not show one and schema compare does
+  not compare them. In a Manual tab, a read the user stops — the
   binary-cell panel dismissed mid-read, a re-fetch stopped — aborts the transaction (measured),
   since there is no savepoint to fence it in; reading such a cell on a fresh connection would see
   none of the tab's uncommitted writes, so it is left an honest loss rather than a wrong answer.

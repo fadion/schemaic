@@ -1791,11 +1791,48 @@ fn read_schema(conn: &DuckConn) -> Result<DbSchema, DbError> {
         tables,
         sequences,
         routines,
+        user_types: user_types(conn)?,
         database: Some(database),
         namespaces,
         names_ignore_case: true,
         ..Default::default()
     })
+}
+
+/// The database's user types, for the dump ([`DbSchema::user_types`]).
+/// `duckdb_types()` lists them, with an enum's labels but only the *logical*
+/// type of a `STRUCT` or `DECIMAL` alias, so each definition is read as
+/// DuckDB prints the type itself: `typeof(CAST(NULL AS t))` answers
+/// `STRUCT(x INTEGER, y INTEGER)` (measured on 2.0.0).
+fn user_types(conn: &DuckConn) -> Result<Vec<schemaic_core::schema::UserType>, DbError> {
+    let listed: Vec<(String, String, Option<String>)> = conn
+        .prepare(
+            "SELECT schema_name, type_name, comment FROM duckdb_types() \
+              WHERE database_name = current_database() AND NOT internal \
+              ORDER BY schema_name, type_name",
+        )
+        .and_then(|mut s| {
+            s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect()
+        })
+        .map_err(query_err)?;
+    listed
+        .into_iter()
+        .map(|(schema, name, comment)| {
+            let qname = schemaic_core::schema::qualified_ident(&name, Some(&schema), D);
+            let definition: String = conn
+                .query_row(&format!("SELECT typeof(CAST(NULL AS {qname}))"), [], |r| {
+                    r.get(0)
+                })
+                .map_err(query_err)?;
+            Ok(schemaic_core::schema::UserType {
+                name,
+                schema: Some(schema),
+                definition,
+                comment: comment.filter(|c| !c.is_empty()),
+            })
+        })
+        .collect()
 }
 
 /// A key or constraint column, as the catalogue names it.
@@ -5117,5 +5154,78 @@ mod tests {
             cells(&db, "SELECT count(*) FROM t WHERE a = 'x'"),
             vec![vec!["1"]]
         );
+    }
+
+    const TYPES_FIXTURE: &str = "
+        CREATE TYPE mood AS ENUM ('sad', 'it''s ok');
+        CREATE SCHEMA s;
+        CREATE TYPE s.lvl AS ENUM ('lo', 'hi');
+        CREATE TABLE s.u(l s.lvl);
+        CREATE TYPE pt AS STRUCT(x INTEGER, \"Y y\" VARCHAR);
+        CREATE TYPE money2 AS DECIMAL(12, 2);
+        COMMENT ON TYPE mood IS 'feelings';
+        CREATE TABLE t(m mood, l s.lvl, p pt, c money2);
+        INSERT INTO t VALUES ('sad', 'hi', {'x': 1, 'Y y': 'a'}, 3.5);
+        CREATE VIEW v AS SELECT CAST('sad' AS mood) AS m, CAST(1.25 AS money2) AS c;
+        COMMENT ON VIEW v IS 'a view''s comment';
+        CREATE MACRO mm(a) AS CAST(a AS mood);
+        CREATE MACRO nums(n) AS TABLE SELECT * FROM range(n);
+        COMMENT ON MACRO mm IS 'to a mood';
+        COMMENT ON MACRO TABLE nums IS 'counts';
+    ";
+
+    /// The types, the view and macro comments and the rows a restore of
+    /// [`TYPES_FIXTURE`] has to reproduce.
+    fn type_fingerprint(db: &Db) -> Vec<String> {
+        vec![
+            cells(
+                db,
+                "SELECT schema_name, type_name, coalesce(comment, '') FROM duckdb_types() \
+                  WHERE NOT internal ORDER BY ALL",
+            ),
+            cells(
+                db,
+                "SELECT typeof(CAST(NULL AS mood)), typeof(CAST(NULL AS s.lvl)), \
+                        typeof(CAST(NULL AS pt)), typeof(CAST(NULL AS money2))",
+            ),
+            cells(
+                db,
+                "SELECT comment FROM duckdb_views() WHERE view_name = 'v'",
+            ),
+            cells(
+                db,
+                "SELECT function_name, function_type, comment FROM duckdb_functions() \
+                  WHERE function_name IN ('mm', 'nums') ORDER BY ALL",
+            ),
+            cells(db, "SELECT CAST(v AS VARCHAR) FROM v"),
+            cells(db, "SELECT CAST(mm('sad') AS VARCHAR)"),
+            cells(db, "SELECT CAST(t AS VARCHAR) FROM t"),
+        ]
+        .into_iter()
+        .map(|rows| format!("{rows:?}"))
+        .collect()
+    }
+
+    /// **A dump carries DuckDB's user types**, ahead of the view and macro
+    /// that name them — a table does not need them, DuckDB inlining the type
+    /// into each column, but a view or a macro failed its restore without —
+    /// **and a view's and a macro's comment**, which the file used to drop.
+    /// Into an empty database, and replayed onto its source.
+    #[test]
+    fn a_dump_carries_user_types_and_view_and_macro_comments() {
+        use schemaic_core::script::ExecEnd;
+        let src = mem("dump-types-src");
+        seed(&src, TYPES_FIXTURE);
+        let before = type_fingerprint(&src);
+        let seen = before.join("\n");
+        for part in ["feelings", "a view's comment", "counts", "DECIMAL(12,2)"] {
+            assert!(seen.contains(part), "the fingerprint misses {part}: {seen}");
+        }
+        let file = dump_file(&src, schemaic_core::dump::DumpOptions::default());
+        let dst = mem("dump-types-dst");
+        assert_eq!(restore_file(&dst, &file), ExecEnd::Done, "{file}");
+        assert_eq!(type_fingerprint(&dst), before, "{file}");
+        assert_eq!(restore_file(&src, &file), ExecEnd::Done, "{file}");
+        assert_eq!(type_fingerprint(&src), before, "{file}");
     }
 }

@@ -3662,6 +3662,33 @@ pub fn plan(
                 });
             }
         }
+        // **DuckDB's user types**, ahead of everything: a table does not need
+        // one — DuckDB inlines the type into each column — but a view or a
+        // macro naming one failed its restore without it. Dropped up front
+        // where the file drops (a table typed with it does not stop the drop,
+        // measured), and created only where missing on a replay that drops
+        // nothing, as a sequence is.
+        for t in &schema.user_types {
+            if !namespaces
+                .iter()
+                .any(|ns| ns.as_deref() == t.schema.as_deref())
+            {
+                continue;
+            }
+            let create = t.create_sql(dialect);
+            let sql = if !up_front && opts.structure && opts.drop_if_exists {
+                create.replacen("CREATE TYPE ", "CREATE TYPE IF NOT EXISTS ", 1)
+            } else {
+                create.clone()
+            };
+            objects.push(Emitted {
+                name: t.name.clone(),
+                body: create,
+                sql,
+                drop: up_front.then(|| t.drop_sql(dialect)),
+                function: false,
+            });
+        }
     }
     // A domain over a domain is the same edge as a routine over a routine —
     // `kinds` above orders Enum before Domain, and nothing ordered two Domains

@@ -2950,6 +2950,8 @@ async fn collect_schema(client: &Client) -> Result<DbSchema, DbError> {
         // SQL Server's; PostgreSQL's own are the three lists above.
         tsql_objects: Vec::new(),
         tsql_type_bindings: Vec::new(),
+        // DuckDB's; PostgreSQL's types are `enums` and `domains` above.
+        user_types: Vec::new(),
         body_index: Default::default(),
         // A MySQL-family flavour is meaningless here, and `Unknown` is what
         // makes the emitter withhold MariaDB-specific behaviour rather than

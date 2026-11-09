@@ -97,10 +97,9 @@ A DuckDB connection is a database file on this machine, like SQLite's; see
 - exporting results, and query plans, with **Analyze**;
 - **Server variables**, which lists DuckDB's settings;
 - **Back up**, which writes a new `.duckdb` file;
-- a SQL dump under **Export** — tables with their indexes and comments, views, sequences (which
-  carry on from the source's counter) and macros. A type made with `CREATE TYPE` isn't in the
-  file as a type: DuckDB writes it into each column, so tables load, but a view or macro that
-  names the type won't;
+- a SQL dump under **Export** — types made with `CREATE TYPE`, tables with their indexes and
+  comments, views and macros with theirs, and sequences (which carry on from the source's
+  counter). A type is written only for the schemas the file exports tables from;
 - **Manual** transactions, as on PostgreSQL: a failed statement aborts the transaction and only
   **Rollback** ends it. A read-only connection gets read-only transactions. The tab keeps the file
   open, and other programs out of it, until it goes back to **Auto-commit**; and because DuckDB

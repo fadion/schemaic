@@ -270,13 +270,21 @@ from the source's (9 and 101), the macro callable and a default key clearing the
 fingerprint and the counters unmoved (`a_dump_replays_onto_its_source`); and without *One
 transaction* that replay stops at `DROP TABLE … "parent"`, the first table a key points at,
 leaving the source as it was (`a_replay_without_a_transaction_stops_at_a_referenced_table`).
-**What the file does not carry**, measured by the change's author: a user type — `CREATE TYPE
-mood AS ENUM …`, a `STRUCT` alias — is inlined into each column in `duckdb_tables().sql` (`m
-ENUM('ok', 'sad')`), so the table restores without the named type, and the type itself is not
-carried, none being read into the model; a view or macro naming the type would fail its restore.
-A view's or a macro's comment is not carried either — only a table's and its columns' are — nor a
-macro parameter's default, for the reason above, though a macro the reader found one on says so
-in the line above its `CREATE`. A macro is dropped up front as what it is, `DROP MACRO [TABLE] IF EXISTS`
+**A user type is carried, ahead of everything** (`DbSchema::user_types`, read by `user_types`
+for the dump alone — not shown in the tree, not compared). A table does not need one: the type is
+inlined into each column in `duckdb_tables().sql` (`m ENUM('ok', 'sad')`), and `DROP TYPE` does
+not refuse a type a table is typed with (measured) — but a view or a macro naming it failed its
+restore without it. `duckdb_types()` lists each with an enum's labels and only a `STRUCT` or
+`DECIMAL` alias's logical type, so the definition is DuckDB's own printing of the type,
+`typeof(CAST(NULL AS t))`; `UserType::create_sql` writes `CREATE TYPE … AS …` and its `COMMENT ON
+TYPE`. The file drops it up front where it drops, and otherwise creates it `IF NOT EXISTS`, as a
+sequence; a type in a namespace the export does not carry is left out, as a sequence there is.
+**So is a view's and a macro's comment**, a `COMMENT ON VIEW` / `COMMENT ON MACRO [TABLE]` after
+its `CREATE` (`ddl::script_restates_object_comments`, `view_comment_sql`, `routine_comment_sql`,
+in *Copy DDL* too) — the dump dropped both, keeping only a table's and its columns'
+(`a_dump_carries_user_types_and_view_and_macro_comments`, into an empty database and replayed
+onto its source). **What the file does not carry** is a macro parameter's default, for the
+reason above, though a macro the reader found one on says so in the line above its `CREATE`. A macro is dropped up front as what it is, `DROP MACRO [TABLE] IF EXISTS`
 (`RoutineInfo::object_keyword`, under `schema.rs`).
 **A Manual tab pins one connection, and with it the file** (`Pinned`, opened by `pin`, behind
 `session.rs`'s `Backend::DuckDb`). It is the connection an operation would take — `connect`'s, so
