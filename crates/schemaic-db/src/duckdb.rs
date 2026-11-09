@@ -514,6 +514,47 @@ fn counts_rows(sql: &str) -> bool {
     }
 }
 
+/// Is this result only DuckDB's word that `sql` ran — a lone `Count` or
+/// `Success` column, which it answers `CREATE` and `DROP`, `ALTER`, `SET`,
+/// `COMMENT` and transaction control with (2.0.0, measured: empty, never a
+/// row)? Shown as data it was a zero-row grid headed `Success BOOLEAN`. The
+/// statement's head decides as well as the column, so a query that names a
+/// column `Success` is still shown.
+fn reports_status(sql: &str, columns: &[Column]) -> bool {
+    let [only] = columns else {
+        return false;
+    };
+    if only.name != "Count" && only.name != "Success" {
+        return false;
+    }
+    let words = schemaic_core::sql::leading_words(sql, 1, D);
+    matches!(
+        words.first().map(String::as_str),
+        Some(
+            "CREATE"
+                | "DROP"
+                | "ALTER"
+                | "SET"
+                | "RESET"
+                | "COMMENT"
+                | "BEGIN"
+                | "START"
+                | "COMMIT"
+                | "END"
+                | "ROLLBACK"
+                | "ABORT"
+                | "ATTACH"
+                | "DETACH"
+                | "USE"
+                | "CHECKPOINT"
+                | "FORCE"
+                | "VACUUM"
+                | "LOAD"
+                | "INSTALL"
+        )
+    )
+}
+
 /// The blocking half of [`fetch_query`]. `home` is the file's own catalog,
 /// read when the connection opened ([`origins_of`]).
 fn run_query(
@@ -556,6 +597,13 @@ fn run_query(
         };
         let mut rs = ResultSet::default();
         rs.affected = Some(affected);
+        rs.elapsed_ms = start.elapsed().as_millis();
+        return Ok(rs);
+    }
+    if reports_status(sql, &columns) {
+        // Said as SQLite says a statement with no columns: zero affected.
+        let mut rs = ResultSet::default();
+        rs.affected = Some(0);
         rs.elapsed_ms = start.elapsed().as_millis();
         return Ok(rs);
     }
@@ -3394,6 +3442,34 @@ mod tests {
             .unwrap();
         assert_eq!(rs.columns[0].name, "x");
         assert_eq!(rs.cell(0, 0).unwrap().to_value(), Value::Int(4));
+    }
+
+    /// **A statement that only reports success shows no grid.** DuckDB
+    /// answers `CREATE` with an empty `Count` result and `DROP`, `SET` and
+    /// the rest with an empty `Success` one; both reached the window as a
+    /// zero-row grid headed `Success BOOLEAN`. A query that names a column
+    /// so is still a query.
+    #[test]
+    fn a_status_only_statement_reports_no_rows() {
+        let db = mem("status");
+        let rt = rt();
+        for sql in [
+            "CREATE TABLE t(x INT)",
+            "SET threads = 2",
+            "COMMENT ON TABLE t IS 'c'",
+            "ALTER TABLE t ADD COLUMN y INT",
+            "DROP TABLE t",
+        ] {
+            let rs = rt.block_on(q(&db, sql)).unwrap();
+            assert!(rs.columns.is_empty(), "{sql}: {:?}", rs.columns);
+            // As SQLite reports a statement with no columns: an affected
+            // count, which `exec` and the window both say.
+            assert_eq!(rs.affected, Some(0), "{sql}");
+        }
+        let rs = rt
+            .block_on(q(&db, "SELECT true AS \"Success\" WHERE false"))
+            .unwrap();
+        assert_eq!(rs.columns.len(), 1, "a query keeps its column");
     }
 
     #[test]

@@ -82,7 +82,18 @@ re-fetched row reads exactly as the result it is spliced into. **A write's
 row count arrives as a result**: DuckDB answers `INSERT`/`UPDATE`/`DELETE` without `RETURNING`,
 and `CREATE TABLE … AS`, with a one-row `Count` column, which `counts_rows` recognises and turns
 into `ResultSet::affected` so the grid does not show it as data
-(`a_write_reports_its_count_not_a_count_column`).
+(`a_write_reports_its_count_not_a_count_column`). **So does a statement's mere success**: DuckDB
+answers `CREATE` with an empty `Count` result and `DROP`, `ALTER`, `SET`, `COMMENT`, transaction
+control and the like with an empty `Success` one (2.0.0, measured), and both reached the window
+as a zero-row grid headed `Success BOOLEAN`, while `schemaic exec` printed an empty table.
+`reports_status` recognises a lone `Count` or `Success` column under a statement whose head is on
+its list (`CREATE`, `DROP`, `ALTER`, `SET`/`RESET`, `COMMENT`, the transaction words,
+`ATTACH`/`DETACH`, `USE`, `CHECKPOINT`, `VACUUM`, `LOAD`/`INSTALL`, …), and `run_query` turns it
+into `affected = Some(0)` with no columns — what SQLite reports for any statement without
+columns — so both say *0 rows affected*. **The head decides as well as the column**, so `SELECT
+true AS "Success"` stays a query; don't reduce it to the column name. It is asked after
+`counts_rows`, so `CREATE TABLE … AS` keeps its real count
+(`a_status_only_statement_reports_no_rows`).
 **`Enforce` is a read-only transaction**: anything that `refuses_writes` — `ReadOnly` and
 `Generated` alike — runs inside `BEGIN TRANSACTION READ ONLY`, where DuckDB refuses a write by its
 effect (*Cannot write to database … transaction is launched in read-only mode*), and is rolled
