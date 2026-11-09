@@ -71,9 +71,7 @@ come after DuckDB.
   DuckDB's `CREATE SEQUENCE` lacks — and nothing alters one there (`ALTER SEQUENCE` refuses
   every option on 2.0.0), so a compare that finds a sequence changed has no statement for it; a
   re-create would have to drop it, which DuckDB refuses while a column default uses it. The read-only half of the seal (`AccessMode::ReadOnly`) has no test, the
-  suites' in-memory instance having no file to open read-only. The designer offers a column
-  collation, which `ALTER` refuses to change and the rebuild writes, but the reader does not read
-  one back, so a collation set there shows as an edit again on the next open. A file named
+  suites' in-memory instance having no file to open read-only. A file named
   `main.duckdb` makes `main.t` both a schema and a catalog, and its results are not attributed;
   accept the reading where both resolve to the same table, if anyone hits it. The dump carries no
   user type (`CREATE TYPE … AS ENUM`, a `STRUCT` alias): `duckdb_tables().sql` inlines it into each
@@ -95,15 +93,8 @@ come after DuckDB.
   never saved, and connecting says the session is closed; a form-level refusal would be clearer.
   The read-time options of `read_csv` (delimiter, header, types) are DuckDB's sniffer's alone; a
   file it guesses wrong needs the view rewritten by hand.
-- **Phase 3:** translate the new strings (`db-refused-duckdb-*`, `connections-duckdb-*`,
-  `ddl-withheld-duckdb-referenced`, `table-problem-sequence-no-default`, and retranslate
-  `ddl-withheld-strands-generated-column`, which no longer names SQLite in `en-GB` now DuckDB
-  shares it,
-  `backup-kind-duckdb`, `dump-drop-hint-up-front-no-grants`, `write-rollback-transaction`,
-  `routine-editor-returns-placeholder-duckdb`, `ddl-risk-view-cost-duckdb`,
-  `compare-held-defaults-unread` are
-  English in every catalogue but `en-GB`); the full CI
-  bar on every leg, which builds the amalgamation cold (about five minutes on this machine).
+- **Phase 3:** the full CI bar on every leg, which builds the amalgamation cold (about five
+  minutes on this machine).
 
 ## MCP server
 

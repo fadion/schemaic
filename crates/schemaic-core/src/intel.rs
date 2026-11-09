@@ -18352,6 +18352,40 @@ pub fn is_column_type(text: &str, dialect: SqlDialect) -> bool {
         )
 }
 
+/// Each column's `COLLATE` in a stored `CREATE TABLE`, as `(column,
+/// collation)` — for an engine whose catalogue keeps the collation nowhere
+/// else: DuckDB's `duckdb_columns()` has no such column and
+/// `information_schema.columns.collation_name` is always null (2.0.0,
+/// measured), while `duckdb_tables().sql` keeps `a VARCHAR COLLATE NOCASE`.
+/// The names come back unquoted, as the catalogue keys them; a statement that
+/// does not parse as one `CREATE TABLE` answers nothing.
+pub fn column_collations(create_sql: &str, dialect: SqlDialect) -> Vec<(String, String)> {
+    use sqlparser::ast::{ColumnOption, Statement};
+    let Ok(parsed) = sqlparser::parser::Parser::parse_sql(&*dialect.parser(), create_sql) else {
+        return Vec::new();
+    };
+    let [Statement::CreateTable(create)] = parsed.as_slice() else {
+        return Vec::new();
+    };
+    create
+        .columns
+        .iter()
+        .filter_map(|c| {
+            c.options.iter().find_map(|o| match &o.option {
+                ColumnOption::Collation(name) => Some((
+                    c.name.value.clone(),
+                    name.0
+                        .iter()
+                        .filter_map(|p| p.as_ident().map(|i| i.value.clone()))
+                        .collect::<Vec<_>>()
+                        .join("."),
+                )),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
 /// A table a statement reads from, as written: the bare name plus whatever
 /// qualified it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26314,6 +26348,26 @@ mod tests {
             "timestamp with time zone",
             SqlDialect::Postgres
         ));
+    }
+
+    /// DuckDB keeps a column's collation only in its stored `CREATE TABLE`
+    /// (2.0.0, measured), as `duckdb_tables().sql` writes it back.
+    #[test]
+    fn a_columns_collation_is_read_from_its_create_table() {
+        let d = SqlDialect::DuckDb;
+        assert_eq!(
+            column_collations(
+                "CREATE TABLE t(a VARCHAR COLLATE NOCASE, b VARCHAR, \"C d\" VARCHAR COLLATE \"de\");",
+                d
+            ),
+            [
+                ("a".to_string(), "NOCASE".to_string()),
+                ("C d".to_string(), "de".to_string())
+            ]
+        );
+        assert!(column_collations("CREATE TABLE t(a VARCHAR);", d).is_empty());
+        assert!(column_collations("CREATE VIEW v AS SELECT 1", d).is_empty());
+        assert!(column_collations("not sql at all", d).is_empty());
     }
 
     #[test]

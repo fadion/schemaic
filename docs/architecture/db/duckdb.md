@@ -104,7 +104,11 @@ rows; a key or unique constraint is in the text already. A view's definition is 
 top-level `AS` (`view_body`, over `sql::skip_noncode`). The primary key marks its columns and is
 the `PRIMARY` index the model reads keys from, a `UNIQUE` constraint is a unique index of its
 name, checks and foreign keys are themselves, and a column defaulting to `nextval(…)` is read as
-auto-numbered. **A generated column is told apart by `information_schema.columns.is_generated`**,
+auto-numbered. **A column's collation is read from the table's stored statement**
+(`intel::column_collations` over `duckdb_tables().sql`), the one place DuckDB keeps it:
+`duckdb_columns()` has no column for it and `information_schema.columns.collation_name` is always
+null (measured), so a collation the designer set read as an edit again on every open
+(`a_columns_collation_is_read_back_and_survives_a_rebuild`). **A generated column is told apart by `information_schema.columns.is_generated`**,
 because `duckdb_columns()` reports its expression as the column's *default* (measured:
 `CAST((a * 2) AS INTEGER)`) and says nothing else; read as given, it was an ordinary column with a
 default. It arrives as `generated: Some(expr)` with `default: None`, which is what has `edit.rs`

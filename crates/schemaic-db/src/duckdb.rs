@@ -1563,6 +1563,20 @@ fn read_schema(conn: &DuckConn) -> Result<DbSchema, DbError> {
     drop(rows);
     drop(stmt);
 
+    // Collations: kept nowhere but the stored statement — `duckdb_columns()`
+    // has no column for one, and `information_schema` reports none (measured)
+    // — so a collation the designer set read as an edit again on every open.
+    for t in tables.iter_mut().filter(|t| !t.is_view) {
+        let Some(sql) = t.create_sql.as_deref() else {
+            continue;
+        };
+        for (column, collation) in schemaic_core::intel::column_collations(sql, D) {
+            if let Some(c) = t.columns.iter_mut().find(|c| c.name == column) {
+                c.collation = Some(collation);
+            }
+        }
+    }
+
     // Constraints: the primary key marks its columns and is the `PRIMARY`
     // index the model reads keys from; a unique constraint is a unique index
     // named after it; a check and a foreign key are themselves.
@@ -5073,5 +5087,37 @@ mod tests {
         assert!(again.is_empty(), "still: {again:#?}");
         assert_eq!(cells(&dst, "SELECT count(*) FROM plain"), vec![vec!["1"]]);
         assert_eq!(cells(&dst, "SELECT nextval('s2')"), vec![vec!["5"]]);
+    }
+
+    /// A column's collation is read back from the table's stored statement —
+    /// the only place DuckDB keeps it — so one set in the designer is not an
+    /// edit again on the next open, and a rebuild that leaves it alone keeps
+    /// it.
+    #[test]
+    fn a_columns_collation_is_read_back_and_survives_a_rebuild() {
+        let db = mem("designer_collation");
+        seed(
+            &db,
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a VARCHAR COLLATE NOCASE, b VARCHAR);
+             INSERT INTO t VALUES (1, 'X', 'y');",
+        );
+        let t = table_of(&db, "t");
+        assert_eq!(t.columns[1].collation.as_deref(), Some("NOCASE"));
+        assert_eq!(t.columns[2].collation, None);
+        // Set one, then rebuild for something else: `designed` asserts the
+        // table reads back as the draft described it.
+        designed(&db, "t", |d| {
+            d.columns[2].info.collation = Some("NOCASE".into())
+        });
+        designed(&db, "t", |d| {
+            d.columns[0].info.type_name = "BIGINT".into();
+        });
+        let t = table_of(&db, "t");
+        assert_eq!(t.columns[1].collation.as_deref(), Some("NOCASE"));
+        assert_eq!(t.columns[2].collation.as_deref(), Some("NOCASE"));
+        assert_eq!(
+            cells(&db, "SELECT count(*) FROM t WHERE a = 'x'"),
+            vec![vec!["1"]]
+        );
     }
 }
