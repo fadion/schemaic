@@ -1365,7 +1365,10 @@ at"** — one statement, a `SELECT` body, no CTE, one `FROM` entry, no joins, a 
 statement that produced a result), by `filter::page_size`/`with_page` (so a statement the pager
 turns is one the filter bar could also rewrite) and by SQLite's write-back, which reaches it through
 `projection_of` and — now that the driver's own provenance does the attributing — needs it only
-to recover the *spelling* a projected `rowid` was written with. Two predicates that agreed on the day they were written is the
+to recover the *spelling* a projected `rowid` was written with. DuckDB's write-back reaches it the
+same way and needs much more of it, its driver reporting no provenance at all: there
+`projection_of`'s placement *is* the attribution, which `db::duckdb` then proves against the
+catalogue. Two predicates that agreed on the day they were written is the
 arrangement `ident_sql` exists to rule out, and a test pins that the two callers still agree.
 `single_source_table` is its entry point for a caller holding only SQL.
 **`full_table_source` is the stricter twin of it**, and the two are not
@@ -1441,6 +1444,21 @@ SQLite table editable, but the relaxation is **general**: `intel` carries no SQL
 and doesn't know why anyone wanted it. Two tests hold either side of the line —
 `projection_places_the_columns_ahead_of_a_trailing_wildcard` and
 `projection_still_refuses_a_wildcard_that_is_not_the_last_item`.
+**Two shapes are refused because a positional reading gets them wrong on DuckDB**, which reads
+`projection_of` as its whole write-back provenance (`db::duckdb`). A **wildcard with options** —
+`* EXCLUDE`, `REPLACE`, `RENAME`, `ILIKE`, `EXCEPT`, or an aliased one — is not the table's
+columns, so any wildcard carrying one makes the whole answer `None`: `* EXCLUDE (a)` drops a column
+and shifts every later position, and `* REPLACE (a + 1 AS a)` keeps every name and position while
+computing the value, so a positional reading would make an expression editable as `a`. A
+**qualified reference** — `x.col`, or `x.*` — is read only when `x` is the source's alias, or its
+name where it has none (an alias hides the name), compared ignoring case: on DuckDB `s.a` can be
+field `a` of a struct column `s`, and `s.*` its fields. A qualified item that fails this is `None`
+at its position; a qualified wildcard that fails it refuses the whole statement, as any wildcard
+that is not plainly the table's does. Both rules are general — `intel` applies them whatever the
+dialect, SQLite's `rowid`-spelling read included.
+`projection_refuses_a_wildcard_that_carries_options` and
+`projection_reads_a_qualified_reference_only_through_the_source` hold them; the latter also pins
+that a three-part `main.t.a` places nothing.
 **The relaxation moved the safety into another crate**, which is why it is tested from both
 ends. `SELECT a, * FROM t` used to return `None`, and no projection meant no origins meant
 read-only by construction; now every column is attributed and two of them claim the base column

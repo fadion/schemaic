@@ -10,9 +10,10 @@ siblings, and the MCP server both `schemaic mcp` and the AI panel run; no Floem)
 `--mcp-serve` branch, the CLI's argv branch).
 
 **Five engines, and they are not equal.** MySQL/MariaDB, PostgreSQL and SQL Server are full;
-**DuckDB** (`db::duckdb`, embedded like SQLite) is phase 1 of its roadmap entry — it reads, runs
-scripts and DDL plans, introspects, exports, plans and backs up, and refuses grid writes, import,
-the designer and Manual tabs until phase 2, through the same capability predicates.
+**DuckDB** (`db::duckdb`, embedded like SQLite) is partway through its roadmap entry — it reads,
+runs scripts and DDL plans, introspects, exports, plans, backs up and writes grid edits back (on
+provenance read from the statement, never keyed on `rowid`), and refuses import, the designer and
+Manual tabs until the rest of phase 2 lands, through the same capability predicates.
 SQLite reads, writes, imports and edits **tables** (through the twelve-step rebuild —
 `ddl::sqlite_rebuild_sql`), **views** and **triggers**, but has **no manual-transaction mode** — a
 statement about SQLite rather than unfinished work (`db::session::Session::open` carries the

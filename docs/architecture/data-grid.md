@@ -722,7 +722,8 @@ this bundle's.
   an `EditModel`: which columns are editable + each base table's WHERE key (schema PK first —
   authoritative for composite keys; else a fully-present unique NOT NULL index; else wire PK flags
   when schema isn't loaded; else, last, a backend-asserted implicit key — SQLite's projected
-  `rowid` — which keys the write but is itself never editable). Flow: double-click an editable cell (or Enter) → inline editor; **Enter**
+  `rowid`, never DuckDB's, which a checkpoint renumbers (`db::duckdb`) — which keys the write but
+  is itself never editable). Flow: double-click an editable cell (or Enter) → inline editor; **Enter**
   stages into `gs.dirty` and paints the cell `grid_edit_staged()`; **Ctrl+Enter** / toolbar ✓ calls
   `commit_grid` → a `GridWrite { updates, inserts, deletes }` → the app's `commit_edits`. On success
   the app re-runs the query; on failure the error shows in the toolbar and green edits stay. The

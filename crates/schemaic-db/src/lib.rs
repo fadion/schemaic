@@ -3688,8 +3688,8 @@ pub(crate) fn order_by_clause(cols: Option<&[String]>, quote: fn(&str) -> String
 }
 
 /// A DuckDB identifier, quoted — `export::ident_sql` as a `fn` pointer, for
-/// [`order_by_clause`].
-fn ident_duckdb(name: &str) -> String {
+/// [`order_by_clause`], and for `duckdb.rs`'s write paths.
+pub(crate) fn ident_duckdb(name: &str) -> String {
     schemaic_core::export::ident_sql(name, schemaic_core::intel::SqlDialect::DuckDb)
 }
 

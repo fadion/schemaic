@@ -10,10 +10,17 @@ is — the table's primary key, or a unique key with no NULLs, has to be in the 
 table with no key is edited through its hidden `rowid`.
 
 - *Not editable:* computed columns (`price * qty`, `COUNT(*)`), a table with no usable key, any
-  result on a connection marked read-only, and a pinned result. On DuckDB no result can be edited
-  yet.
+  result on a connection marked read-only, and a pinned result.
 - *A join* can be edited cell by cell when each table's key is in the result. Adding, cloning and
   deleting rows needs a result from a single table.
+- *On DuckDB* a result is editable only when it is read from one table — opening the table, or a
+  plain `SELECT … FROM t` — and that table has a primary key or a single-column `UNIQUE NOT NULL`
+  key. There is no `rowid` fallback, because DuckDB renumbers rowids when it compacts a table. A
+  view, a join, a set operation, a CTE, a subquery in `FROM`, or `* EXCLUDE (…)`/`* REPLACE (…)`
+  gives a read-only result, and so does a query run after `SET search_path`, `USE` or a temporary
+  table has changed which table a bare name means. Lists, structs and maps are edited in DuckDB's
+  own text form, with a quote or backslash inside a string escaped by a backslash:
+  `['it\'s', 'b']`.
 
 The right-click menu tells you which case you are in: it offers **Edit row** where something in
 the row can be written, and **View row** where nothing can.

@@ -2169,7 +2169,7 @@ connections-database-file = Database file
 # The file pickers' window titles.
 connections-database-file-dialog = Select SQLite database
 connections-duckdb-file-dialog = Select DuckDB database
-connections-duckdb-hint = A DuckDB database is a single file, so there is no server to reach — no host, user, password or tunnel. Schemaic opens the file only while a statement runs, so another program can open it in between. Editing results, importing and Manual transactions aren't available on one yet.
+connections-duckdb-hint = A DuckDB database is a single file, so there is no server to reach — no host, user, password or tunnel. Schemaic opens the file only while a statement runs, so another program can open it in between. Results from a table with a primary key can be edited; importing and Manual transactions aren't available on one yet.
 connections-sqlite-hint = A SQLite database is a single file, so there is no server to reach — no host, user, password or tunnel. Manual transactions aren't available on one yet: statements commit as they are sent.
 connections-ssh-tunnel = SSH tunnel
 connections-ssh-tunnel-hint = Reach the server through an SSH tunnel.

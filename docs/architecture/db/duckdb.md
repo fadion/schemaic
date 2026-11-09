@@ -1,14 +1,15 @@
 # `db/duckdb.rs`
 
 **`duckdb.rs` is the fifth engine** (the `duckdb` crate, the engine compiled in — `bundled`,
-with the `parquet` and `json` extensions linked statically), phase 1 of the roadmap's *DuckDB as
-a fifth engine*: it connects, reads, introspects, validates, runs batches, scripts and DDL plans,
-plans a query, lists its settings and backs a file up. It is **embedded, as SQLite is**, so most
+with the `parquet` and `json` extensions linked statically), phase 1 and the first part of phase 2
+of the roadmap's *DuckDB as a fifth engine*: it connects, reads, introspects, validates, runs
+batches, scripts and DDL plans, plans a query, lists its settings, backs a file up and writes grid
+edits back. It is **embedded, as SQLite is**, so most
 of `sqlite.rs`'s first paragraph holds here unchanged — there is no server, a connection is a
 file (`Db::file`, `connection::is_file_backed`), host/port/user/password/SSH are inert, the one
 database is the file's own catalog (`current_database()`, named after the file), and the driver
 is blocking, so every call runs on Tokio's blocking pool. What makes it more than a second SQLite
-is four things, and the module doc names the same four.
+is the things below, and the module doc names the same ones.
 **One database instance per file, per process.** DuckDB locks a file per *instance*, and a
 second instance on the same file in the same process is refused outright — measured on 2.0, *The
 process cannot access the file because it is being used by another process*, naming this
@@ -55,10 +56,18 @@ unreachable rather than downloaded behind a query (`no_extension_is_fetched_behi
 timestamp in ISO form with `TIMESTAMP WITH TIME ZONE` in UTC (`+00`, this build linking no ICU),
 an interval as `1 year 2 months 3 days 04:05:06`, a list `[1, 2]`, a struct `{'a': 1}`, a blob
 as its size and its column marked binary. A column's type name keeps a declared alias (`JSON`).
+**A string inside a list, struct or map, and a struct's field name, is escaped with backslashes**
+(`nested_string`: `['it\'s', 'a\\b']`), not by SQL's doubling of the quote, because that text is
+what a grid edit of the cell sends back for DuckDB to cast, and the cast does not read doubling —
+`['it''s']` reads back as `its` (measured on 2.0). The doubled form was what this rendered first;
+`a_nested_string_is_escaped_the_way_duckdb_reads_it_back` casts each rendering back and compares
+it with the value it came from.
 **Two decode hazards are walled off, both in the driver** (duckdb 1.20000.1): a `NULL`-typed
 column (`SELECT NULL`) is never asked of it, since decoding one panics, and every other cell is
 read under `catch_unwind`, so a value it cannot decode costs that cell — a `<TYPE>` placeholder —
-rather than the worker and the whole result (`values_read_as_duckdb_writes_them`). **A write's
+rather than the worker and the whole result (`values_read_as_duckdb_writes_them`). Both walls
+are in `decode_cell`, the one cell decoder, which `run_query` and `refetch_rows` share so that a
+re-fetched row reads exactly as the result it is spliced into. **A write's
 row count arrives as a result**: DuckDB answers `INSERT`/`UPDATE`/`DELETE` without `RETURNING`,
 and `CREATE TABLE … AS`, with a one-row `Count` column, which `counts_rows` recognises and turns
 into `ResultSet::affected` so the grid does not show it as data
@@ -83,7 +92,12 @@ rather than a reconstruction; a view's definition is the text after the stored s
 top-level `AS` (`view_body`, over `sql::skip_noncode`). The primary key marks its columns and is
 the `PRIMARY` index the model reads keys from, a `UNIQUE` constraint is a unique index of its
 name, checks and foreign keys are themselves, and a column defaulting to `nextval(…)` is read as
-auto-numbered. **Macros are DuckDB's user functions and arrive as `RoutineInfo`** — one per name,
+auto-numbered. **A generated column is told apart by `information_schema.columns.is_generated`**,
+because `duckdb_columns()` reports its expression as the column's *default* (measured:
+`CAST((a * 2) AS INTEGER)`) and says nothing else; read as given, it was an ordinary column with a
+default. It arrives as `generated: Some(expr)` with `default: None`, which is what has `edit.rs`
+keep it read-only, as on every engine — `table_facts`, provenance's own column read, makes the same
+join for the same reason. **Macros are DuckDB's user functions and arrive as `RoutineInfo`** — one per name,
 an overload being the same macro to `DROP MACRO`, a table macro's `returns` reading `TABLE`.
 `main` is always among the namespaces (`schema::DUCKDB_DEFAULT_SCHEMA`, `default_namespace`), and
 names compare ignoring case (`names_ignore_case`). Table sizes are `duckdb_tables()`'
@@ -95,10 +109,14 @@ answered *unavailable*; `activity::supports_activity` answers no for DuckDB, as 
 nothing asks. (It was `!matches!(dialect, Sqlite)` until DuckDB arrived and fell onto the "has
 sessions" side — the shape of every bug the capability rule exists for.)
 **Writes, phase 1.** `run_ddl` is one connection and one transaction, all or nothing, DuckDB's
-DDL being transactional (`a_ddl_plan_is_all_or_nothing`) — but it reads its cancel token only
-before it starts, where `sqlite::run_ddl` was fixed to interrupt a running statement; nothing
-reaches it yet, since `ddl::duckdb_supports` refuses every change. `run_script` is one connection
-for the whole file and wraps nothing, with SQLite's runtime-flavour choice between
+DDL being transactional (`a_ddl_plan_is_all_or_nothing`), and Stop reaches a statement already
+running through the connection's interrupt handle, as `sqlite::run_ddl`'s does. It once read its
+token only before it started, which would have had a plan's one long statement hold the preview
+modal open for its whole length with the button reading *Stop*. An interrupt surfaces as an
+ordinary error, so the token is what maps it to `DdlCause::Cancelled`
+(`stop_interrupts_a_running_ddl_statement`, a `CREATE TABLE … AS` counting 10^11 rows). No plan
+from the editors reaches it yet, since `ddl::duckdb_supports` refuses every change. `run_script`
+is one connection for the whole file and wraps nothing, with SQLite's runtime-flavour choice between
 `block_in_place` and `spawn_blocking`. **A backup is `ATTACH` + `COPY FROM DATABASE` + `DETACH`**
 (`backup_to`, behind `Db::backup_to_file`): every schema, table, view, sequence and macro with its
 rows, into a **new** file. A target that already exists is refused before anything runs, as
@@ -106,10 +124,64 @@ SQLite's `VACUUM INTO` refuses one, because `ATTACH` would open it and copy *int
 (`a_backup_copies_every_table_with_its_rows`, into `:memory:`). `Db::explain` builds `EXPLAIN` or
 `EXPLAIN ANALYZE` in the dispatcher, on a read-only transaction where it is asked `read_only`, and
 `fetch_table` — the Live Monitor — is a generated `SELECT * … LIMIT` there too.
-**What phase 1 does not do is refused, never faked**: `commit_writes`, `refetch_rows`,
-`fetch_blob` and `import_rows` answer `DbRefusal::DuckDbNotYet`; no result column carries
-provenance (`origin: None`), so every result is read-only and the grid offers no edit to commit;
-`Session::open` refuses a pinned session (`DuckDbNoManual`) and `tx::supports_manual_mode` keeps
+**Grid write-back reads its provenance from the statement, because the driver reports none.**
+`run_query` calls `origins_of` on the connection that ran the statement, after it ran and before
+its rows are read, so the session state the result was read under — a temporary table,
+`search_path`, a `USE` — is the state that decides it; `fetch_query` and `run_batch` capture the
+file's own catalog (`home`) when they connect, for it to compare against. `attribute` takes
+`intel::projection_of`'s placement — positional, one base table, refusing a join, a set operation,
+a CTE, a derived table, a wildcard with options and a qualifier that may be a struct column (see
+`core::intel`) — and proves it against the catalogue, and **any doubt about the relation
+attributes the whole result to nothing**, since a wrong origin is an `UPDATE` of another row or
+another table while a missing one is only a read-only grid. The doubts: the connection is no
+longer on `home` (a `USE` of an attached database would have a bare name mean another file); for a
+bare name, `search_path` is set or a temporary table or view has that name, either of which has
+DuckDB resolve it elsewhere; a qualifier is also a catalog's name (`duckdb_databases()`), which
+DuckDB could read either way; the relation is not a base table of that schema — a view's rows
+belong to whatever it reads; and a wildcard's result columns are not the table's, in order and by
+name. **The catalog refusal has a known casualty**: a file named `main.duckdb` is the catalog
+`main`, so `main.t` could name the schema or the catalog and its results get no edits. Within a
+proven relation a placed name that is not one of its columns — `rowid`, an earlier select-list
+alias — is that one column attributed to nothing; names match case-insensitively, as DuckDB binds,
+and come back in the catalogue's spelling. That match is sound because a table column wins over an
+earlier alias of the same name (measured: `SELECT x + 10 AS a, a` returns the column `a`). The
+flags are `table_facts`': the primary key (its columns `not_null` too), a single-column `UNIQUE`
+as a unique key, `NOT NULL`, a `nextval(…)` default as auto-increment, and `no_default` for a
+`NOT NULL` column with neither a default nor a generation expression
+(`a_single_table_read_is_attributed_by_position`,
+`what_the_statement_cannot_vouch_for_is_attributed_to_nothing`).
+**`rowid` is never an origin, and so never the implicit key it is on SQLite: a keyless table is
+read-only here.** A checkpoint after a delete that empties most of a row group compacts it and
+renumbers what is left — the row holding 63 comes back as rowid 3, a number another row held
+before — so a grid that read rowid 3 and then committed would write that other row, and the 1-row
+net would see exactly the one row it wants. Measured on 2.0 on a file and across a reopen, and in
+memory by `a_checkpoint_renumbers_rowids_so_none_is_a_key`, which fails if rowids ever survive the
+compaction — the cue to re-measure the decision, not to start keying on them. (An `UPDATE` alone
+keeps the rowid.) **The seam is tested, not only the halves**:
+`the_grid_edits_a_keyed_table_and_not_a_keyless_one` puts this engine's results and its schema
+read through `edit::analyze_edit` — a keyed table editable by its key with its generated column
+read-only, and `SELECT rowid, * FROM k` over a keyless one not editable at all.
+**The executors** — `commit_writes`, `refetch_rows`, `fetch_blob` — share `with_conn_stoppable`:
+an operation's own connection on the blocking pool, with Stop reaching a running statement through
+its interrupt handle, the shape of `sqlite::commit_writes`. As there, a cancel answers
+`DbError::Cancelled` at once rather than awaiting the worker, whose interrupted statement then
+fails into the closure's `ROLLBACK`. A write names `"schema"."table"` (`table_sql`), never the
+catalog, which is safe for the reason SQLite's bare name is: the statement runs on a fresh
+connection on the file's own catalog, and `origins_of` attributes nothing outside it. Key values
+bind as typed `DValue`s, a text key cast by DuckDB to the column's type at bind (measured on 2.0
+for integers, decimals, zoned timestamps, intervals, booleans, UUIDs and `HUGEINT`s past `i64` —
+the forms `cell_of` writes), and a `NULL` key compares `IS NULL`. A staged `CellEdit::Default` is
+the keyword `DEFAULT` in `SET` and in `VALUES` alike (measured), and an insert that stages no
+column at all is `DEFAULT VALUES`. The commit is one transaction, each statement held to `one_row_verdict`, and its
+rollback is always `Rollback::Complete`, DuckDB having no non-transactional table
+(`a_grid_commit_updates_inserts_and_deletes_in_one_transaction`,
+`a_write_that_misses_its_row_rolls_the_whole_commit_back`). `refetch_rows` looks a row up by its
+key and confirming columns, in `edit::refetch_key`'s order, and skips one no longer there.
+`fetch_blob` reads the **whole** value and cuts it to `blob::FETCH_CAP` on this side, DuckDB having
+no byte-slicing of a `BLOB` in SQL — so showing a large blob's first bytes still carries all of it
+across (`rows_are_refetched_and_blobs_read_by_key`).
+**What is not written yet is refused, never faked**: `import_rows` answers
+`DbRefusal::DuckDbNotYet`; `Session::open` refuses a pinned session (`DuckDbNoManual`) and `tx::supports_manual_mode` keeps
 the segment off; `import::supports_import` and `dump::supports_dump` say no, and
 `ddl::duckdb_supports` keeps the designer and the view, trigger and routine editors off. For
 when the session lands, `session::tx_engine_of` already maps DuckDB to PostgreSQL's model — it
@@ -125,9 +197,8 @@ the sanctioned exception in-memory SQLite already is: a `memory:<name>` target, 
 `cfg(test)`, is a shared in-memory instance the tests seed, held for the process in `KEEP`, since
 an in-memory instance *is* its data and letting it close between two operations of one test would
 empty it.
-**`duckdb.rs` answers every name in `ENGINE_ENTRY_POINTS`**, the unwritten ones with the refusal,
-and the dispatcher calls it for each — but neither convention test lists it yet: the module list
-of `every_engine_module_answers_the_whole_interface` and the loop of
-`the_dispatcher_calls_every_engine_module_for_every_entry_point` stop at `mssql`, and
-`the_entry_point_list_is_what_the_dispatcher_actually_dispatches` intersects four modules. A name
-this module drops is a compile error at its dispatch arm and nothing at the census.
+**`duckdb.rs` answers every name in `ENGINE_ENTRY_POINTS`**, `import_rows` still with the
+refusal, and the dispatcher calls it for each — and all three convention tests hold it to that:
+it is in the module list of `every_engine_module_answers_the_whole_interface` and the loop of
+`the_dispatcher_calls_every_engine_module_for_every_entry_point`, and
+`the_entry_point_list_is_what_the_dispatcher_actually_dispatches` intersects all five modules.

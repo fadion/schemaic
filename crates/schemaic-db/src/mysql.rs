@@ -8414,6 +8414,11 @@ mod write_tests {
                 ident_sql(name, SqlDialect::Sqlite),
                 "{name:?}"
             );
+            assert_eq!(
+                crate::ident_duckdb(name),
+                ident_sql(name, SqlDialect::DuckDb),
+                "{name:?}"
+            );
         }
     }
 }

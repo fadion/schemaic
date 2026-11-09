@@ -64,8 +64,10 @@ Each of these is a one-session change.
 ### DuckDB as a fifth engine
 
 Phase 1 has landed: the engine reads, runs scripts and DDL plans, introspects, exports, plans,
-backs up and opens its CLI, behind its own read-only gate (`docs/architecture/db/duckdb.md`). What
-is left is below. ClickHouse would come after DuckDB.
+backs up and opens its CLI, behind its own read-only gate (`docs/architecture/db/duckdb.md`).
+Phase 2's grid write-back has landed too, on provenance read from the statement; `rowid` is never
+a key, because a checkpoint renumbers it. What is left is below. ClickHouse would come after
+DuckDB.
 
 - **Decided — the unattended paths cannot read files:** done in phase 1 (`Db::sealed`, called by
   `cli::query`). The editor reads files as normal.
@@ -73,13 +75,7 @@ is left is below. ClickHouse would come after DuckDB.
 - **Decided — one instance per file, shared while operations overlap:** done in phase 1, and
   stated in the invariants. A Manual tab's session will hold the instance — and with it the file's
   lock — for as long as the tab is pinned, which is the one thing phase 2 must say in the UI.
-- **Phase 2 — writes:**
-  - **Grid write-back.** Column provenance first: DuckDB has no `column_metadata`, so a result's
-    columns have to be attributed from the statement (`intel::provenance_sources`, as SQLite's
-    were before rusqlite 0.40), refusing anything it cannot verify. Then `commit_writes`,
-    `refetch_rows` and `fetch_blob`. `rowid` is DuckDB's implicit column
-    (`intel::implicit_columns`); **measure whether it survives a delete and a checkpoint** before
-    it is let near an edit key — a key that moves writes the wrong row.
+- **Phase 2 — the rest of the writes:**
   - **Import** (`import_rows`, then `import::supports_import`), the **dump** (`dump::supports_dump`;
     every arm already answers), and **Manual tabs** (`Session` for DuckDB, then
     `tx::supports_manual_mode`; `BEGIN TRANSACTION READ ONLY` is the read-only session).
@@ -94,12 +90,12 @@ is left is below. ClickHouse would come after DuckDB.
     instance is its data, so it must be held for as long as the session is open, not closed with
     its last operation as a file's is.
   - **Schema compare** between two DuckDB files.
-- **Loose ends from phase 1:** `duckdb::run_ddl` checks its token only before it starts — hand
-  it an interrupt handle as `run_script` has, before a plan can reach it; the read-only half of the
-  seal (`AccessMode::ReadOnly`) has no test, the suites' in-memory instance having no file to open
-  read-only; `db::ident_duckdb` is not in the test that binds the engine quoters (`mysql.rs`); and
-  *Compare with* / *Copy to* are offered on a DuckDB connection with every change refused behind
-  them — gate the entries, or land the designer first.
+- **Loose ends:** the read-only half of the seal (`AccessMode::ReadOnly`) has no test, the
+  suites' in-memory instance having no file to open read-only; and *Compare with* is offered on a
+  DuckDB connection with every change refused behind it (*Copy to* is already hidden, through
+  `ddl::supports_table_design`) — it clears itself when the designer lands. A file named
+  `main.duckdb` makes `main.t` both a schema and a catalog, and its results are not attributed;
+  accept the reading where both resolve to the same table, if anyone hits it.
 - **Phase 3:** translate the new strings (`db-refused-duckdb-*`, `connections-duckdb-*`,
   `backup-kind-duckdb` are English in every catalogue but `en-GB`); measure
   `intel::select_list_subquery_sees_earlier_aliases` (answered `false` unmeasured); the full CI

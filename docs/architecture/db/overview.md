@@ -20,8 +20,8 @@ three engines now, and the second is renamed for it:
 and answers every name**, the unwritten ones with a refusal: it is in the first test's list and
 in `the_entry_point_list_is_what_the_dispatcher_actually_dispatches`'s intersection, whose
 listed-⊆-called half is what holds its dispatch arms, and the second test's own loop names all
-four modules. **`duckdb.rs` is a fifth and answers every name too — but none of the three tests
-lists it yet** (under `duckdb.rs`), so for that module the census is the compiler's alone.
+four modules. **`duckdb.rs` is a fifth and answers every name too**, and all three tests list it
+(under `duckdb.rs`).
 **Flipping them to three is what found the last three doors.** `commit_writes`, `refetch_rows`
 and `fetch_blob` existed in `mysql.rs` only as `write_on`, `refetch_on` and `blob_on` — the
 bodies `session.rs` calls directly — while the dispatcher's arm was still inline, so the interface
@@ -700,7 +700,7 @@ read-only gate (`read_only_refusal(..).reason`), `kill_session`'s cancel, the bl
 code-page checks, `sqlite::open_target`'s three refusals, SQLite's "the SQLite worker failed: …"
 (a `Query` once) at each of its six sites, its default-reset refusals and `table_stats`' size
 cap, and DuckDB's — `duckdb::open_target`'s three, a sealed or unsealed instance asked for the
-other kind (`DuckDbSealedElsewhere`), its worker failing, phase 1's `DuckDbNotYet` and
+other kind (`DuckDbSealedElsewhere`), its worker failing, `DuckDbNotYet` (import alone now) and
 `Session::open`'s `DuckDbNoManual` (under `duckdb.rs`). It renders **as written**, `#[error("{0}")]` with no prefix — `DbRefusal`'s `Display`, its
 English: each is already the whole sentence, and "query failed:" in front of "Commit cancelled
 — …" named a failure that was the user's own act. The window words it instead

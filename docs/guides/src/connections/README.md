@@ -59,7 +59,7 @@ Type the path in **Database file**, or press **Browse…** inside the field to p
   other program and run again.
 - *Nothing is downloaded.* DuckDB extensions are never installed or loaded behind a query. Parquet
   and JSON support are built in; any other extension isn't available.
-- *Not yet:* editing results in the grid, importing files, **Manual** transactions, designing
+- *Not yet:* importing files, **Manual** transactions, designing
   tables, and editing views and macros. See [Engine differences](../reference/engines.md#duckdb).
 
 ## Switching connections

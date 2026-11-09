@@ -18649,6 +18649,14 @@ pub enum Projection {
 /// returned as [`Projection::LeadingThenWildcard`]. That is what makes
 /// `SELECT rowid, * FROM t` — a keyless SQLite table's editable form — analysable
 /// without the caller having to spell out every column.
+///
+/// Two DuckDB shapes are refused because a positional reading gets them wrong.
+/// A **wildcard with options** (`* EXCLUDE (a)`, `* REPLACE (a + 1 AS a)`)
+/// is not the table's columns, so the whole answer is `None`. A **qualified
+/// reference** (`x.a`, `x.*`) counts only when `x` is the source's alias, or
+/// its name where it has none: `s.a` may be a field of a struct column `s`.
+/// This is DuckDB's write-back provenance (`db::duckdb`), which also checks
+/// every placed name against the catalogue.
 pub fn projection_of(sql: &str, dialect: SqlDialect) -> Option<(SourceTable, Projection)> {
     use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement};
 
@@ -18661,11 +18669,49 @@ pub fn projection_of(sql: &str, dialect: SqlDialect) -> Option<(SourceTable, Pro
         return None;
     };
 
+    // **The one name a qualifier may use for the source**: its alias where it
+    // has one (which hides the table's name), the table's own name otherwise.
+    // On DuckDB `s.a` is also field `a` of a struct column `s`, and `s.*` its
+    // fields, so a qualifier that is anything else is no column of the table.
+    let own_name = match &select.from[0].relation {
+        sqlparser::ast::TableFactor::Table {
+            alias: Some(alias), ..
+        } => alias.name.value.clone(),
+        _ => source.name.clone(),
+    };
+    let names_source = |id: &sqlparser::ast::Ident| id.value.eq_ignore_ascii_case(&own_name);
+
     let is_wildcard = |p: &SelectItem| {
         matches!(
             p,
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
         )
+    };
+    // **A wildcard with options is not the table's columns**: DuckDB's
+    // `* EXCLUDE (a)` drops one and shifts every later position, and
+    // `* REPLACE (a + 1 AS a)` keeps names and positions while computing the
+    // value — a positional reading would make an expression editable as `a`.
+    let plain_wildcard = |p: &SelectItem| {
+        let plain = |o: &sqlparser::ast::WildcardAdditionalOptions| {
+            o.opt_ilike.is_none()
+                && o.opt_exclude.is_none()
+                && o.opt_except.is_none()
+                && o.opt_replace.is_none()
+                && o.opt_rename.is_none()
+                && o.opt_alias.is_none()
+        };
+        match p {
+            SelectItem::Wildcard(o) => plain(o),
+            SelectItem::QualifiedWildcard(
+                sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name),
+                o,
+            ) => {
+                plain(o)
+                    && matches!(object_name_parts(name).as_slice(),
+                                [q] if q.eq_ignore_ascii_case(&own_name))
+            }
+            _ => false,
+        }
     };
     // Where the wildcards are. More than one, or one that isn't last, leaves
     // every position after it at an unknowable offset — refuse the statement.
@@ -18676,6 +18722,12 @@ pub fn projection_of(sql: &str, dialect: SqlDialect) -> Option<(SourceTable, Pro
         .filter(|(_, p)| is_wildcard(p))
         .map(|(i, _)| i)
         .collect();
+    if wildcards
+        .iter()
+        .any(|&i| !plain_wildcard(&select.projection[i]))
+    {
+        return None;
+    }
     let trailing_wildcard = match wildcards.as_slice() {
         [] => None,
         [i] if *i == select.projection.len() - 1 => Some(*i),
@@ -18688,9 +18740,11 @@ pub fn projection_of(sql: &str, dialect: SqlDialect) -> Option<(SourceTable, Pro
     let base_of = |e: &Expr| -> Option<String> {
         match e {
             Expr::Identifier(id) => Some(id.value.clone()),
-            // `t.a` — the qualifier is the source table or its alias either way,
-            // since a single-table SELECT has nothing else it could name.
-            Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some(parts[1].value.clone()),
+            // `t.a` — only when the qualifier is the source table or its alias
+            // (see `own_name`): `s.a` may be a struct column's field.
+            Expr::CompoundIdentifier(parts) if parts.len() == 2 && names_source(&parts[0]) => {
+                Some(parts[1].value.clone())
+            }
             _ => None,
         }
     };
@@ -26442,6 +26496,53 @@ mod tests {
         // belongs to a column.
         assert_eq!(
             p("SELECT a * 2, * FROM t"),
+            Some(Projection::LeadingThenWildcard(vec![None]))
+        );
+    }
+
+    /// **A wildcard with options is not the table's columns.** DuckDB's
+    /// `* EXCLUDE (a)` drops one, so every later position shifts; `* REPLACE
+    /// (a + 1 AS a)` keeps the names and positions while the value is computed,
+    /// so a positional reading would make an expression editable as column `a`.
+    /// Either is refused whole, as `*` with anything behind it is.
+    #[test]
+    fn projection_refuses_a_wildcard_that_carries_options() {
+        let p = |s: &str| projection_of(s, SqlDialect::DuckDb).map(|(_, p)| p);
+        assert_eq!(p("SELECT * FROM t"), Some(Projection::Wildcard));
+        assert_eq!(p("SELECT * EXCLUDE (a) FROM t"), None);
+        assert_eq!(p("SELECT * REPLACE (a + 1 AS a) FROM t"), None);
+        assert_eq!(p("SELECT t.* EXCLUDE (a) FROM t"), None);
+        assert_eq!(p("SELECT id, * EXCLUDE (id) FROM t"), None);
+    }
+
+    /// **A qualifier has to be the source.** On DuckDB `s.a` is also field `a`
+    /// of a struct column `s`, and `s.*` its fields, so a qualified reference
+    /// is read as a column only when the qualifier names the table — or its
+    /// alias, which hides the name.
+    #[test]
+    fn projection_reads_a_qualified_reference_only_through_the_source() {
+        let p = |s: &str| projection_of(s, SqlDialect::DuckDb).map(|(_, p)| p);
+        assert_eq!(
+            p("SELECT t.a, s.a FROM t"),
+            Some(Projection::Items(vec![Some("a".into()), None]))
+        );
+        assert_eq!(
+            p("SELECT x.a, t.a FROM t AS x"),
+            Some(Projection::Items(vec![Some("a".into()), None]))
+        );
+        assert_eq!(
+            p("SELECT \"T\".a FROM t"),
+            Some(Projection::Items(vec![Some("a".into())]))
+        );
+        assert_eq!(
+            p("SELECT main.t.a FROM main.t"),
+            Some(Projection::Items(vec![None]))
+        );
+        assert_eq!(p("SELECT s.* FROM t"), None);
+        assert_eq!(p("SELECT t.* FROM t AS x"), None);
+        assert_eq!(p("SELECT x.* FROM t AS x"), Some(Projection::Wildcard));
+        assert_eq!(
+            p("SELECT s.a, * FROM t"),
             Some(Projection::LeadingThenWildcard(vec![None]))
         );
     }

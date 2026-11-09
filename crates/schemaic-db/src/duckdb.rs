@@ -4,7 +4,7 @@
 //! is [`crate::Engine::DuckDb`]. Embedded like SQLite, so most of what
 //! [`crate::sqlite`]'s doc says holds here too — **there is no server**, a
 //! connection is a file ([`crate::Db::file`]) and nothing else, and the driver
-//! is blocking, so every call runs on Tokio's blocking pool. Four things make it
+//! is blocking, so every call runs on Tokio's blocking pool. Five things make it
 //! unlike SQLite, and each shapes the code below.
 //!
 //! **One database instance per file, per process.** DuckDB locks a file per
@@ -45,9 +45,13 @@
 //! a timestamp in ISO form (`TIMESTAMP WITH TIME ZONE` in UTC, this build linking
 //! no ICU), a list `[1, 2]`, a struct `{'a': 1}` — see [`cell_of`].
 //!
-//! **What phase 1 of the roadmap does not do yet**, refused rather than faked:
-//! grid write-back, re-fetch, blob fetch and import ([`DbRefusal::DuckDbNotYet`]),
-//! column provenance (so a result is read-only), and Manual tabs
+//! **Grid write-back rests on provenance read from the statement**, since
+//! the driver reports none: [`origins_of`] places each result column on one
+//! base table and proves it against the catalogue, or attributes nothing.
+//! `rowid` is never a key — a checkpoint renumbers it.
+//!
+//! **What the roadmap's phase 2 has not reached yet**, refused rather than
+//! faked: import ([`DbRefusal::DuckDbNotYet`]) and Manual tabs
 //! (`tx::supports_manual_mode`). DDL plans and `.sql` scripts run.
 
 use std::collections::HashMap;
@@ -60,8 +64,8 @@ use duckdb::{AccessMode, Config, Connection as DuckConn};
 use schemaic_core::blob::{BlobRef, BlobValue};
 use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{
-    Column, DbRefusal, GridWrite, RefetchRow, RefetchTemplate, ResultBuilder, ResultSet, Value,
-    binary_display,
+    CellEdit, Column, ColumnOrigin, DbRefusal, GridWrite, RefetchRow, RefetchTemplate,
+    ResultBuilder, ResultSet, Value, WriteStep, binary_display,
 };
 use schemaic_core::schema::{
     CheckInfo, ColumnInfo, DbSchema, ForeignKeyInfo, IndexColumn, IndexInfo, RoutineInfo,
@@ -281,10 +285,11 @@ pub(crate) async fn fetch_query(
             Err(e) => return (Err(e), moved),
         };
         let _ = tx.send(conn.interrupt_handle());
+        let home = catalog(&conn).ok();
         if read_only && let Err(e) = conn.execute_batch("BEGIN TRANSACTION READ ONLY") {
             return (Err(query_err(e)), moved);
         }
-        let rs = run_query(&conn, &sql, &mut moved);
+        let rs = run_query(&conn, home.as_deref(), &sql, &mut moved);
         if read_only {
             let _ = conn.execute_batch("ROLLBACK");
         }
@@ -337,6 +342,7 @@ pub(crate) async fn run_batch(
             }
         };
         let _ = handle_tx.send(conn.interrupt_handle());
+        let home = catalog(&conn).ok();
         if read_only && let Err(e) = conn.execute_batch("BEGIN TRANSACTION READ ONLY") {
             let _ = res_tx.send((0usize, Err(query_err(e))));
             return;
@@ -346,7 +352,7 @@ pub(crate) async fn run_batch(
                 break;
             }
             let mut dest = crate::RowDest::Capped(row_cap);
-            let r = match run_query(&conn, stmt, &mut dest) {
+            let r = match run_query(&conn, home.as_deref(), stmt, &mut dest) {
                 Err(_) if worker_cancel.is_cancelled() => Err(DbError::Cancelled),
                 other => other,
             };
@@ -391,8 +397,14 @@ fn counts_rows(sql: &str) -> bool {
     }
 }
 
-/// The blocking half of [`fetch_query`].
-fn run_query(conn: &DuckConn, sql: &str, dest: &mut crate::RowDest) -> Result<ResultSet, DbError> {
+/// The blocking half of [`fetch_query`]. `home` is the file's own catalog,
+/// read when the connection opened ([`origins_of`]).
+fn run_query(
+    conn: &DuckConn,
+    home: Option<&str>,
+    sql: &str,
+    dest: &mut crate::RowDest,
+) -> Result<ResultSet, DbError> {
     let row_cap = dest.cap();
     let start = Instant::now();
     let mut stmt = conn.prepare(sql).map_err(query_err)?;
@@ -435,6 +447,14 @@ fn run_query(conn: &DuckConn, sql: &str, dest: &mut crate::RowDest) -> Result<Re
         rs.elapsed_ms = start.elapsed().as_millis();
         return Ok(rs);
     }
+    // Before the rows are read, on the same connection — the result is
+    // already materialised, and the session state it was read under (a
+    // temporary table, `search_path`, `USE`) is the state that decides it.
+    let mut columns = columns;
+    let origins = origins_of(conn, home, sql, &columns);
+    for (c, o) in columns.iter_mut().zip(origins) {
+        c.origin = o;
+    }
     let ncols = columns.len();
     let chunk_capacity = dest.chunk_capacity();
     let mut builder = ResultBuilder::with_capacity(columns, chunk_capacity);
@@ -447,27 +467,11 @@ fn run_query(conn: &DuckConn, sql: &str, dest: &mut crate::RowDest) -> Result<Re
         }
         cells.clear();
         for (i, kind) in kinds.iter().enumerate() {
-            // A `NULL`-typed column (`SELECT NULL`) is asked nothing: the driver
-            // panics decoding one (duckdb 1.20000.1, `row.rs`).
-            if *kind == LogicalTypeId::SqlNull {
-                cells.push(Value::Null);
-                continue;
-            }
-            // And any other value it cannot decode costs that cell, not the
-            // worker and with it the whole result.
-            let got =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| row.get::<_, DValue>(i)));
-            let v: DValue = match got {
-                Ok(r) => r.map_err(query_err)?,
-                Err(_) => {
-                    cells.push(Value::Str(format!("<{}>", columns_type(&builder, i))));
-                    continue;
-                }
-            };
-            if matches!(v, DValue::Blob(_) | DValue::Geometry(_)) {
+            let (v, bytes) = decode_cell(row, i, *kind, || columns_type(&builder, i))?;
+            if bytes {
                 builder.mark_binary(i);
             }
-            cells.push(cell_of(v, *kind));
+            cells.push(v);
         }
         builder.push_row(&cells);
         if dest.chunk_full(builder.row_count(), builder.text_bytes()) {
@@ -479,6 +483,267 @@ fn run_query(conn: &DuckConn, sql: &str, dest: &mut crate::RowDest) -> Result<Re
     rs.truncated = truncated;
     rs.elapsed_ms = start.elapsed().as_millis();
     Ok(rs)
+}
+
+// ── Provenance ──────────────────────────────────────────────────────────────
+
+/// One column of a table, as provenance needs it.
+struct ColFacts {
+    name: String,
+    type_name: String,
+    not_null: bool,
+    default: Option<String>,
+    generated: bool,
+    primary_key: bool,
+    unique: bool,
+}
+
+/// Where each of `columns` came from — the per-column provenance MySQL and
+/// PostgreSQL read off the wire and DuckDB's driver does not report at all.
+///
+/// **Read from the statement, then checked against the catalogue, on the
+/// connection that ran it.** [`schemaic_core::intel::projection_of`] places each result
+/// column positionally on one base table (an alias renames the output, not the
+/// column), and refuses every shape where a position could move — a join, a
+/// set operation, a CTE, a derived table, `* EXCLUDE`/`* REPLACE`, a qualifier
+/// that may be a struct column. What it places is then proven here, and any
+/// doubt attributes the *whole* result to nothing, because a wrong origin is
+/// an `UPDATE` of another row or another table while a missing one is only a
+/// read-only grid:
+///
+/// - the connection is still on the file's own catalog (`home`) — a `USE` of
+///   an attached database would have the bare name mean another file;
+/// - a bare name is read in `current_schema()`, and only with `search_path`
+///   unset and no temporary relation of that name, either of which would have
+///   DuckDB resolve it elsewhere;
+/// - the relation is a **base table** of that schema (a view is not: its rows
+///   belong to whatever it reads);
+/// - a wildcard's columns are the table's, in order and by name.
+///
+/// One thing costs only its own column rather than the result: a placed name
+/// that is not a column of the table — `rowid`, or an earlier alias — is
+/// attributed to nothing while the columns around it keep theirs. Names match
+/// case-insensitively, as DuckDB binds, and come back in the catalogue's
+/// spelling. A table column wins over an earlier alias of the same name, which
+/// is what makes reading a bare name as the column sound (measured:
+/// `SELECT x + 10 AS a, a` returns the column `a`).
+///
+/// **`rowid` is never an origin**, and so never the implicit key it is on
+/// SQLite: a checkpoint renumbers rowids after a delete
+/// (`a_checkpoint_renumbers_rowids_so_none_is_a_key`), so a keyless table is
+/// read-only here.
+fn origins_of(
+    conn: &DuckConn,
+    home: Option<&str>,
+    sql: &str,
+    columns: &[Column],
+) -> Vec<Option<ColumnOrigin>> {
+    attribute(conn, home, sql, columns).unwrap_or_else(|| vec![None; columns.len()])
+}
+
+/// [`origins_of`], `None` for "attribute nothing".
+fn attribute(
+    conn: &DuckConn,
+    home: Option<&str>,
+    sql: &str,
+    columns: &[Column],
+) -> Option<Vec<Option<ColumnOrigin>>> {
+    use schemaic_core::intel::Projection;
+    let (source, projection) = schemaic_core::intel::projection_of(sql, D)?;
+    let home = home?;
+    let one = |q: &str, p: &[&str]| -> Option<String> {
+        conn.query_row(q, duckdb::params_from_iter(p), |r| r.get(0))
+            .ok()
+    };
+    if one("SELECT current_database()", &[])?.as_str() != home {
+        return None;
+    }
+    let schema = match &source.qualifier {
+        // A qualifier that is also a catalog's name is DuckDB's to read either
+        // way; refuse rather than guess which.
+        Some(q) => {
+            let catalogs: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM duckdb_databases() WHERE lower(database_name) = lower(?)",
+                    [q],
+                    |r| r.get(0),
+                )
+                .ok()?;
+            if catalogs > 0 {
+                return None;
+            }
+            one(
+                "SELECT schema_name FROM duckdb_schemas() \
+                 WHERE database_name = current_database() AND lower(schema_name) = lower(?)",
+                &[q],
+            )?
+        }
+        None => {
+            if !one("SELECT current_setting('search_path')", &[])?.is_empty() {
+                return None;
+            }
+            let shadows: i64 = conn
+                .query_row(
+                    "SELECT (SELECT count(*) FROM duckdb_tables() \
+                              WHERE database_name = 'temp' AND lower(table_name) = lower(?1)) \
+                          + (SELECT count(*) FROM duckdb_views() \
+                              WHERE database_name = 'temp' AND lower(view_name) = lower(?1))",
+                    [&source.name],
+                    |r| r.get(0),
+                )
+                .ok()?;
+            if shadows > 0 {
+                return None;
+            }
+            one("SELECT current_schema()", &[])?
+        }
+    };
+    let table = one(
+        "SELECT table_name FROM duckdb_tables() \
+         WHERE database_name = current_database() AND schema_name = ? \
+           AND lower(table_name) = lower(?)",
+        &[&schema, &source.name],
+    )?;
+    let facts = table_facts(conn, &schema, &table).ok()?;
+
+    let find = |name: &str| facts.iter().find(|c| c.name.eq_ignore_ascii_case(name));
+    let tail_matches = |from: usize| {
+        columns.len() == from + facts.len()
+            && columns[from..]
+                .iter()
+                .zip(&facts)
+                .all(|(c, f)| c.name == f.name)
+    };
+    let placed: Vec<Option<&ColFacts>> = match &projection {
+        Projection::Wildcard => {
+            if !tail_matches(0) {
+                return None;
+            }
+            facts.iter().map(Some).collect()
+        }
+        Projection::Items(items) => {
+            if items.len() != columns.len() {
+                return None;
+            }
+            items.iter().map(|i| i.as_deref().and_then(find)).collect()
+        }
+        Projection::LeadingThenWildcard(lead) => {
+            if !tail_matches(lead.len()) {
+                return None;
+            }
+            lead.iter()
+                .map(|i| i.as_deref().and_then(find))
+                .chain(facts.iter().map(Some))
+                .collect()
+        }
+    };
+    Some(
+        placed
+            .into_iter()
+            .map(|f| {
+                f.map(|f| {
+                    let auto_increment = f.default.as_deref().is_some_and(|d| {
+                        d.trim_start().to_ascii_lowercase().starts_with("nextval(")
+                    });
+                    ColumnOrigin {
+                        database: home.to_string(),
+                        schema: Some(schema.clone()),
+                        table: table.clone(),
+                        column: f.name.clone(),
+                        flags: schemaic_core::model::ColumnFlags {
+                            primary_key: f.primary_key,
+                            unique_key: f.unique,
+                            not_null: f.not_null,
+                            auto_increment,
+                            no_default: f.not_null
+                                && f.default.is_none()
+                                && !auto_increment
+                                && !f.generated,
+                        },
+                        binary: schemaic_core::model::type_is_binary(&f.type_name),
+                        implicit_key: false,
+                    }
+                })
+            })
+            .collect(),
+    )
+}
+
+/// `schema.table`'s columns in declared order, with the keys each is part of
+/// — a single-column `UNIQUE` marks its column unique, as a key would be.
+fn table_facts(conn: &DuckConn, schema: &str, table: &str) -> duckdb::Result<Vec<ColFacts>> {
+    let mut facts: Vec<ColFacts> = conn
+        .prepare(
+            "SELECT c.column_name, c.data_type, NOT c.is_nullable, c.column_default, \
+                    coalesce(ic.is_generated = 'ALWAYS', false) \
+               FROM duckdb_columns() c \
+               LEFT JOIN information_schema.columns ic \
+                 ON ic.table_catalog = c.database_name AND ic.table_schema = c.schema_name \
+                AND ic.table_name = c.table_name AND ic.column_name = c.column_name \
+              WHERE c.database_name = current_database() AND c.schema_name = ? \
+                AND c.table_name = ? \
+              ORDER BY c.column_index",
+        )?
+        .query_map([schema, table], |r| {
+            let generated: bool = r.get(4)?;
+            Ok(ColFacts {
+                name: r.get(0)?,
+                type_name: r.get(1)?,
+                not_null: r.get(2)?,
+                default: if generated { None } else { r.get(3)? },
+                generated,
+                primary_key: false,
+                unique: false,
+            })
+        })?
+        .collect::<duckdb::Result<_>>()?;
+    let mut stmt = conn.prepare(
+        "SELECT constraint_type, constraint_column_names FROM duckdb_constraints() \
+          WHERE database_name = current_database() AND schema_name = ? AND table_name = ? \
+            AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')",
+    )?;
+    let mut rows = stmt.query([schema, table])?;
+    while let Some(r) = rows.next()? {
+        let kind: String = r.get(0)?;
+        let cols = strings(r.get(1)?);
+        for f in &mut facts {
+            if !cols.iter().any(|c| c == &f.name) {
+                continue;
+            }
+            if kind == "PRIMARY KEY" {
+                f.primary_key = true;
+                f.not_null = true;
+            } else if cols.len() == 1 {
+                f.unique = true;
+            }
+        }
+    }
+    Ok(facts)
+}
+
+/// Cell `i` of `row` as [`cell_of`] renders it, and whether it held bytes —
+/// the one decoder, so a re-fetched row reads as the result it replaces.
+///
+/// A `NULL`-typed column (`SELECT NULL`) is asked nothing, since the driver
+/// panics decoding one (duckdb 1.20000.1, `row.rs`), and any other value it
+/// cannot decode costs that cell — a `<TYPE>` placeholder from `type_name` —
+/// rather than the worker and with it the whole result.
+fn decode_cell(
+    row: &duckdb::Row<'_>,
+    i: usize,
+    kind: LogicalTypeId,
+    type_name: impl FnOnce() -> String,
+) -> Result<(Value, bool), DbError> {
+    if kind == LogicalTypeId::SqlNull {
+        return Ok((Value::Null, false));
+    }
+    let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| row.get::<_, DValue>(i)));
+    let v: DValue = match got {
+        Ok(r) => r.map_err(query_err)?,
+        Err(_) => return Ok((Value::Str(format!("<{}>", type_name())), false)),
+    };
+    let bytes = matches!(v, DValue::Blob(_) | DValue::Geometry(_));
+    Ok((cell_of(v, kind), bytes))
 }
 
 /// Column `i`'s type name, for a cell the driver could not decode.
@@ -603,7 +868,7 @@ fn text_of(v: &DValue, kind: LogicalTypeId, nested: bool) -> String {
         DValue::Double(f) => f.to_string(),
         DValue::Decimal(d) => d.to_string(),
         DValue::Timestamp(unit, t) => timestamp_text(*unit, *t, kind == LogicalTypeId::TimestampTZ),
-        DValue::Text(s) | DValue::Enum(s) if nested => format!("'{}'", s.replace('\'', "''")),
+        DValue::Text(s) | DValue::Enum(s) if nested => nested_string(s),
         DValue::Text(s) | DValue::Enum(s) => s.clone(),
         DValue::Blob(b) | DValue::Geometry(b) => binary_display(b.len()),
         DValue::Date32(days) => date_text(*days),
@@ -623,7 +888,13 @@ fn text_of(v: &DValue, kind: LogicalTypeId, nested: bool) -> String {
         DValue::Struct(fields) => {
             let inner: Vec<String> = fields
                 .iter()
-                .map(|(k, x)| format!("'{k}': {}", text_of(x, LogicalTypeId::Invalid, true)))
+                .map(|(k, x)| {
+                    format!(
+                        "{}: {}",
+                        nested_string(k),
+                        text_of(x, LogicalTypeId::Invalid, true)
+                    )
+                })
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
@@ -645,6 +916,15 @@ fn text_of(v: &DValue, kind: LogicalTypeId, nested: bool) -> String {
         // than the row failing.
         other => format!("{other:?}"),
     }
+}
+
+/// A string inside a list, struct or map — or a struct's field name — as
+/// DuckDB writes it and, more to the point, **reads it back**: quoted, with a
+/// backslash before a quote or a backslash. Doubling the quote, SQL's own
+/// escape, is not this grammar's — `['it''s']` casts back as `its` (measured
+/// on 2.0) — and this text is what a grid edit of the cell sends.
+fn nested_string(s: &str) -> String {
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 /// `t` in `unit`, in microseconds — the finest the text below writes.
@@ -1014,13 +1294,21 @@ fn read_schema(conn: &DuckConn) -> Result<DbSchema, DbError> {
             .position(|t| t.schema.as_deref() == Some(schema) && t.name == name)
     };
 
-    // Columns, in declared order.
+    // Columns, in declared order. A **generated** column is reported by
+    // `duckdb_columns()` with its expression as the default (measured:
+    // `CAST((a * 2) AS INTEGER)`); only `information_schema` says which it is,
+    // and it is read as generated — no default — so the grid keeps it
+    // read-only, as it does every engine's.
     let mut stmt = conn
         .prepare(
-            "SELECT schema_name, table_name, column_name, data_type, is_nullable, \
-                    column_default, comment \
-               FROM duckdb_columns() WHERE database_name = current_database() AND NOT internal \
-              ORDER BY schema_name, table_name, column_index",
+            "SELECT c.schema_name, c.table_name, c.column_name, c.data_type, c.is_nullable, \
+                    c.column_default, c.comment, coalesce(ic.is_generated = 'ALWAYS', false) \
+               FROM duckdb_columns() c \
+               LEFT JOIN information_schema.columns ic \
+                 ON ic.table_catalog = c.database_name AND ic.table_schema = c.schema_name \
+                AND ic.table_name = c.table_name AND ic.column_name = c.column_name \
+              WHERE c.database_name = current_database() AND NOT c.internal \
+              ORDER BY c.schema_name, c.table_name, c.column_index",
         )
         .map_err(query_err)?;
     let mut rows = stmt.query([]).map_err(query_err)?;
@@ -1031,7 +1319,14 @@ fn read_schema(conn: &DuckConn) -> Result<DbSchema, DbError> {
             continue;
         };
         let default: Option<String> = r.get(5).map_err(query_err)?;
+        let generated: bool = r.get(7).map_err(query_err)?;
+        let (default, generated) = if generated {
+            (None, default)
+        } else {
+            (default, None)
+        };
         tables[k].columns.push(ColumnInfo {
+            generated,
             name: r.get(2).map_err(query_err)?,
             type_name: r.get(3).map_err(query_err)?,
             nullable: r.get(4).map_err(query_err)?,
@@ -1326,6 +1621,13 @@ fn check_expression(text: &str) -> String {
 
 /// Run a DDL plan in one transaction, all or nothing — DuckDB's DDL is
 /// transactional, as SQLite's is, so a failure leaves nothing applied.
+///
+/// **Stop reaches a statement already running**, through the connection's
+/// interrupt handle, as `sqlite::run_ddl` and [`run_script`] do: a plan's one
+/// long statement — a rebuild's copy over a large table — would otherwise
+/// hold the preview modal open for its whole length with the button reading
+/// *Stop* (`stop_interrupts_a_running_ddl_statement`). An interrupt surfaces
+/// as an ordinary error, so the token is what tells the two apart.
 pub(crate) async fn run_ddl(
     db: &Db,
     stmts: &[String],
@@ -1338,18 +1640,41 @@ pub(crate) async fn run_ddl(
         applied: 0,
     };
     if cancel.is_cancelled() {
-        return Err(fail(0, DdlCause::Db(DbError::Cancelled)));
+        return Err(fail(0, DdlCause::Cancelled));
     }
     let owned = stmts.to_vec();
     let db = db.clone();
-    tokio::task::spawn_blocking(move || {
+    let (handle_tx, handle_rx) = tokio::sync::oneshot::channel::<Arc<duckdb::InterruptHandle>>();
+    let watcher = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let Ok(h) = handle_rx.await else { return };
+            cancel.cancelled().await;
+            h.interrupt();
+        })
+    };
+    let worker_cancel = cancel.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        let cancel = worker_cancel;
         let (_inst, conn) = connect(&db).map_err(|e| fail(0, DdlCause::Db(e)))?;
+        let _ = handle_tx.send(conn.interrupt_handle());
         conn.execute_batch("BEGIN TRANSACTION")
             .map_err(|e| fail(0, DdlCause::Server(e.to_string())))?;
         for (i, s) in owned.iter().enumerate() {
-            if let Err(e) = conn.execute_batch(s) {
+            let failed = if cancel.is_cancelled() {
+                Some(DdlCause::Cancelled)
+            } else {
+                conn.execute_batch(s).err().map(|e| {
+                    if cancel.is_cancelled() {
+                        DdlCause::Cancelled
+                    } else {
+                        DdlCause::Server(e.to_string())
+                    }
+                })
+            };
+            if let Some(cause) = failed {
                 let _ = conn.execute_batch("ROLLBACK");
-                return Err(fail(i, DdlCause::Server(e.to_string())));
+                return Err(fail(i, cause));
             }
         }
         conn.execute_batch("COMMIT").map_err(|e| {
@@ -1365,7 +1690,9 @@ pub(crate) async fn run_ddl(
             0,
             DdlCause::Db(DbError::Refused(DbRefusal::DuckDbWorker(e.to_string()))),
         )
-    })?
+    });
+    watcher.abort();
+    out?
 }
 
 /// Run a `.sql` file's statements in order on **one connection**, as they
@@ -1470,33 +1797,300 @@ fn copy_into(conn: &DuckConn, target: &str) -> Result<(), DbError> {
     copied.and(detached)
 }
 
-/// Not yet (roadmap, DuckDB phase 2): a result carries no provenance, so the
-/// grid offers no edit to commit.
+/// Run `f` on an operation's own connection on a blocking thread, with Stop
+/// reaching a running statement through the connection's interrupt handle —
+/// the grid's commit, re-fetch and blob read, as SQLite's are.
+async fn with_conn_stoppable<T, F>(db: &Db, cancel: CancellationToken, f: F) -> Result<T, DbError>
+where
+    T: Send + 'static,
+    F: FnOnce(&DuckConn) -> Result<T, DbError> + Send + 'static,
+{
+    refuse_if_cancelled(&cancel)?;
+    let db = db.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let work = tokio::task::spawn_blocking(move || {
+        let (_inst, conn) = connect(&db)?;
+        let _ = tx.send(conn.interrupt_handle());
+        f(&conn)
+    });
+    let interrupt = rx.await.ok();
+    tokio::select! {
+        r = work => r.map_err(|e| DbError::Refused(DbRefusal::DuckDbWorker(e.to_string())))?,
+        _ = cancel.cancelled() => {
+            if let Some(h) = interrupt {
+                h.interrupt();
+            }
+            Err(DbError::Cancelled)
+        }
+    }
+}
+
+/// A table a grid write names, as `"schema"."table"`.
+///
+/// **Not catalog-qualified**, and that is safe for the reason SQLite's bare
+/// name is: the statement runs on a fresh connection whose catalog is the
+/// file's, and [`origins_of`] attributes nothing outside it — a result read
+/// after a `USE` of an attached database has no origin at all, so no write can
+/// name one of its tables.
+fn table_sql(schema: Option<&str>, table: &str) -> String {
+    match schema {
+        Some(s) => format!("{}.{}", crate::ident_duckdb(s), crate::ident_duckdb(table)),
+        None => crate::ident_duckdb(table),
+    }
+}
+
+/// A key value as a bound parameter. Text keys are cast by DuckDB to the
+/// column's type at bind time (measured on 2.0 for integers, decimals,
+/// timestamps with their zone, intervals, booleans, UUIDs and `HUGEINT`s past
+/// `i64` — the forms [`cell_of`] writes them in).
+fn key_param(v: &Value) -> DValue {
+    match v {
+        Value::Null => DValue::Null,
+        Value::Int(i) => DValue::BigInt(*i),
+        Value::UInt(u) => DValue::UBigInt(*u),
+        Value::Float(f) => DValue::Double(*f),
+        Value::Str(s) => DValue::Text(s.clone()),
+    }
+}
+
+/// `col = ?` … ` AND ` …, a NULL key value compared as `IS NULL` — `= NULL`
+/// matches nothing, which the one-row guard would report as a failed write
+/// rather than as the wrong `WHERE`.
+fn where_clause(key: &[(String, Value)], params: &mut Vec<DValue>) -> String {
+    key.iter()
+        .map(|(col, v)| {
+            if v.is_null() {
+                format!("{} IS NULL", crate::ident_duckdb(col))
+            } else {
+                params.push(key_param(v));
+                format!("{} = ?", crate::ident_duckdb(col))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// One staged cell as a bound parameter, or `None` for
+/// [`CellEdit::Default`], which is the keyword `DEFAULT` in the statement —
+/// DuckDB takes it in `SET` and in `VALUES` alike (measured). Text is cast to
+/// the column's type by DuckDB, nested types included, which is why
+/// [`nested_string`] writes a list, struct or map in the form that cast reads.
+fn cell_param(v: &CellEdit) -> Option<DValue> {
+    match v {
+        CellEdit::Text(t) => Some(DValue::Text(t.clone())),
+        CellEdit::Bytes(b) => Some(DValue::Blob(b.to_vec())),
+        CellEdit::Null => Some(DValue::Null),
+        CellEdit::Default => None,
+    }
+}
+
+/// The SQL and bound parameters for one step of a [`GridWrite`].
+fn statement_for(step: WriteStep<'_>) -> (String, Vec<DValue>) {
+    let mut params = Vec::new();
+    let sql = match step {
+        WriteStep::Delete(d) => {
+            let w = where_clause(&d.key, &mut params);
+            format!(
+                "DELETE FROM {} WHERE {w}",
+                table_sql(d.schema.as_deref(), &d.table)
+            )
+        }
+        WriteStep::Update(u) => {
+            // The SET parameters bind before the WHERE ones, in statement order.
+            let sets = u
+                .set
+                .iter()
+                .map(|(col, val)| match cell_param(val) {
+                    Some(p) => {
+                        params.push(p);
+                        format!("{} = ?", crate::ident_duckdb(col))
+                    }
+                    None => format!("{} = DEFAULT", crate::ident_duckdb(col)),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let w = where_clause(&u.key, &mut params);
+            format!(
+                "UPDATE {} SET {sets} WHERE {w}",
+                table_sql(u.schema.as_deref(), &u.table)
+            )
+        }
+        WriteStep::Insert(i) => {
+            let table = table_sql(i.schema.as_deref(), &i.table);
+            if i.cols.is_empty() {
+                format!("INSERT INTO {table} DEFAULT VALUES")
+            } else {
+                let cols: Vec<String> =
+                    i.cols.iter().map(|(c, _)| crate::ident_duckdb(c)).collect();
+                let values: Vec<&str> = i
+                    .cols
+                    .iter()
+                    .map(|(_, v)| match cell_param(v) {
+                        Some(p) => {
+                            params.push(p);
+                            "?"
+                        }
+                        None => "DEFAULT",
+                    })
+                    .collect();
+                format!(
+                    "INSERT INTO {table} ({}) VALUES ({})",
+                    cols.join(", "),
+                    values.join(", ")
+                )
+            }
+        }
+    };
+    (sql, params)
+}
+
+/// Commit a batch of grid edits in **one transaction**, each statement held to
+/// exactly one row — the order and the verdict are `core::model`'s
+/// ([`GridWrite::plan`], [`schemaic_core::model::one_row_verdict`]), as on
+/// every engine. DuckDB has no non-transactional table, so a failure rolls
+/// back completely ([`schemaic_core::model::Rollback::Complete`]). Returns the rows affected, which the guard makes
+/// the number of statements.
 pub(crate) async fn commit_writes(
-    _db: &Db,
-    _write: &GridWrite,
-    _cancel: CancellationToken,
+    db: &Db,
+    write: &GridWrite,
+    cancel: CancellationToken,
 ) -> Result<u64, DbError> {
-    Err(not_yet())
+    use schemaic_core::model::{Rollback, WriteCause, one_row_verdict};
+    if write.is_empty() {
+        return Ok(0);
+    }
+    let write = write.clone();
+    with_conn_stoppable(db, cancel, move |conn| {
+        conn.execute_batch("BEGIN TRANSACTION").map_err(query_err)?;
+        let applied = (|| {
+            let mut total = 0u64;
+            for step in write.plan() {
+                let (sql, params) = statement_for(step);
+                let affected = conn
+                    .execute(&sql, duckdb::params_from_iter(params))
+                    .map_err(query_err)? as u64;
+                one_row_verdict(step, affected).map_err(|miss| {
+                    DbError::write(WriteCause::OneRow(miss), Some(Rollback::Complete))
+                })?;
+                total += affected;
+            }
+            Ok(total)
+        })();
+        match applied {
+            Ok(total) => {
+                conn.execute_batch("COMMIT").map_err(query_err)?;
+                Ok(total)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    })
+    .await
 }
 
-/// Not yet — see [`commit_writes`].
+/// Re-read the rows a commit changed, so the grid splices them in place
+/// rather than re-running the query. A row no longer there is skipped — the
+/// right answer to a concurrent delete is nothing to splice.
 pub(crate) async fn refetch_rows(
-    _db: &Db,
-    _template: &RefetchTemplate,
-    _rows: &[RefetchRow],
-    _cancel: CancellationToken,
+    db: &Db,
+    template: &RefetchTemplate,
+    rows: &[RefetchRow],
+    cancel: CancellationToken,
 ) -> Result<Vec<(usize, Vec<Value>)>, DbError> {
-    Err(not_yet())
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let template = template.clone();
+    let rows = rows.to_vec();
+    with_conn_stoppable(db, cancel, move |conn| {
+        let cols = template
+            .columns
+            .iter()
+            .map(|c| crate::ident_duckdb(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let table = table_sql(template.schema.as_deref(), &template.table);
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            // Key then confirming columns, the order `edit::refetch_key`
+            // builds the values in.
+            let key: Vec<(String, Value)> = template
+                .key_cols
+                .iter()
+                .chain(template.confirm_cols.iter())
+                .zip(&row.key)
+                .map(|(&ci, v)| (template.columns[ci].clone(), v.clone()))
+                .collect();
+            let mut params = Vec::new();
+            let w = where_clause(&key, &mut params);
+            let mut stmt = conn
+                .prepare(&format!("SELECT {cols} FROM {table} WHERE {w} LIMIT 1"))
+                .map_err(query_err)?;
+            let mut got = stmt
+                .query(duckdb::params_from_iter(params))
+                .map_err(query_err)?;
+            let kinds: Vec<(LogicalTypeId, String)> = match got.as_ref() {
+                Some(st) => (0..st.column_count())
+                    .map(|i| {
+                        let lt = st.column_logical_type(i);
+                        (lt.id(), type_name(&lt))
+                    })
+                    .collect(),
+                None => continue,
+            };
+            if let Some(r) = got.next().map_err(query_err)? {
+                let cells = kinds
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (kind, name))| {
+                        decode_cell(r, i, *kind, || name.clone()).map(|(v, _)| v)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                out.push((row.data_row, cells));
+            }
+        }
+        Ok(out)
+    })
+    .await
 }
 
-/// Not yet — see [`commit_writes`].
+/// Read one `BLOB` cell: its octet length and its first
+/// [`schemaic_core::blob::FETCH_CAP`] bytes. `None` for a vanished row or a
+/// NULL, as on every engine. DuckDB has no byte-slicing of a `BLOB` in SQL, so
+/// the value comes over whole and is cut here.
 pub(crate) async fn fetch_blob(
-    _db: &Db,
-    _r: &BlobRef,
-    _cancel: CancellationToken,
+    db: &Db,
+    r: &BlobRef,
+    cancel: CancellationToken,
 ) -> Result<Option<BlobValue>, DbError> {
-    Err(not_yet())
+    let r = r.clone();
+    with_conn_stoppable(db, cancel, move |conn| {
+        let mut params = Vec::new();
+        let w = where_clause(&r.key, &mut params);
+        let col = crate::ident_duckdb(&r.column);
+        let sql = format!(
+            "SELECT {col} FROM {} WHERE {w} LIMIT 1",
+            table_sql(r.schema.as_deref(), &r.table)
+        );
+        let mut stmt = conn.prepare(&sql).map_err(query_err)?;
+        let mut got = stmt
+            .query(duckdb::params_from_iter(params))
+            .map_err(query_err)?;
+        let Some(row) = got.next().map_err(query_err)? else {
+            return Ok(None);
+        };
+        match row.get::<_, DValue>(0).map_err(query_err)? {
+            DValue::Blob(mut bytes) | DValue::Geometry(mut bytes) => {
+                let len = bytes.len() as u64;
+                bytes.truncate(schemaic_core::blob::FETCH_CAP);
+                Ok(Some(BlobValue { bytes, len }))
+            }
+            _ => Ok(None),
+        }
+    })
+    .await
 }
 
 /// Not yet (roadmap, DuckDB phase 2); `import::supports_import` keeps the
@@ -1729,6 +2323,47 @@ mod tests {
         assert!(rs.binary_columns.contains(&12));
     }
 
+    /// **A string inside a list, struct or map is written as DuckDB writes it
+    /// and reads it back**: quoted, with a backslash before a quote or a
+    /// backslash (measured on 2.0 — `'it''s'` casts back as `its`). The text
+    /// is what a grid edit sends, so a form the cast misreads would write
+    /// another value than the one shown.
+    #[test]
+    fn a_nested_string_is_escaped_the_way_duckdb_reads_it_back() {
+        let db = mem("nested-escape");
+        let rt = rt();
+        let rs = rt
+            .block_on(q(
+                &db,
+                r"SELECT ['it''s', 'a\b', NULL] AS l, {'it''s': 'x''y'} AS s,
+                         MAP {'k''': 'v\'} AS m",
+            ))
+            .unwrap();
+        let row: Vec<String> = (0..3)
+            .map(|c| rs.cell(0, c).unwrap().display().to_string())
+            .collect();
+        assert_eq!(
+            row,
+            [
+                r"['it\'s', 'a\\b', NULL]",
+                r"{'it\'s': 'x\'y'}",
+                r"{'k\''='v\\'}"
+            ]
+        );
+        // And each reads back as the value it came from.
+        let (_i, c) = connect(&db).unwrap();
+        let same: bool = c
+            .query_row(
+                r#"SELECT ?::VARCHAR[] IS NOT DISTINCT FROM ['it''s', 'a\b', NULL]
+                     AND ?::STRUCT("it's" VARCHAR) = {'it''s': 'x''y'}
+                     AND ?::MAP(VARCHAR, VARCHAR) = MAP {'k''': 'v\'}"#,
+                [&row[0], &row[1], &row[2]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(same);
+    }
+
     #[test]
     fn the_schema_reads_tables_views_keys_and_macros() {
         let db = mem("schema");
@@ -1743,6 +2378,7 @@ mod tests {
              CREATE SCHEMA other;
              CREATE TABLE other.w(k INT);
              CREATE MACRO plus_one(x) AS x + 1;
+             CREATE TABLE g(a INT, b INT GENERATED ALWAYS AS (a * 2));
              COMMENT ON TABLE p IS 'parents';",
         );
         let rt = rt();
@@ -1788,9 +2424,324 @@ mod tests {
         );
         assert_eq!(v.columns.len(), 2);
         assert_eq!(t("w").schema.as_deref(), Some("other"));
+        // A generated column is its expression, not a default — which is how
+        // `duckdb_columns()` reports it — so the grid keeps it read-only.
+        let b = &t("g").columns[1];
+        assert!(
+            b.generated.as_deref().is_some_and(|g| g.contains("a * 2")),
+            "{b:?}"
+        );
+        assert_eq!(b.default, None);
+        assert_eq!(t("g").columns[0].generated, None);
         assert_eq!(s.sequences[0].name, "s");
         assert_eq!(s.routines[0].name, "plus_one");
         assert_eq!(s.routines[0].arguments, "x");
+    }
+
+    /// A provenance fixture: a keyed table with every kind of column, a
+    /// same-named table in another schema, and a view over the first.
+    fn provenance_db(name: &str) -> Db {
+        let db = mem(name);
+        seed(
+            &db,
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, name VARCHAR NOT NULL, note VARCHAR DEFAULT 'x',
+                            g INT GENERATED ALWAYS AS (id * 2), b BLOB, code VARCHAR UNIQUE);
+             INSERT INTO p (id, name, b, code) VALUES (1, 'one', 'ab'::BLOB, 'c1');
+             CREATE SCHEMA other; CREATE TABLE other.p(id INT);
+             CREATE VIEW v AS SELECT * FROM p;",
+        );
+        db
+    }
+
+    /// Each result column's origin as `schema.table.column`, `-` for none.
+    fn origins(rs: &ResultSet) -> Vec<String> {
+        rs.columns
+            .iter()
+            .map(|c| match &c.origin {
+                Some(o) => format!(
+                    "{}.{}.{}",
+                    o.schema.as_deref().unwrap_or("?"),
+                    o.table,
+                    o.column
+                ),
+                None => "-".to_string(),
+            })
+            .collect()
+    }
+
+    /// A plain read of one table is attributed, column by column and by
+    /// position — an alias renames the output, not the column behind it —
+    /// with the flags the grid's key choice and inserts read.
+    #[test]
+    fn a_single_table_read_is_attributed_by_position() {
+        let db = provenance_db("prov-plain");
+        let rt = rt();
+        let rs = rt.block_on(q(&db, "SELECT * FROM p")).unwrap();
+        assert_eq!(
+            origins(&rs),
+            [
+                "main.p.id",
+                "main.p.name",
+                "main.p.note",
+                "main.p.g",
+                "main.p.b",
+                "main.p.code"
+            ]
+        );
+        let o = |i: usize| rs.columns[i].origin.clone().unwrap();
+        assert_eq!(o(0).database, "memory");
+        assert!(o(0).flags.primary_key && o(0).flags.not_null && !o(0).implicit_key);
+        assert!(o(1).flags.not_null && o(1).flags.no_default);
+        assert!(!o(2).flags.no_default && !o(2).flags.not_null);
+        assert!(o(4).binary);
+        assert!(o(5).flags.unique_key);
+
+        let rs = rt
+            .block_on(q(&db, "SELECT name AS id, id, id + 1, upper(name) FROM p"))
+            .unwrap();
+        assert_eq!(origins(&rs), ["main.p.name", "main.p.id", "-", "-"]);
+        // Case-folded names come back in the catalogue's spelling.
+        let rs = rt.block_on(q(&db, "SELECT X.ID FROM P AS x")).unwrap();
+        assert_eq!(origins(&rs), ["main.p.id"]);
+        let rs = rt.block_on(q(&db, "SELECT * FROM other.p")).unwrap();
+        assert_eq!(origins(&rs), ["other.p.id"]);
+    }
+
+    /// Whatever the statement cannot vouch for is attributed to nothing: a
+    /// view, a join, a wildcard with options, `rowid` (which a checkpoint
+    /// renumbers — `a_checkpoint_renumbers_rowids_so_none_is_a_key`), and a
+    /// name a temporary table or a `search_path` points elsewhere. A wrong
+    /// origin is a write to another row or another table; a missing one is a
+    /// read-only grid.
+    #[test]
+    fn what_the_statement_cannot_vouch_for_is_attributed_to_nothing() {
+        let db = provenance_db("prov-refused");
+        let rt = rt();
+        for sql in [
+            "SELECT * FROM v",
+            "SELECT p.id FROM p JOIN other.p o ON o.id = p.id",
+            "SELECT * EXCLUDE (note) FROM p",
+            "SELECT * REPLACE (id + 1 AS id) FROM p",
+            "SELECT id FROM p UNION ALL SELECT id FROM p",
+            "WITH w AS (SELECT * FROM p) SELECT * FROM w",
+            "SELECT * FROM (SELECT * FROM p) s",
+        ] {
+            let rs = rt.block_on(q(&db, sql)).unwrap();
+            assert!(
+                rs.columns.iter().all(|c| c.origin.is_none()),
+                "{sql}: {:?}",
+                origins(&rs)
+            );
+        }
+        let rs = rt.block_on(q(&db, "SELECT rowid, id FROM p")).unwrap();
+        assert_eq!(origins(&rs), ["-", "main.p.id"]);
+
+        // Session state the statement's own connection carries.
+        let batch = |stmts: &[&str]| -> ResultSet {
+            let stmts: Vec<String> = stmts.iter().map(|s| s.to_string()).collect();
+            let mut last = None;
+            rt.block_on(
+                db.run_batch(None, &stmts, 100, CancellationToken::new(), |_, r| {
+                    last = Some(r)
+                }),
+            );
+            last.unwrap().unwrap()
+        };
+        let rs = batch(&["CREATE TEMP TABLE p(z INT)", "SELECT * FROM p"]);
+        assert_eq!(origins(&rs), ["-"]);
+        let rs = batch(&["SET search_path = 'other'", "SELECT * FROM p"]);
+        assert_eq!(origins(&rs), ["-"]);
+        let rs = batch(&["USE memory.other", "SELECT * FROM p"]);
+        assert!(
+            origins(&rs).iter().all(|o| o == "-" || o == "other.p.id"),
+            "{:?}",
+            origins(&rs)
+        );
+    }
+
+    fn edit(set: Vec<(&str, CellEdit)>, id: i64) -> schemaic_core::model::RowEdit {
+        schemaic_core::model::RowEdit {
+            database: "memory".into(),
+            schema: Some("main".into()),
+            table: "p".into(),
+            set: set.into_iter().map(|(c, v)| (c.to_string(), v)).collect(),
+            key: vec![("id".into(), Value::Int(id))],
+        }
+    }
+
+    fn names(db: &Db, rt: &tokio::runtime::Runtime) -> Vec<String> {
+        let rs = rt
+            .block_on(q(
+                db,
+                "SELECT id || ':' || name || ':' || coalesce(note, '-') FROM p ORDER BY id",
+            ))
+            .unwrap();
+        (0..rs.row_count())
+            .map(|r| rs.cell(r, 0).unwrap().display().to_string())
+            .collect()
+    }
+
+    /// A grid commit is one transaction: an update — with a staged `DEFAULT`
+    /// written as the keyword — an insert and a delete, each held to one row.
+    #[test]
+    fn a_grid_commit_updates_inserts_and_deletes_in_one_transaction() {
+        let db = provenance_db("commit");
+        let rt = rt();
+        let write = GridWrite {
+            updates: vec![edit(
+                vec![
+                    ("name", CellEdit::Text("uno".into())),
+                    ("note", CellEdit::Null),
+                ],
+                1,
+            )],
+            inserts: vec![schemaic_core::model::RowInsert {
+                database: "memory".into(),
+                schema: Some("main".into()),
+                table: "p".into(),
+                cols: vec![
+                    ("id".into(), CellEdit::Text("2".into())),
+                    ("name".into(), CellEdit::Text("it's".into())),
+                    ("note".into(), CellEdit::Default),
+                ],
+            }],
+            deletes: vec![],
+        };
+        let n = rt
+            .block_on(commit_writes(&db, &write, CancellationToken::new()))
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(names(&db, &rt), ["1:uno:-", "2:it's:x"]);
+
+        let write = GridWrite {
+            updates: vec![edit(vec![("note", CellEdit::Default)], 1)],
+            deletes: vec![schemaic_core::model::RowDelete {
+                database: "memory".into(),
+                schema: Some("main".into()),
+                table: "p".into(),
+                key: vec![("id".into(), Value::Str("2".into()))],
+            }],
+            ..Default::default()
+        };
+        rt.block_on(commit_writes(&db, &write, CancellationToken::new()))
+            .unwrap();
+        assert_eq!(names(&db, &rt), ["1:uno:x"]);
+    }
+
+    /// **The seam, not the halves**: this engine's provenance and its schema
+    /// read, put through the grid's own `edit::analyze_edit`. A keyed table is
+    /// editable by its key with its generated column read-only; a keyless one
+    /// is not editable at all, its `rowid` included.
+    #[test]
+    fn the_grid_edits_a_keyed_table_and_not_a_keyless_one() {
+        let db = provenance_db("grid-seam");
+        seed(
+            &db,
+            "CREATE TABLE k(x INT, y VARCHAR); INSERT INTO k VALUES (1, 'a')",
+        );
+        let rt = rt();
+        let schema = rt
+            .block_on(fetch_schema(&db, CancellationToken::new()))
+            .unwrap();
+        let schema_for = |d: &str, s: Option<&str>, t: &str| {
+            assert_eq!(d, "memory");
+            schema
+                .tables
+                .iter()
+                .find(|x| x.schema.as_deref() == s && x.name == t)
+                .cloned()
+        };
+        let rs = rt.block_on(q(&db, "SELECT * FROM main.p")).unwrap();
+        let m = schemaic_core::edit::analyze_edit(&rs, D, schema_for);
+        let t = m.insert_target().expect("one keyed table");
+        assert_eq!((t.table.as_str(), t.key_cols.as_slice()), ("p", &[0][..]));
+        assert!(m.editable(1) && m.editable(2) && m.editable(5));
+        assert!(!m.editable(3), "the generated column");
+
+        let rs = rt.block_on(q(&db, "SELECT rowid, * FROM k")).unwrap();
+        let m = schemaic_core::edit::analyze_edit(&rs, D, schema_for);
+        assert!(!m.any_editable());
+        assert!(m.insert_target().is_none());
+    }
+
+    /// The one-row safety net: a statement that matches no row fails the
+    /// commit, and the update before it in the same batch is rolled back.
+    #[test]
+    fn a_write_that_misses_its_row_rolls_the_whole_commit_back() {
+        let db = provenance_db("commit-miss");
+        let rt = rt();
+        let write = GridWrite {
+            updates: vec![
+                edit(vec![("name", CellEdit::Text("changed".into()))], 1),
+                edit(vec![("name", CellEdit::Text("ghost".into()))], 99),
+            ],
+            ..Default::default()
+        };
+        let e = rt
+            .block_on(commit_writes(&db, &write, CancellationToken::new()))
+            .unwrap_err();
+        assert!(matches!(e, DbError::Write(_)), "{e:?}");
+        assert_eq!(names(&db, &rt), ["1:one:x"]);
+    }
+
+    #[test]
+    fn rows_are_refetched_and_blobs_read_by_key() {
+        let db = provenance_db("refetch");
+        let rt = rt();
+        let template = RefetchTemplate {
+            database: "memory".into(),
+            schema: Some("main".into()),
+            table: "p".into(),
+            columns: vec!["id".into(), "name".into(), "note".into(), "b".into()],
+            key_cols: vec![0],
+            confirm_cols: vec![],
+        };
+        let rows = vec![
+            RefetchRow {
+                data_row: 4,
+                key: vec![Value::Int(1)],
+            },
+            RefetchRow {
+                data_row: 5,
+                key: vec![Value::Int(99)],
+            },
+        ];
+        let got = rt
+            .block_on(refetch_rows(
+                &db,
+                &template,
+                &rows,
+                CancellationToken::new(),
+            ))
+            .unwrap();
+        assert_eq!(got.len(), 1, "the vanished row is skipped");
+        assert_eq!(got[0].0, 4);
+        assert_eq!(
+            got[0].1,
+            [
+                Value::Int(1),
+                Value::Str("one".into()),
+                Value::Str("x".into()),
+                Value::Str(binary_display(2)),
+            ]
+        );
+        let blob = |id: i64| BlobRef {
+            database: "memory".into(),
+            schema: Some("main".into()),
+            table: "p".into(),
+            column: "b".into(),
+            key: vec![("id".into(), Value::Int(id))],
+        };
+        let b = rt
+            .block_on(fetch_blob(&db, &blob(1), CancellationToken::new()))
+            .unwrap()
+            .unwrap();
+        assert_eq!((b.bytes.as_slice(), b.len), (&b"ab"[..], 2));
+        assert!(
+            rt.block_on(fetch_blob(&db, &blob(99), CancellationToken::new()))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1836,6 +2787,46 @@ mod tests {
         );
     }
 
+    /// Stop reaches a statement already running, not only the gap before the
+    /// next one — a plan's one long statement would otherwise hold the preview
+    /// modal open for its whole length. The statement counts 10^11 rows, which
+    /// is minutes; the interrupt makes it a fraction of a second.
+    #[test]
+    fn stop_interrupts_a_running_ddl_statement() {
+        let db = mem("ddl-stop");
+        let rt = rt();
+        let cancel = CancellationToken::new();
+        let later = cancel.clone();
+        rt.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            later.cancel();
+        });
+        let r = rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                run_ddl(
+                    &db,
+                    &["CREATE TABLE big AS SELECT count(*) AS n FROM range(100000000000)".into()],
+                    cancel,
+                ),
+            )
+            .await
+        });
+        let outcome = r.expect("the statement was interrupted, not run to its end");
+        assert!(
+            matches!(
+                outcome,
+                Err(crate::DdlError {
+                    cause: crate::DdlCause::Cancelled,
+                    ..
+                })
+            ),
+            "{outcome:?}"
+        );
+        assert!(rt.block_on(q(&db, "SELECT * FROM big")).is_err());
+        rt.shutdown_background();
+    }
+
     /// The copy carries the tables and their rows. Into an in-memory
     /// `ATTACH`, so no file is written; the refusal of an existing target is
     /// a path check this suite does not make.
@@ -1853,6 +2844,30 @@ mod tests {
             .query_row("SELECT count(*) FROM probe.t", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2);
+    }
+
+    /// **Why `rowid` is never an edit key here** — the roadmap's measurement,
+    /// kept. A checkpoint after a delete that empties most of a row group
+    /// compacts it and renumbers what is left: the row holding 63 had rowid 63
+    /// and comes back as 3, a rowid another row held before. A grid that read
+    /// rowid 3 and then committed would write that other row. (Measured the
+    /// same on a file, across a reopen; an `UPDATE` alone keeps the rowid.)
+    #[test]
+    fn a_checkpoint_renumbers_rowids_so_none_is_a_key() {
+        let db = mem("rowid-moves");
+        seed(
+            &db,
+            "CREATE TABLE t(x BIGINT); INSERT INTO t SELECT range FROM range(300000);
+             CHECKPOINT; DELETE FROM t WHERE x % 20 <> 3 AND x < 250000; CHECKPOINT;",
+        );
+        let (_i, c) = connect(&db).unwrap();
+        let r: i64 = c
+            .query_row("SELECT rowid FROM t WHERE x = 63", [], |r| r.get(0))
+            .unwrap();
+        assert_ne!(
+            r, 63,
+            "rowids survived the compaction — re-measure the key decision"
+        );
     }
 
     #[test]

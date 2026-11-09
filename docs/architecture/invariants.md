@@ -1499,8 +1499,12 @@ Re-introducing the anti-patterns these guard against is a regression:
   tables are editable where the derivation refused them, and so is a table in an `ATTACH`ed
   database — attributed to the database it is really in, now that every schema lookup behind the
   attribution takes one — while a set operation at any depth and a view anywhere in the statement
-  are each refused for their own stated reason.
-  `intel::projection_of` is still read, for the `rowid` *spelling* alone — which is what the
+  are each refused for their own stated reason. **DuckDB's driver reports no provenance at all**,
+  so there the statement is the whole of it: `intel::projection_of` places each column, and
+  `db::duckdb` proves the placement against the catalogue on the connection that ran it, any doubt
+  attributing the whole result to nothing — narrower than SQLite's by construction, a join, a CTE
+  and a derived table all read-only there.
+  `intel::projection_of` is still read on SQLite, for the `rowid` *spelling* alone — which is what the
   relaxation placing items ahead of a lone trailing `*` makes analysable in `SELECT rowid, * FROM t`,
   a keyless table opened through its rowid. The guard did not
   move with any of it: an implicit key is an ordinary key column to `commit_writes`, so the ordering and
@@ -1511,8 +1515,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   repaired where the key is built rather than where it is checked: `EditTable::confirm_cols` puts
   the values the grid read into the same `WHERE` for an implicit key only, and `edit::row_key` is
   the one builder that appends them. Restoring the premise is the shape any future key of this kind
-  has to take; loosening the guard is not. **And where the premise cannot be restored, the table is
-  read-only**: `confirm_columns` answers `None` when an implicit key has nothing left to confirm it
+  has to take; loosening the guard is not. **DuckDB's `rowid` is never offered as one**: a
+  checkpoint after a delete renumbers what is left, so the number a grid holds can come to name
+  another row (measured on 2.0, `a_checkpoint_renumbers_rowids_so_none_is_a_key`), and a keyless
+  DuckDB table is read-only rather than keyed on it (`db::duckdb`). **And where the premise cannot
+  be restored, the table is read-only**: `confirm_columns` answers `None` when an implicit key has nothing left to confirm it
   — every non-key column holding bytes, which `blobs(data BLOB)` is — and `analyze_edit` refuses the
   table outright rather than falling back to a bare `rowid = ?`, which is that premise stated and
   then abandoned. A column holding bytes is excluded from the confirming set because its cell is a
@@ -1520,7 +1527,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   wire flag: a blob in a SQLite `TEXT`-declared column reads back as the same placeholder, and
   comparing *it* refused every write to the table rather than only the misdirected ones. Its rollback, by contrast, needs no
   hedging — there is no non-transactional table type — and SQL Server's is the second that needs
-  none, answering `Complete` or `Unknown` and never `Incomplete` (`db::mssql`). That
+  none, answering `Complete` or `Unknown` and never `Incomplete` (`db::mssql`); DuckDB's, a third,
+  is always `Complete`, having no non-transactional table either (`db::duckdb`). That
   promise is MySQL-engine-dependent: `MyISAM`/`MEMORY`/`ARCHIVE`/`CSV` ignore `BEGIN`/`ROLLBACK`,
   and `ROLLBACK` *succeeds* there while raising warning 1196. So no write path may discard a
   rollback's outcome (`let _ = conn.query_drop("ROLLBACK")` was the bug): roll back through
@@ -1871,9 +1879,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   `qualified_table` elsewhere: the write-back (`qname3`) and the grid's copies of it. **DuckDB
   emits `"x"`** and `qualified_table` names `schema.table` there too, never the catalog, which is
   the file the operation opened rather than a name to carry; its literals take Postgres' arm, a
-  plain string having no backslash escape (measured). `db::ident_duckdb`, the Live Monitor's
-  quoter in `lib.rs`, is one more thin delegation, and the test that binds the other engine-fixed
-  ones does not name it. SQL Server's literals double only the quote and are **`N`-prefixed** — an unprefixed one is
+  plain string having no backslash escape (measured). `db::ident_duckdb`, the quoter in `lib.rs`
+  behind the Live Monitor and `db::duckdb`'s grid write-back (`pub(crate)` for it), is one more
+  thin delegation, and `mysql.rs`'s `the_write_paths_quote_identifiers_the_way_core_does` binds it
+  with the other engine-fixed ones. SQL Server's literals double only the quote and are **`N`-prefixed** — an unprefixed one is
   `varchar`, converted to the database's code page on the way in, so `'Ωμέγα'` can arrive as
   `'?????'` (`a_sql_server_string_literal_is_national_and_doubles_only_the_quote`). That is the
   literal's half only: `N'…'` carries the text as far as the column, and a `varchar` column still
