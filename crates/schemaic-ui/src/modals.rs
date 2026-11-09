@@ -108,11 +108,12 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
             let snippet_open = ui.overlay.snippet_edit;
             let alias_open = ui.overlay.alias_rename;
             let usages_open = ui.overlay.usages;
+            let csv_open = ui.overlay.csv_options;
             stack((
-                // The snippet editor and *Rename alias* share one tuple
-                // element (this stack is at Floem's 16-arity limit): both are
-                // small dialogs about the editor's text, and only one is ever
-                // up. The style fills the layer while either is, as the
+                // The snippet editor, *Rename alias*, *Find usages* and *CSV
+                // read options* share one tuple element (this stack is at
+                // Floem's 16-arity limit): all are small dialogs, and only one
+                // is ever up. The style fills the layer while any is, as the
                 // Export/script element below explains.
                 stack((
                     crate::snippet_edit::snippet_edit_overlay(
@@ -125,11 +126,16 @@ pub(crate) fn modal_layer(ui: Ui, modal_up: impl Fn() -> bool + Copy + 'static) 
                     // *Find usages*' list, the third of the editor's small
                     // dialogs about its text, raised from the same menu.
                     crate::usages_view::usages_overlay(usages_open),
+                    // *CSV read options*, a small dialog raised from the
+                    // schema tree; it hands on to the view editor and is
+                    // closed before that opens, so never up beside these.
+                    crate::csv_options::csv_options_overlay(csv_open),
                 ))
                 .style(move |s| {
                     if snippet_open.get().is_some()
                         || alias_open.with(Option::is_some)
                         || usages_open.with(Option::is_some)
+                        || csv_open.with(Option::is_some)
                     {
                         s.absolute().inset(0.0)
                     } else {
@@ -497,6 +503,7 @@ fn ddl_modals_up(
     let snippet_edit = overlay.snippet_edit;
     let alias_rename = overlay.alias_rename;
     let usages = overlay.usages;
+    let csv_options = overlay.csv_options;
     let editors = ddl_editors_up(ddl);
     move || {
         // **The shared error modal is deliberately not here.** It is its own
@@ -532,6 +539,8 @@ fn ddl_modals_up(
             || alias_rename.with(Option::is_some)
             // And *Find usages*' list, the element's third.
             || usages.with(Option::is_some)
+            // And *CSV read options*, the element's fourth.
+            || csv_options.with(Option::is_some)
             || editors()
     }
 }
@@ -734,6 +743,9 @@ mod modal_backdrop_gate {
         // In the layer's DDL group, the third of that tuple element, raised by
         // `ddl_modals_up`'s `usages` arm.
         "usages_view.rs",
+        // In the layer's DDL group, the fourth of that tuple element, raised
+        // by `ddl_modals_up`'s `csv_options` arm.
+        "csv_options.rs",
         // In the layer's workspace group, beside `properties.rs`, raised by
         // `workspace_modals_up`'s `blob_open.get().is_some()` arm.
         "blob_view.rs",

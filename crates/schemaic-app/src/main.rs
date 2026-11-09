@@ -3357,6 +3357,8 @@ fn app_view(
     let alias_rename_open: RwSignal<Option<schemaic_ui::AliasRenameRequest>> = RwSignal::new(None);
     // Its *Find usages* list, raised from the same menu.
     let usages_open: RwSignal<Option<schemaic_ui::UsagesRequest>> = RwSignal::new(None);
+    // The schema tree's *CSV read options* dialog, on an Open data file view.
+    let csv_options_open: RwSignal<Option<schemaic_ui::CsvOptionsRequest>> = RwSignal::new(None);
 
     // Query-plan (EXPLAIN) modal signals.
     let plan_open = RwSignal::new(false);
@@ -15899,6 +15901,7 @@ fn app_view(
             snippet_edit: snippet_edit_open,
             alias_rename: alias_rename_open,
             usages: usages_open,
+            csv_options: csv_options_open,
         },
         schema: SchemaUi {
             db_nodes,

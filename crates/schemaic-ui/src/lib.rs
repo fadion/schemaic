@@ -70,6 +70,8 @@ mod shortcuts_view;
 mod snippet_edit;
 mod snippet_panel;
 pub use alias_rename::AliasRenameRequest;
+mod csv_options;
+pub use csv_options::CsvOptionsRequest;
 mod usages_view;
 pub use usages_view::UsagesRequest;
 /// The shared machinery behind this crate's source gates.
@@ -6564,6 +6566,9 @@ pub struct OverlayUi {
     /// *Find usages*' list (`usages_view`), or `None`. Set by the SQL
     /// editor's context menu, beside *Rename alias*.
     pub usages: RwSignal<Option<UsagesRequest>>,
+    /// *CSV read options*' dialog (`csv_options`), or `None`. Set by the
+    /// schema tree's entry on an Open data file view.
+    pub csv_options: RwSignal<Option<CsvOptionsRequest>>,
     /// A run the write guard held back, or `None`. Set by
     /// [`TabsActions::run`]/[`TabsActions::run_all`] — which *are* the guarded
     /// run path — and rendered as the editor's guard bar. It lives here, not in

@@ -87,6 +87,14 @@ before the containers (`only_postgres_is_offered_an_extension`;
 `create_children` asked `supports_routine_editing` once for both: DuckDB's macros are functions
 and it has no procedure, so once its routine editor came on, one answer for both would have
 offered it a *Procedure* whose plan `ddl::duckdb_supports` refuses. The entries are absent where the predicate says no, as before.
+**A view in an *Open data file* session is offered *CSV read options*, under Edit view** — on
+`offers.edit`, when the active connection `is_data_session` (DuckDB's alone, so no engine is
+asked), `is_editable_view` admits the view and `data_file::csv_view_of` reads its
+`view_definition`; dimmed on a read-only connection. It sets `OverlayUi::csv_options` to a
+`CsvOptionsRequest` whose `apply` is `view_editor::open_for_view_with_body` with
+`data_file::csv_view_body`'s body, so the entry, like the dialog (`csv_options.rs`), writes no
+DDL. A view whose body `csv_view_of` cannot read whole is not offered the entry at all, where
+a read-only connection dims it.
 **`whole_ui_gate` 13 → 4, and six of the nine that came down were the small menus** — they read
 their bundles into locals at the top and never touch the root again, so `popup_menu_overlay`
 and `tx_prompt_overlay` take `OverlayUi`, `db_visibility_overlay` `SchemaUi`,

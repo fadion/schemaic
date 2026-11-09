@@ -37,3 +37,21 @@ user reads, so it quotes through `ident_if_needed` and `SELECT * FROM sales` sta
 VIEW` on purpose**: it is the one generated statement run without the preview, and only ever
 creating — never `OR REPLACE` — is one of the terms that let it (*Generated DDL is never run
 silently*, in the invariants).
+
+**Where the sniffer guesses a CSV wrong, the delimiter and the header can be said** — the schema
+tree's *CSV read options* (`ui/csv_options.rs`), which replaces the view's body and leaves the
+statement to the view editor. `csv_view_body(path, options)` writes `SELECT * FROM
+read_csv('path', delim = ';', header = false)` with only the options set, so
+`CsvReadOptions::default()` — `Auto` on both — is the body `create_view_sql` opens with
+(`a_csv_body_writes_the_options_set`). `CsvDelimiter` is a closed list — comma, semicolon, tab,
+pipe, and `Auto` for the sniffer's choice — rather than free text, so no escaping question (a tab
+typed as `\t`) reaches the user; `CsvHeader` is `Auto`, `Yes` or `No`. The column types stay the
+sniffer's guess. `csv_view_of(body)` reads one back through `intel::star_from_table_function`, as
+written and as DuckDB re-prints it — `(delim = ';'), ("header" = false)`, measured on 2.0.0 by
+the change's author — taking `read_csv` or `read_csv_auto`, `delim` or `sep`, and `header`
+(`a_csv_body_reads_back_written_or_reprinted`); a `read_csv_auto` body is written back as
+`read_csv`. **It answers `None` for any body carrying what it does not model** — `columns = …`, a
+two-character delimiter, a list of files, a filter, an alias, a projection
+(`a_body_the_form_would_rewrite_lossily_is_not_read`) — and that is the gate, not a gap: the form
+writes the whole call again, so a body it had half read would lose what the user wrote by hand,
+and the menu entry is offered only where this answers `Some`.

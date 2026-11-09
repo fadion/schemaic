@@ -438,6 +438,7 @@ tree-edit-kind = Redakto { $kind }
 tree-folder-create-extension = Krijo zgjerim
 tree-edit-table = Redakto tabelën
 tree-edit-view = Redakto pamjen
+tree-csv-read-options = Opsionet e leximit CSV
 tree-edit-column = Redakto kolonën
 tree-edit-index = Redakto indeksin
 tree-edit-primary-key = Redakto çelësin primar
@@ -4062,3 +4063,17 @@ script-reader-stopped = lexuesi i skedarit ndaloi papritur: { $error }
 script-changed-since-read = Ky skedar ndryshoi në disk pasi u lexua, kështu përmbledhja më sipër nuk është ajo që do të ekzekutohej. Zgjidheni sërish.
 script-no-terminator = Ky skedar nuk përmban mbyllës urdhri, kështu nuk është skript SQL që Schemaic mund ta ekzekutojë. Kontrolloni që zgjodhët skedarin që kishit parasysh.
 ai-cursor-enable-unfinished = `mcp enable` nuk përfundoi
+
+## CSV read options (csv_options.rs). $view is the view's name.
+csv-options-title = Opsionet e leximit CSV: { $view }
+csv-options-delimiter = Ndarësi
+csv-options-header = Rreshti i titujve
+csv-options-detect = Zbulo
+csv-options-comma = Presje
+csv-options-semicolon = Pikëpresje
+csv-options-tab = Tab
+csv-options-pipe = Vija vertikale
+csv-options-yes = Po
+csv-options-no = Jo
+csv-options-continue = Vazhdo
+csv-options-hint = Hap redaktuesin e pamjes me thirrjen read_csv të rishkruar. Asgjë nuk ekzekutohet derisa të zbatoni pamjen paraprake.

@@ -479,6 +479,7 @@ tree-edit-kind = Edit { $kind }
 tree-folder-create-extension = Create extension
 tree-edit-table = Edit table
 tree-edit-view = Edit view
+tree-csv-read-options = CSV read options
 tree-edit-column = Edit column
 tree-edit-index = Edit index
 tree-edit-primary-key = Edit primary key
@@ -4815,3 +4816,17 @@ script-changed-since-read = This file changed on disk after it was read, so the 
 script-no-terminator = This file holds no statement terminator, so it is not a SQL script Schemaic can run. Check that you picked the file you meant.
 # mcp enable is the Cursor CLI command; never translated.
 ai-cursor-enable-unfinished = `mcp enable` did not finish
+
+## CSV read options (csv_options.rs). $view is the view's name.
+csv-options-title = CSV read options: { $view }
+csv-options-delimiter = Delimiter
+csv-options-header = Header row
+csv-options-detect = Detect
+csv-options-comma = Comma
+csv-options-semicolon = Semicolon
+csv-options-tab = Tab
+csv-options-pipe = Pipe
+csv-options-yes = Yes
+csv-options-no = No
+csv-options-continue = Continue
+csv-options-hint = Opens the view editor with the view's read_csv call rewritten. Nothing runs until you apply its preview.

@@ -1347,7 +1347,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   alter or drop anything the user made there — a name taken between the read and the create
   fails the open rather than giving way. And the file is only read. Nothing on that list has a
   destructive consequence for a preview to state. It is the one such place (`open_data_file`'s
-  own doc says so).
+  own doc says so). **Changing that view afterwards is not part of the exception**: *CSV read
+  options* (`ui/csv_options.rs`) writes only a body, `data_file::csv_view_body`, and hands it to
+  the view editor (`view_editor::open_for_view_with_body`), so the replace goes draft →
+  `diff_view` → the preview like any other view edit.
   **A dump is on the written side of this rule rather than an exception to it.** `core::dump::plan`
   composes a file out of the emitters that already exist — `TableInfo::create_ddl`, `ddl::view_ddl`,
   `TriggerInfo::create_sql` and `ChangeSet::emit` for the closing foreign keys — and `cli::dump`

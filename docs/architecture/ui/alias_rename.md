@@ -24,8 +24,8 @@ nowhere and Ctrl+Z after a rename did nothing until the editor was clicked (`Non
 rather than on the request, so nothing rebuilds the field and takes its caret; the footer is keyed on whether the
 trimmed name is empty, so the buttons rebuild when Rename turns on and not on every keystroke.
 It shares `snippet_edit.rs`'s tuple element in the modal layer's DDL group, with `usages_view.rs`
-as the element's third member — that stack is at
-floem's 16-arity limit, and no two of the three are up together: that is a stated claim rather
+as the element's third member and `csv_options.rs` its fourth — that stack is at
+floem's 16-arity limit, and no two of the four are up together: that is a stated claim rather
 than a check, resting on each being modal, so none can be raised from behind another — so the
 element fills the layer while
 any of them is open, `ddl_modals_up` has an `alias_rename` arm, and the file is on

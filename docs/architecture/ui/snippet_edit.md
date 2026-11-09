@@ -18,7 +18,8 @@ payload had drifted apart, and the whitespace-only edit that got lost to it is w
 `ddl_modals_up` group and is therefore *in* that predicate: an overlay in that group whose flag
 the predicate doesn't know about resolves its `inset(0)` against a zero-by-zero box and paints
 nothing, which is exactly how the event editor once shipped invisible. It shares its tuple
-element with *Rename alias* and *Find usages* (`alias_rename.rs` and `usages_view.rs`, next).
+element with *Rename alias*, *Find usages* and the schema tree's *CSV read options*
+(`alias_rename.rs`, `usages_view.rs` and `csv_options.rs`, next).
 **Its words are the catalogue's** (`snippet-edit-*`) — the title (`$name`),
 the *Name*, *Expansion shortcut* and *Query* labels, the name field's and the shortcut field's
 placeholders (both through `FieldCfg::placeholder_of`; the shortcut's is the word *none*), and

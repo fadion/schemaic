@@ -429,6 +429,7 @@ tree-edit-kind = Bearbeiten: { $kind }
 tree-folder-create-extension = Erweiterung erstellen
 tree-edit-table = Tabelle bearbeiten
 tree-edit-view = Sicht bearbeiten
+tree-csv-read-options = CSV-Leseoptionen
 tree-edit-column = Spalte bearbeiten
 tree-edit-index = Index bearbeiten
 tree-edit-primary-key = Primärschlüssel bearbeiten
@@ -3722,3 +3723,17 @@ script-reader-stopped = Das Lesen der Datei brach unerwartet ab: { $error }
 script-changed-since-read = Diese Datei wurde nach dem Lesen auf der Festplatte geändert, daher ist die Zusammenfassung oben nicht das, was laufen würde. Wähle sie erneut.
 script-no-terminator = Diese Datei enthält kein Anweisungsende, ist also kein SQL-Skript, das Schemaic ausführen kann. Prüfe, ob du die gemeinte Datei gewählt hast.
 ai-cursor-enable-unfinished = `mcp enable` wurde nicht abgeschlossen
+
+## CSV read options (csv_options.rs). $view is the view's name.
+csv-options-title = CSV-Leseoptionen: { $view }
+csv-options-delimiter = Trennzeichen
+csv-options-header = Kopfzeile
+csv-options-detect = Erkennen
+csv-options-comma = Komma
+csv-options-semicolon = Semikolon
+csv-options-tab = Tabulator
+csv-options-pipe = Senkrechter Strich
+csv-options-yes = Ja
+csv-options-no = Nein
+csv-options-continue = Weiter
+csv-options-hint = Öffnet den Sichten-Editor mit umgeschriebenem read_csv-Aufruf. Nichts wird ausgeführt, bis Sie dessen Vorschau anwenden.

@@ -442,6 +442,7 @@ tree-edit-kind = Editează { $kind }
 tree-folder-create-extension = Creează extensie
 tree-edit-table = Editează tabelul
 tree-edit-view = Editează vizualizarea
+tree-csv-read-options = Opțiuni de citire CSV
 tree-edit-column = Editează coloana
 tree-edit-index = Editează indexul
 tree-edit-primary-key = Editează cheia primară
@@ -4208,3 +4209,17 @@ script-reader-stopped = cititorul de fișiere s-a oprit neașteptat: { $error }
 script-changed-since-read = Acest fișier s-a modificat pe disc după ce a fost citit, așa că rezumatul de mai sus nu este ce ar rula. Alege-l din nou.
 script-no-terminator = Acest fișier nu conține niciun terminator de instrucțiune, așa că nu este un script SQL pe care Schemaic îl poate rula. Verifică dacă ai ales fișierul dorit.
 ai-cursor-enable-unfinished = `mcp enable` nu s-a terminat
+
+## CSV read options (csv_options.rs). $view is the view's name.
+csv-options-title = Opțiuni de citire CSV: { $view }
+csv-options-delimiter = Delimitator
+csv-options-header = Rând de antet
+csv-options-detect = Detectare
+csv-options-comma = Virgulă
+csv-options-semicolon = Punct și virgulă
+csv-options-tab = Tab
+csv-options-pipe = Bară verticală
+csv-options-yes = Da
+csv-options-no = Nu
+csv-options-continue = Continuă
+csv-options-hint = Deschide editorul de vizualizări cu apelul read_csv rescris. Nu se execută nimic până nu aplicați previzualizarea.

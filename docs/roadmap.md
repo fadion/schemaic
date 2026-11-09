@@ -85,8 +85,8 @@ come after DuckDB.
   An Open data file session is out of the AI panel's reach: its MCP server is a subprocess that
   reads `connections.json`, where a session never is, and could not share the in-process database
   if it did.
-  The read-time options of `read_csv` (delimiter, header, types) are DuckDB's sniffer's alone; a
-  file it guesses wrong needs the view rewritten by hand.
+  *CSV read options* sets the delimiter and the header row; a column's type the sniffer guesses
+  wrong (`types = …`) still needs the view rewritten by hand.
 - **Phase 3:** the full CI bar on every leg, which builds the amalgamation cold (about five
   minutes on this machine).
 

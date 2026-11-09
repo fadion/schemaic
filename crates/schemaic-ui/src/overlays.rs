@@ -2593,6 +2593,18 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // A view Schemaic can edit — read before `info` is moved
                         // into the Import entry below.
                         let editable_view = crate::view_editor::is_editable_view(info.as_ref());
+                        // An Open data file view reading a CSV whose options
+                        // the dialog can rewrite whole (`data_file::csv_view_of`)
+                        // — only in a data session, which is DuckDB's alone.
+                        let data_session = connections.with_untracked(|cs| {
+                            let id = active_conn.get_untracked();
+                            cs.iter().any(|c| c.id == id && c.is_data_session())
+                        });
+                        let csv_view = info
+                            .as_ref()
+                            .filter(|_| is_view && data_session && editable_view)
+                            .and_then(|i| i.view_definition.as_deref())
+                            .and_then(schemaic_core::data_file::csv_view_of);
                         // **Read, not inferred.** This was `is_view &&
                         // !editable_view`, which is true today only because a
                         // materialized view is the one thing `is_editable_view`
@@ -2748,6 +2760,42 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                                             !has_columns
                                         },
                                 ),
+                            );
+                        }
+                        // *CSV read options*, under Edit view: the same editor,
+                        // opened on the view with its `read_csv` call rewritten
+                        // for the delimiter and header the dialog is told.
+                        if offers.edit
+                            && let Some(csv) = csv_view
+                        {
+                            let ui = import_ui.clone();
+                            let open = import_ui.overlay.csv_options;
+                            let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());
+                            entries.push(
+                                MenuEntry::action(tr!("tree-csv-read-options"), move || {
+                                    let ui = ui.clone();
+                                    let (db, ns, tbl) = (db.clone(), ns.clone(), tbl.clone());
+                                    let path = csv.path.clone();
+                                    open.set(Some(crate::CsvOptionsRequest {
+                                        view: tbl.clone(),
+                                        options: csv.options,
+                                        apply: std::rc::Rc::new(move |options| {
+                                            crate::view_editor::open_for_view_with_body(
+                                                ui.conn,
+                                                ui.schema,
+                                                ui.ddl,
+                                                &ui.schema_actions.view_algorithm,
+                                                &db,
+                                                ns.as_deref(),
+                                                &tbl,
+                                                Some(schemaic_core::data_file::csv_view_body(
+                                                    &path, options,
+                                                )),
+                                            );
+                                        }),
+                                    }));
+                                })
+                                .disabled(read_only),
                             );
                         }
                         // Triggers: one entry opening a modal over the table's
@@ -8825,6 +8873,9 @@ fn ",
             | "tree-restore-from-file"
             | "tree-edit-table"
             | "tree-edit-view"
+            // An Open data file view's read options: a view edit, opened
+            // in the view editor.
+            | "tree-csv-read-options"
             | "tree-edit-column"
             | "tree-edit-index"
             | "tree-edit-primary-key"

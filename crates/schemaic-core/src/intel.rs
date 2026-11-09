@@ -18897,6 +18897,174 @@ pub fn select_output_names(sql: &str, dialect: SqlDialect) -> Option<Vec<String>
     Some(out)
 }
 
+/// One argument of a table function call, as [`star_from_table_function`]
+/// reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableFunctionArg {
+    /// A positional string literal: `'C:/data/x.csv'`.
+    Text(String),
+    /// `name = 'text'`, however written — bare, in parentheses as DuckDB
+    /// re-prints it (`(delim = ';')`), the name quoted (`"header"`) or not.
+    NamedText(String, String),
+    /// `name = true` / `false`.
+    NamedBool(String, bool),
+    /// Anything else, kept so a caller can refuse what it does not know.
+    Other,
+}
+
+/// `SELECT * FROM f(args)` and nothing else — no `WHERE`, no alias, one
+/// source — read into the function's name (unquoted, as written) and its
+/// arguments; `None` for any other statement. The shape an **Open data file**
+/// view has (`core::data_file`), read back so its reader's options can be
+/// edited without losing the path.
+pub fn star_from_table_function(
+    sql: &str,
+    dialect: SqlDialect,
+) -> Option<(String, Vec<TableFunctionArg>)> {
+    use sqlparser::ast::{
+        BinaryOperator, Expr, FunctionArg, FunctionArgExpr, SelectItem, SetExpr, Statement,
+        TableFactor, Value,
+    };
+    let mut asts = sqlparser::parser::Parser::parse_sql(&*dialect.parser(), sql).ok()?;
+    if asts.len() != 1 {
+        return None;
+    }
+    let Statement::Query(query) = asts.pop()? else {
+        return None;
+    };
+    if query.with.is_some() || query.order_by.is_some() || query.limit_clause.is_some() {
+        return None;
+    }
+    let SetExpr::Select(select) = *query.body else {
+        return None;
+    };
+    // **Nothing else** is checked as the statement printing back as the bare
+    // form, not as a list of clauses that must be empty: a list missed
+    // `GROUP BY`, `QUALIFY` and `WINDOW`, and would miss the next clause the
+    // parser grows, each one dropped by the caller's rewrite.
+    let plain = select.from.len() == 1
+        && select.from[0].joins.is_empty()
+        && matches!(select.projection.as_slice(), [SelectItem::Wildcard(_)])
+        && select.to_string() == format!("SELECT * FROM {}", select.from[0]);
+    if !plain {
+        return None;
+    }
+    let TableFactor::Table {
+        name,
+        alias: None,
+        args: Some(args),
+        ..
+    } = &select.from[0].relation
+    else {
+        return None;
+    };
+    let [part] = name.0.as_slice() else {
+        return None;
+    };
+    let fname = part.as_ident()?.value.clone();
+    let text = |e: &Expr| match e {
+        Expr::Value(v) => match &v.value {
+            Value::SingleQuotedString(s) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let named = |key: String, e: &Expr| match e {
+        Expr::Value(v) => match &v.value {
+            Value::SingleQuotedString(s) => TableFunctionArg::NamedText(key, s.clone()),
+            Value::Boolean(b) => TableFunctionArg::NamedBool(key, *b),
+            _ => TableFunctionArg::Other,
+        },
+        _ => TableFunctionArg::Other,
+    };
+    let read = |e: &Expr| -> TableFunctionArg {
+        let mut e = e;
+        while let Expr::Nested(inner) = e {
+            e = inner;
+        }
+        match e {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => match &**left {
+                Expr::Identifier(id) => named(id.value.clone(), right),
+                _ => TableFunctionArg::Other,
+            },
+            other => text(other).map_or(TableFunctionArg::Other, TableFunctionArg::Text),
+        }
+    };
+    let out = args
+        .args
+        .iter()
+        .map(|a| match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => read(e),
+            FunctionArg::Named {
+                name,
+                arg: FunctionArgExpr::Expr(e),
+                ..
+            } => named(name.value.clone(), e),
+            _ => TableFunctionArg::Other,
+        })
+        .collect();
+    Some((fname, out))
+}
+
+#[cfg(test)]
+mod star_from_table_function_tests {
+    use super::{SqlDialect, TableFunctionArg as A, star_from_table_function};
+
+    const D: SqlDialect = SqlDialect::DuckDb;
+
+    #[test]
+    fn a_calls_arguments_are_read_however_an_option_is_spelled() {
+        assert_eq!(
+            star_from_table_function(
+                "SELECT * FROM read_csv('/d/x.csv', delim = ';', (\"header\" = false), (n = 3))",
+                D
+            ),
+            Some((
+                "read_csv".into(),
+                vec![
+                    A::Text("/d/x.csv".into()),
+                    A::NamedText("delim".into(), ";".into()),
+                    A::NamedBool("header".into(), false),
+                    A::Other,
+                ]
+            ))
+        );
+        assert_eq!(
+            star_from_table_function("SELECT * FROM f()", D),
+            Some(("f".into(), vec![]))
+        );
+    }
+
+    #[test]
+    fn anything_but_a_bare_star_from_one_call_is_none() {
+        for sql in [
+            "SELECT * FROM t",
+            "SELECT * FROM f('x') WHERE a = 1",
+            "SELECT a FROM f('x')",
+            "SELECT * FROM f('x') AS g",
+            "SELECT * FROM f('x'), g('y')",
+            "SELECT * FROM f('x') JOIN t ON true",
+            "SELECT DISTINCT * FROM f('x')",
+            "SELECT * FROM f('x') ORDER BY 1",
+            "SELECT * FROM f('x') LIMIT 1",
+            "SELECT * FROM f('x') GROUP BY ALL",
+            "SELECT * FROM f('x') GROUP BY a",
+            "SELECT * FROM f('x') QUALIFY row_number() OVER () = 1",
+            "SELECT * FROM f('x') WINDOW w AS (ORDER BY a)",
+            "WITH c AS (SELECT 1) SELECT * FROM f('x')",
+            "SELECT * FROM s.f('x')",
+            "SELECT * FROM f('x'); SELECT 1",
+            "",
+        ] {
+            assert_eq!(star_from_table_function(sql, D), None, "{sql}");
+        }
+    }
+}
+
 /// Generic phrases MySQL/MariaDB puts in quotes that aren't object names.
 fn is_error_phrase(s: &str) -> bool {
     matches!(

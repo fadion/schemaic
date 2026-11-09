@@ -57,6 +57,11 @@ an `UNDEFINED` one folds to `None` anyway. The round trip itself is MySQL 8's pa
 covered by nothing here. The four doors are called from `overlays.rs` (the tree's Edit view and Create ▸
 View), `properties.rs` (the properties modal's Edit) and `lib.rs`'s `create_view` callback (the
 editor's *Create view from this query*).
+**`open_for_view_with_body` is `open_for_view` with the draft's body replaced before the editor
+opens** — the *CSV read options* dialog's way in (`csv_options.rs`, whose request `overlays.rs`
+builds with `data_file::csv_view_body`). The editor opens already changed and Preview SQL shows
+the replace, so the dialog writes no DDL of its own. `open_for_view` is it with `None`, which keeps
+the launch's `is_editable_view` gate and its read-only refusal in one copy rather than two.
 **Its words are the catalogue's** (`view-editor-*`) — labels, sections, the
 column-names placeholder, the re-create toggle and its hint, both titles — with **Cancel**
 `dialog-cancel` and the footer's other two named for no one editor: `editor-preview-sql`, which

@@ -47,6 +47,25 @@ queries on its view fail.
 Within the session you can do anything DuckDB allows — create a table from the view
 (`CREATE TABLE t AS SELECT …`), add more views, and so on. All of it lives in memory only.
 
+## When a CSV reads wrong
+
+DuckDB guesses a CSV file's delimiter and whether its first line holds column names. When it
+guesses wrong, right-click the file's view in the schema tree and choose **CSV read options**.
+
+- **Delimiter** — **Detect**, **Comma**, **Semicolon**, **Tab** or **Pipe**.
+- **Header row** — **Detect**, **Yes** or **No**.
+
+The dialog opens on what the view reads with now; **Detect** leaves the choice to DuckDB.
+**Continue** opens the view editor with the view's `read_csv(…)` call rewritten. Nothing changes
+until you press **Preview SQL** there and apply it, as with any view edit.
+
+The entry is there only while the view still reads one file with `SELECT * FROM read_csv(…)` and
+no options besides those two, because the dialog writes the whole call again. If you've edited
+the view by hand to add more — another option, a filter, several files — change it in
+**Edit view** instead.
+That is also where to fix a column type DuckDB guesses wrong, with `read_csv`'s `types` option,
+for example `types = {'zip': 'VARCHAR'}`.
+
 ## Closing a session
 
 A data-file session is never saved. It isn't in your saved connections, **Export connections**

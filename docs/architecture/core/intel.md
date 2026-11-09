@@ -175,8 +175,21 @@ popup would have stopped that resolving (`an_engine_keyword_is_still_an_alias`).
 nothing completion offers on an engine is squiggled there as a misspelling. Also
 `join_condition` (FK-aware
 `JOIN … ON` auto-fill), `db_error_diagnostic` (positions a live DB error within the statement),
-`parses` (Tier-2 gate), and `select_output_names` (a projection's column names *in order*, or
-`None` when the statement alone can't say — what `ddl::pg_replaceable` reads).
+`parses` (Tier-2 gate), `select_output_names` (a projection's column names *in order*, or
+`None` when the statement alone can't say — what `ddl::pg_replaceable` reads), and
+`star_from_table_function` — `SELECT * FROM f(args)` read into the function's name, unquoted,
+and its arguments as `TableFunctionArg`s: a positional string, `name = 'text'`, `name =
+true`/`false`, each bare or in the parentheses and with the quoted name DuckDB re-prints a view's
+options with, and `Other` for anything else, kept so a caller can refuse what it does not model.
+It is `None` for anything more: a `WITH`, `ORDER BY` or `LIMIT` around the query, a
+schema-qualified function or a second statement, and — **asked as the `SELECT` printing back as
+`SELECT * FROM <its one source>`, not as a list of clauses that must be empty** — any clause on
+the `SELECT` itself: a `WHERE`, a `GROUP BY`, a `QUALIFY`, a `WINDOW`, an alias, a join. A list
+was the first spelling and let `GROUP BY ALL`, `QUALIFY` and `WINDOW` through, which the caller's
+rewrite would have dropped; the printed form covers whatever clause the parser grows next
+(`star_from_table_function_tests`). It is what `data_file::csv_view_of` reads an *Open
+data file* view's `read_csv` call back with — here rather than a scan of the body in
+`data_file.rs`, as the invariant on structure-aware analysis has it.
 **`clause_context` takes the last clause keyword within the caret's paren**, not across the
 statement: each `(` opens a scope whose keywords end at its `)`, and a closed one gives the
 outer clause back. Read across the statement, the last keyword answered wherever it stood,

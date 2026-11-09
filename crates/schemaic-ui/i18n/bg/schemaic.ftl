@@ -438,6 +438,7 @@ tree-edit-kind = Редактиране: { $kind }
 tree-folder-create-extension = Създаване на разширение
 tree-edit-table = Редактиране на таблицата
 tree-edit-view = Редактиране на изгледа
+tree-csv-read-options = Опции за четене на CSV
 tree-edit-column = Редактиране на колоната
 tree-edit-index = Редактиране на индекса
 tree-edit-primary-key = Редактиране на първичния ключ
@@ -4062,3 +4063,17 @@ script-reader-stopped = четецът на файла спря неочаква
 script-changed-since-read = Този файл е променен на диска, след като е прочетен, така че обобщението по-горе не е това, което би се изпълнило. Изберете го отново.
 script-no-terminator = Този файл не съдържа знак за край на израз, така че не е SQL скрипт, който Schemaic може да изпълни. Проверете дали сте избрали правилния файл.
 ai-cursor-enable-unfinished = `mcp enable` не завърши
+
+## CSV read options (csv_options.rs). $view is the view's name.
+csv-options-title = Опции за четене на CSV: { $view }
+csv-options-delimiter = Разделител
+csv-options-header = Заглавен ред
+csv-options-detect = Автоматично
+csv-options-comma = Запетая
+csv-options-semicolon = Точка и запетая
+csv-options-tab = Табулация
+csv-options-pipe = Вертикална черта
+csv-options-yes = Да
+csv-options-no = Не
+csv-options-continue = Продължи
+csv-options-hint = Отваря редактора на изгледи с пренаписаното извикване на read_csv. Нищо не се изпълнява, докато не приложите прегледа.

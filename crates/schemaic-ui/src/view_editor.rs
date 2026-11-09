@@ -87,6 +87,24 @@ pub(crate) fn open_for_view(
     schema: Option<&str>,
     view: &str,
 ) {
+    open_for_view_with_body(conn, schema_ui, d, algorithm, database, schema, view, None)
+}
+
+/// [`open_for_view`], with the draft's body already replaced by `body` — the
+/// *CSV read options* dialog's way in (`csv_options`): the editor opens
+/// changed, and its Preview SQL shows the replace as for any edit, so the
+/// dialog writes no DDL of its own.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_for_view_with_body(
+    conn: ConnUi,
+    schema_ui: SchemaUi,
+    d: DdlUi,
+    algorithm: &ViewAlgoFn,
+    database: &str,
+    schema: Option<&str>,
+    view: &str,
+    body: Option<String>,
+) {
     // The gate the menu entry is disabled by, asked again at the launch: an
     // encrypted SQL Server view would otherwise open on an empty body.
     let Some(info) =
@@ -94,9 +112,12 @@ pub(crate) fn open_for_view(
     else {
         return;
     };
-    let Some(draft) = ViewDraft::from_table(&info) else {
+    let Some(mut draft) = ViewDraft::from_table(&info) else {
         return;
     };
+    if let Some(body) = body {
+        draft.select = body;
+    }
     let ctx = edit_ctx(conn);
     // Three of this editor's four launchers carry a read-only term; the fourth
     // is the schema tree's Edit view, which shares its `.disabled` with Edit

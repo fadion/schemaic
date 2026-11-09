@@ -105,6 +105,131 @@ pub fn create_view_sql(name: &str, path: &str, kind: DataFileKind) -> String {
     )
 }
 
+/// The delimiter a CSV view reads with: DuckDB's sniffer's guess, or one of
+/// the four a file is nearly always delimited by. A closed list rather than
+/// free text, so no escaping question (a tab typed as `\t`) reaches the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CsvDelimiter {
+    #[default]
+    Auto,
+    Comma,
+    Semicolon,
+    Tab,
+    Pipe,
+}
+
+impl CsvDelimiter {
+    pub const ALL: [CsvDelimiter; 5] = [
+        CsvDelimiter::Auto,
+        CsvDelimiter::Comma,
+        CsvDelimiter::Semicolon,
+        CsvDelimiter::Tab,
+        CsvDelimiter::Pipe,
+    ];
+
+    /// The character, or `None` for the sniffer's choice.
+    fn char(self) -> Option<char> {
+        match self {
+            CsvDelimiter::Auto => None,
+            CsvDelimiter::Comma => Some(','),
+            CsvDelimiter::Semicolon => Some(';'),
+            CsvDelimiter::Tab => Some('\t'),
+            CsvDelimiter::Pipe => Some('|'),
+        }
+    }
+
+    fn of(s: &str) -> Option<CsvDelimiter> {
+        let mut cs = s.chars();
+        let c = cs.next()?;
+        if cs.next().is_some() {
+            return None;
+        }
+        CsvDelimiter::ALL.into_iter().find(|d| d.char() == Some(c))
+    }
+}
+
+/// Whether a CSV view's first line is its column names: the sniffer's guess,
+/// or said outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CsvHeader {
+    #[default]
+    Auto,
+    Yes,
+    No,
+}
+
+/// The read-time options of a CSV view that DuckDB's sniffer otherwise
+/// guesses — what a file it guesses wrong needs said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CsvReadOptions {
+    pub delimiter: CsvDelimiter,
+    pub header: CsvHeader,
+}
+
+/// A CSV view as [`csv_view_of`] reads its body back: the file, and the
+/// options it is read with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CsvView {
+    pub path: String,
+    pub options: CsvReadOptions,
+}
+
+/// The body of a view reading `path` as CSV with `options` — what an
+/// **Open data file** view is replaced with when its options change. Only
+/// the options set are written, so [`CsvReadOptions::default`] gives the
+/// body [`create_view_sql`] opens with.
+pub fn csv_view_body(path: &str, options: CsvReadOptions) -> String {
+    let lit = |s: &str| sql_literal(&Value::Str(s.to_string()), D);
+    let mut args = vec![lit(path)];
+    if let Some(c) = options.delimiter.char() {
+        args.push(format!("delim = {}", lit(&c.to_string())));
+    }
+    match options.header {
+        CsvHeader::Auto => {}
+        CsvHeader::Yes => args.push("header = true".into()),
+        CsvHeader::No => args.push("header = false".into()),
+    }
+    format!("SELECT * FROM read_csv({})", args.join(", "))
+}
+
+/// The file and options of a view whose body is `SELECT * FROM
+/// read_csv('path', …)` — as [`csv_view_body`] writes it, or as DuckDB
+/// re-prints it (`(delim = ';'), ("header" = false)`, measured on 2.0.0).
+///
+/// `read_csv_auto` is read too, and comes back from [`csv_view_body`] as
+/// `read_csv`: DuckDB has made the one an alias of the other.
+///
+/// `None` for any other body, **and for one carrying an option this does not
+/// model** (`columns = …`, a two-character delimiter, a second file): the
+/// options form writes the whole call again, so offering it there would drop
+/// what the user wrote by hand.
+pub fn csv_view_of(body: &str) -> Option<CsvView> {
+    use crate::intel::TableFunctionArg as A;
+    let (f, args) = crate::intel::star_from_table_function(body, D)?;
+    if !f.eq_ignore_ascii_case("read_csv") && !f.eq_ignore_ascii_case("read_csv_auto") {
+        return None;
+    }
+    let mut args = args.into_iter();
+    let Some(A::Text(path)) = args.next() else {
+        return None;
+    };
+    let mut options = CsvReadOptions::default();
+    for a in args {
+        match a {
+            A::NamedText(k, v)
+                if k.eq_ignore_ascii_case("delim") || k.eq_ignore_ascii_case("sep") =>
+            {
+                options.delimiter = CsvDelimiter::of(&v)?;
+            }
+            A::NamedBool(k, b) if k.eq_ignore_ascii_case("header") => {
+                options.header = if b { CsvHeader::Yes } else { CsvHeader::No };
+            }
+            _ => return None,
+        }
+    }
+    Some(CsvView { path, options })
+}
+
 /// The query the session's tab opens with.
 pub fn select_sql(name: &str) -> String {
     format!("SELECT * FROM {}", ident_if_needed(name, D))
@@ -174,6 +299,76 @@ mod tests {
             create_view_sql("a\"b", "/d/x.parquet", DataFileKind::Parquet),
             "CREATE VIEW \"a\"\"b\" AS SELECT * FROM read_parquet('/d/x.parquet')"
         );
+    }
+
+    /// Only the options set are written; the defaults give the body a file
+    /// opens with.
+    #[test]
+    fn a_csv_body_writes_the_options_set() {
+        let o = |delimiter, header| CsvReadOptions { delimiter, header };
+        assert_eq!(
+            csv_view_body("C:\\d\\o'b.csv", CsvReadOptions::default()),
+            "SELECT * FROM read_csv('C:\\d\\o''b.csv')"
+        );
+        assert!(
+            create_view_sql("x", "/d/x.csv", DataFileKind::Csv)
+                .ends_with(&csv_view_body("/d/x.csv", CsvReadOptions::default()))
+        );
+        assert_eq!(
+            csv_view_body("/d/x.csv", o(CsvDelimiter::Semicolon, CsvHeader::No)),
+            "SELECT * FROM read_csv('/d/x.csv', delim = ';', header = false)"
+        );
+        assert_eq!(
+            csv_view_body("/d/x.csv", o(CsvDelimiter::Tab, CsvHeader::Yes)),
+            "SELECT * FROM read_csv('/d/x.csv', delim = '\t', header = true)"
+        );
+    }
+
+    /// What is written reads back, and so does DuckDB's re-printing of it.
+    #[test]
+    fn a_csv_body_reads_back_written_or_reprinted() {
+        for delimiter in CsvDelimiter::ALL {
+            for header in [CsvHeader::Auto, CsvHeader::Yes, CsvHeader::No] {
+                let options = CsvReadOptions { delimiter, header };
+                assert_eq!(
+                    csv_view_of(&csv_view_body("C:/d/x.csv", options)),
+                    Some(CsvView {
+                        path: "C:/d/x.csv".into(),
+                        options
+                    }),
+                    "{options:?}"
+                );
+            }
+        }
+        assert_eq!(
+            csv_view_of("SELECT * FROM read_csv('/d/x.csv', (delim = '|'), (\"header\" = false))"),
+            Some(CsvView {
+                path: "/d/x.csv".into(),
+                options: CsvReadOptions {
+                    delimiter: CsvDelimiter::Pipe,
+                    header: CsvHeader::No
+                }
+            })
+        );
+    }
+
+    /// Any other body is not a CSV view the form can rewrite — another
+    /// reader, a filter, an alias, an option it does not model.
+    #[test]
+    fn a_body_the_form_would_rewrite_lossily_is_not_read() {
+        for body in [
+            "SELECT * FROM read_parquet('/d/x.parquet')",
+            "SELECT * FROM read_csv('/d/x.csv') WHERE a > 1",
+            "SELECT a FROM read_csv('/d/x.csv')",
+            "SELECT * FROM read_csv('/d/x.csv') AS t",
+            "SELECT * FROM read_csv('/d/x.csv', columns = {'a': 'INT'})",
+            "SELECT * FROM read_csv('/d/x.csv', delim = '::')",
+            "SELECT * FROM read_csv(['/d/a.csv', '/d/b.csv'])",
+            "SELECT * FROM t",
+            "not sql",
+        ] {
+            assert_eq!(csv_view_of(body), None, "{body}");
+        }
     }
 
     #[test]
