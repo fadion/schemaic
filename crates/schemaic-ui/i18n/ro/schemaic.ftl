@@ -2074,6 +2074,7 @@ dump-tables-unreadable = Lista de tabele nu a putut fi citită.
 dump-section-contents = Conținut
 dump-structure = Structură
 dump-structure-hint = CREATE TABLE, triggerele sale și cheile străine, reformulate după date.
+dump-structure-hint-inline = CREATE TABLE cu cheile străine scrise în el, fiecare tabel după tabelele spre care arată cheile sale.
 dump-data = Date
 dump-data-hint = Fiecare rând, ca instrucțiuni INSERT.
 dump-other-objects = Alte obiecte
@@ -2091,6 +2092,7 @@ dump-disable-fk-checks = Dezactivează verificările cheilor străine
 dump-fk-hint = Dezactivate pe durata încărcării, ca ordinea în care sosesc rândurile să nu le poată refuza.
 dump-fk-hint-drops = Dezactivate pe durata încărcării, ca ordinea în care sosesc rândurile să nu le poată refuza. Un fișier care elimină tabele le dezactivează oricum: o eliminare cu ele active șterge rândurile tabelelor din afara fișierului prin acțiunile lor ON DELETE.
 dump-no-fk-guard-hint = Acest motor nu are un comutator de sesiune pentru verificările cheilor străine; în schimb, fișierul adaugă constrângerile după date.
+dump-no-fk-guard-hint-inline = Acest motor nu are un comutator de sesiune pentru verificările cheilor străine și nu poate adăuga o cheie ulterior; fișierul creează fiecare tabel după tabelele spre care arată cheile sale străine.
 dump-export = Exportă
 dump-progress = { $count ->
     [one] Se scrie { $table } — { $index } din { $total }, { $rows } rând până acum

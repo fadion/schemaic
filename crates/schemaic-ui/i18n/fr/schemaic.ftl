@@ -2031,6 +2031,7 @@ dump-tables-unreadable = La liste des tables n'a pas pu être lue.
 dump-section-contents = Contenu
 dump-structure = Structure
 dump-structure-hint = CREATE TABLE, ses déclencheurs, et les clés étrangères, rétablies après les données.
+dump-structure-hint-inline = CREATE TABLE avec ses clés étrangères écrites dedans, chaque table après les tables que visent ses clés.
 dump-data = Données
 dump-data-hint = Toutes les lignes, sous forme d'instructions INSERT.
 dump-other-objects = Autres objets
@@ -2048,6 +2049,7 @@ dump-disable-fk-checks = Désactiver la vérification des clés étrangères
 dump-fk-hint = Désactivée pendant le chargement, pour que l'ordre d'arrivée des lignes ne puisse pas les faire refuser.
 dump-fk-hint-drops = Désactivée pendant le chargement, pour que l'ordre d'arrivée des lignes ne puisse pas les faire refuser. Un fichier qui supprime des tables la désactive de toute façon : une suppression avec la vérification active efface les lignes de tables hors du fichier via leurs actions ON DELETE.
 dump-no-fk-guard-hint = Ce moteur n'a pas d'interrupteur de session pour la vérification des clés étrangères ; le fichier ajoute plutôt les contraintes après les données.
+dump-no-fk-guard-hint-inline = Ce moteur n'a pas d'interrupteur de session pour les contrôles de clés étrangères et ne peut pas ajouter une clé après coup ; le fichier crée chaque table après les tables que visent ses clés étrangères.
 dump-export = Exporter
 dump-progress = { $count ->
     [one] Écriture de { $table } — { $index } sur { $total }, { $rows } ligne jusqu'ici

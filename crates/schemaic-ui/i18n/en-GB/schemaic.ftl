@@ -2372,6 +2372,7 @@ dump-section-contents = Contents
 # CREATE TABLE and INSERT are SQL keywords.
 dump-structure = Structure
 dump-structure-hint = CREATE TABLE, its triggers, and the foreign keys, restated after the data.
+dump-structure-hint-inline = CREATE TABLE with its foreign keys written into it, each table after the tables its keys point at.
 dump-data = Data
 dump-data-hint = Every row, as INSERT statements.
 dump-other-objects = Other objects
@@ -2394,6 +2395,7 @@ dump-disable-fk-checks = Disable foreign-key checks
 dump-fk-hint = Off for the duration of the load, so the order rows arrive in can't refuse them.
 dump-fk-hint-drops = Off for the duration of the load, so the order rows arrive in can't refuse them. A file that drops tables turns them off anyway: a drop with them on deletes the rows of tables outside the file through their ON DELETE actions.
 dump-no-fk-guard-hint = This engine has no session switch for foreign-key checks; the file adds the constraints after the data instead.
+dump-no-fk-guard-hint-inline = This engine has no session switch for foreign-key checks, and cannot add a key afterwards; the file creates each table after the tables its foreign keys point at.
 dump-export = Export
 # The progress line; $rows is an abbreviated count (9.4k), and $count the
 # number itself, which decides the plural.

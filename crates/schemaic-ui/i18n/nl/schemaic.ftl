@@ -2031,6 +2031,7 @@ dump-tables-unreadable = De tabellenlijst kon niet worden gelezen.
 dump-section-contents = Inhoud
 dump-structure = Structuur
 dump-structure-hint = CREATE TABLE, de triggers ervan, en de refererende sleutels, na de gegevens opnieuw opgegeven.
+dump-structure-hint-inline = CREATE TABLE met de vreemde sleutels erin geschreven, elke tabel na de tabellen waarnaar haar sleutels verwijzen.
 dump-data = Gegevens
 dump-data-hint = Elke rij, als INSERT-instructies.
 dump-other-objects = Andere objecten
@@ -2048,6 +2049,7 @@ dump-disable-fk-checks = Controles op refererende sleutels uitschakelen
 dump-fk-hint = Uit zolang het laden duurt, zodat de volgorde waarin rijen binnenkomen ze niet kan laten weigeren.
 dump-fk-hint-drops = Uit zolang het laden duurt, zodat de volgorde waarin rijen binnenkomen ze niet kan laten weigeren. Een bestand dat tabellen verwijdert, zet ze hoe dan ook uit: een drop terwijl ze aan staan, verwijdert via hun ON DELETE-acties de rijen van tabellen buiten het bestand.
 dump-no-fk-guard-hint = Deze engine heeft geen sessieschakelaar voor controles op refererende sleutels; het bestand voegt de beperkingen in plaats daarvan na de gegevens toe.
+dump-no-fk-guard-hint-inline = Deze engine heeft geen sessieschakelaar voor controles op vreemde sleutels en kan achteraf geen sleutel toevoegen; het bestand maakt elke tabel na de tabellen waarnaar haar vreemde sleutels verwijzen.
 dump-export = Exporteren
 dump-progress = { $count ->
     [one] { $table } schrijven — { $index } van { $total }, tot nu toe { $rows } rij

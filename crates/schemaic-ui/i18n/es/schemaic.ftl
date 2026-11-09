@@ -2025,6 +2025,7 @@ dump-tables-unreadable = No se ha podido leer la lista de tablas.
 dump-section-contents = Contenido
 dump-structure = Estructura
 dump-structure-hint = CREATE TABLE, sus disparadores y las claves foráneas, reformuladas después de los datos.
+dump-structure-hint-inline = CREATE TABLE con sus claves foráneas escritas dentro, cada tabla después de las tablas a las que apuntan sus claves.
 dump-data = Datos
 dump-data-hint = Todas las filas, como sentencias INSERT.
 dump-other-objects = Otros objetos
@@ -2042,6 +2043,7 @@ dump-disable-fk-checks = Desactivar las comprobaciones de claves foráneas
 dump-fk-hint = Desactivadas mientras dura la carga, para que el orden en que llegan las filas no haga que se rechacen.
 dump-fk-hint-drops = Desactivadas mientras dura la carga, para que el orden en que llegan las filas no haga que se rechacen. Un archivo que elimina tablas las desactiva en cualquier caso: una eliminación con ellas activadas borra filas de tablas ajenas al archivo mediante sus acciones ON DELETE.
 dump-no-fk-guard-hint = Este motor no tiene un interruptor de sesión para las comprobaciones de claves foráneas; en su lugar, el archivo añade las restricciones después de los datos.
+dump-no-fk-guard-hint-inline = Este motor no tiene un interruptor de sesión para las comprobaciones de claves foráneas ni puede añadir una clave después; el archivo crea cada tabla después de las tablas a las que apuntan sus claves foráneas.
 dump-export = Exportar
 dump-progress = { $count ->
     [one] Escribiendo { $table }: { $index } de { $total }, { $rows } fila hasta ahora

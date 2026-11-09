@@ -2417,6 +2417,7 @@ dump-tables-unreadable = Die Tabellenliste konnte nicht gelesen werden.
 dump-section-contents = Inhalt
 dump-structure = Struktur
 dump-structure-hint = CREATE TABLE, seine Trigger und die Fremdschlüssel, nach den Daten erneut angegeben.
+dump-structure-hint-inline = CREATE TABLE mit den Fremdschlüsseln darin, jede Tabelle nach den Tabellen, auf die ihre Schlüssel verweisen.
 dump-data = Daten
 dump-data-hint = Jede Zeile, als INSERT-Anweisungen.
 dump-other-objects = Weitere Objekte
@@ -2434,6 +2435,7 @@ dump-disable-fk-checks = Fremdschlüsselprüfungen deaktivieren
 dump-fk-hint = Für die Dauer des Ladens aus, damit die Reihenfolge, in der Zeilen ankommen, sie nicht abweisen kann.
 dump-fk-hint-drops = Für die Dauer des Ladens aus, damit die Reihenfolge, in der Zeilen ankommen, sie nicht abweisen kann. Eine Datei, die Tabellen löscht, schaltet sie ohnehin aus: Ein Löschen bei eingeschalteten Prüfungen löscht über ihre ON-DELETE-Aktionen die Zeilen von Tabellen außerhalb der Datei.
 dump-no-fk-guard-hint = Diese Engine hat keinen Sitzungsschalter für Fremdschlüsselprüfungen; die Datei fügt die Constraints stattdessen nach den Daten hinzu.
+dump-no-fk-guard-hint-inline = Diese Engine hat keinen Sitzungsschalter für Fremdschlüsselprüfungen und kann keinen Schlüssel nachträglich hinzufügen; die Datei legt jede Tabelle nach den Tabellen an, auf die ihre Fremdschlüssel verweisen.
 dump-export = Exportieren
 dump-progress = { $count ->
     [one] Schreibe { $table } – { $index } von { $total }, bisher { $rows } Zeile

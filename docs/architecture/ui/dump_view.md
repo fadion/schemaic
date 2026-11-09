@@ -173,6 +173,11 @@ and the modal renders nothing at all. The foreign-key toggle is offered only whe
 `dump::fk_guard_sql` returns something, and where it doesn't the modal *says* so in a `form_hint`
 rather than greying out a control: PostgreSQL's switch is superuser-only, so the honest thing is
 a sentence about the constraints section, not a checkbox that fails the restore for most roles.
+**Which sentence is `dump::restates_foreign_keys`'s call**, and so is the Structure toggle's
+hint: where the engine cannot add a key to an existing table (SQLite, DuckDB) the file writes
+each key inside its `CREATE TABLE` and orders the tables by them, so `dump_options` takes
+`dump-structure-hint-inline` and `dump-no-fk-guard-hint-inline` instead — the plain pair told a
+DuckDB user the keys were restated after the data, which that file never does.
 `watch_connection` closes the modal when the active connection changes under it — the Export
 button would otherwise launch against a `conn_id` that is no longer selected — unless a dump is
 running.
@@ -224,7 +229,8 @@ export modal's: the title through `dump_title` — two whole messages, `dump-tit
 `dump-title`, rather than a namespace spliced in — the save and folder dialogs' window titles
 (`dump-sql-dialog`, `dump-folder-dialog` with `$format`), the folder hint, the picker's count
 (`dump-all-selected`, `dump-some-selected`), its Select all/None and its three notes, the two
-sections' toggles and the hints this file owns, the no-FK-guard hint, Export, the progress line
+sections' toggles and the hints this file owns (the Structure one in two forms, `-inline` beside
+the plain), the no-FK-guard hint in the same two, Export, the progress line
 `dump-progress` through `dump_progress_text` (`$table`, `$index`, `$total`, `$rows`,
 `human_count`'s abbreviated figure, and `$count`, the raw number the plural selects on),
 *Reading the schema* and the *Replace files* confirm's title. The progress box's: its count

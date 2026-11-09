@@ -185,6 +185,15 @@ also what stops the insert order invalidating the file. It is **skipped for a ta
 `create_sql` is `Some`** (`needs_fk_section`): SQLite's verbatim captured `CREATE TABLE` already
 carries the keys, and SQLite has no `ALTER TABLE … ADD CONSTRAINT` to restate them with. That
 question is asked of the *table*, never of the dialect — the data answers it directly.
+**The modal asks the other half of it of the dialect, because it words a toggle before any table
+is read**: `restates_foreign_keys` — true on MySQL, PostgreSQL and SQL Server, false on SQLite
+and DuckDB — picks `dump_view`'s Structure line and its no-switch note. It is computed as
+`ddl::supports_change(dialect, &Change::AddForeignKey(..))` rather than listed, so the sentence
+and the engine's capability cannot drift apart. They did, before it: DuckDB's modal said *the
+file adds the constraints after the data instead* and its Structure line *the foreign keys,
+restated after the data* — the latter on SQLite too — while each file wrote every key inside its
+`CREATE TABLE` (found in a sandboxed GUI check of a DuckDB dump;
+`foreign_keys_follow_the_data_only_where_the_engine_can_add_one`).
 **A table no `CREATE` from the model restates is left out of the file and named in its
 header** — a system-versioned table, its history table, a memory-optimised table, and an
 updatable or append-only ledger table with its history table and its ledger view

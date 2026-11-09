@@ -2031,6 +2031,7 @@ dump-tables-unreadable = Non è stato possibile leggere l'elenco delle tabelle.
 dump-section-contents = Contenuto
 dump-structure = Struttura
 dump-structure-hint = CREATE TABLE, i suoi trigger e le chiavi esterne, riformulate dopo i dati.
+dump-structure-hint-inline = CREATE TABLE con le chiavi esterne scritte al suo interno, ogni tabella dopo le tabelle a cui puntano le sue chiavi.
 dump-data = Dati
 dump-data-hint = Ogni riga, come istruzioni INSERT.
 dump-other-objects = Altri oggetti
@@ -2048,6 +2049,7 @@ dump-disable-fk-checks = Disattiva i controlli delle chiavi esterne
 dump-fk-hint = Disattivati per tutta la durata del caricamento, così l'ordine in cui arrivano le righe non può farle rifiutare.
 dump-fk-hint-drops = Disattivati per tutta la durata del caricamento, così l'ordine in cui arrivano le righe non può farle rifiutare. Un file che elimina tabelle li disattiva comunque: un'eliminazione con i controlli attivi cancella le righe di tabelle esterne al file tramite le loro azioni ON DELETE.
 dump-no-fk-guard-hint = Questo motore non ha un interruttore di sessione per i controlli delle chiavi esterne; il file aggiunge invece i vincoli dopo i dati.
+dump-no-fk-guard-hint-inline = Questo motore non ha un interruttore di sessione per i controlli delle chiavi esterne e non può aggiungere una chiave in seguito; il file crea ogni tabella dopo le tabelle a cui puntano le sue chiavi esterne.
 dump-export = Esporta
 dump-progress = { $count ->
     [one] Scrittura di { $table } — { $index } di { $total }, { $rows } riga finora

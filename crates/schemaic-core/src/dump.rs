@@ -1085,6 +1085,20 @@ pub fn fk_guard_says_drops(dialect: SqlDialect) -> FkHint {
     }
 }
 
+/// Does a dump on `dialect` put foreign keys back **after the data**, as
+/// statements of their own — or write each inside its table's `CREATE`?
+///
+/// After, only where the engine can add a key to a table that already exists:
+/// MySQL, PostgreSQL and SQL Server. SQLite and DuckDB cannot
+/// (`ALTER TABLE … ADD FOREIGN KEY` is no statement there), and their files
+/// carry each key in the captured `CREATE TABLE` ([`needs_fk_section`]), in
+/// an order that creates a referenced table first. The modal's Structure line
+/// and its no-switch note ask this. Computed from [`crate::ddl::supports_change`]
+/// rather than listed, so the two cannot disagree.
+pub fn restates_foreign_keys(dialect: SqlDialect) -> bool {
+    crate::ddl::supports_change(dialect, &crate::ddl::Change::AddForeignKey(Box::default()))
+}
+
 /// What the modal adds to a finished dump's report about
 /// [`DumpPlan::refused`] — empty when there is nothing to say.
 ///
@@ -4782,6 +4796,20 @@ mod tests {
     use crate::schema::{
         ColumnInfo, ForeignKeyInfo, TriggerAction, TriggerEvent, TriggerInfo, TriggerTiming,
     };
+
+    /// **A dump restates foreign keys after the data only where the engine
+    /// can add one.** DuckDB's modal said "the file adds the constraints after
+    /// the data instead" while its file wrote every key inside its `CREATE
+    /// TABLE`, and its Structure line, which SQLite shares, said the same.
+    #[test]
+    fn foreign_keys_follow_the_data_only_where_the_engine_can_add_one() {
+        for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::MsSql] {
+            assert!(restates_foreign_keys(d), "{d:?}");
+        }
+        for d in [SqlDialect::Sqlite, SqlDialect::DuckDb] {
+            assert!(!restates_foreign_keys(d), "{d:?}");
+        }
+    }
 
     /// SQL Server has no `CREATE SCHEMA IF NOT EXISTS`, and a `CREATE SCHEMA`
     /// must be alone in its batch, so the test-and-`EXEC` form is the one that

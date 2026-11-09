@@ -607,7 +607,12 @@ fn dump_options(d: crate::DumpUi, dialect: SqlDialect, ring: FocusRing) -> impl 
         form_section_header(tr!("dump-section-contents")),
         crate::settings::focusable_toggle_row(
             tr!("dump-structure"),
-            tr!("dump-structure-hint"),
+            // Keys after the data only where the engine can add one.
+            if schemaic_core::dump::restates_foreign_keys(dialect) {
+                tr!("dump-structure-hint")
+            } else {
+                tr!("dump-structure-hint-inline")
+            },
             d.structure,
             ring.clone(),
             TAB_OPTS,
@@ -663,7 +668,13 @@ fn dump_options(d: crate::DumpUi, dialect: SqlDialect, ring: FocusRing) -> impl 
             // Said, rather than shown greyed: PostgreSQL's switch is
             // superuser-only, so offering it would be a checkbox that fails the
             // restore for most roles.
-            form_hint(tr!("dump-no-fk-guard-hint")).into_any()
+            form_hint(if schemaic_core::dump::restates_foreign_keys(dialect) {
+                tr!("dump-no-fk-guard-hint")
+            } else {
+                // DuckDB: no switch, and no `ADD FOREIGN KEY` either.
+                tr!("dump-no-fk-guard-hint-inline")
+            })
+            .into_any()
         },
     ))
     .style(|s| s.flex_col().width_full().gap(theme::scaled(10.0)));

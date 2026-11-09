@@ -2031,6 +2031,7 @@ dump-tables-unreadable = Lista e tabelave nuk mund të lexohej.
 dump-section-contents = Përmbajtja
 dump-structure = Struktura
 dump-structure-hint = CREATE TABLE, trigger-ët e saj dhe çelësat e jashtëm, të riformuluar pas të dhënave.
+dump-structure-hint-inline = CREATE TABLE me çelësat e jashtëm të shkruar brenda, çdo tabelë pas tabelave ku tregojnë çelësat e saj.
 dump-data = Të dhënat
 dump-data-hint = Çdo rresht, si urdhra INSERT.
 dump-other-objects = Objekte të tjera
@@ -2048,6 +2049,7 @@ dump-disable-fk-checks = Çaktivizo kontrollet e çelësave të jashtëm
 dump-fk-hint = Joaktive gjatë ngarkimit, që rendi në të cilin mbërrijnë rreshtat të mos i refuzojë ata.
 dump-fk-hint-drops = Joaktive gjatë ngarkimit, që rendi në të cilin mbërrijnë rreshtat të mos i refuzojë ata. Një skedar që fshin tabela i çaktivizon gjithsesi: një fshirje me to aktive fshin rreshtat e tabelave jashtë skedarit përmes veprimeve të tyre ON DELETE.
 dump-no-fk-guard-hint = Ky motor nuk ka çelës seance për kontrollet e çelësave të jashtëm; në vend të kësaj, skedari i shton kufizimet pas të dhënave.
+dump-no-fk-guard-hint-inline = Ky motor nuk ka çelës sesioni për kontrollet e çelësave të jashtëm dhe nuk mund të shtojë një çelës më pas; skedari krijon çdo tabelë pas tabelave ku tregojnë çelësat e saj të jashtëm.
 dump-export = Eksporto
 dump-progress = { $count ->
     [one] Po shkruhet { $table } — { $index } nga { $total }, { $rows } rresht deri tani
