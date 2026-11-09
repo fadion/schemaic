@@ -3196,7 +3196,8 @@ fn select_alias_in_having(dialect: SqlDialect) -> bool {
 /// no source has; PostgreSQL 16 answers *column "t" does not exist*, and SQL
 /// Server's subqueries see input columns alone. Which clauses those are is
 /// the clause's own predicate, but for the select list
-/// ([`select_list_subquery_sees_earlier_aliases`]).
+/// ([`select_list_subquery_sees_earlier_aliases`]) and for `GROUP BY` and
+/// `HAVING` ([`grouping_subquery_sees_output_aliases`]).
 fn subquery_sees_output_aliases(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::DuckDb => true,
@@ -3204,37 +3205,65 @@ fn subquery_sees_output_aliases(dialect: SqlDialect) -> bool {
     }
 }
 
-/// May a subquery in the select list read an alias the list defines
-/// **before** it? MySQL and MariaDB do — `SELECT 1 AS a, (SELECT a + 1)` —
-/// and refuse one defined after it (1247, *forward reference in item list*);
-/// SQLite answers *no such column*, and PostgreSQL and SQL Server see no
-/// alias from a subquery at all ([`subquery_sees_output_aliases`]).
-fn select_list_subquery_sees_earlier_aliases(dialect: SqlDialect) -> bool {
+/// Does a subquery in `GROUP BY` or `HAVING` see an alias the clause itself
+/// reads? MySQL, MariaDB and SQLite bind both. **DuckDB does not** (2.0.0,
+/// measured), though `GROUP BY t` and `HAVING t > 0` bind: `GROUP BY (SELECT
+/// t)` is *not found in FROM clause*, and `HAVING (SELECT t) > 0` *cannot
+/// reference alias "t" in correlated subquery*. PostgreSQL and SQL Server see
+/// no alias from a subquery at all ([`subquery_sees_output_aliases`]).
+fn grouping_subquery_sees_output_aliases(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql => true,
-        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite | SqlDialect::DuckDb => false,
+        SqlDialect::MySql | SqlDialect::Sqlite => true,
+        SqlDialect::DuckDb | SqlDialect::Postgres | SqlDialect::MsSql => false,
     }
 }
 
-/// Does a window's `ORDER BY` / `PARTITION BY` read a select-list alias —
-/// ahead of a same-named column? `None` where the catalogue cannot say which
-/// MySQL-family server it is: MariaDB 10.11 does, ahead of the column, and
-/// MySQL 8.4 answers *Unknown column 't' in 'window order by'*. SQLite,
+/// May a subquery in the select list read an alias the list defines
+/// **before** it? MySQL and MariaDB do — `SELECT 1 AS a, (SELECT a + 1)` —
+/// and refuse one defined after it (1247, *forward reference in item list*);
+/// so does DuckDB 2.0.0 (measured), whose forward reference is *cannot be
+/// referenced before it is defined*. SQLite answers *no such column*, and
+/// PostgreSQL and SQL Server see no alias from a subquery at all
+/// ([`subquery_sees_output_aliases`]).
+fn select_list_subquery_sees_earlier_aliases(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::DuckDb => true,
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite => false,
+    }
+}
+
+/// How a window's `ORDER BY` / `PARTITION BY` reads a select-list alias
+/// ([`window_sees_output_aliases`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowAlias {
+    /// The alias, ahead of a same-named column.
+    Ahead,
+    /// The alias where no source has a column of its name.
+    BehindColumns,
+    /// Input columns alone.
+    Never,
+}
+
+/// Does a window's `ORDER BY` / `PARTITION BY` read a select-list alias, and
+/// ahead of a same-named column or behind it? `None` where the catalogue
+/// cannot say which MySQL-family server it is: MariaDB 10.11 reads it ahead of
+/// the column, and MySQL 8.4 answers *Unknown column 't' in 'window order
+/// by'*. DuckDB 2.0.0 reads it behind the columns (measured: `OVER (ORDER BY
+/// total)` sorts by `orders.total` beside an alias `total`). SQLite,
 /// PostgreSQL and SQL Server read input columns alone there.
 fn window_sees_output_aliases(
     dialect: SqlDialect,
     flavour: crate::schema::ServerFlavour,
-) -> Option<bool> {
+) -> Option<WindowAlias> {
     use crate::schema::ServerFlavour;
     match dialect {
         SqlDialect::MySql => match flavour {
-            ServerFlavour::MariaDb => Some(true),
-            ServerFlavour::MySql => Some(false),
+            ServerFlavour::MariaDb => Some(WindowAlias::Ahead),
+            ServerFlavour::MySql => Some(WindowAlias::Never),
             ServerFlavour::Unknown => None,
         },
-        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite | SqlDialect::DuckDb => {
-            Some(false)
-        }
+        SqlDialect::DuckDb => Some(WindowAlias::BehindColumns),
+        SqlDialect::Postgres | SqlDialect::MsSql | SqlDialect::Sqlite => Some(WindowAlias::Never),
     }
 }
 
@@ -15759,18 +15788,33 @@ mod output_alias {
                 }
             }
             // A window's `ORDER BY` / `PARTITION BY`: the alias ahead of a
-            // column on MariaDB, never elsewhere, and on a MySQL-family
-            // server the catalogue cannot name, not known.
+            // column on MariaDB, behind the columns on DuckDB, never
+            // elsewhere, and on a MySQL-family server the catalogue cannot
+            // name, not known.
+            use super::WindowAlias;
             let window = super::window_sees_output_aliases(dialect, self.flavour);
             for id in &blk.windows {
                 match (window, id.same(target, dialect)) {
-                    (Some(true), true) => found.refs.push(id.at),
+                    (Some(WindowAlias::Ahead), true) => found.refs.push(id.at),
+                    (Some(WindowAlias::BehindColumns), true) => match is_column(id) {
+                        Some(true) => {}
+                        Some(false) => {
+                            found.refs.push(id.at);
+                            refs_behind_columns = true;
+                        }
+                        None => {
+                            found.unsure = true;
+                            found.maybe.push(id.at);
+                        }
+                    },
                     (None, true) => {
                         found.unsure = true;
                         found.maybe.push(id.at);
                     }
-                    (Some(true) | None, false) => order_names.push((id.value.clone(), id.quoted)),
-                    (Some(false), _) => {}
+                    (Some(WindowAlias::Ahead | WindowAlias::BehindColumns) | None, false) => {
+                        order_names.push((id.value.clone(), id.quoted))
+                    }
+                    (Some(WindowAlias::Never), _) => {}
                 }
             }
             let mut outer = Vec::new();
@@ -15836,8 +15880,14 @@ mod output_alias {
                             && start >= target.at.1
                     }
                     Spot::Where => super::select_alias_in_where(dialect),
-                    Spot::Group => super::group_by_sees_output_aliases(dialect),
-                    Spot::Having => super::select_alias_in_having(dialect),
+                    Spot::Group => {
+                        super::group_by_sees_output_aliases(dialect)
+                            && super::grouping_subquery_sees_output_aliases(dialect)
+                    }
+                    Spot::Having => {
+                        super::select_alias_in_having(dialect)
+                            && super::grouping_subquery_sees_output_aliases(dialect)
+                    }
                     Spot::Order => super::order_by_expression_sees_output_aliases(dialect),
                     Spot::On => super::select_alias_in_join_on(dialect),
                 });
@@ -38255,6 +38305,7 @@ mod output_alias_tests {
     const MS: SqlDialect = SqlDialect::MsSql;
     const LITE: SqlDialect = SqlDialect::Sqlite;
     const ALL: [SqlDialect; 4] = [MY, PG, MS, LITE];
+    const DUCK: SqlDialect = SqlDialect::DuckDb;
 
     /// `orders(id, total, qty)` in `shop`, the active database.
     fn catalog() -> Catalog {
@@ -38684,14 +38735,18 @@ mod output_alias_tests {
     /// MySQL in the select list (an alias written before it), `HAVING`,
     /// `GROUP BY` and `ORDER BY`; SQLite in `WHERE`, `GROUP BY`, `HAVING`
     /// and `ORDER BY`, not the select list. A column of the alias's own
-    /// `FROM` beats it there, as everywhere behind columns.
+    /// `FROM` beats it there, as everywhere behind columns. DuckDB 2.0.0
+    /// (measured) binds it in the select list, `WHERE` and `ORDER BY`, and
+    /// refuses it in `GROUP BY` (*not found in FROM clause*) and `HAVING`
+    /// (*cannot reference alias … in correlated subquery*) — two clauses
+    /// that read the alias themselves.
     #[test]
     fn an_alias_read_inside_a_subquery_is_renamed_where_the_engine_binds_it() {
         let cases: [(&str, &str, &[SqlDialect]); 6] = [
             (
                 "SELECT qty AS t|, (SELECT t) AS u FROM orders",
                 "SELECT qty AS z, (SELECT z) AS u FROM orders",
-                &[MY],
+                &[MY, DUCK],
             ),
             (
                 "SELECT qty AS t| FROM orders GROUP BY qty HAVING EXISTS (SELECT 1 WHERE t > 0)",
@@ -38701,7 +38756,7 @@ mod output_alias_tests {
             (
                 "SELECT qty AS t| FROM orders ORDER BY (SELECT t)",
                 "SELECT qty AS z FROM orders ORDER BY (SELECT z)",
-                &[MY, LITE],
+                &[MY, LITE, DUCK],
             ),
             (
                 "SELECT qty AS t| FROM orders GROUP BY (SELECT t)",
@@ -38711,7 +38766,7 @@ mod output_alias_tests {
             (
                 "SELECT qty AS t| FROM orders WHERE (SELECT t) > 1",
                 "SELECT qty AS z FROM orders WHERE (SELECT z) > 1",
-                &[LITE],
+                &[LITE, DUCK],
             ),
             // A forward reference is MySQL's error 1247, not the alias.
             (
@@ -38721,7 +38776,7 @@ mod output_alias_tests {
             ),
         ];
         for (sql, binds, engines) in cases {
-            for d in ALL {
+            for d in ALL.into_iter().chain([DUCK]) {
                 let want = if engines.contains(&d) {
                     binds.to_string()
                 } else {
@@ -38732,7 +38787,7 @@ mod output_alias_tests {
         }
         // `orders.total` beats the alias inside the subquery too.
         let col = "SELECT qty AS total| FROM orders ORDER BY (SELECT total)";
-        for d in [MY, LITE] {
+        for d in [MY, LITE, DUCK] {
             assert_eq!(
                 renamed(col, "z", d),
                 Ok(col.replace("AS total|", "AS z")),
@@ -38803,6 +38858,39 @@ mod output_alias_tests {
                 "{d:?}"
             );
         }
+    }
+
+    /// **DuckDB's window reads the alias behind the columns** (2.0.0,
+    /// measured): `OVER (ORDER BY t)` and `OVER (PARTITION BY t)` bind an
+    /// alias no source has, and `OVER (ORDER BY total)` sorts by the column
+    /// `orders.total` when an alias of that name exists too.
+    #[test]
+    fn a_duckdb_window_reads_the_alias_behind_the_columns() {
+        for (sql, want) in [
+            (
+                "SELECT qty AS t|, sum(qty) OVER (ORDER BY t) AS s FROM orders",
+                "SELECT qty AS z, sum(qty) OVER (ORDER BY z) AS s FROM orders",
+            ),
+            (
+                "SELECT qty AS t|, sum(qty) OVER (PARTITION BY t) AS s FROM orders",
+                "SELECT qty AS z, sum(qty) OVER (PARTITION BY z) AS s FROM orders",
+            ),
+            (
+                "SELECT qty AS total|, sum(qty) OVER (ORDER BY total) AS s FROM orders",
+                "SELECT qty AS z, sum(qty) OVER (ORDER BY total) AS s FROM orders",
+            ),
+        ] {
+            assert_eq!(renamed(sql, "z", DUCK), Ok(want.to_string()), "{sql}");
+        }
+        // A rename to a column's name would hand the window's read to it.
+        assert_eq!(
+            renamed(
+                "SELECT qty * 2 AS t|, sum(qty) OVER (ORDER BY t) AS s FROM orders",
+                "id",
+                DUCK
+            ),
+            Err(AliasRenameRefusal::Conflict)
+        );
     }
 
     /// *Find usages* answers for each of the three names, with the same

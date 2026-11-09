@@ -2070,15 +2070,18 @@ wins, needs no catalogue at all (`an_unknowable_source_refuses_a_group_by_refere
 sqlparser's own visitor at their `SELECT`'s own level rather than by a match over the expression
 kinds — a kind the match left out would be a reference the rename leaves behind, to bind to a
 same-named column. **A subquery's names are its own only where the engine keeps them so**
-(`subquery_sees_output_aliases`: PostgreSQL and SQL Server). On MySQL and SQLite a subquery in
-one of the alias's clauses sees it, behind every column on the way out — checked live on
-MariaDB 10.11, MySQL 8.4 and SQLite 3.50, where `ORDER BY (SELECT t)` beside a column `t` reads
-the column. `Tree::nested` takes each block inside the alias's through opaque subqueries alone
+(`subquery_sees_output_aliases`: PostgreSQL and SQL Server). On MySQL, SQLite and DuckDB a
+subquery in one of the alias's clauses sees it, behind every column on the way out — checked live
+on MariaDB 10.11, MySQL 8.4, SQLite 3.50 and DuckDB 2.0.0, where `ORDER BY (SELECT t)` beside a
+column `t` reads the column. **DuckDB's subqueries in `GROUP BY` and `HAVING` see no alias**,
+though both clauses read one themselves (*not found in FROM clause*, *cannot reference alias … in
+correlated subquery*), so those two spots also ask `grouping_subquery_sees_output_aliases`. `Tree::nested` takes each block inside the alias's through opaque subqueries alone
 (a derived table's or a CTE's body on the way sees no enclosing alias — `nested_spot`), places
 the subquery in the alias block's clauses by span (`Block::spots`, whose `Spot::On` covers the
 block's own join conditions, a nested join's included — `join_ons`), and asks that clause's own
-predicate, the select list's being `select_list_subquery_sees_earlier_aliases` (MySQL, and only
-for an alias written before the subquery — after it is error 1247). A bare name there that
+predicate, the select list's being `select_list_subquery_sees_earlier_aliases` (MySQL and
+DuckDB, and only for an alias written before the subquery — after it is MySQL's error 1247 and
+DuckDB's *cannot be referenced before it is defined*). A bare name there that
 `resolve_bare` finds no source for is the alias; one a source inside or the alias's own `FROM`
 has is the column; anything else — an unknowable source, an outer query's column, a clause the
 walk does not place, a same-named alias on the way in — is `Unsure`
@@ -2088,9 +2091,12 @@ once such a clause, so a subquery there refused the rename as unsure even on MyS
 reads the alias there; placed, it is renamed on SQLite and left alone on MySQL. Each subquery
 renamed adds a `Reach` whose rivals are its own sources' columns. **A window's `ORDER BY` and
 `PARTITION BY`** (`Block::windows`, from `window_idents`) read the alias ahead of a column on
-MariaDB alone — MySQL 8.4 answers *Unknown column 't' in 'window order by'* — so
-`window_sees_output_aliases` asks `Catalog::flavour`, and a MySQL-family server it cannot name
-leaves the rename `Unsure` (`a_windows_order_by_reads_the_alias_on_mariadb_alone`).
+MariaDB — MySQL 8.4 answers *Unknown column 't' in 'window order by'* — and behind the columns on
+DuckDB, where `OVER (ORDER BY total)` sorts by `orders.total` beside an alias `total`; so
+`window_sees_output_aliases` answers a `WindowAlias` (`Ahead`, `BehindColumns`, `Never`), asking
+`Catalog::flavour` on MySQL, and a MySQL-family server it cannot name leaves the rename `Unsure`
+(`a_windows_order_by_reads_the_alias_on_mariadb_alone`,
+`a_duckdb_window_reads_the_alias_behind_the_columns`).
 **`output_alias::find` builds a `Tree` of every `SELECT` in the statement** — a sqlparser
 `Visitor` over `pre_visit_query`, `pre_visit_select` and `pre_visit_table_factor`, keyed by node
 address, since the borrow each callback is handed cannot be stored — holding each block's
