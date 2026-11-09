@@ -2265,7 +2265,17 @@ pub struct ViewOptions {
     /// **SQL Server has one too**, `CREATE VIEW v (x, y) AS …`, read off the
     /// stored definition's header by `db::mssql` and restated for the same
     /// reason: `ALTER VIEW` without it names the columns after the body.
+    ///
+    /// **And DuckDB's**, read out of `duckdb_views().sql` the way SQLite's is
+    /// ([`crate::ddl::view_column_list`]).
     pub column_list: Option<String>,
+    /// **DuckDB.** The view's comment, carried here — beside
+    /// [`TableInfo::comment`], which every engine fills — because
+    /// `CREATE OR REPLACE VIEW` there **clears** it (measured on 2.0.0), so
+    /// the plan has to restate it after the replace
+    /// ([`crate::ddl::replace_clears_comment`]). `None` on the engines whose
+    /// replace keeps it, and only the DuckDB reader fills it.
+    pub comment: Option<String>,
     /// **SQL Server's view attributes** — `SCHEMABINDING`, `VIEW_METADATA` —
     /// upper-cased, in the order the header states them. Empty elsewhere.
     ///
@@ -2433,6 +2443,7 @@ impl Default for ViewOptions {
             materialized: false,
             populated: true,
             column_list: None,
+            comment: None,
             attributes: Vec::new(),
             tsql: TsqlView::default(),
         }

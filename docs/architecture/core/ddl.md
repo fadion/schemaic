@@ -11,14 +11,15 @@ stating it: a predicate that discards its `SqlDialect` and returns `true` is the
 for a fourth engine as confidently as for these three. **DuckDB is the engine that computation
 answers per object**, and without an edit to any of them: `supports_change` sends it to
 `duckdb_supports`, which admits a table's own changes — in place where DuckDB's `ALTER TABLE`
-can, by a rebuild where it cannot (`duckdb_rebuild_sql`, below) — and refuses every view, trigger
-and macro change until the roadmap's later DuckDB phase writes and runs those. DuckDB's DDL is
+can, by a rebuild where it cannot (`duckdb_rebuild_sql`, below) — and a view's create, replace,
+rename and drop (with the other engines' views, below), and refuses every trigger and macro
+change: DuckDB has no triggers, and macros wait on the roadmap's later DuckDB phase. DuckDB's DDL is
 close to PostgreSQL's but not the same (no `ADD CONSTRAINT` for a key or a foreign key once a
 table exists, no index rename, no `ALTER INDEX`, a table something depends on cannot be renamed
 or retyped), so the designer — **Edit table**, **Edit column**, the key rows' edit entries and,
-through `CreateTable`, a new table — is on for a DuckDB connection, while the view, trigger and
-routine editors and *Apply* stay off, each because its `supports_*` gate computes from the same
-table. `emit`'s DuckDB arm is `emit_duckdb`, below with the rebuild. Two more join them.
+through `CreateTable`, a new table — and the view editor are on for a DuckDB connection, while the
+trigger and routine editors and *Apply* stay off, each because its `supports_*` gate computes
+from the same table. `emit`'s DuckDB arm is `emit_duckdb`, below with the rebuild. Two more join them.
 `supports_table_design` is what the tree's **Edit table**, **Edit column** and **Edit index**
 entries ask — three literal `true`s until it existed — and its probe is a column retype, since
 that is the designer's own edit: expressible in place on MySQL, PostgreSQL and SQL Server
@@ -483,7 +484,8 @@ so a renamed SQL Server view would have come out as a `CREATE OR ALTER` under th
 (`sql_server_renames_a_view_by_re_creating_it`).
 `ChangeSet::view_statements`' `RenameView` arm is therefore spelled out per dialect with a
 `debug_assert!` on the SQLite and SQL Server ones — unreachable by construction, and a `_ =>`
-there is exactly what would hand SQLite MySQL's `RENAME TABLE`. The arm is guarded by
+there is exactly what would hand SQLite MySQL's `RENAME TABLE`. DuckDB shares PostgreSQL's
+`ALTER VIEW … RENAME TO`. The arm is guarded by
 `supports_change`, as its `DropView` and `RefreshView` siblings are, so a refused rename writes
 nothing rather than reaching them. **Triggers needed the reader before the
 emitter**; that is `sqlite_trigger_info`, below. The schema tree's
@@ -1943,13 +1945,39 @@ asks per engine (`my`/`pg` locals) rather than `!pg`, which had been sorting SQL
 MySQL's side and would have emitted `ALGORITHM`/`DEFINER`/`SQL SECURITY` at an engine that
 has none of them. The check option and the column list are capabilities of their own,
 `supports_view_check_option` (MySQL, PostgreSQL) and `view_keeps_column_list` (SQLite, SQL
-Server), asked by `create_view_sql` and `view_editor.rs` alike in place of an `== Sqlite` that
+Server, DuckDB), asked by `create_view_sql` and `view_editor.rs` alike in place of an `== Sqlite` that
 sorted SQL Server onto MySQL's side of both. SQL Server's `WITH CHECK OPTION` has neither
 `CASCADED` nor `LOCAL` and stays in the body the user edits, where introspection leaves it.
 `emit_sqlite` and `emit_mssql`
 now call `view_statements` (and `emit_sqlite` `trigger_statements`) rather than keeping a
 hand-rolled `DropView` arm, so there is still one view emitter; `tsql_supports` admits
 `CreateView` and `ReplaceView`, which is what switched SQL Server's view editor on.
+**DuckDB's view editor came on the same way**: `duckdb_supports` admits `CreateView`,
+`ReplaceView`, `RenameView` and a non-materialized `DropView` — `CREATE [OR REPLACE] VIEW`,
+`ALTER VIEW … RENAME TO` and `DROP VIEW`, each a statement of its own (measured on the bundled
+2.0.0) — and `supports_view_editing` followed with no edit of its own
+(`duckdb_creates_replaces_renames_and_drops_views`). `emit_duckdb` reaches them through
+`emit_postgres`, and so through `view_statements`. Its replace takes any body —
+`view_replace_can_refuse` answers no, so `diff_view` never re-creates there — and it has no
+materialized view, so `RefreshView` and a materialized `DropView` stay refused. Two things a
+replace would lose are restated. The explicit column list, as on SQLite and SQL Server, read out
+of the stored statement by **`view_column_list(create_sql, dialect)`** — once `db::sqlite`'s
+`view_columns_of`, moved here when DuckDB's reader needed the same read of `duckdb_views().sql`:
+the one parenthesised group before the header's `AS`, at code position and paren depth zero over
+`sql::skip_noncode`, kept verbatim because re-quoting a parsed list is a way to change it
+(`a_views_column_list_is_read_out_of_its_create_statement`,
+`a_view_without_a_column_list_reports_none`). And **the comment, which DuckDB's `CREATE OR
+REPLACE VIEW` clears** — measured on 2.0.0, `hello` read back `NULL` after a replace, while
+`ALTER VIEW … RENAME` keeps it. `replace_clears_comment(dialect)`, DuckDB's alone and an
+exhaustive `match`, has the in-place `ReplaceView` arm follow the replace with a `COMMENT ON VIEW
+… IS …` from `ViewOptions::comment`, under the name the server still knows — **before** any
+rename, which then carries it along (`a_duckdb_view_replace_restates_the_comment_it_clears`,
+which also pins that a rename alone restates nothing and that PostgreSQL, whose replace keeps its
+comment, is written no such statement). The comment is carried, not edited: the view editor has
+no control for it. The live half, `a_view_edit_keeps_its_column_list_and_comment` under
+`duckdb.rs`, runs a body change and a rename end to end and reads the list and the comment back.
+**DuckDB tracks no view's dependents**: a replace or a drop that breaks another view succeeds, and
+the other fails when it is next read, as on MySQL.
 The MySQL `ALGORITHM` a replace would reset arrives *after* the editor opens
 (`SchemaActions::view_algorithm` → `Db::view_algorithm`; see `schemaic-db`), and
 `view_editor::fetch_algorithm` patches **both** sides of the diff with it — writing

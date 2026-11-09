@@ -109,11 +109,16 @@ A DuckDB connection is a database file on this machine, like SQLite's; see
 - the [table designer](../schema/table-designer.md#what-differs-between-engines), **Copy to** and
   **Compare with**. DuckDB's `ALTER TABLE` refuses most changes to a table that anything depends
   on, so many changes rebuild the table in one transaction, and a table another table's foreign key
-  points at can't be rebuilt.
+  points at can't be rebuilt;
+- the view editor: **Edit view**, a new view from **Create** › **View** or the query editor's
+  **Create view**, renaming a view in its name field, and **Drop**. An edit keeps the view's
+  **Column names** and its comment, which Schemaic sets again after the replace, since DuckDB's
+  would clear it. DuckDB doesn't track which views read a view, so a change that breaks another
+  view goes through, and that view fails the next time it's read.
 
 *Not yet:*
 
-- the view and macro editors, so changing a view or macro is SQL you write and run yourself;
+- the macro editor, so changing a macro is SQL you write and run yourself;
 - **Restore from file**.
 
 There are no users to manage, as on SQLite. The AI assistant and the command line read only the

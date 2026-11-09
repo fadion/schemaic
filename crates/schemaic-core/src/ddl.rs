@@ -1456,6 +1456,90 @@ pub fn view_body(sql: &str) -> String {
     sql.trim().trim_end_matches(';').trim_end().to_string()
 }
 
+/// A view's explicit **column list** — the `(x, y)` of `CREATE VIEW v (x, y) AS
+/// …` — read out of the statement the engine stores, without its parentheses.
+/// `None` for the usual view, which takes its column names from its body.
+///
+/// SQLite (`sqlite_master.sql`) and DuckDB (`duckdb_views().sql`) both hand
+/// back the statement rather than the parts, and both are engines where
+/// [`view_keeps_column_list`] answers yes: the list is restated on every
+/// replace or re-create, so a list not read here is a list *emitted* absent,
+/// and the view's columns quietly take the body's names instead.
+///
+/// The list is the one parenthesised group that can appear *before* the `AS`
+/// that ends the header, at code position and paren depth zero. Everything
+/// after that `AS` is the user's own SQL, where a `(` is arithmetic or a
+/// subquery rather than a column list.
+///
+/// Kept **verbatim**, quoting and spacing included: parsing the names apart
+/// and re-quoting them is a way to change them.
+pub fn view_column_list(create_sql: &str, dialect: SqlDialect) -> Option<String> {
+    use crate::sql::{is_word_byte, is_word_start, skip_noncode};
+
+    let b = create_sql.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    let mut seen_create = false;
+    // The most recent depth-0 parenthesised group, as byte bounds of its
+    // contents. Only the one still in hand when the header's `AS` arrives is a
+    // column list.
+    let mut group: Option<(usize, usize)> = None;
+    let mut open: Option<usize> = None;
+    while i < b.len() {
+        if let Some(j) = skip_noncode(b, i, dialect) {
+            i = j.max(i + 1);
+            continue;
+        }
+        match b[i] {
+            b'(' => {
+                if depth == 0 {
+                    open = Some(i + 1);
+                }
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0
+                    && let Some(start) = open.take()
+                {
+                    group = Some((start, i));
+                }
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if !is_word_start(b[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i + 1;
+        while end < b.len() && is_word_byte(b[end]) {
+            end += 1;
+        }
+        let word = &create_sql[start..end];
+        if !seen_create {
+            // Whatever this is, it isn't a `CREATE VIEW`; refuse rather than
+            // hand back a list read out of something else.
+            if !word.eq_ignore_ascii_case("CREATE") {
+                return None;
+            }
+            seen_create = true;
+        } else if depth == 0 && word.eq_ignore_ascii_case("AS") {
+            let (s, e) = group?;
+            let cols = create_sql[s..e].trim();
+            return (!cols.is_empty()).then(|| cols.to_string());
+        }
+        i = end;
+    }
+    // No header-ending `AS`: the statement is unreadable, and a list without the
+    // body it names is nothing to hand back.
+    None
+}
+
 /// Can PostgreSQL redefine a view whose columns are `current` with the body
 /// `select`, in place?
 ///
@@ -9510,6 +9594,17 @@ impl ChangeSet {
                             settings,
                         ));
                         out.extend(view_index_statements(draft, server_name, d));
+                        // What the replace cleared, under the name the
+                        // server still knows — before any rename below.
+                        if replace_clears_comment(d)
+                            && let Some(comment) = &draft.options.comment
+                        {
+                            out.push(format!(
+                                "COMMENT ON VIEW {} IS {};",
+                                qualified(server_name, draft.schema.as_deref(), d),
+                                ddl_string(comment, d)
+                            ));
+                        }
                     }
                 }
                 // Guarded for the reason the `RefreshView` arm three lines down
@@ -14751,6 +14846,27 @@ pub fn ddl_is_transactional(dialect: SqlDialect) -> bool {
     }
 }
 
+/// Does an **in-place replace** — `CREATE OR REPLACE VIEW`, `CREATE OR
+/// REPLACE MACRO` — clear the object's comment on `dialect`, so the plan has
+/// to restate it after the replace?
+///
+/// DuckDB's does, for a view and a macro alike: each replace is a new catalogue
+/// entry, and the comment was the old one's (measured on 2.0.0 — `hello` read
+/// back `NULL`; a `COMMENT ON` in the same transaction after it keeps it, and
+/// `ALTER VIEW … RENAME` keeps it on its own). PostgreSQL's replace keeps the
+/// comment, SQL Server's `CREATE OR ALTER` its extended properties, MySQL's
+/// routine replace is a recreate that restates its `COMMENT` clause
+/// ([`recreate_restates_routine_comment`]) and its views carry none, and
+/// SQLite has no comments at all.
+///
+/// An exhaustive `match`, for the reason [`supports_owners`] gives.
+pub fn replace_clears_comment(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::DuckDb => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
 /// Does a routine's drop-and-create on `dialect` **put its comment back**?
 /// MySQL's `CREATE` carries a `COMMENT` clause, and SQL Server's plan sets the
 /// `MS_Description` again after it (`routine_follow_ups`); PostgreSQL's
@@ -18960,6 +19076,18 @@ fn duckdb_supports(change: &Change) -> bool {
             collation: None,
             comment: Some(_),
         } => true,
+        // Views: `CREATE [OR REPLACE] VIEW`, `ALTER VIEW … RENAME TO` and
+        // `DROP VIEW`, each a statement of its own. A replace never refuses
+        // ([`view_replace_can_refuse`]), so `diff_view` never re-creates
+        // here; the comment it clears is restated after it
+        // ([`replace_clears_comment`]). No materialized view exists to drop
+        // or refresh.
+        Change::CreateView(_)
+        | Change::ReplaceView { .. }
+        | Change::RenameView { .. }
+        | Change::DropView {
+            materialized: false,
+        } => true,
         // **Admitted when everything that differs is something an `ALTER
         // COLUMN` writes** — the rename, the type, nullability, the default
         // and the comment — asked of `columns_equal`, the comparison that
@@ -21228,6 +21356,67 @@ mod tests {
     use super::*;
     use crate::intel::SqlDialect::{DuckDb, MsSql, MySql, Postgres, Sqlite};
     use crate::schema::{IndexColumn, TriggerEnabled};
+
+    /// `CREATE VIEW v (x, y) AS …` names the view's columns independently of
+    /// its body, and SQLite and DuckDB report the statement rather than the
+    /// parts. A list read wrong is a list *emitted* wrong, and the view's
+    /// columns quietly take the body's names instead.
+    #[test]
+    fn a_views_column_list_is_read_out_of_its_create_statement() {
+        for (sql, cols) in [
+            ("CREATE VIEW v (x, y) AS SELECT a, b FROM t", "x, y"),
+            // No space before the paren, and none inside it.
+            ("CREATE VIEW v(x,y) AS SELECT 1,2", "x,y"),
+            // Each of SQLite's three quotings, kept verbatim: re-quoting a
+            // parsed list is a way to change it.
+            (
+                r#"CREATE VIEW v ("odd name", [b], `c`) AS SELECT 1, 2, 3"#,
+                r#""odd name", [b], `c`"#,
+            ),
+            // A column *named* `as` doesn't end the header — it's quoted, and
+            // the lexer skips it whole.
+            (r#"CREATE VIEW v ("as") AS SELECT 1"#, r#""as""#),
+            // …and neither does a view named `as`.
+            (r#"CREATE VIEW "as" (a) AS SELECT 1"#, "a"),
+            ("CREATE TEMP VIEW IF NOT EXISTS main.v (a) AS SELECT 1", "a"),
+        ] {
+            assert_eq!(
+                view_column_list(sql, Sqlite).as_deref(),
+                Some(cols),
+                "{sql}"
+            );
+        }
+        // DuckDB's own rendering of one (measured on 2.0.0): a space before
+        // the list, and the terminating `;` it keeps.
+        assert_eq!(
+            view_column_list("CREATE VIEW v2 (x, y) AS SELECT a, (b + 1) FROM t;", DuckDb)
+                .as_deref(),
+            Some("x, y")
+        );
+        assert_eq!(
+            view_column_list(r#"CREATE VIEW s."V" ("a b") AS SELECT 1;"#, DuckDb).as_deref(),
+            Some(r#""a b""#)
+        );
+    }
+
+    /// The usual view has no column list, and parentheses in the *body* are not
+    /// one — the list can only appear before the `AS` that ends the header.
+    #[test]
+    fn a_view_without_a_column_list_reports_none() {
+        for sql in [
+            "CREATE VIEW v AS SELECT 1",
+            "CREATE VIEW v AS SELECT (1 + 2)",
+            "CREATE VIEW v AS SELECT a FROM (SELECT 1 AS a)",
+            // An unreadable header yields nothing: a list guessed wrong would
+            // be emitted.
+            "CREATE VIEW v (a, b)",
+            "SELECT 1",
+            "",
+        ] {
+            assert_eq!(view_column_list(sql, Sqlite), None, "{sql:?}");
+            assert_eq!(view_column_list(sql, DuckDb), None, "{sql:?}");
+        }
+    }
 
     fn col(name: &str, ty: &str) -> ColumnInfo {
         ColumnInfo {
@@ -28994,7 +29183,7 @@ mod tests {
     /// change to one table rather than to every call site.
     #[test]
     fn view_editing_is_offered_exactly_where_a_view_edit_emits() {
-        for dialect in [MySql, Postgres, Sqlite] {
+        for dialect in [MySql, Postgres, Sqlite, DuckDb] {
             let cur = TableInfo {
                 name: "v".into(),
                 columns: vec![col("a", "int")],
@@ -29014,6 +29203,89 @@ mod tests {
                 cs.unsupported()
             );
         }
+    }
+
+    /// DuckDB's view statements, each its own (measured on 2.0.0): `CREATE
+    /// [OR REPLACE] VIEW`, `DROP VIEW` and `ALTER VIEW … RENAME TO`. It has
+    /// no materialized view, so nothing refreshes one.
+    #[test]
+    fn duckdb_creates_replaces_renames_and_drops_views() {
+        let d = DuckDb;
+        for c in [
+            Change::CreateView(Box::default()),
+            Change::ReplaceView {
+                draft: Box::default(),
+                recreate: false,
+                replay: Vec::new(),
+                server_indexes: Vec::new(),
+            },
+            Change::RenameView { to: "w".into() },
+            Change::DropView {
+                materialized: false,
+            },
+        ] {
+            assert!(supports_change(d, &c), "{c:?}");
+        }
+        for c in [
+            Change::DropView { materialized: true },
+            Change::RefreshView {
+                concurrently: false,
+            },
+        ] {
+            assert!(!supports_change(d, &c), "{c:?}");
+        }
+        assert!(supports_view_editing(d));
+    }
+
+    /// DuckDB's `CREATE OR REPLACE VIEW` clears the view's comment (measured on
+    /// 2.0.0: `hello` read back `NULL` after a replace), so the plan restates
+    /// it after the replace, under the name the server still knows — before
+    /// the rename, which keeps a comment.
+    #[test]
+    fn a_duckdb_view_replace_restates_the_comment_it_clears() {
+        let cur = TableInfo {
+            name: "v".into(),
+            schema: Some("main".into()),
+            columns: vec![col("x", "INTEGER")],
+            is_view: true,
+            view_definition: Some("SELECT a FROM t".into()),
+            view_options: Some(ViewOptions {
+                column_list: Some("x".into()),
+                comment: Some("it's here".into()),
+                ..Default::default()
+            }),
+            comment: Some("it's here".into()),
+            ..Default::default()
+        };
+        let mut d = ViewDraft::from_table(&cur).unwrap();
+        d.select = "SELECT a + 1 FROM t".into();
+        d.name = "w".into();
+        let sql = diff_view(&cur, &d, DuckDb).emit();
+        assert_eq!(
+            sql,
+            vec![
+                "CREATE OR REPLACE VIEW \"main\".\"v\" (x) AS\nSELECT a + 1 FROM t;".to_string(),
+                "COMMENT ON VIEW \"main\".\"v\" IS 'it''s here';".to_string(),
+                "ALTER VIEW \"main\".\"v\" RENAME TO \"w\";".to_string(),
+            ]
+        );
+        // A rename alone restates nothing: `ALTER VIEW … RENAME` keeps it.
+        let mut d = ViewDraft::from_table(&cur).unwrap();
+        d.name = "w".into();
+        assert_eq!(
+            diff_view(&cur, &d, DuckDb).emit(),
+            vec!["ALTER VIEW \"main\".\"v\" RENAME TO \"w\";".to_string()]
+        );
+        // PostgreSQL's replace keeps the comment, so nothing is restated
+        // there even when the options carry one.
+        let mut d = ViewDraft::from_table(&cur).unwrap();
+        d.select = "SELECT a + 1 FROM t".into();
+        assert!(
+            !diff_view(&cur, &d, Postgres)
+                .emit()
+                .iter()
+                .any(|s| s.starts_with("COMMENT")),
+        );
     }
 
     #[test]

@@ -51,8 +51,9 @@
 //! `rowid` is never a key — a checkpoint renumbers it.
 //!
 //! **What the roadmap's phase 2 has not reached yet**, refused rather than
-//! faked: the view and macro editors (`ddl::duckdb_supports`). The table
-//! designer runs — in place where DuckDB's `ALTER TABLE` can, by rebuilding
+//! faked: the macro editor (`ddl::duckdb_supports`). The view editor runs,
+//! restating the column list and the comment a replace would lose, and the
+//! table designer runs — in place where DuckDB's `ALTER TABLE` can, by rebuilding
 //! the table where it cannot (`ddl::duckdb_rebuild_sql`) — as do DDL plans,
 //! `.sql` scripts, imports and the dump, and a Manual tab holds a connection
 //! of its own ([`Pinned`]) — with the instance, and a file's lock, for as long
@@ -73,7 +74,7 @@ use schemaic_core::model::{
 };
 use schemaic_core::schema::{
     CheckInfo, ColumnInfo, DbSchema, ForeignKeyInfo, IndexColumn, IndexInfo, RoutineInfo,
-    RoutineKind, SequenceInfo, TableInfo,
+    RoutineKind, SequenceInfo, TableInfo, ViewOptions,
 };
 use schemaic_core::server_vars::ServerVar;
 use tokio_util::sync::CancellationToken;
@@ -1270,10 +1271,22 @@ fn read_schema(conn: &DuckConn) -> Result<DbSchema, DbError> {
             s.query_map([], |r| {
                 let sql: Option<String> = r.get(2)?;
                 let is_view: bool = r.get(4)?;
+                let comment = r.get::<_, Option<String>>(3)?.filter(|c| !c.is_empty());
                 Ok(TableInfo {
                     schema: Some(r.get(0)?),
                     name: r.get(1)?,
-                    comment: r.get::<_, Option<String>>(3)?.filter(|c| !c.is_empty()),
+                    // What a replace has to restate: the explicit column list
+                    // (`ddl::view_keeps_column_list`), and the comment, which
+                    // `CREATE OR REPLACE VIEW` clears
+                    // (`ddl::replace_clears_comment`).
+                    view_options: is_view.then(|| ViewOptions {
+                        column_list: sql
+                            .as_deref()
+                            .and_then(|s| schemaic_core::ddl::view_column_list(s, D)),
+                        comment: comment.clone(),
+                        ..Default::default()
+                    }),
+                    comment,
                     is_view,
                     view_definition: if is_view {
                         sql.as_deref().map(view_body)
@@ -4357,5 +4370,74 @@ mod tests {
         let t = table_of(&db, "n");
         let left = schemaic_core::ddl::diff(&t, &rebased(&draft), SqlDialect::DuckDb);
         assert!(left.changes.is_empty(), "{:#?}", left.changes);
+    }
+
+    /// A view edited in the view editor's way — `diff_view` → `emit` →
+    /// `run_ddl` — reads back as the draft described: the body replaced in
+    /// place, the explicit column list kept (an edit without it renames the
+    /// view's columns after the body), the comment `CREATE OR REPLACE VIEW`
+    /// clears restated, and the rename applied after both.
+    #[test]
+    fn a_view_edit_keeps_its_column_list_and_comment() {
+        use schemaic_core::ddl::{ViewDraft, diff_view};
+        let db = mem("view-edit");
+        seed(
+            &db,
+            "CREATE TABLE t(a INTEGER, b INTEGER); INSERT INTO t VALUES (1, 2);
+             CREATE VIEW v (x, y) AS SELECT a, b FROM t;
+             COMMENT ON VIEW v IS 'it''s v';",
+        );
+        let before = table_of(&db, "v");
+        let draft = ViewDraft::from_table(&before).unwrap();
+        // The reading drafts as itself: nothing to apply.
+        assert!(
+            diff_view(&before, &draft, SqlDialect::DuckDb)
+                .changes
+                .is_empty()
+        );
+
+        let mut draft = draft;
+        draft.select = "SELECT a, b * 10 FROM t".into();
+        draft.name = "w".into();
+        let cs = diff_view(&before, &draft, SqlDialect::DuckDb);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        let stmts = cs.emit();
+        rt().block_on(db.run_ddl("", &stmts, CancellationToken::new()))
+            .unwrap_or_else(|e| panic!("{e} — plan {stmts:#?}"));
+
+        let after = table_of(&db, "w");
+        assert_eq!(after.comment.as_deref(), Some("it's v"), "plan {stmts:#?}");
+        let names: Vec<&str> = after.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["x", "y"], "plan {stmts:#?}");
+        // The new body, in DuckDB's own rendering of it — it re-prints what
+        // it stores, so the draft's text is not what reads back.
+        assert_eq!(
+            after.view_definition.as_deref(),
+            Some("SELECT a, (b * 10) FROM t")
+        );
+    }
+
+    /// A view dropped from its tree row: `DROP VIEW`, as the shortcut raises it.
+    #[test]
+    fn a_view_drops() {
+        use schemaic_core::ddl::{Change, ChangeSet};
+        let db = mem("view-drop");
+        seed(&db, "CREATE VIEW v AS SELECT 1 AS x");
+        let cs = ChangeSet {
+            table: "v".into(),
+            schema: Some("main".into()),
+            dialect: SqlDialect::DuckDb,
+            flavour: Default::default(),
+            changes: vec![Change::DropView {
+                materialized: false,
+            }],
+        };
+        assert!(cs.unsupported().is_empty());
+        rt().block_on(db.run_ddl("", &cs.emit(), CancellationToken::new()))
+            .unwrap();
+        let s = rt()
+            .block_on(fetch_schema(&db, CancellationToken::new()))
+            .unwrap();
+        assert!(s.tables.iter().all(|t| t.name != "v"));
     }
 }

@@ -12,7 +12,7 @@ override for the cases `ddl::pg_replaceable` can't read off the statement. The `
 SQL-coloured in the target's dialect (`FieldCfg::sql`, under `lib.rs`).
 The form is built **per engine** — check option for MySQL and PostgreSQL, the security/definer
 block for MySQL, the re-create toggle for PostgreSQL, and a "Column names" field for
-`ViewOptions::column_list` on SQLite and SQL Server. The first and last ask
+`ViewOptions::column_list` on SQLite, SQL Server and DuckDB. The first and last ask
 `ddl::supports_view_check_option` and `ddl::view_keeps_column_list`; both were `== Sqlite`,
 which, once SQL Server's editor opened, offered it a `CASCADED`/`LOCAL` picker nothing writes
 and hid the column list its `ALTER VIEW` has to restate. SQL Server's attributes

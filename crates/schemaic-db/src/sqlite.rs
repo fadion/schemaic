@@ -2398,7 +2398,10 @@ pub(crate) async fn fetch_schema(db: &Db, cancel: CancellationToken) -> Result<D
                 // the one the re-create behind every view edit would otherwise
                 // drop: the explicit column list.
                 view_options: is_view.then(|| ViewOptions {
-                    column_list: view_columns_of(&sql),
+                    column_list: schemaic_core::ddl::view_column_list(
+                        &sql,
+                        schemaic_core::intel::SqlDialect::Sqlite,
+                    ),
                     ..Default::default()
                 }),
                 engine: None,
@@ -2931,91 +2934,6 @@ fn view_body_of(create_sql: &str) -> Option<String> {
         }
         i = end;
     }
-    None
-}
-
-/// A view's explicit **column list** — the `(x, y)` of `CREATE VIEW v (x, y) AS
-/// …` — read out of the statement `sqlite_master` stores, without its
-/// parentheses. `None` for the usual view, which takes its column names from its
-/// body.
-///
-/// The third positional reader over the shared lexer, beside [`view_body_of`]
-/// and `checks_of`, and it splits the same header: the list is the one
-/// parenthesised group that can appear *before* the `AS` at code position and
-/// paren depth zero. Everything after that `AS` is the user's own SQL, where a
-/// `(` is arithmetic or a subquery rather than a column list.
-///
-/// Kept **verbatim**, quoting and spacing included. SQLite hands back whatever
-/// the list was written with, and it goes straight back out again on the
-/// re-create that every view edit there performs
-/// ([`schemaic_core::ddl::supports_or_replace_view`]) — parsing the names apart
-/// and re-quoting them is a way to change them, and this list is what stops the
-/// view's columns silently taking the body's names.
-fn view_columns_of(create_sql: &str) -> Option<String> {
-    use schemaic_core::intel::SqlDialect;
-    use schemaic_core::sql::{is_word_byte, is_word_start, skip_noncode};
-
-    let b = create_sql.as_bytes();
-    let mut i = 0usize;
-    let mut depth = 0i32;
-    let mut seen_create = false;
-    // The most recent depth-0 parenthesised group, as byte bounds of its
-    // contents. Only the one still in hand when the header's `AS` arrives is a
-    // column list.
-    let mut group: Option<(usize, usize)> = None;
-    let mut open: Option<usize> = None;
-    while i < b.len() {
-        if let Some(j) = skip_noncode(b, i, SqlDialect::Sqlite) {
-            i = j.max(i + 1);
-            continue;
-        }
-        match b[i] {
-            b'(' => {
-                if depth == 0 {
-                    open = Some(i + 1);
-                }
-                depth += 1;
-                i += 1;
-                continue;
-            }
-            b')' => {
-                depth -= 1;
-                if depth == 0
-                    && let Some(start) = open.take()
-                {
-                    group = Some((start, i));
-                }
-                i += 1;
-                continue;
-            }
-            _ => {}
-        }
-        if !is_word_start(b[i]) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        let mut end = i + 1;
-        while end < b.len() && is_word_byte(b[end]) {
-            end += 1;
-        }
-        let word = &create_sql[start..end];
-        if !seen_create {
-            // Whatever this is, it isn't a `CREATE VIEW`; refuse rather than
-            // hand back a list read out of something else.
-            if !word.eq_ignore_ascii_case("CREATE") {
-                return None;
-            }
-            seen_create = true;
-        } else if depth == 0 && word.eq_ignore_ascii_case("AS") {
-            let (s, e) = group?;
-            let cols = create_sql[s..e].trim();
-            return (!cols.is_empty()).then(|| cols.to_string());
-        }
-        i = end;
-    }
-    // No header-ending `AS`: the statement is unreadable, and a list without the
-    // body it names is nothing to hand back.
     None
 }
 
@@ -8081,53 +7999,6 @@ mod tests {
             "",
         ] {
             assert_eq!(view_body_of(sql), None, "{sql:?}");
-        }
-    }
-
-    /// `CREATE VIEW v (x, y) AS …` names the view's columns independently of its
-    /// body, and SQLite is the only engine that reports the two separately — the
-    /// other two bake the names into the definition they hand back. Since every
-    /// edit to a SQLite view is a drop and a re-create, a list read wrong is a
-    /// list *emitted* wrong, and the view's columns quietly take the body's
-    /// names instead.
-    #[test]
-    fn a_views_column_list_is_read_out_of_its_create_statement() {
-        for (sql, cols) in [
-            ("CREATE VIEW v (x, y) AS SELECT a, b FROM t", "x, y"),
-            // No space before the paren, and none inside it.
-            ("CREATE VIEW v(x,y) AS SELECT 1,2", "x,y"),
-            // Each of SQLite's three quotings, kept verbatim: re-quoting a
-            // parsed list is a way to change it.
-            (
-                r#"CREATE VIEW v ("odd name", [b], `c`) AS SELECT 1, 2, 3"#,
-                r#""odd name", [b], `c`"#,
-            ),
-            // A column *named* `as` doesn't end the header — it's quoted, and
-            // the lexer skips it whole.
-            (r#"CREATE VIEW v ("as") AS SELECT 1"#, r#""as""#),
-            // …and neither does a view named `as`.
-            (r#"CREATE VIEW "as" (a) AS SELECT 1"#, "a"),
-            ("CREATE TEMP VIEW IF NOT EXISTS main.v (a) AS SELECT 1", "a"),
-        ] {
-            assert_eq!(view_columns_of(sql).as_deref(), Some(cols), "{sql}");
-        }
-    }
-
-    /// The usual view has no column list, and parentheses in the *body* are not
-    /// one — the list can only appear before the `AS` that ends the header.
-    #[test]
-    fn a_view_without_a_column_list_reports_none() {
-        for sql in [
-            "CREATE VIEW v AS SELECT 1",
-            "CREATE VIEW v AS SELECT (1 + 2)",
-            "CREATE VIEW v AS SELECT a FROM (SELECT 1 AS a)",
-            // An unreadable header yields nothing, the same direction
-            // `view_body_of` refuses in: a list guessed wrong would be emitted.
-            "CREATE VIEW v (a, b)",
-            "SELECT 1",
-            "",
-        ] {
-            assert_eq!(view_columns_of(sql), None, "{sql:?}");
         }
     }
 

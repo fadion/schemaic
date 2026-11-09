@@ -5,7 +5,7 @@ with the `parquet` and `json` extensions linked statically), phase 1 and the fir
 of the roadmap's *DuckDB as a fifth engine*: it connects, reads, introspects, validates, runs
 batches, scripts and DDL plans, plans a query, lists its settings, backs a file up, writes grid
 edits back, imports a file into a table, dumps to a `.sql` file, holds a Manual tab's
-transaction and designs tables. It is **embedded, as SQLite is**, so most
+transaction, designs tables and edits views. It is **embedded, as SQLite is**, so most
 of `sqlite.rs`'s first paragraph holds here unchanged — there is no server, a connection is a
 file (`Db::file`, `connection::is_file_backed`), host/port/user/password/SSH are inert, the one
 database is the file's own catalog (`current_database()`, named after the file), and the driver
@@ -142,7 +142,8 @@ modal open for its whole length with the button reading *Stop*. An interrupt sur
 ordinary error, so the token is what maps it to `DdlCause::Cancelled`
 (`stop_interrupts_a_running_ddl_statement`, a `CREATE TABLE … AS` counting 10^11 rows). The
 table designer's plans reach it now — `ALTER TABLE` one action at a time where the table allows,
-the rebuild where it does not (below) — and nothing from the view or routine editors does yet.
+the rebuild where it does not (below) — and the view editor's, and nothing from the routine
+editor does yet.
 `run_script`
 is one connection for the whole file and wraps nothing, with SQLite's runtime-flavour choice between
 `block_in_place` and `spawn_blocking`. **A backup is `ATTACH` + `COPY FROM DATABASE` + `DETACH`**
@@ -314,8 +315,17 @@ left between them: `a_plain_table_alters_in_place` (no copy, one action per `ALT
 `constraints_are_added_and_dropped_by_a_rebuild`, `a_referenced_table_is_not_rebuilt`,
 `a_rebuild_keeps_a_generated_column`, `a_sequence_default_survives_a_rebuild` and
 `a_new_table_is_created_as_drawn`.
-**What is not written yet is refused, never faked**: `ddl::duckdb_supports` keeps the view,
-trigger and routine editors off.
+**The view editor is on too** — `CREATE [OR REPLACE] VIEW`, `ALTER VIEW … RENAME TO` and `DROP
+VIEW`, whose entry under `ddl.rs` has the measurements — and `read_schema` fills a view's
+`ViewOptions` with what a replace would lose: the explicit column list, out of
+`duckdb_views().sql` through `ddl::view_column_list` as SQLite's reader takes it, and the comment,
+which DuckDB's `CREATE OR REPLACE VIEW` clears and the plan restates after it
+(`ddl::replace_clears_comment`). `a_view_edit_keeps_its_column_list_and_comment` runs a body change
+and a rename through `diff_view` → `emit` → `run_ddl` and reads back the list, the comment and the
+body in DuckDB's own rendering — it re-prints what it stores, so the draft's text is not what reads
+back — and `a_view_drops` drops one.
+**What is not written yet is refused, never faked**: `ddl::duckdb_supports` keeps the routine
+editor off until the macro editor lands, and the trigger editor, DuckDB having no triggers.
 **A missing file is refused, never created** (`open_target`, `DbRefusal::DuckDbMissing`). DuckDB's
 open creates one, which for a database *client* is the wrong default by some distance: a mistyped
 path would open an empty database that looked like it worked. An empty path is `DuckDbNoFile`, and

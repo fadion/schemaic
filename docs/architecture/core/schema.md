@@ -83,14 +83,19 @@ see it. `ViewOptions` is the same
 idea for a view (check option, MySQL definer/security/algorithm, PG storage params +
 `materialized`) — `CREATE OR REPLACE VIEW` replaces the whole view, so what isn't restated
 resets, and `SQL SECURITY DEFINER → INVOKER` is a privilege change. `definer_sql` quotes the
-two halves of a MySQL account. **`column_list` is SQLite's and SQL Server's, and arrives by the
-opposite route**: the explicit `(x, y)` of `CREATE VIEW v (x, y) AS …`, held verbatim and
+two halves of a MySQL account. **`column_list` is SQLite's, SQL Server's and DuckDB's, and
+arrives by the opposite route**: the explicit `(x, y)` of `CREATE VIEW v (x, y) AS …`, held verbatim and
 without its parentheses, `None` on the two engines that bake the names into the body they report
 (`ddl::view_keeps_column_list` is that split). It has to be modelled because *every* SQLite view
 edit is a drop-and-re-create (`ddl::supports_or_replace_view`), and T-SQL's `ALTER VIEW` resets
 what it is not told, so a list left behind would silently rename the view's columns to whatever
 the body calls them; verbatim rather than a parsed `Vec<String>` because SQLite hands the list
-back with whatever quoting it was written with and re-quoting it is a way to change it.
+back with whatever quoting it was written with and re-quoting it is a way to change it. DuckDB's
+is read out of `duckdb_views().sql` by the same `ddl::view_column_list` as SQLite's.
+**`comment` is DuckDB's alone**, beside `TableInfo::comment`, which every engine fills: DuckDB's
+`CREATE OR REPLACE VIEW` clears a view's comment (measured on 2.0.0), so the plan restates it after
+the replace (`ddl::replace_clears_comment`). Only the DuckDB reader fills it, and it is `None` on
+the engines whose replace keeps the comment.
 **`attributes` is SQL Server's alone** — `SCHEMABINDING` and `VIEW_METADATA`, upper-cased in
 the header's order, empty elsewhere — restated for the same `ALTER VIEW` reason: a schema-bound
 view altered without the word comes back unbound. Restating it does **not** keep the view's

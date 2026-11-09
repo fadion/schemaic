@@ -1437,7 +1437,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   moved down to the narrower predicates that decide how an edit is *performed* rather than whether
   it is offered — `supports_or_replace_view`, false on SQLite alone, `supports_view_rename`, false
   on SQLite and SQL Server, `supports_view_check_option` and `view_keeps_column_list`,
-  `supports_view_security` and `view_replace_can_refuse`,
+  `supports_view_security` and `view_replace_can_refuse`, `replace_clears_comment`, true on
+  DuckDB alone,
   `supports_trigger_alter_in_place`, true on SQL Server alone, with the trigger form's
   `trigger_timings`, `trigger_events`, `trigger_fires_on_several_events`,
   `supports_trigger_not_for_replication`, `supports_trigger_execute_as`,

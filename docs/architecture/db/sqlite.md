@@ -385,8 +385,9 @@ per table, which is what asking the same question N times would have been.
 A view now also gets `view_options: Some(…)` rather than `None`. SQLite has none of the options
 the other two carry — no definer, security type, algorithm, storage parameters or check option —
 and exactly one the re-create behind every view edit would otherwise drop: the explicit column
-list, read by `view_columns_of`, a third positional reader over the shared lexer beside
-`view_body_of` and `checks_of`. It is the one parenthesised group *before* the header's `AS` at
+list, read by `ddl::view_column_list` — this module's `view_columns_of` until DuckDB's reader
+needed the same read of its own stored statement, a third positional reader over the shared lexer
+beside `view_body_of` and `checks_of`. It is the one parenthesised group *before* the header's `AS` at
 code position and paren depth zero, both qualifications carrying the weight they do in
 `view_body_of` — after that `AS` a `(` is the user's own arithmetic or a subquery.
 `EXPLAIN QUERY PLAN` is what `explain` runs — plain `EXPLAIN` disassembles to VDBE
