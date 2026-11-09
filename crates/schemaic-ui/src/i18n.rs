@@ -1271,6 +1271,13 @@ pub fn db_refusal_text(r: &schemaic_core::model::DbRefusal) -> String {
         DbRefusal::DuckDbMissing(path) => tr!("db-refused-duckdb-missing", path = path.as_str()),
         DbRefusal::DuckDbSealedElsewhere => tr!("db-refused-duckdb-sealed-elsewhere"),
         DbRefusal::DuckDbWorker(e) => tr!("db-refused-duckdb-worker", error = e.as_str()),
+        DbRefusal::DuckDbSessionClosed(name) => {
+            tr!("db-refused-duckdb-session-closed", name = name.as_str())
+        }
+        DbRefusal::DuckDbNotADataFile(path) => {
+            tr!("db-refused-duckdb-not-a-data-file", path = path.as_str())
+        }
+        DbRefusal::DuckDbNotASession => tr!("db-refused-duckdb-not-a-session"),
     }
 }
 
@@ -1908,6 +1915,9 @@ mod tests {
             DbRefusal::DuckDbMissing(s("C:/data/x.duckdb")),
             DbRefusal::DuckDbSealedElsewhere,
             DbRefusal::DuckDbWorker(s("task 7 panicked")),
+            DbRefusal::DuckDbSessionClosed(s("memory:session-3")),
+            DbRefusal::DuckDbNotADataFile(s("C:/data/x.xlsx")),
+            DbRefusal::DuckDbNotASession,
         ];
         for auth in [
             AuthMode::Password,

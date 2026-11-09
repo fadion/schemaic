@@ -16,7 +16,9 @@ grid edits back (on provenance read from the statement, never keyed on `rowid`) 
 tab's transaction — pinning the file's instance, and its lock, while it does — and edits
 **tables** (in place where its `ALTER TABLE` can, through a rebuild where it cannot —
 `ddl::duckdb_rebuild_sql`, decided per table by `ddl::alters_in_place`), **views** and
-**macros** — a macro whose parameter defaults its catalogue hides is listed but not editable.
+**macros** — a macro whose parameter defaults its catalogue hides is listed but not editable — and
+opens a CSV, Parquet or JSON file as a view in an in-memory session that is never saved
+(`db::duckdb::DataSession`, `Connection::is_data_session`).
 SQLite reads, writes, imports and edits **tables** (through the twelve-step rebuild —
 `ddl::sqlite_rebuild_sql`), **views** and **triggers**, but has **no manual-transaction mode** — a
 statement about SQLite rather than unfinished work (`db::session::Session::open` carries the
@@ -256,7 +258,8 @@ start with a failing test, then the code that makes it pass.
   pure (no live DB / network / filesystem — model those at the boundary). **In-memory SQLite is
   allowed** and is not an exception to that rule: it needs no server, touches no file and is
   deterministic, which is why `db::sqlite` and `db::duckdb` are the backends whose DB layer is
-  tested directly — DuckDB's through a `memory:<name>` target only a `cfg(test)` build accepts.
+  tested directly — DuckDB's through a `memory:<name>` target only a `cfg(test)` build may create
+  unheld.
   Use SQLite's shared-cache memory URI (`file:name?mode=memory&cache=shared`, unique name per test)
   where several connections must reach one database, as the write paths do — a plain `:memory:` is
   private to one connection, and a temp file would break the rule for real. **Exactly one function

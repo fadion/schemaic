@@ -11753,6 +11753,13 @@ fn app_view(
         )
     };
 
+    // The open **Open data file** sessions, by connection id: each one's
+    // in-memory database lives exactly as long as its entry here. Removed by
+    // the delete path (the connection list's *Close session*), and dropped
+    // with the app.
+    let data_sessions: Rc<RefCell<HashMap<u64, schemaic_db::duckdb::DataSession>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+
     // Persist the current connections list with a given active id.
     //
     // `saving` is the caller's answer to "is anything gone from this list?".
@@ -11773,9 +11780,12 @@ fn app_view(
             .get_untracked()
             .max(cs.iter().map(|c| c.id).max().unwrap_or(0));
         highest_conn_id.set(high);
+        // An Open data file session is never written: its data is in this
+        // process alone. Its id still raises the mark above, so no later
+        // connection takes the id its chat or history was kept under.
         let file = ConnectionsFile {
-            connections: cs,
-            active,
+            active: Connection::active_to_save(active, &cs),
+            connections: Connection::to_save(&cs),
             highest_id: high,
         };
         // **Every mid-session save funnels through here**, which is why the
@@ -12131,6 +12141,123 @@ fn app_view(
     // The forward reference declared beside `open_sql_file`, which needs this to
     // reach a file already open under another connection.
     *switch_conn_late.borrow_mut() = Some(switch_conn.clone());
+
+    // ── Open data file ─────────────────────────────────────────────────────
+    //
+    // A CSV, Parquet or JSON file read through a view in an in-memory DuckDB
+    // session (`core::data_file`, `db::duckdb::open_data_file`). With a
+    // session active the file **joins it**, so two files can be joined in one
+    // query; otherwise a new session opens, as a connection that is never
+    // saved (`Connection::is_data_session`) and that the connection list's
+    // *Close session* closes. The new connection is added only once its view
+    // exists: a file DuckDB cannot read leaves nothing behind but the error.
+    let open_data_file: Rc<dyn Fn()> = {
+        let switch_conn = switch_conn.clone();
+        let data_sessions = data_sessions.clone();
+        let open_table_filtered = open_table_filtered.clone();
+        let load_schema = load_schema.clone();
+        let handle = handle.clone();
+        Rc::new(move || {
+            let opts = floem::file::FileDialogOptions::new()
+                .title(tr!("file-open-data-title"))
+                .allowed_types(vec![floem::file::FileSpec {
+                    name: tr_static!("file-data-filter"),
+                    extensions: schemaic_core::data_file::EXTENSIONS,
+                }]);
+            let switch_conn = switch_conn.clone();
+            let data_sessions = data_sessions.clone();
+            let open_table_filtered = open_table_filtered.clone();
+            let load_schema = load_schema.clone();
+            let handle = handle.clone();
+            floem::file_action::open_file(opts, move |file| {
+                let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
+                    return; // cancelled
+                };
+                let path = path.to_string_lossy().into_owned();
+                let fail = move |e: DbError| {
+                    error_modal_text.set(Some(
+                        ModalError::new(e.to_string(), e.modal_source())
+                            .shown_as(db_error_shown(&e)),
+                    ));
+                    error_modal_open.set(true);
+                };
+                // The active connection, when it is a session this app holds.
+                let joining = {
+                    let id = active_conn.get_untracked();
+                    connections
+                        .with_untracked(|cs| cs.iter().find(|c| c.id == id).cloned())
+                        .filter(|c| {
+                            c.is_data_session() && data_sessions.borrow().contains_key(&c.id)
+                        })
+                };
+                let (conn, fresh) = match joining {
+                    Some(conn) => (conn, None),
+                    None => {
+                        let session = match schemaic_db::duckdb::DataSession::open() {
+                            Ok(s) => s,
+                            Err(e) => return fail(e),
+                        };
+                        let (id, used_colors) = connections.with_untracked(|cs| {
+                            (
+                                Connection::next_id_after(cs, highest_conn_id.get_untracked()),
+                                cs.iter()
+                                    .filter_map(|c| c.color.clone())
+                                    .collect::<Vec<_>>(),
+                            )
+                        });
+                        let name = std::path::Path::new(&path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.clone());
+                        let conn = Connection::data_session(
+                            id,
+                            name,
+                            session.target().to_string(),
+                            Some(pick_connection_color(&used_colors)),
+                        );
+                        (conn, Some(session))
+                    }
+                };
+                let db = connect_saved(&conn, None);
+                let dialect = SqlDialect::from_db_type(&conn.db_type);
+                let switch_conn = switch_conn.clone();
+                let data_sessions = data_sessions.clone();
+                let open_table_filtered = open_table_filtered.clone();
+                let load_schema = load_schema.clone();
+                let report = create_ext_action(cx, move |r: Result<(String, String), DbError>| {
+                    let (database, view) = match r {
+                        Ok(opened) => opened,
+                        // A fresh session drops here, unlisted.
+                        Err(e) => return fail(e),
+                    };
+                    let id = conn.id;
+                    match fresh {
+                        Some(session) => {
+                            data_sessions.borrow_mut().insert(id, session);
+                            connections.update(|cs| cs.push(conn));
+                            (switch_conn)(id);
+                        }
+                        // The tree learns of the new view.
+                        None => load_schema(conn),
+                    }
+                    // A `SELECT *` of a name this app quoted, so the guard
+                    // passes it; minted all the same, as every re-run is.
+                    if let Some(req) = schemaic_ui::RerunRequest::approved(
+                        schemaic_core::data_file::select_sql(&view),
+                        dialect,
+                    ) {
+                        (open_table_filtered)(
+                            TableSource::new(database, Some("main".to_string()), view),
+                            req,
+                        );
+                    }
+                });
+                handle.spawn(async move {
+                    report(schemaic_db::duckdb::open_data_file(&db, path).await);
+                });
+            });
+        })
+    };
 
     // Read saved connection `id`'s secrets, hand them to the saved list, then
     // run `then` — all three kinds, since what follows shows or copies them.
@@ -12813,12 +12940,12 @@ fn app_view(
                 let target = conn_import::ExportPath::of(&picked);
                 // Not a *New connection* nobody has filled in
                 // (`is_untouched_new`): a 127.0.0.1 placeholder is nothing to
-                // share.
+                // share. Nor a data-file session, which is a connection to
+                // nothing outside this process (`Connection::to_save`).
                 let text = connections.with_untracked(|cs| {
-                    let saved: Vec<Connection> = cs
-                        .iter()
+                    let saved: Vec<Connection> = Connection::to_save(cs)
+                        .into_iter()
                         .filter(|c| !c.is_untouched_new())
-                        .cloned()
                         .collect();
                     conn_import::export_connections(&saved)
                 });
@@ -13281,6 +13408,7 @@ fn app_view(
         let snippet_clear_conn = snippet_store.clear_conn.clone();
         let log_write = log_write.clone();
         let select_conn = select_conn.clone();
+        let data_sessions = data_sessions.clone();
         Rc::new(move |id: u64| {
             let was_active = active_conn.get_untracked() == id;
             // Release any pinned transaction connection on the connection being
@@ -13383,6 +13511,9 @@ fn app_view(
                 ai_session.borrow_mut().take();
             }
             connections.update(|cs| cs.retain(|c| c.id != id));
+            // A data-file session's database closes with its hold — once any
+            // operation still running on it ends (`DataSession`).
+            data_sessions.borrow_mut().remove(&id);
             // The **top row as drawn**, which with folders need not be the
             // first saved — the form, the fallback and the switch all take it.
             let top = connections
@@ -13622,16 +13753,29 @@ fn app_view(
     let delete_conn: Rc<dyn Fn(u64)> = {
         let delete_conn_now = delete_conn_now.clone();
         Rc::new(move |id: u64| {
-            let name = connections.with_untracked(|cs| {
+            let (name, session) = connections.with_untracked(|cs| {
                 cs.iter()
                     .find(|c| c.id == id)
-                    .map(|c| c.name.clone())
+                    .map(|c| (c.name.clone(), c.is_data_session()))
                     .unwrap_or_default()
             });
             let delete = delete_conn_now.clone();
+            // A data-file session has no password to lose but holds whatever
+            // was made in it, which is what its confirm says instead.
+            let (title, message) = if session {
+                (
+                    tr!("conn-close-session-title", name = name.clone()),
+                    tr!("conn-close-session-question"),
+                )
+            } else {
+                (
+                    tr!("conn-delete-title", name = name.clone()),
+                    tr!("conn-delete-question"),
+                )
+            };
             confirm.set(Some(Confirm {
-                title: tr!("conn-delete-title", name = name.clone()),
-                message: tr!("conn-delete-question"),
+                title,
+                message,
                 resolve: Rc::new(move |yes| {
                     if yes {
                         (delete)(id);
@@ -15937,6 +16081,7 @@ fn app_view(
             add_pasted_url,
             choose_import_file,
             import_chosen,
+            open_data_file,
         }),
         ai: AiUi {
             messages: ai_messages,

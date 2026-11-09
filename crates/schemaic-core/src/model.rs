@@ -1581,6 +1581,15 @@ pub enum DbRefusal {
     DuckDbSealedElsewhere,
     /// DuckDB's worker thread failed, with the runtime's own words.
     DuckDbWorker(String),
+    /// A `memory:` target with no open data-file session behind it — closed,
+    /// or never opened by this process (`db::duckdb::DataSession`).
+    DuckDbSessionClosed(String),
+    /// A file **Open data file** has no reader for, by its extension.
+    DuckDbNotADataFile(String),
+    /// **Open data file** asked to add a view to a connection that is not a
+    /// data-file session — a database file the user owns, whose schema only
+    /// the previewed DDL path changes.
+    DuckDbNotASession,
 }
 
 impl DbRefusal {
@@ -1624,7 +1633,10 @@ impl DbRefusal {
             | DbRefusal::KeyringUnreadable(_)
             | DbRefusal::DuckDbNoFile
             | DbRefusal::DuckDbNotAFile(_)
-            | DbRefusal::DuckDbMissing(_) => true,
+            | DbRefusal::DuckDbMissing(_)
+            | DbRefusal::DuckDbSessionClosed(_)
+            | DbRefusal::DuckDbNotADataFile(_)
+            | DbRefusal::DuckDbNotASession => true,
         }
     }
 
@@ -1784,6 +1796,17 @@ impl DbRefusal {
                                                  another kind of run. Try again when it finishes."
                 .to_string(),
             DbRefusal::DuckDbWorker(e) => format!("the DuckDB worker failed: {e}"),
+            DbRefusal::DuckDbSessionClosed(name) => format!(
+                "{name} is an in-memory session that is not open. Its data lived only while \
+                 it was open — open the data file again."
+            ),
+            DbRefusal::DuckDbNotADataFile(path) => format!(
+                "{path} is not a file Schemaic opens as data. Open a .csv, .tsv, .parquet, \
+                 .json, .jsonl or .ndjson file (a .gz or .zst one too, for the text kinds)."
+            ),
+            DbRefusal::DuckDbNotASession => "A data file opens into an in-memory session, not \
+                                             into a database file."
+                .to_string(),
         }
     }
 }

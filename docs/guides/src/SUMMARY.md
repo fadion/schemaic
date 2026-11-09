@@ -10,6 +10,7 @@
   - [SSH tunnels](connections/ssh.md)
   - [Safeguards](connections/safeguards.md)
   - [Importing connections](connections/import.md)
+  - [Querying a data file](connections/data-file.md)
 - [Query editor](query-editor/README.md)
   - [Writing SQL](query-editor/writing-sql.md)
   - [History and snippets](query-editor/history-and-snippets.md)

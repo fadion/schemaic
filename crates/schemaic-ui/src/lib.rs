@@ -5916,6 +5916,10 @@ pub struct ConnActions {
     pub choose_import_file: Rc<dyn Fn()>,
     /// Save the ticked rows as real connections — the only step that writes.
     pub import_chosen: Rc<dyn Fn()>,
+    /// **Open data file**: pick a CSV, Parquet or JSON file and query it in
+    /// an in-memory DuckDB session — the active one when a session is
+    /// active, else a new one (`Connection::is_data_session`).
+    pub open_data_file: Rc<dyn Fn()>,
 }
 
 /// Query-history signals (Copy bundle). The full list across all connections;

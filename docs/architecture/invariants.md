@@ -955,7 +955,11 @@ Re-introducing the anti-patterns these guard against is a regression:
   closes, releasing the file's lock, the moment the last operation holding it ends — nothing is
   cached past that. What is shared is therefore *instance* state, which is why a DuckDB init SQL
   may not `SET GLOBAL` (`init_sql`), and why a sealed and an unsealed handle cannot both have the
-  file open at once (`DbRefusal::DuckDbSealedElsewhere`). A batch, a DDL plan and a script are each
+  file open at once (`DbRefusal::DuckDbSealedElsewhere`). **An *Open data file* session is the one
+  instance that does not close with its last operation**: an in-memory instance *is* its data, so
+  `db::duckdb::DataSession` holds it strongly for as long as the app keeps the session, the
+  registry staying `Weak`; dropping it closes the database once any running operation ends, and
+  the target is refused from then on (`DuckDbSessionClosed`) rather than reopened empty. A batch, a DDL plan and a script are each
   one connection there as everywhere. A DuckDB Manual tab is the *first* exception, not this one —
   its `Session` pins a connection like any engine's — but it pins the instance with it
   (`duckdb::Pinned` keeps the `Arc<Instance>`), so the file stays locked against every other
@@ -1292,7 +1296,8 @@ Re-introducing the anti-patterns these guard against is a regression:
   exists for, so the bound is worth more than the purity. The file is created and removed inside the
   call, so a test of it is still deterministic and still needs no server; it is the same pragmatic
   exception in-memory SQLite already is in `schemaic-db` and `cli::catalog`'s tests, and in-memory
-  DuckDB in `db::duckdb`'s (a `memory:<name>` target, which only `cfg(test)` accepts). Read it as the one case, not as licence
+  DuckDB in `db::duckdb`'s (a `memory:<name>` target, which only a `cfg(test)` build may *create*
+  unheld — a release build reaches one only while a `DataSession` holds it). Read it as the one case, not as licence
   for a second: anything else wanting a file still models it at the boundary.
 - **What the source knew is carried, never re-derived from the text it rendered into.** Two
   separate defects turned out to be one shape — a precise oracle two functions upstream, dropped by
@@ -1325,6 +1330,18 @@ Re-introducing the anti-patterns these guard against is a regression:
   Don't add a path that builds `ALTER`/`CREATE`/`DROP` text somewhere else, and
   don't add one that applies a plan without the preview — the preview is where the destructive
   consequence is stated in plain language and where "Open in editor" hands the script over.
+  **One statement is run without it, as a stated exception**: `db::duckdb::open_data_file`'s
+  `CREATE VIEW`, built by `core::data_file::create_view_sql` rather than by `ddl`, and run the
+  moment a data file is opened. Its terms are what let it skip the preview, and each is
+  load-bearing. The target must be an *Open data file* session's in-memory database —
+  `DbRefusal::DuckDbNotASession` otherwise, checked before anything opens, so a database file the
+  user owns never takes it (`a_data_file_opens_only_into_a_session_and_only_with_a_reader`). The
+  statement only *creates*, under a name nothing in the session's `main` has
+  (`free_view_name`), and it is a plain `CREATE VIEW`, never `OR REPLACE`, so it cannot replace,
+  alter or drop anything the user made there — a name taken between the read and the create
+  fails the open rather than giving way. And the file is only read. Nothing on that list has a
+  destructive consequence for a preview to state. It is the one such place (`open_data_file`'s
+  own doc says so).
   **A dump is on the written side of this rule rather than an exception to it.** `core::dump::plan`
   composes a file out of the emitters that already exist — `TableInfo::create_ddl`, `ddl::view_ddl`,
   `TriggerInfo::create_sql` and `ChangeSet::emit` for the closing foreign keys — and `cli::dump`

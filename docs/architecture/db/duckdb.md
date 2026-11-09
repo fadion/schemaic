@@ -5,7 +5,8 @@ with the `parquet` and `json` extensions linked statically), phase 1 and the fir
 of the roadmap's *DuckDB as a fifth engine*: it connects, reads, introspects, validates, runs
 batches, scripts and DDL plans, plans a query, lists its settings, backs a file up, writes grid
 edits back, imports a file into a table, dumps to a `.sql` file, holds a Manual tab's
-transaction, designs tables and edits views and macros. It is **embedded, as SQLite is**, so most
+transaction, designs tables and edits views and macros, and opens a CSV, Parquet or JSON file into a
+throwaway in-memory session (*Open data file*, below). It is **embedded, as SQLite is**, so most
 of `sqlite.rs`'s first paragraph holds here unchanged — there is no server, a connection is a
 file (`Db::file`, `connection::is_file_backed`), host/port/user/password/SSH are inert, the one
 database is the file's own catalog (`current_database()`, named after the file), and the driver
@@ -47,8 +48,9 @@ there being no file to open read-only, so that half of the seal has no test. **W
 seals every handle it serves in `mcp::serve`/`serve_many` — none of its tools writes, and
 `sample_rows` and `describe_table`'s samples read through views a body may have aimed at a file.
 The Live Monitor's `fetch_table` is the editor's, attended, and unsealed. No test reaches a
-DuckDB file through `cli` (the `memory:` targets are `schemaic-db`'s `cfg(test)` alone), and no
-source gate reads the `.sealed()` calls.
+DuckDB file through `cli` (the suites' `memory:` targets live in `schemaic-db`'s own tests, and an
+*Open data file* session in the app's process alone), and no source gate reads the `.sealed()`
+calls.
 **Nothing is fetched from the network.** Every instance — sealed or not — opens with extension
 auto-install and auto-load off, so `parquet` and `json` are there and any other extension is
 unreachable rather than downloaded behind a query (`no_extension_is_fetched_behind_a_query`).
@@ -367,10 +369,51 @@ path would open an empty database that looked like it worked. An empty path is `
 that dies with each operation's instance, the second needing an extension this build does not
 fetch (`a_missing_file_is_refused_not_created`, `names_that_are_not_a_file_are_refused`, whose
 filesystem question is a parameter so no file is touched). **The suite runs on in-memory DuckDB**,
-the sanctioned exception in-memory SQLite already is: a `memory:<name>` target, accepted only under
-`cfg(test)`, is a shared in-memory instance the tests seed, held for the process in `KEEP`, since
-an in-memory instance *is* its data and letting it close between two operations of one test would
-empty it.
+the sanctioned exception in-memory SQLite already is. A `memory:<name>` target resolves in every
+build (`open_target`'s `Target::Memory`); what `cfg(test)` decides is only whether one nobody holds
+may be *made* — `instance` is `instance_with(db, cfg!(test))`. The suites make theirs and hold each
+for the process in `KEEP` (itself `cfg(test)`), since an in-memory instance *is* its data and
+letting it close between two operations of one test would empty it. **A release build refuses one
+nobody holds** — `DbRefusal::DuckDbSessionClosed(name)` — rather than creating it empty, which is
+the missing file's refusal over again: a connection naming a session that has closed would
+otherwise open an empty database that looked like it worked
+(`a_memory_target_with_no_session_is_refused_outside_the_suites`, which asks `instance_with(…,
+false)` from inside the suite). The one thing that makes such a target outside the suites is a
+`DataSession`.
+**Open data file is a view in a throwaway in-memory session** — `core/data_file.rs` decides the
+words, this module holds the database. `DataSession::open` makes an in-memory instance, unsealed
+and with the configuration every instance takes, under a fresh `memory:session-<n>` target — a
+process-wide counter, so no two sessions of one run share one (`two_sessions_are_two_databases`) —
+registers it in `INSTANCES` as any instance is, and keeps the **strong** `Arc` itself. The registry
+stays `Weak`, so the file rule — close with the last operation — is untouched; the session is what
+an in-memory instance needs instead, since that rule would empty it between two queries. Dropping
+the `DataSession` closes the database once any operation still running on it ends, as a file's
+instance closes, and the target is refused `DuckDbSessionClosed` from then on
+(`a_data_session_holds_its_database_until_it_is_dropped`, a seeded row read back across two
+operations and the target refused after the drop). **It is opened unsealed**, as the editor's
+handles are, because reading the file is the point; a sealed handle on the target is
+`DuckDbSealedElsewhere`, as for any file open the other way, and the unattended paths could not
+reach it regardless — the session exists in this process alone, never in `connections.json`
+(`Connection::to_save`, under `core/connection.rs`), and `schemaic query` and the AI panel's MCP
+server are other processes reading that file. **So the AI panel cannot see a session**: its MCP
+server is such a subprocess, and could not share the in-process database if it did.
+`open_data_file(db, path)` refuses `DuckDbNotASession` unless `db.file` is a `memory:` target —
+checked before anything opens, so a database file the user owns never takes an unpreviewed view —
+and `DuckDbNotADataFile(path)` for a path `data_file::kind_of` has no reader for
+(`a_data_file_opens_only_into_a_session_and_only_with_a_reader`). It then takes a name free in the
+session's `main` (`free_view_name`: `information_schema.tables` for `current_database()` and
+`main`, tables and views alike, compared without case —
+`a_data_file_view_takes_a_name_free_in_the_session`, where another schema's `events` is no
+collision), runs `data_file::create_view_sql` on that operation's connection, and answers
+`current_database()` — `memory` for an in-memory database — and the view's name, which together
+are the tab's `TableSource`. That `CREATE VIEW` is generated DDL run without the preview, the one
+place that is, on the terms stated under *Generated DDL is never run silently* in the invariants.
+The view reads the file through DuckDB's reader each time it is queried: nothing is copied in, and
+nothing written to the session reaches the file. Measured by the change's author: a CSV, a JSONL
+and a Parquet file each read through the view, `parquet` and `json` being linked in, and the views
+list in the tree through `fetch_table_list`. No test reads a real data file, the suite touching
+none. The app's half — when a file joins the active session rather than opening a new one, and
+what closing one takes with it — is under `app/main.rs`.
 **`duckdb.rs` answers every name in `ENGINE_ENTRY_POINTS`**, and the dispatcher calls it for each — and all three convention tests hold it to that:
 it is in the module list of `every_engine_module_answers_the_whole_interface` and the loop of
 `the_dispatcher_calls_every_engine_module_for_every_entry_point`, and

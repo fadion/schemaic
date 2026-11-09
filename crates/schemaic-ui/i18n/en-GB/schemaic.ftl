@@ -361,6 +361,8 @@ palette-reopen-closed-tab = Reopen closed tab
 palette-reopen-closed-tab-hint = <tab>
 palette-open-file = Open file
 palette-open-file-hint = a .sql script
+palette-open-data-file = Open data file
+palette-open-data-file-hint = a CSV, Parquet or JSON file, queried in an in-memory DuckDB session
 palette-save-file = Save file
 palette-save-file-as = Save file as
 palette-next-tab = Next tab
@@ -596,6 +598,9 @@ db-refused-duckdb-not-a-file = { $name } is not a database file — a DuckDB con
 db-refused-duckdb-missing = There is no file at { $path }. Schemaic opens an existing DuckDB database and never creates one, so a mistyped path cannot become an empty database.
 db-refused-duckdb-sealed-elsewhere = This DuckDB file is open in Schemaic for another kind of run. Try again when it finishes.
 db-refused-duckdb-worker = the DuckDB worker failed: { $error }
+db-refused-duckdb-session-closed = { $name } is an in-memory session that is not open. Its data lived only while it was open — open the data file again.
+db-refused-duckdb-not-a-data-file = { $path } is not a file Schemaic opens as data. Open a .csv, .tsv, .parquet, .json, .jsonl or .ndjson file (a .gz or .zst one too, for the text kinds).
+db-refused-duckdb-not-a-session = A data file opens into an in-memory session, not into a database file.
 db-refused-sqlite-sizes-too-large = Table sizes are read only for a database up to { $cap }: SQLite measures them by reading every page of the file, and this one is { $file }.
 
 ## Why a connection could not be made (core's model::ConnectFailure), after
@@ -2075,6 +2080,7 @@ connections-import = Import connections
 connections-export = Export connections
 connections-duplicate = Duplicate
 connections-delete = Delete
+connections-close-session = Close session
 connections-test = Test
 connections-save = Save
 # The tooltip on a failed test when the failure carried no text of its own.
@@ -4518,6 +4524,8 @@ file-open-title = Open SQL file
 file-save-title = Save SQL file
 # The open and save dialogs' file-type filter.
 file-sql-filter = SQL script
+file-open-data-title = Open data file
+file-data-filter = Data file
 file-read-failed = Couldn't read { $path }: { $error }
 file-save-failed = Couldn't save { $path }: { $error }
 file-too-large = { $path } is { $size } — too large to open in an editor tab. Schemaic would spend most of its time re-analysing it. Run it from a query tab, or use Import for a data file.
@@ -4594,6 +4602,8 @@ import-added-foreign = { $count ->
     } The environment badge is not carried over from another client, and read-only only where its URL asked for it — set them in Manage connections for anything that matters.
 conn-delete-title = Delete “{ $name }”
 conn-delete-question = This deletes the connection, its stored password, its saved AI conversation, its query history and its tabs. It can't be undone.
+conn-close-session-title = Close “{ $name }”
+conn-close-session-question = Everything made in this in-memory session goes with it — its views, any tables, its query history and its tabs. The data files themselves are only read, and stay as they are.
 # A notice shown after a delete; its two lines are shown one under the other.
 # The ** marks bold.
 conn-delete-keyring-kept = Schemaic could not reach the OS keyring, so the deleted connection's stored password and SSH secrets are **still in it**.

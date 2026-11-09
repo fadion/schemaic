@@ -4183,6 +4183,7 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
     let close_tab = ui.tab_actions.close_tab.clone();
     let duplicate_tab = ui.tab_actions.duplicate_tab.clone();
     let open_sql_file = ui.tab_actions.open_sql_file.clone();
+    let open_data_file = ui.conn_actions.open_data_file.clone();
     let save_sql_file = ui.tab_actions.save_sql_file.clone();
     let save_sql_file_as = ui.tab_actions.save_sql_file_as.clone();
     let run_all = ui.tab_actions.run_all.clone();
@@ -4385,6 +4386,12 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
             label: tr!("palette-open-file"),
             hint: tr!("palette-open-file-hint"),
             arg: instant(open_sql_file.clone(), &close),
+        },
+        Command {
+            id: "open data file",
+            label: tr!("palette-open-data-file"),
+            hint: tr!("palette-open-data-file-hint"),
+            arg: instant(open_data_file.clone(), &close),
         },
         Command {
             id: "save file",

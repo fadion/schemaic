@@ -14,6 +14,9 @@ the [schema tree](../schema/README.md), on a database or on a table.
 | Load such a backup back in                      | the database  | **Restore from file**      |
 | Copy a table into another database              | the table     | **Copy to**                |
 
+To query a CSV, Parquet or JSON file without loading it into a table, open it with
+**Open data file** instead; see [Querying a data file](../connections/data-file.md).
+
 **Import** means two things depending on where you click: on a table it loads a data file into
 that table; on a database it runs a SQL script, whose statements say for themselves which tables
 they touch. **Export** on a table opens the same window as on its database, with just that

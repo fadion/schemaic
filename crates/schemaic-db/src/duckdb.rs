@@ -105,7 +105,8 @@ static INSTANCES: LazyLock<Mutex<HashMap<String, Weak<Instance>>>> =
 
 /// The test suites' in-memory databases, held for the process: an in-memory
 /// instance *is* its data, so letting it close between two operations of one
-/// test would empty it. Only `cfg(test)` targets reach here ([`open_target`]).
+/// test would empty it. Only the suites' own `memory:` targets reach here
+/// ([`instance`]); a [`DataSession`] holds its own.
 #[cfg(test)]
 static KEEP: LazyLock<Mutex<Vec<Arc<Instance>>>> = LazyLock::new(Default::default);
 
@@ -114,8 +115,7 @@ static KEEP: LazyLock<Mutex<Vec<Arc<Instance>>>> = LazyLock::new(Default::defaul
 enum Target {
     /// A database file that exists.
     File(std::path::PathBuf),
-    /// A named in-memory database, for the suites alone.
-    #[cfg(test)]
+    /// A named in-memory database: a [`DataSession`]'s, or a suite's.
     Memory,
 }
 
@@ -126,24 +126,20 @@ enum Target {
 /// path would open an empty database that looked like it worked. `:memory:` and
 /// a MotherDuck `md:` name are refused too: the first is a database that dies
 /// with each operation's instance, the second needs an extension this build
-/// does not fetch. `allow_memory` is `cfg!(test)` at the one call site, where a
-/// `memory:<name>` target is a shared in-memory database the suites seed, and
-/// `is_file` is the filesystem's answer — a parameter so the refusals are
-/// reachable from a test that touches no file.
+/// does not fetch. A `memory:<name>` target is an in-memory database held
+/// elsewhere — by a [`DataSession`], or for the suites — and [`instance_with`]
+/// decides whether it may be made. `is_file` is the filesystem's answer — a
+/// parameter so the refusals are reachable from a test that touches no file.
 fn open_target(
     file: &str,
-    allow_memory: bool,
     is_file: impl Fn(&std::path::Path) -> bool,
 ) -> Result<(String, Target), DbError> {
     let f = file.trim();
     if f.is_empty() {
         return Err(DbError::Refused(DbRefusal::DuckDbNoFile));
     }
-    if allow_memory && let Some(name) = f.strip_prefix("memory:") {
-        #[cfg(test)]
+    if let Some(name) = f.strip_prefix("memory:") {
         return Ok((format!("memory:{name}"), Target::Memory));
-        #[cfg(not(test))]
-        let _ = name;
     }
     if f.eq_ignore_ascii_case(":memory:")
         || f.to_ascii_lowercase().starts_with("md:")
@@ -183,7 +179,16 @@ fn config(sealed: bool, read_only_file: bool) -> duckdb::Result<Config> {
 
 /// The instance for `db`'s file — the one already open, or a new one.
 fn instance(db: &Db) -> Result<Arc<Instance>, DbError> {
-    let (key, target) = open_target(&db.file, cfg!(test), std::path::Path::is_file)?;
+    instance_with(db, cfg!(test))
+}
+
+/// [`instance`], with whether a `memory:` target nobody holds may be made —
+/// `cfg!(test)` there, where the suites seed their own, and never in a
+/// release build, where only a [`DataSession`] makes one: a connection naming
+/// one that has closed would otherwise open an empty database that looked
+/// like it worked, which is the missing file's refusal over again.
+fn instance_with(db: &Db, make_memory: bool) -> Result<Arc<Instance>, DbError> {
+    let (key, target) = open_target(&db.file, std::path::Path::is_file)?;
     let mut map = INSTANCES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(inst) = map.get(&key).and_then(Weak::upgrade) {
         if inst.sealed != db.sealed {
@@ -197,7 +202,11 @@ fn instance(db: &Db) -> Result<Arc<Instance>, DbError> {
             DuckConn::open_with_flags(&path, config(db.sealed, true).map_err(connect_err)?)
                 .map_err(connect_err)?
         }
-        #[cfg(test)]
+        Target::Memory if !make_memory => {
+            return Err(DbError::Refused(DbRefusal::DuckDbSessionClosed(
+                db.file.trim().to_string(),
+            )));
+        }
         Target::Memory => {
             DuckConn::open_in_memory_with_flags(config(db.sealed, false).map_err(connect_err)?)
                 .map_err(connect_err)?
@@ -216,6 +225,114 @@ fn instance(db: &Db) -> Result<Arc<Instance>, DbError> {
             .push(inst.clone());
     }
     Ok(inst)
+}
+
+/// An **Open data file** session: a throwaway in-memory database, open for as
+/// long as this value is held.
+///
+/// The registry holds instances by [`Weak`] so that a file's closes with its
+/// last operation and releases the lock. An in-memory instance *is* its data,
+/// so that rule would empty it between two queries; this is the strong hold
+/// that keeps it — the app keeps one per open session and drops it when the
+/// session is closed, after which the target is refused
+/// ([`DbRefusal::DuckDbSessionClosed`]) rather than reopened empty. An
+/// operation running at the drop keeps the instance until it ends, as on a
+/// file.
+///
+/// Opened unsealed, as the editor's own handles are: reading the data file is
+/// the point. A sealed handle on the target is refused as for any file open
+/// the other way ([`DbRefusal::DuckDbSealedElsewhere`]), so the unattended
+/// paths cannot reach it — nor could they, the session being nowhere but this
+/// process.
+pub struct DataSession {
+    target: String,
+    _inst: Arc<Instance>,
+}
+
+impl std::fmt::Debug for DataSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DataSession")
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DataSession {
+    /// Open a fresh session under a target no other session in this process
+    /// has had.
+    pub fn open() -> Result<DataSession, DbError> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let target = format!("memory:session-{n}");
+        let connect_err = |e: duckdb::Error| DbError::Connect(format!("{target}: {e}"));
+        let conn = DuckConn::open_in_memory_with_flags(config(false, false).map_err(connect_err)?)
+            .map_err(connect_err)?;
+        let inst = Arc::new(Instance {
+            root: Mutex::new(conn),
+            sealed: false,
+        });
+        let mut map = INSTANCES.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, w| w.strong_count() > 0);
+        map.insert(target.clone(), Arc::downgrade(&inst));
+        Ok(DataSession {
+            target,
+            _inst: inst,
+        })
+    }
+
+    /// The connection `file` that reaches this session's database.
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+}
+
+/// Open the data file at `path` into the session `db` reaches: a view over
+/// its reader ([`schemaic_core::data_file`]), named for the file and free in
+/// the session's `main`. Answers the database it is in (DuckDB names an
+/// in-memory one `memory`) and the view's name, which together are its
+/// `TableSource`.
+///
+/// **Generated DDL run without the preview**, and the one place that does, on
+/// these terms: the target must be a session's in-memory database
+/// ([`DbRefusal::DuckDbNotASession`] otherwise, before anything opens), and
+/// the statement only *creates*, under a name nothing there has — it cannot
+/// replace, alter or drop a thing the user made. The file is only read.
+pub async fn open_data_file(db: &Db, path: String) -> Result<(String, String), DbError> {
+    if !db.file.trim_start().starts_with("memory:") {
+        return Err(DbError::Refused(DbRefusal::DuckDbNotASession));
+    }
+    let Some(kind) = schemaic_core::data_file::kind_of(&path) else {
+        return Err(DbError::Refused(DbRefusal::DuckDbNotADataFile(path)));
+    };
+    with_conn(db, move |c| {
+        let name = free_view_name(c, &path)?;
+        c.execute_batch(&schemaic_core::data_file::create_view_sql(
+            &name, &path, kind,
+        ))
+        .map_err(query_err)?;
+        let database: String = c
+            .query_row("SELECT current_database()", [], |r| r.get(0))
+            .map_err(query_err)?;
+        Ok((database, name))
+    })
+    .await
+}
+
+/// [`schemaic_core::data_file::view_name`] against what the session's `main`
+/// already holds.
+fn free_view_name(c: &DuckConn, path: &str) -> Result<String, DbError> {
+    let mut st = c
+        .prepare(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_catalog = current_database() AND table_schema = 'main'",
+        )
+        .map_err(query_err)?;
+    let taken = st
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(query_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(query_err)?;
+    Ok(schemaic_core::data_file::view_name(path, &taken))
 }
 
 /// An operation's own connection, with the instance it must keep alive, and
@@ -2578,12 +2695,12 @@ mod tests {
     /// DuckDB's open would create one.
     #[test]
     fn a_missing_file_is_refused_not_created() {
-        let r = open_target("C:/data/nope.duckdb", false, |_| false);
+        let r = open_target("C:/data/nope.duckdb", |_| false);
         assert!(matches!(
             r,
             Err(DbError::Refused(DbRefusal::DuckDbMissing(p))) if p == "C:/data/nope.duckdb"
         ));
-        let (_, t) = open_target("C:/data/yes.duckdb", false, |_| true).unwrap();
+        let (_, t) = open_target("C:/data/yes.duckdb", |_| true).unwrap();
         assert!(matches!(t, Target::File(_)));
     }
 
@@ -2592,20 +2709,104 @@ mod tests {
         for f in [":memory:", "md:my_db", "MotherDuck:x"] {
             assert!(
                 matches!(
-                    open_target(f, false, |_| true),
+                    open_target(f, |_| true),
                     Err(DbError::Refused(DbRefusal::DuckDbNotAFile(_)))
                 ),
                 "{f}"
             );
         }
         assert!(matches!(
-            open_target("  ", false, |_| true),
+            open_target("  ", |_| true),
             Err(DbError::Refused(DbRefusal::DuckDbNoFile))
         ));
-        // A suite's memory target is a release build's ordinary missing file.
+    }
+
+    /// A data-file session's database lives exactly as long as its
+    /// [`DataSession`]: across operations that each take and drop their own
+    /// connection, and no longer.
+    #[test]
+    fn a_data_session_holds_its_database_until_it_is_dropped() {
+        let session = DataSession::open().unwrap();
+        let db = Db::from_parts(
+            crate::Engine::DuckDb,
+            String::new(),
+            0,
+            String::new(),
+            String::new(),
+            session.target().to_string(),
+        );
+        seed(&db, "CREATE TABLE t(x INT); INSERT INTO t VALUES (7)");
+        // A second operation, after the first's connection has gone.
+        let (_i, c) = connect(&db).unwrap();
+        let x: i32 = c.query_row("SELECT x FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(x, 7);
+        drop((_i, c));
+        drop(session);
+        // A release build's rule: the suites' own would make it afresh.
         assert!(matches!(
-            open_target("memory:x", false, |_| false),
-            Err(DbError::Refused(DbRefusal::DuckDbMissing(_)))
+            instance_with(&db, false),
+            Err(DbError::Refused(DbRefusal::DuckDbSessionClosed(t))) if t == db.file
+        ));
+    }
+
+    /// The view takes a name nothing in the session's `main` has — a table or
+    /// a view, compared without case as DuckDB resolves one — so opening a
+    /// second file of the same name adds rather than replaces.
+    #[test]
+    fn a_data_file_view_takes_a_name_free_in_the_session() {
+        let db = mem("free-view-name");
+        seed(
+            &db,
+            "CREATE TABLE sales(x INT); CREATE VIEW SALES_2 AS SELECT 1 AS y; \
+             CREATE SCHEMA other; CREATE TABLE other.events(x INT)",
+        );
+        let (_i, c) = connect(&db).unwrap();
+        assert_eq!(free_view_name(&c, "/d/Sales.csv").unwrap(), "Sales_3");
+        // Another schema's name is no collision: the view goes to `main`.
+        assert_eq!(free_view_name(&c, "/d/events.parquet").unwrap(), "events");
+    }
+
+    /// A view is added to a session alone — never, unpreviewed, to a database
+    /// file the user owns — and only for a file with a reader.
+    #[test]
+    fn a_data_file_opens_only_into_a_session_and_only_with_a_reader() {
+        let file = Db::from_parts(
+            crate::Engine::DuckDb,
+            String::new(),
+            0,
+            String::new(),
+            String::new(),
+            r"C:\data\warehouse.duckdb".to_string(),
+        );
+        let r = rt().block_on(open_data_file(&file, "/d/x.csv".into()));
+        assert!(
+            matches!(r, Err(DbError::Refused(DbRefusal::DuckDbNotASession))),
+            "{r:?}"
+        );
+        let session = mem("not-a-data-file");
+        let r = rt().block_on(open_data_file(&session, "/d/x.xlsx".into()));
+        assert!(
+            matches!(&r, Err(DbError::Refused(DbRefusal::DuckDbNotADataFile(p))) if p == "/d/x.xlsx"),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn two_sessions_are_two_databases() {
+        let a = DataSession::open().unwrap();
+        let b = DataSession::open().unwrap();
+        assert_ne!(a.target(), b.target());
+        assert!(a.target().starts_with("memory:"));
+    }
+
+    /// Outside the suites a `memory:` name nobody opened is refused, not
+    /// created — the connection form cannot conjure an in-memory database.
+    #[test]
+    fn a_memory_target_with_no_session_is_refused_outside_the_suites() {
+        let db = mem("never-opened");
+        assert!(matches!(
+            instance_with(&db, false),
+            Err(DbError::Refused(DbRefusal::DuckDbSessionClosed(_)))
         ));
     }
 

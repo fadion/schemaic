@@ -700,7 +700,8 @@ read-only gate (`read_only_refusal(..).reason`), `kill_session`'s cancel, the bl
 code-page checks, `sqlite::open_target`'s three refusals, SQLite's "the SQLite worker failed: …"
 (a `Query` once) at each of its six sites, its default-reset refusals and `table_stats`' size
 cap, and DuckDB's — `duckdb::open_target`'s three, a sealed or unsealed instance asked for the
-other kind (`DuckDbSealedElsewhere`) and its worker failing (under `duckdb.rs`). It renders **as written**, `#[error("{0}")]` with no prefix — `DbRefusal`'s `Display`, its
+other kind (`DuckDbSealedElsewhere`), its worker failing, a closed session's target
+(`DuckDbSessionClosed`) and `open_data_file`'s two (under `duckdb.rs`). It renders **as written**, `#[error("{0}")]` with no prefix — `DbRefusal`'s `Display`, its
 English: each is already the whole sentence, and "query failed:" in front of "Commit cancelled
 — …" named a failure that was the user's own act. The window words it instead
 (`i18n::db_refusal_text`, from `db_error_shown`); the CLI, the MCP server and the logs keep

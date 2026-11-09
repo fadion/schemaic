@@ -1004,25 +1004,45 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
                             menu_row.set(Some(id));
                             popup_anchor.set(None);
                             popup_width.set(conn_menu_w());
-                            popup_menu.set(Some(vec![
-                                MenuEntry::action(tr!("connections-duplicate"), move || {
-                                    (sel)(id);
-                                    (dup)(id)
-                                }),
-                                // Red, like every other destructive menu entry in
-                                // the app (the schema tree's Drop), and it asks
-                                // before it runs — the connection, its keyring
-                                // secrets, its history and its tabs are all
-                                // unrecoverable.
-                                MenuEntry::action_colored(
-                                    tr!("connections-delete"),
+                            // An Open data file session is not a saved
+                            // connection: no copy of it reaches its data, and
+                            // removing it closes it — the app's delete path,
+                            // which asks in the session's own words.
+                            let session = connections.with_untracked(|cs| {
+                                cs.iter().any(|c| c.id == id && c.is_data_session())
+                            });
+                            let entries = if session {
+                                vec![MenuEntry::action_colored(
+                                    tr!("connections-close-session"),
                                     theme::error,
                                     move || {
                                         (sel_del)(id);
                                         (del)(id)
                                     },
-                                ),
-                            ]));
+                                )]
+                            } else {
+                                vec![
+                                    MenuEntry::action(tr!("connections-duplicate"), move || {
+                                        (sel)(id);
+                                        (dup)(id)
+                                    }),
+                                    // Red, like every other destructive menu
+                                    // entry in the app (the schema tree's Drop),
+                                    // and it asks before it runs — the
+                                    // connection, its keyring secrets, its
+                                    // history and its tabs are all
+                                    // unrecoverable.
+                                    MenuEntry::action_colored(
+                                        tr!("connections-delete"),
+                                        theme::error,
+                                        move || {
+                                            (sel_del)(id);
+                                            (del)(id)
+                                        },
+                                    ),
+                                ]
+                            };
+                            popup_menu.set(Some(entries));
                         })
                         // Full-width row: resting `conn_list_text`, hover text
                         // brightens (no bg), selected = bright text on a full-width

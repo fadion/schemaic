@@ -128,7 +128,9 @@ offsets are relative to a buffer this side never saw.
 A right-click in the list on the left **selects on the action taken, not on the click**: its
 menu's Duplicate and Delete carry the connection id themselves, and selecting up front meant
 merely *opening* the menu ran `draft.load` over every field the user had typed, with no undo and
-no copy in the keyring. What answers "which connection is this menu
+no copy in the keyring. For an *Open data file* session (`Connection::is_data_session`) the menu
+is a single red *Close session*: no copy of a session reaches its data, and removing it closes it —
+the app's delete path, whose confirm asks in the session's words. What answers "which connection is this menu
 about" instead is the shared open-menu rule (`widgets::row_menu_mark`, *Popup menus*), keyed off
 a `menu_row: RwSignal<Option<u64>>` created in the modal's **stable scope** beside `save_flash`
 and `test_flash` and for the same reason — the clearing effect outlives the open/close

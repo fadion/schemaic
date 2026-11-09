@@ -21,7 +21,8 @@ it, before it shipped). **A renamed path that already exists is asked about firs
 as typed, so the write landing on `team.schemaic-connections.json` for a typed `team` replaced a
 teammate's export with nothing asked; a name the dialog itself showed is its own consent. A *New
 connection* nobody has filled in (`Connection::is_untouched_new`) is left out: a 127.0.0.1 placeholder is nothing
-to share. The file is written with `persist::write_file_atomic` on `handle.spawn_blocking`; a failure
+to share. Nor is an *Open data file* session (`Connection::to_save`, the save's own filter), a
+connection to nothing outside this process. The file is written with `persist::write_file_atomic` on `handle.spawn_blocking`; a failure
 reaches the error modal through `file_error`, and a success says nothing. What goes in the file
 is `core::conn_import`'s decision, under that entry.
 **Four ways in, and the modal opens empty.** A pasted *Connection URL* at the top, then

@@ -179,8 +179,10 @@ SQL's `InitSql(InitRefusal)`, a sign-in's `Transport(AuthMode)`, SQL Server's `B
 `CodePage` (each with the file's `row` where an import names one, and `CodePage` the `lost`
 character and its code page where it is known), SQLite's `open_target` refusals and worker
 failure, DuckDB's — `open_target`'s `DuckDbNoFile`, `DuckDbNotAFile` and `DuckDbMissing`, a file
-open for the other kind of run (`DuckDbSealedElsewhere`), and `DuckDbWorker` (under
-`db::duckdb`) — MySQL's quote-safety and read-only plan refusals, a read-only PostgreSQL session's
+open for the other kind of run (`DuckDbSealedElsewhere`), `DuckDbWorker`, and *Open data
+file*'s three — `DuckDbSessionClosed(String)`, a `memory:` target with no session behind it,
+`DuckDbNotADataFile(String)`, a path with no reader, and `DuckDbNotASession`, a data file opened
+into anything but a session — all three standing (under `db::duckdb`) — MySQL's quote-safety and read-only plan refusals, a read-only PostgreSQL session's
 `ShadowedBuiltin { schema, name, operator }` — a schema on its path holding what PostgreSQL could
 pick in a builtin's place, its two wordings `db-refused-shadowed-function` and
 `db-refused-shadowed-operator` in `i18n::db_refusal_text` — `KeyringUnreadable(String)`, the one

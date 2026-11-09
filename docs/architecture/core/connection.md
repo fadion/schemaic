@@ -28,6 +28,23 @@ answer to which engine a label names — `schemaic_db::Engine::from_db_type`, th
 would send a TDS handshake to a MySQL port. `read_only_caveat` is the sentence the form puts
 under the Read-only switch on SQL Server alone, since that engine's read-only is a rollback
 rather than a refusal (`db::mssql`).
+**An *Open data file* session is a `Connection` that is never saved.**
+`Connection::data_session(id, name, target, color)` is a DuckDB connection whose `file` is a
+`db::duckdb::DataSession`'s `memory:session-<n>` target, named for the data file — `new_blank`
+underneath, so it is writable, the session being the user's scratch space. `is_data_session` is
+DuckDB with a `file` beginning `memory:`, **asked of the connection rather than remembered**, as
+`is_untouched_new` is and for its reason: every site that saves, lists or exports must give the
+same answer, and a release build refuses a `memory:` target nobody holds, so the file is the whole
+answer (`a_data_session_is_a_duckdb_connection_to_a_memory_target` — a `.duckdb` file named
+`memory` is not one, nor is a SQLite connection). `to_save` is the list a save writes, the sessions
+left out, and `active_to_save` the active id it writes — `None` when that id names a session, so
+startup falls back as for any id that names nothing (`startup_active_id`) — because a session's
+data is in this process alone and after a restart it would be a connection to nothing
+(`a_save_leaves_the_data_sessions_out`). The app's save and its connection export both write
+through `to_save` (under `app/main.rs`). **What it does not cover**: a `memory:` path typed into
+the connection form is not refused at Save. It answers `is_data_session` like a session's, so it is
+never written, and connecting is refused in the closed-session words (`DuckDbSessionClosed`) — or,
+should it name a session this process holds, reaches that session's database.
 **`sql_server_address` is the one reading of a SQL Server Host field**, as Microsoft's clients
 read it: a leading `tcp:` (any case) is the protocol and goes, `.` and `(local)` are
 `localhost`, a trailing `,port` is the port — a non-zero `u16`, or the text stays in `server`

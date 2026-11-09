@@ -1838,6 +1838,57 @@ impl Connection {
         named_new && *self == Self::new_blank(self.id, self.name.clone(), self.color.clone())
     }
 
+    /// The connection an **Open data file** session is reached through: a
+    /// DuckDB connection whose file is the session's `memory:` target
+    /// (`db::duckdb::DataSession::target`), under `name` — the data file's.
+    pub fn data_session(
+        id: u64,
+        name: String,
+        target: String,
+        color: Option<String>,
+    ) -> Connection {
+        Connection {
+            db_type: "DuckDB".to_string(),
+            host: String::new(),
+            port: 0,
+            file: target,
+            ..Self::new_blank(id, name, color)
+        }
+    }
+
+    /// Is this an **Open data file** session rather than a saved connection?
+    ///
+    /// **Asked of the connection, not remembered**, as
+    /// [`is_untouched_new`](Self::is_untouched_new) is and for its reason: the
+    /// answer has to be the same at every site that saves, lists or exports.
+    /// A DuckDB `memory:` target is one only a session makes — a release build
+    /// refuses one nobody holds — so the file is the whole answer.
+    pub fn is_data_session(&self) -> bool {
+        is_duckdb(&self.db_type) && self.file.trim_start().starts_with("memory:")
+    }
+
+    /// The connections a save writes: all but the data sessions, which hold
+    /// their data in this process alone and would be a connection to nothing
+    /// after a restart.
+    pub fn to_save(connections: &[Connection]) -> Vec<Connection> {
+        connections
+            .iter()
+            .filter(|c| !c.is_data_session())
+            .cloned()
+            .collect()
+    }
+
+    /// The active id a save writes: `active` when it names a connection the
+    /// save keeps ([`to_save`](Self::to_save)), else none — startup then picks
+    /// as it does for any id that names nothing ([`startup_active_id`](Self::startup_active_id)).
+    pub fn active_to_save(active: Option<u64>, connections: &[Connection]) -> Option<u64> {
+        active.filter(|id| {
+            connections
+                .iter()
+                .any(|c| c.id == *id && !c.is_data_session())
+        })
+    }
+
     /// Which connection is active at startup, given the id the last session
     /// saved and the connections that actually loaded.
     ///
@@ -4593,6 +4644,44 @@ mod tests {
         assert_eq!(saved.port, 0);
         assert_eq!(saved.ssh, SshTunnel::default());
         assert!(saved.database.is_empty());
+    }
+
+    #[test]
+    fn a_data_session_is_a_duckdb_connection_to_a_memory_target() {
+        let c = Connection::data_session(9, "sales.csv".into(), "memory:session-1".into(), None);
+        assert!(c.is_data_session());
+        assert!(is_duckdb(&c.db_type));
+        assert_eq!(c.file, "memory:session-1");
+        assert_eq!(c.name, "sales.csv");
+        assert!(!c.read_only, "the session is the user's scratch space");
+        let mut file = c.clone();
+        file.file = r"C:\data\memory.duckdb".into();
+        assert!(!file.is_data_session());
+        // SQLite's file is never a session, whatever it is called.
+        let mut lite = c.clone();
+        lite.db_type = "SQLite".into();
+        assert!(!lite.is_data_session());
+    }
+
+    /// A session is never written to `connections.json`, and an active id
+    /// naming one is not saved as the active connection.
+    #[test]
+    fn a_save_leaves_the_data_sessions_out() {
+        let saved = conn();
+        let session = Connection::data_session(
+            saved.id + 1,
+            "x.parquet".into(),
+            "memory:session-2".into(),
+            None,
+        );
+        let cs = vec![saved.clone(), session.clone()];
+        assert_eq!(Connection::to_save(&cs), vec![saved.clone()]);
+        assert_eq!(Connection::active_to_save(Some(session.id), &cs), None);
+        assert_eq!(
+            Connection::active_to_save(Some(saved.id), &cs),
+            Some(saved.id)
+        );
+        assert_eq!(Connection::active_to_save(None, &cs), None);
     }
 
     /// Only the engine with no read-only session needs the sentence.

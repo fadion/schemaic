@@ -52,7 +52,8 @@ Type the path in **Database file**, or press **Browse…** inside the field to p
 
 - *The file must already exist.* Schemaic never creates a DuckDB database, so a mistyped path is
   refused rather than turned into an empty one. Create the file with DuckDB first. An in-memory
-  database (`:memory:`) and a MotherDuck name (`md:…`) are refused too.
+  database (`:memory:`) and a MotherDuck name (`md:…`) are refused too. To query a CSV, Parquet
+  or JSON file in an in-memory session instead, see [Querying a data file](data-file.md).
 - *The file is open only while something runs.* Between statements Schemaic lets go of it, so
   another program, such as the `duckdb` command-line client, can open it. While that program
   holds it, Schemaic's own statements fail with DuckDB's error that the file is in use; close the
@@ -106,3 +107,5 @@ password for Windows, Microsoft Entra or cloud IAM sign-in, and stores none.
 - [SSH tunnels](ssh.md) — reach a server through an SSH host, with jump hosts and `~/.ssh/config`.
 - [Safeguards](safeguards.md) — read-only mode, command-line and AI access, timeouts and init SQL.
 - [Importing connections](import.md) — bring connections over from other tools, and share your own.
+- [Querying a data file](data-file.md) — query a CSV, Parquet or JSON file in a throwaway DuckDB
+  session.

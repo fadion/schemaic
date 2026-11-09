@@ -23,6 +23,7 @@ pub mod compare;
 pub mod conn_import;
 pub mod connection;
 pub mod copy_table;
+pub mod data_file;
 pub mod date;
 pub mod db_color;
 pub mod db_hidden;

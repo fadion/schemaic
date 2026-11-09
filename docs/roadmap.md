@@ -69,8 +69,9 @@ Phase 2's grid write-back has landed too, on provenance read from the statement 
 a key, because a checkpoint renumbers it), and so have import, the `.sql` dump and Manual tabs (a
 failed grid commit there rolls the whole transaction back, DuckDB having no savepoint), and so
 has the table designer — in place where DuckDB's `ALTER TABLE` can, by a rebuild where it cannot
-— and so have the view and macro editors (`docs/architecture/db/duckdb.md`). What is left is
-below. ClickHouse would come after
+— and so have the view and macro editors, and **Open data file**, a CSV, Parquet or JSON file
+read through a view in an in-memory session that is never saved (`docs/architecture/db/duckdb.md`).
+What is left is below. ClickHouse would come after
 DuckDB.
 
 - **Decided — the unattended paths cannot read files:** done in phase 1 (`Db::sealed`, called by
@@ -80,10 +81,6 @@ DuckDB.
   stated in the invariants. A Manual tab's session holds the instance — and with it the file's
   lock — for as long as the tab stays in Manual mode, and the connection form's hint says so.
 - **Phase 2 — the rest of the writes:**
-  - **Open data file:** a CSV, Parquet or JSON file opened in a throwaway in-memory session —
-    which the test-only `memory:` target in `db::duckdb` already models. **Trap:** an in-memory
-    instance is its data, so it must be held for as long as the session is open, not closed with
-    its last operation as a file's is.
   - **Schema compare** between two DuckDB files.
 - **Loose ends:** the read-only half of the seal (`AccessMode::ReadOnly`) has no test, the
   suites' in-memory instance having no file to open read-only. The designer offers a column
@@ -104,6 +101,12 @@ DuckDB.
   would be a source for them).
   A view's **column** comments are cleared by `CREATE OR REPLACE VIEW` too (measured), and an
   edit does not restate them, the new body's columns being unknown until it runs.
+  An Open data file session is out of the AI panel's reach: its MCP server is a subprocess that
+  reads `connections.json`, where a session never is, and could not share the in-process database
+  if it did. A `memory:` path typed into the connection form is not refused at Save — it is only
+  never saved, and connecting says the session is closed; a form-level refusal would be clearer.
+  The read-time options of `read_csv` (delimiter, header, types) are DuckDB's sniffer's alone; a
+  file it guesses wrong needs the view rewritten by hand.
 - **Phase 3:** translate the new strings (`db-refused-duckdb-*`, `connections-duckdb-*`,
   `ddl-withheld-duckdb-referenced`, `table-problem-sequence-no-default`, and retranslate
   `ddl-withheld-strands-generated-column`, which no longer names SQLite in `en-GB` now DuckDB

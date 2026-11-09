@@ -493,6 +493,29 @@ Save falls through to Save As when the tab has no path, and Reload asks through 
 `Confirm` channel when the tab is modified, since nothing else in the app can put those edits
 back. None of the four is connection-gated, deliberately and like the export: a file is between
 the editor and the disk.
+**Open data file is the `open_data_file` closure**, handed to the interface as
+`ConnActions::open_data_file` and reached from the palette's *Open data file* (`overlays.rs`'s
+`palette_commands`, an `instant` command), its one way in. The dialog is filtered on
+`core::data_file::EXTENSIONS`. **With a session active the file joins it**: when `active_conn`
+names a connection that `is_data_session` and whose id `data_sessions` holds,
+`db::duckdb::open_data_file` runs on it and `load_schema` refreshes the tree, so two files can be
+joined in one query. Otherwise a `DataSession` opens and `Connection::data_session` makes its
+connection — an id from `next_id_after`, a colour from `pick_connection_color`, the file's name —
+but **the connection is pushed and switched to only once the view exists**: a file DuckDB cannot
+read drops the fresh session unlisted and leaves nothing behind but the error modal. Either way the
+tab opens through `open_table_filtered`, on a `RerunRequest::approved` minted over
+`data_file::select_sql(view)` for DuckDB — a `SELECT *` of a name this app quoted, which the guard
+passes, minted all the same as every re-run is — with `TableSource(database, Some("main"), view)`.
+`data_sessions: Rc<RefCell<HashMap<u64, DataSession>>>` holds each session by connection id, and
+its entry *is* the database's life: `delete_conn_now` removes it beside the connection, closing
+the database once any running operation ends, and the session's tabs go as a deleted connection's
+do. `delete_conn`'s confirm asks in the session's own words (`conn-close-session-*`: what was
+made in it goes, the data files are only read) rather than about a password it never had.
+**A session is never written**: `persist_conns` writes `Connection::to_save` and `active_to_save`,
+and the connections export filters through `to_save` before `is_untouched_new`. The high-water
+mark still counts a session's id, so no later connection takes the id its chat or history was kept
+under. Across a restart a session's tabs are rebound like a deleted connection's
+(`Connection::rebind_tab`, under `ui/lib.rs`).
 **Closing a modified file tab asks too, and `guard_close` is where both close questions live.**
 It has `GuardTxFn`'s signature (aliased `GuardCloseFn`) and wraps `guard_tx`, so it drops into
 every path that already took one — `close_tab` (×, middle-click, Ctrl+W) and `close_tabs_seq`,
