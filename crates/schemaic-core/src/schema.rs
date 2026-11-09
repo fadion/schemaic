@@ -2205,8 +2205,9 @@ impl CheckInfo {
 ///
 /// Most fields belong to one engine (as [`TableInfo::engine`] does): MySQL has
 /// the definer and the security type, PostgreSQL the storage parameters and
-/// materialization, SQL Server the attributes; the explicit column list is
-/// SQLite's and SQL Server's. `check_option` is the one MySQL and PostgreSQL
+/// materialization, SQL Server the attributes, DuckDB the comment its replace
+/// clears; the explicit column list is SQLite's, SQL Server's and DuckDB's.
+/// `check_option` is the one MySQL and PostgreSQL
 /// spell the same way — SQLite has no form of it, and SQL Server's is in the
 /// body.
 #[derive(Clone, Debug, PartialEq, Eq)]

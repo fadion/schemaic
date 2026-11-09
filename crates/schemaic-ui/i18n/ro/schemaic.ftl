@@ -2498,6 +2498,7 @@ ddl-risk-view-cost-sqlserver = Permisiunile acordate pe ea, descrierea și trigg
 ddl-risk-view-cost-sqlserver-restored = Permisiunile acordate pe ea și descrierea ei sunt eliminate odată cu ea și nu sunt restaurate; triggerele ei INSTEAD OF sunt și ele eliminate.
 ddl-risk-view-cost-other = Vizualizările dependente, regulile, permisiunile acordate și triggerele ei INSTEAD OF sunt eliminate odată cu ea și nu sunt restaurate.
 ddl-risk-view-cost-other-restored = Vizualizările dependente, regulile și permisiunile acordate sunt eliminate odată cu ea și nu sunt restaurate; triggerele ei INSTEAD OF sunt și ele eliminate.
+ddl-risk-view-cost-duckdb = Views that select from it are not dropped with it and fail at their next read; its comment is dropped with it.
 ddl-risk-recreate-view = Recrearea { $name } o elimină mai întâi. { $cost } { $why ->
         [sqlite] SQLite nu are o modalitate de a înlocui o vizualizare pe loc, așa că fiecare editare a uneia — inclusiv o redenumire — urmează această cale.
         [sqlserver] sp_rename din SQL Server ar lăsa definiția stocată a vizualizării cu numele vechi, așa că o redenumire urmează această cale.

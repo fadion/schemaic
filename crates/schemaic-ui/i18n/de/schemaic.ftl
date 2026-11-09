@@ -849,6 +849,7 @@ ddl-risk-view-cost-sqlserver = Berechtigungen auf ihr, ihre Beschreibung und ihr
 ddl-risk-view-cost-sqlserver-restored = Berechtigungen auf ihr und ihre Beschreibung werden mit ihr gelöscht und nicht wiederhergestellt; ihre INSTEAD-OF-Trigger werden ebenfalls gelöscht.
 ddl-risk-view-cost-other = Abhängige Sichten, Regeln, Berechtigungen und ihre INSTEAD-OF-Trigger werden mit ihr gelöscht und nicht wiederhergestellt.
 ddl-risk-view-cost-other-restored = Abhängige Sichten, Regeln und Berechtigungen werden mit ihr gelöscht und nicht wiederhergestellt; ihre INSTEAD-OF-Trigger werden ebenfalls gelöscht.
+ddl-risk-view-cost-duckdb = Views that select from it are not dropped with it and fail at their next read; its comment is dropped with it.
 ddl-risk-recreate-view = Das Neuerstellen von { $name } löscht die Sicht zuerst. { $cost } { $why ->
         [sqlite] SQLite kann eine Sicht nicht an Ort und Stelle ersetzen, daher nimmt jede Änderung daran — auch eine Umbenennung — diesen Weg.
         [sqlserver] sp_rename von SQL Server würde die gespeicherte Definition der Sicht beim alten Namen belassen, daher nimmt eine Umbenennung diesen Weg.

@@ -2425,6 +2425,7 @@ ddl-risk-view-cost-sqlserver = Lejet mbi të, përshkrimi i saj dhe trigger-ët 
 ddl-risk-view-cost-sqlserver-restored = Lejet mbi të dhe përshkrimi i saj fshihen bashkë me të dhe nuk rikthehen; fshihen edhe trigger-ët e saj INSTEAD OF.
 ddl-risk-view-cost-other = Pamjet e varura, rregullat, lejet dhe trigger-ët e saj INSTEAD OF fshihen bashkë me të dhe nuk rikthehen.
 ddl-risk-view-cost-other-restored = Pamjet e varura, rregullat dhe lejet fshihen bashkë me të dhe nuk rikthehen; fshihen edhe trigger-ët e saj INSTEAD OF.
+ddl-risk-view-cost-duckdb = Views that select from it are not dropped with it and fail at their next read; its comment is dropped with it.
 ddl-risk-recreate-view = Rikrijimi i { $name } e fshin më parë. { $cost } { $why ->
         [sqlite] SQLite nuk ka mënyrë për ta zëvendësuar një pamje në vend, kështu çdo redaktim i saj — përfshirë një riemërtim — ndjek këtë rrugë.
         [sqlserver] sp_rename i SQL Server do ta linte përkufizimin e ruajtur të pamjes duke emërtuar emrin e vjetër, kështu një riemërtim ndjek këtë rrugë.

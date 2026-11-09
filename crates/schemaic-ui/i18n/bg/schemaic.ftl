@@ -2422,6 +2422,7 @@ ddl-risk-view-cost-sqlserver = Предоставените права върх�
 ddl-risk-view-cost-sqlserver-restored = Предоставените права върху него и описанието му се премахват заедно с него и не се възстановяват; тригерите му INSTEAD OF също се премахват.
 ddl-risk-view-cost-other = Зависимите изгледи, правилата, предоставените права и тригерите му INSTEAD OF се премахват заедно с него и не се възстановяват.
 ddl-risk-view-cost-other-restored = Зависимите изгледи, правилата и предоставените права се премахват заедно с него и не се възстановяват; тригерите му INSTEAD OF също се премахват.
+ddl-risk-view-cost-duckdb = Views that select from it are not dropped with it and fail at their next read; its comment is dropped with it.
 ddl-risk-recreate-view = Пресъздаването на { $name } първо го премахва. { $cost } { $why ->
         [sqlite] SQLite не може да замени изглед на място, така че всяка редакция на изглед — включително преименуване — минава по този път.
         [sqlserver] sp_rename на SQL Server би оставил съхранената дефиниция на изгледа със старото име, така че преименуването минава по този път.

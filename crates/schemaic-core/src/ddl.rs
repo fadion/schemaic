@@ -4909,7 +4909,11 @@ fn view_drop_cost(dialect: SqlDialect, restored: bool) -> ViewCost {
         // view, and goes with it; its indexes, if it is an indexed view, are
         // the plan's to put back (`view_indexes_rebuilt`).
         SqlDialect::MsSql => ViewCostEngine::MsSql,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::DuckDb => ViewCostEngine::Other,
+        // No rules, grants or triggers, and no dependency kept: a view that
+        // selects from it is neither dropped nor in the way, and fails at its
+        // next read (measured on 2.0.0). Its comment goes with it.
+        SqlDialect::DuckDb => ViewCostEngine::DuckDb,
+        SqlDialect::MySql | SqlDialect::Postgres => ViewCostEngine::Other,
     };
     ViewCost { engine, restored }
 }
@@ -5737,6 +5741,10 @@ pub enum ViewCostEngine {
     MsSql,
     /// PostgreSQL and MySQL: dependent views, rules and grants.
     Other,
+    /// DuckDB: views that select from it fail at their next read, and its
+    /// comment goes. It never re-creates a view (its replace never refuses),
+    /// so `restored` does not change the sentence.
+    DuckDb,
 }
 
 impl ViewCost {
@@ -5766,6 +5774,10 @@ impl ViewCost {
             (ViewCostEngine::Other, false) => {
                 "Dependent views, rules, grants and its INSTEAD OF triggers are dropped \
                  with it and aren't restored."
+            }
+            (ViewCostEngine::DuckDb, _) => {
+                "Views that select from it are not dropped with it and fail at their next \
+                 read; its comment is dropped with it."
             }
         }
     }
@@ -14152,11 +14164,11 @@ pub fn checks_equal(a: &CheckInfo, b: &CheckInfo, dialect: SqlDialect) -> bool {
 
 /// Can `dialect` have its **views** edited here?
 ///
-/// All four, now — but they don't get there the same way, which is why the two
+/// All five, now — but they don't get there the same way, which is why the two
 /// predicates below exist rather than a `dialect == Postgres` at each site.
 /// SQLite has neither `CREATE OR REPLACE VIEW` nor a verb that renames a view,
-/// so every edit is a drop and a create; MySQL and PostgreSQL replace in place
-/// and rename with a statement; SQL Server replaces in place
+/// so every edit is a drop and a create; MySQL, PostgreSQL and DuckDB replace
+/// in place and rename with a statement; SQL Server replaces in place
 /// (`CREATE OR ALTER`) and renames by re-creating.
 ///
 /// **The answer is computed, not stated.** This took a `SqlDialect` it discarded
@@ -14374,8 +14386,9 @@ pub fn view_replace_can_refuse(dialect: SqlDialect) -> bool {
 /// `CREATE VIEW v (x, y) AS …` — that the body does not restate
 /// ([`crate::schema::ViewOptions::column_list`])?
 ///
-/// SQLite and SQL Server; the other two bake the names into the body they
-/// report. Where it is kept it is restated, and the editor shows it.
+/// SQLite, SQL Server and DuckDB; MySQL and PostgreSQL bake the names into
+/// the body they report. Where it is kept it is restated, and the editor
+/// shows it.
 pub fn view_keeps_column_list(dialect: SqlDialect) -> bool {
     match dialect {
         SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => true,
@@ -29284,6 +29297,24 @@ mod tests {
             assert!(!supports_change(d, &c), "{c:?}");
         }
         assert!(supports_view_editing(d));
+    }
+
+    /// What dropping a DuckDB view costs is what DuckDB has: a view that
+    /// selects from it is not dropped with it and fails at its next read
+    /// (measured on 2.0.0), and its comment goes. No rules, grants or
+    /// `INSTEAD OF` triggers exist there to name.
+    #[test]
+    fn a_duckdb_view_drop_names_only_what_duckdb_has() {
+        let risks = Change::DropView {
+            materialized: false,
+        }
+        .risks(DuckDb);
+        let all = risks.join(" ");
+        for absent in ["rules", "rants", "INSTEAD OF"] {
+            assert!(!all.contains(absent), "{absent}: {all}");
+        }
+        assert!(all.contains("next read"), "{all}");
+        assert!(all.contains("comment"), "{all}");
     }
 
     /// DuckDB's `CREATE OR REPLACE VIEW` clears the view's comment (measured on

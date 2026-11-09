@@ -109,7 +109,7 @@ DuckDB.
   `ddl-withheld-strands-generated-column`, which no longer names SQLite in `en-GB` now DuckDB
   shares it,
   `backup-kind-duckdb`, `dump-drop-hint-up-front-no-grants`, `write-rollback-transaction`,
-  `routine-editor-returns-placeholder-duckdb` are
+  `routine-editor-returns-placeholder-duckdb`, `ddl-risk-view-cost-duckdb` are
   English in every catalogue but `en-GB`); measure `intel::select_list_subquery_sees_earlier_aliases` (answered `false` unmeasured); the full CI
   bar on every leg, which builds the amalgamation cold (about five minutes on this machine).
 

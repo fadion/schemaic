@@ -2425,6 +2425,7 @@ ddl-risk-view-cost-sqlserver = Les droits accordés dessus, sa description et se
 ddl-risk-view-cost-sqlserver-restored = Les droits accordés dessus et sa description sont supprimés avec elle et ne sont pas rétablis ; ses déclencheurs INSTEAD OF sont aussi supprimés.
 ddl-risk-view-cost-other = Les vues dépendantes, les règles, les droits accordés et ses déclencheurs INSTEAD OF sont supprimés avec elle et ne sont pas rétablis.
 ddl-risk-view-cost-other-restored = Les vues dépendantes, les règles et les droits accordés sont supprimés avec elle et ne sont pas rétablis ; ses déclencheurs INSTEAD OF sont aussi supprimés.
+ddl-risk-view-cost-duckdb = Views that select from it are not dropped with it and fail at their next read; its comment is dropped with it.
 ddl-risk-recreate-view = Recréer { $name } commence par la supprimer. { $cost } { $why ->
         [sqlite] SQLite ne peut pas remplacer une vue sur place : toute modification — renommage compris — passe donc par cette voie.
         [sqlserver] Le sp_rename de SQL Server laisserait la définition stockée de la vue nommer l'ancien nom : un renommage passe donc par cette voie.

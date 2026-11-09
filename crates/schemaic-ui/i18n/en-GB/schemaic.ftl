@@ -2854,6 +2854,7 @@ ddl-risk-view-cost-sqlserver = Grants on it, its description and its INSTEAD OF 
 ddl-risk-view-cost-sqlserver-restored = Grants on it and its description are dropped with it and aren't restored; its INSTEAD OF triggers are dropped too.
 ddl-risk-view-cost-other = Dependent views, rules, grants and its INSTEAD OF triggers are dropped with it and aren't restored.
 ddl-risk-view-cost-other-restored = Dependent views, rules and grants are dropped with it and aren't restored; its INSTEAD OF triggers are dropped too.
+ddl-risk-view-cost-duckdb = Views that select from it are not dropped with it and fail at their next read; its comment is dropped with it.
 # $why is sqlite, sqlserver or postgres: the engine's reason it can't replace in place.
 ddl-risk-recreate-view = Re-creating { $name } drops it first. { $cost } { $why ->
         [sqlite] SQLite has no way to replace a view in place, so every edit to one — a rename included — takes this route.

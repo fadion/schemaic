@@ -2012,6 +2012,7 @@ pub(crate) fn risk_text(risk: &schemaic_core::ddl::Risk) -> String {
         (ViewCostEngine::MsSql, true) => tr!("ddl-risk-view-cost-sqlserver-restored"),
         (ViewCostEngine::Other, false) => tr!("ddl-risk-view-cost-other"),
         (ViewCostEngine::Other, true) => tr!("ddl-risk-view-cost-other-restored"),
+        (ViewCostEngine::DuckDb, _) => tr!("ddl-risk-view-cost-duckdb"),
     };
     match risk {
         R::RebuildTable { name, tsql } => tr!(
@@ -3139,6 +3140,7 @@ mod tests {
                 ViewCostEngine::Sqlite,
                 ViewCostEngine::MsSql,
                 ViewCostEngine::Other,
+                ViewCostEngine::DuckDb,
             ] {
                 let cost = ViewCost {
                     engine,
