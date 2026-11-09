@@ -96,8 +96,14 @@ DuckDB.
     through the interrupt handle. `commit_writes`/`refetch_rows`/`fetch_blob` in `session.rs`
     need DuckDB arms, and the write nests in `SAVEPOINT` (`TxScope::Savepoint`) — which **DuckDB
     does not have** (2.0: a parser error), so a failed grid commit inside a Manual transaction
-    cannot be undone alone: decide with the user whether it aborts the whole transaction (as a
-    failed statement already does there) or the commit is refused inside one.
+    cannot be undone alone.
+  - **Decided — a failed grid commit in a Manual tab aborts the whole transaction**, as a failed
+    statement already does there (`tx_engine_of` maps DuckDB to PostgreSQL's model). The grid
+    commit is not refused inside a transaction. What follows from it: the DuckDB arm of
+    `session::commit_writes` runs the batch with no savepoint around it, and its failure has to
+    be reported as the *transaction's* loss, never as "rolled back these edits" — the earlier
+    statements of the tab's transaction are gone too, and `Rollback::note` must say so rather than
+    claim only the batch was undone. Test that wording against a real abort.
   - **The table designer and the view and macro editors.** `ddl::duckdb_supports` refuses every
     change today. **Trap:** `schema.rs`'s and `ddl.rs`'s DDL emitters branch on
     `dialect == Postgres` in many places, so DuckDB falls onto the MySQL shape wherever a `pg`
