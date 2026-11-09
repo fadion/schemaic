@@ -9,18 +9,21 @@ menus ask it per object, and each **computes** its answer out of `supports_chang
 stating it: a predicate that discards its `SqlDialect` and returns `true` is the constant the
 *"ask a capability"* rule exists to prevent, wearing the name of the fix for it, and it answers
 for a fourth engine as confidently as for these three. **DuckDB is the engine that computation
-answers no for**, and without an edit to any of them: `supports_change` sends it to
-`duckdb_supports`, which refuses every change until the roadmap's later DuckDB phase writes and
-runs each one — DuckDB's DDL is close to PostgreSQL's but not the same (no `ADD CONSTRAINT` for a
-key or a foreign key once a table exists, no index rename, no `ALTER INDEX`, a table something
-depends on cannot be renamed or retyped) — so the designer, the view, trigger and routine
-editors and *Apply* are all off on a DuckDB connection because every `supports_*` editing gate
-computes from it. `emit`'s DuckDB arm is `emit_postgres`, the closest grammar and unreachable
-while no plan can hold a DuckDB change. Two more join them.
+answers per object**, and without an edit to any of them: `supports_change` sends it to
+`duckdb_supports`, which admits a table's own changes — in place where DuckDB's `ALTER TABLE`
+can, by a rebuild where it cannot (`duckdb_rebuild_sql`, below) — and refuses every view, trigger
+and macro change until the roadmap's later DuckDB phase writes and runs those. DuckDB's DDL is
+close to PostgreSQL's but not the same (no `ADD CONSTRAINT` for a key or a foreign key once a
+table exists, no index rename, no `ALTER INDEX`, a table something depends on cannot be renamed
+or retyped), so the designer — **Edit table**, **Edit column**, the key rows' edit entries and,
+through `CreateTable`, a new table — is on for a DuckDB connection, while the view, trigger and
+routine editors and *Apply* stay off, each because its `supports_*` gate computes from the same
+table. `emit`'s DuckDB arm is `emit_duckdb`, below with the rebuild. Two more join them.
 `supports_table_design` is what the tree's **Edit table**, **Edit column** and **Edit index**
 entries ask — three literal `true`s until it existed — and its probe is a column retype, since
 that is the designer's own edit: expressible in place on MySQL, PostgreSQL and SQL Server
-(T-SQL's `ALTER COLUMN`, `emit_mssql`), reached through the rebuild on SQLite, and either route
+(T-SQL's `ALTER COLUMN`, `emit_mssql`), reached through the rebuild on SQLite, either way on
+DuckDB as the table in front of it allows (`alters_in_place`, below), and either route
 counts (`table_design_is_offered_exactly_where_a_retype_emits`, over `SqlDialect::ALL`). `supports_column_reorder` is the one where the
 engines genuinely disagree: MySQL places a column with `AFTER`, SQLite is created in the draft's
 order by the rebuild it is already doing, SQL Server the same way through its own rebuild
@@ -64,7 +67,14 @@ dropped. It was false on SQL Server too until the emitter wrote that engine's co
 are the `MS_Description` extended property — a statement of its own, `TsqlComment`, under
 `mssql.rs`. `identity_wording(dialect)` is the key toggle's label and
 hint, naming the keyword `definition_sql` writes — it read *Auto-increment (AUTO_INCREMENT)* on
-SQL Server. `supports_index_prefix(dialect)` is MySQL's alone, and the index key hint names the
+SQL Server. On DuckDB it reads *Sequence default*, because there the counter **is** the default:
+DuckDB has no identity or `AUTO_INCREMENT`, the reader marks a column auto-numbered by its
+`DEFAULT nextval(…)`, and `counter_is_a_default(dialect)` — DuckDB's alone — has `definition_sql`
+restate that default and write no counter keyword (`AUTO_INCREMENT` there is a parse error, and
+dropping the default would stop the counting). A draft column ticked with no default behind it
+would be a column that never counts, so `TableDraft::problems` refuses it as
+`TableProblem::SequenceNoDefault` (`a_duckdb_counter_needs_a_default_to_count_from`,
+`a_duckdb_column_restates_its_sequence_and_no_mysql_attribute`). `supports_index_prefix(dialect)` is MySQL's alone, and the index key hint names the
 `bio(20)` prefix syntax only there; it named it on every engine but PostgreSQL.
 `supports_partial_index(dialect)` is true on PostgreSQL, SQLite and SQL Server — each a partial
 (or filtered) index whose `WHERE` `create_index_sql` writes and whose introspection reads the
@@ -614,7 +624,9 @@ name (*near "deferrable": syntax error*), so the only way it reaches code is as 
 `Change::RebuildTable(Box<Rebuild>)` is how it reaches a plan: `diff` inserts one at the
 **front** of the set the moment that set holds a change SQLite has no statement of its own for,
 and that one change performs the whole set. Where it does so is `rebuilds_tables(dialect)` — an
-exhaustive `match`, true on SQLite and SQL Server (`tsql_rebuild_sql`, below), false on MySQL
+exhaustive `match`, true on SQLite, SQL Server (`tsql_rebuild_sql`, below) and DuckDB
+(`duckdb_rebuild_sql`, below, which also rebuilds where `alters_in_place` says the table in front
+of a change refuses it), false on MySQL
 and PostgreSQL, which alter in place and whose refusals a rebuild would not make possible — and
 it replaced the literal `dialect == SqlDialect::Sqlite` the insertion was spelled as. It sits *beside* the changes it performs rather than
 instead of them, so the preview still lists the user's edits in their own terms and one line
@@ -970,6 +982,64 @@ S3.2-L5-03 found broken. The unit pins are
 `a_sql_server_rebuild_refuses_what_it_cannot_put_back` and
 `the_rebuild_guard_refuses_what_stands_on_the_table_that_it_would_drop`; the live ones are
 under `mssql.rs`.
+**DuckDB rebuilds too, through `duckdb_rebuild_sql(current, draft)`, and decides it on more than
+the change** — every engine fact here measured on DuckDB 2.0.0, the bundled engine. Its `ALTER
+TABLE` is PostgreSQL's in outline and far narrower. `duckdb_supports` admits a table's create,
+drop, truncate and rename, a dropped column, an index made or dropped that backs no constraint,
+a column added at the end with no key, no generated expression and no counter without a default
+behind it, the table's comment, and an `AlterColumn` whose every difference is something `ALTER
+COLUMN` writes — the name, type, nullability, default, comment — asked of `columns_equal`, the
+comparison that raised the change, as `tsql_supports` asks it. It refuses, and so sends to the
+rebuild, a check, a foreign key or a primary key added to a table that exists and any constraint
+dropped (*No support for that ALTER TABLE option*), a column's generated expression, collation
+or counter changed, and an index renamed, there being no `ALTER INDEX`. **That is half the
+decision; the other half is the table's.** DuckDB's `ALTER` refuses to rename, retype or tighten
+a column, drop one, or rename the table once anything depends on the table — an index, a key, a
+check, a generated column, another table's foreign key (*Cannot alter entry … because there are
+entries that depend on it*, and its siblings: an index depending on a column after it, a type
+change under a check, a unique constraint, a key or a generated column). `alters_in_place(dialect,
+current, changes)` is that question, and `diff` asks it beside `supports_change`, so on DuckDB a
+table with any index, key, check, generated column or inbound key takes the rebuild for those
+structural changes, while adding a column, setting a default or a comment, and making or
+dropping an index stay statements of their own. A plan that makes an index and renames the
+table is rebuilt as well, the rename meeting the index the same plan made. Every other engine
+answers `true`: whether it can perform a change does not depend on what hangs off the table.
+**Dropping the index first is no way round it**, which is the shortcut a future editor will
+reach for: inside one transaction the dependency outlives its `DROP INDEX`. Where nothing is
+rebuilt, `emit_duckdb` writes `emit_postgres`'s statements over the admitted changes alone —
+filtered, as SQLite's are, so a gate that drifts open shows an empty preview rather than handing
+the engine a statement it refuses half-way — each clause its own `ALTER TABLE`, DuckDB's taking
+one action (*Only one ALTER command per statement is supported*); `alter_takes_many_actions` is
+that question, false on SQLite too. **The rebuild is five steps**, inside `run_ddl`'s one
+transaction so a failure anywhere leaves the original (and an engine message naming the
+working table has the name taken back out by `unshadow`, as on SQLite):
+`CREATE TABLE <name>_schemaic_rebuild`
+with the draft's columns, primary key, unique constraints, foreign keys and checks, the checks
+repointed across column renames as SQLite's rebuild repoints them; `INSERT … SELECT` from the
+original by each draft column's `original`, `CAST` where the type changed, a new column left to
+its default and a generated column never copied, DuckDB refusing a value for one; `DROP TABLE`
+of the original; `ALTER TABLE … RENAME TO` the **draft's** name, so a table rename is inside the
+rebuild as on SQL Server; then the indexes and the table's and columns' `COMMENT ON` — the
+indexes **after** the rename, an index's name living in the schema, where the old table's are
+gone only once it is. A view over the table survives, DuckDB binding a view's query when it is
+read rather than when it is made. **A unique constraint goes in the table body, never as a
+`CREATE UNIQUE INDEX`**: `unique_constraint_is_inline(dialect, ix)`, which `create_table_sql`
+asks — SQLite's constraint index and every DuckDB unique constraint — because made the other way
+it is a catalogue index, and the table it sits on then refuses every later `ALTER` above.
+**What the rebuild cannot do is refused up front**, in the rebuild branch's DuckDB arm.
+`duckdb_rebuild_refusals` withholds a plan whose table another table's foreign key references
+(`Withheld::DuckDbReferenced { table, by }`, read off `TableInfo::referenced_by`, under
+`schema.rs`): `DROP TABLE` refuses such a table (*Could not drop the table because this table is
+main key table of the table …*), and with no `ADD FOREIGN KEY` the key cannot be dropped and put
+back around the copy as SQL Server's rebuild does it; a self-reference goes down with the table
+and comes back with it, so it is not counted. And `rebuild_strands_a_generated_column`, which
+takes the dialect now, refuses renaming or dropping a column a generated column reads, whose
+`CREATE` fails as SQLite's does (*Column "qty" referenced by generated column does not exist*).
+The risk line is the non-T-SQL one (`Risk::RebuildTable { tsql: false }`). The unit pins are
+`duckdb_admits_its_own_statements_and_rebuilds_the_rest`,
+`duckdb_alters_in_place_only_where_nothing_depends_on_the_table` and
+`duckdb_will_not_rebuild_a_referenced_table`; the ones that run each plan on in-memory DuckDB
+and read the table back are under `duckdb.rs`.
 `TableDraft` (the desired table; column/index/FK
 entries each carry the name they had on the server, which is what tells a *rename*
 from a drop-plus-add) → `diff(current, draft, dialect) -> ChangeSet` → `emit()`.

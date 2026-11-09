@@ -836,7 +836,7 @@
     joins them, and counts them for *both* or *all*. `TableDraft::problems(dialect)` answers
     `TableProblem`, a variant per refusal carrying the draft's own names (`index`, `column`, `fk`,
     a check's `name`, an XML index's `parent`; `StrictType` the `column` and its `data_type`), SQL
-    Server's XML, spatial and columnstore rules among them. Its `ClusterClash { key, indexes }`
+    Server's XML, spatial and columnstore rules among them, and DuckDB's `SequenceNoDefault`. Its `ClusterClash { key, indexes }`
     keeps what clusters as a flag and a list, because core's English builds the sentence's subject
     from them (*the primary key and index a and index b*): the interface builds the same from
     `table-problem-cluster-key` and `-cluster-index`, joins them in code with a spaced
@@ -950,7 +950,9 @@
     `Change(ChangeLine)` for a change the engine has no statement for, said as its change line
     (where `unsupported` used to read `Change::summary`); `UnreplayableRename`, `NumberedGroup` and
     `LossyViewIndexes { created }`; SQL Server's rebuild refusals `TsqlLossyIndex`,
-    `TsqlEncryptedTrigger`, `TsqlSignedTrigger` and `TsqlRenamedTrigger`; and SQLite's —
+    `TsqlEncryptedTrigger`, `TsqlSignedTrigger` and `TsqlRenamedTrigger`; DuckDB's
+    `DuckDbReferenced { table, by }` (its rebuild also asks `StrandsGeneratedColumn`, below); and
+    SQLite's —
     `PartlyRead { index, why }`, its `PartlyReadWhy` one of `MayName(Moved)`, `NotFound`, `Edited`
     and `NoText`, then `ConditionNamesDropped`, `StrandsTriggers`, `StrandsOtherTrigger { trigger }`
     (`Some((name, table))` where the trigger's text could be read), `StrandsGeneratedColumn`,

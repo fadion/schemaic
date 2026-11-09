@@ -1739,6 +1739,7 @@ table-problem-check-twice = Dy kufizime kontrolli quhen të dy { $name }.
 table-problem-check-no-predicate = Kontrolli { $name } nuk ka kusht.
 table-problem-without-rowid-no-key = Një tabelë WITHOUT ROWID ka nevojë për një çelës primar.
 table-problem-strict-type = Tabelat STRICT pranojnë vetëm INT, INTEGER, REAL, TEXT, BLOB ose ANY — { $column } është { $data_type }.
+table-problem-sequence-no-default = { $column } counts from a sequence, so its default must name one — nextval('sequence').
 designer-hint-unindexed-fk = Çelësi i jashtëm { $fk } nuk ka indeks që fillon me kolonat e tij, kështu një fshirje ose përditësim çelësi në tabelën që ai i referohet e skanon këtë.
 designer-no-index = Asnjë indeks i përzgjedhur. Çelësi primar caktohet te kolonat.
 designer-columns = Kolonat
@@ -2585,6 +2586,7 @@ ddl-withheld-tsql-lossy-index = Rindërtimi i { $table } do të fshinte indeksin
 ddl-withheld-tsql-encrypted-trigger = Rindërtimi i { $table } do të fshinte trigger-in { $trigger }: teksti i tij është i shifruar
 ddl-withheld-tsql-signed-trigger = Rindërtimi i { $table } do të hiqte nënshkrimin e trigger-it { $trigger }, i cili nuk mund të rikthehet pa çelësin privat të certifikatës
 ddl-withheld-tsql-renamed-trigger = Rindërtimi i { $table } me një emër të ri do ta linte trigger-in { $trigger } duke emërtuar emrin e vjetër
+ddl-withheld-duckdb-referenced = { $table } can't be rebuilt while { $by } has a foreign key referencing it — DuckDB neither drops a referenced table nor adds a foreign key back afterwards
 ddl-withheld-partly-read = Indeksi { $index } u lexua vetëm pjesërisht — SQLite e mban kushtin e një indeksi të pjesshëm, dhe një çelës me shprehje, vetëm në tekstin CREATE të vetë indeksit{ $why ->
         [may-name] , dhe ai tekst mund të emërtojë { $moved }. Fshijeni indeksin për të vazhduar pa të.
         [not-found] , kështu nuk mund të krijohet nga ajo që u lexua. Fshijeni indeksin për të vazhduar pa të.

@@ -2687,7 +2687,8 @@ pub(crate) fn context_menu_overlay(ui: Ui) -> impl IntoView {
                         // asks `ddl::supports_table_design` and its siblings)
                         // rather than dimmed: "not supported" and "not here" are
                         // different answers, and dimming gives the second one.
-                        // All three engines can, SQLite by rebuilding the table.
+                        // Every engine can, SQLite, SQL Server and DuckDB by
+                        // rebuilding the table where `ALTER` cannot.
                         if offers.edit {
                             let ui = import_ui.clone();
                             let (db, ns, tbl) = (database.clone(), schema.clone(), table.clone());

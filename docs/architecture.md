@@ -17,9 +17,9 @@ created and edited in the object editor, dropped from their rows and compared. W
 yet is named rather than left to a label, under `db::mssql`; the last index kinds on that list, a
 selective XML index and an ordered columnstore one, are read, restated and authored now.
 **DuckDB is a fifth, embedded like SQLite and not yet a full one**: it connects to a file, reads,
-introspects, runs scripts and DDL plans, shows a plan and backs the file up, while grid
-write-back, import, dumps, the designer and the object editors and Manual mode are refused until
-the roadmap's later phase — `db::duckdb` names each.
+introspects, runs scripts and DDL plans, shows a plan, backs the file up, writes grid edits back,
+imports, dumps, holds a Manual tab's transaction and designs tables, while the view and macro
+editors are refused until the roadmap's later phase — `db::duckdb` names each.
 
 This is the project's reference document: the crate/module map, the architecture invariants, the
 UI conventions, and the Floem hazards each subsystem is built on. `AGENTS.md` at the repo root

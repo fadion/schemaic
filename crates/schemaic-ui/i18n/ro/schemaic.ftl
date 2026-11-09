@@ -1780,6 +1780,7 @@ table-problem-check-twice = Două constrângeri de verificare se numesc amândou
 table-problem-check-no-predicate = Verificarea { $name } nu are predicat.
 table-problem-without-rowid-no-key = Un tabel WITHOUT ROWID are nevoie de o cheie primară.
 table-problem-strict-type = Tabelele STRICT acceptă doar INT, INTEGER, REAL, TEXT, BLOB sau ANY — { $column } este { $data_type }.
+table-problem-sequence-no-default = { $column } counts from a sequence, so its default must name one — nextval('sequence').
 designer-hint-unindexed-fk = Cheia străină { $fk } nu are un index care începe cu coloanele ei, așa că o ștergere sau o actualizare de cheie în tabelul la care face referire scanează acest tabel.
 designer-no-index = Niciun index selectat. Cheia primară se află pe coloane.
 designer-columns = Coloane
@@ -2660,6 +2661,7 @@ ddl-withheld-tsql-lossy-index = Reconstruirea { $table } ar elimina indexul { $i
 ddl-withheld-tsql-encrypted-trigger = Reconstruirea { $table } ar elimina triggerul { $trigger }: textul lui este criptat
 ddl-withheld-tsql-signed-trigger = Reconstruirea { $table } ar elimina semnătura de pe triggerul { $trigger }, care nu poate fi pusă la loc fără cheia privată a certificatului
 ddl-withheld-tsql-renamed-trigger = Reconstruirea { $table } sub un nume nou ar lăsa triggerul { $trigger } cu numele vechi
+ddl-withheld-duckdb-referenced = { $table } can't be rebuilt while { $by } has a foreign key referencing it — DuckDB neither drops a referenced table nor adds a foreign key back afterwards
 ddl-withheld-partly-read = Indexul { $index } a fost citit doar parțial — SQLite păstrează predicatul unui index parțial și o cheie de tip expresie doar în textul CREATE propriu al indexului{ $why ->
         [may-name] , iar acel text poate numi { $moved }. Elimină indexul pentru a continua fără el.
         [not-found] , așa că nu poate fi creat din ce s-a citit. Elimină indexul pentru a continua fără el.

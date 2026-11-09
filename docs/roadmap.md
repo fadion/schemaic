@@ -67,8 +67,9 @@ Phase 1 has landed: the engine reads, runs scripts and DDL plans, introspects, e
 backs up and opens its CLI, behind its own read-only gate (`docs/architecture/db/duckdb.md`).
 Phase 2's grid write-back has landed too, on provenance read from the statement (`rowid` is never
 a key, because a checkpoint renumbers it), and so have import, the `.sql` dump and Manual tabs (a
-failed grid commit there rolls the whole transaction back, DuckDB having no savepoint). What is
-left is below. ClickHouse would come after
+failed grid commit there rolls the whole transaction back, DuckDB having no savepoint), and so
+has the table designer — in place where DuckDB's `ALTER TABLE` can, by a rebuild where it cannot
+(`docs/architecture/db/duckdb.md`). What is left is below. ClickHouse would come after
 DuckDB.
 
 - **Decided — the unattended paths cannot read files:** done in phase 1 (`Db::sealed`, called by
@@ -78,21 +79,21 @@ DuckDB.
   stated in the invariants. A Manual tab's session holds the instance — and with it the file's
   lock — for as long as the tab stays in Manual mode, and the connection form's hint says so.
 - **Phase 2 — the rest of the writes:**
-  - **The table designer and the view and macro editors.** `ddl::duckdb_supports` refuses every
-    change today. **Trap:** `schema.rs`'s and `ddl.rs`'s DDL emitters branch on
-    `dialect == Postgres` in many places, so DuckDB falls onto the MySQL shape wherever a `pg`
-    flag decides — audit each one, turning it into a capability, before turning a change on. DuckDB
-    also has no `ALTER TABLE … ADD CONSTRAINT` for a key or a foreign key, no index rename, and
-    refuses to rename or retype a column anything depends on, so several changes need a rebuild.
+  - **The view and macro editors.** `ddl::duckdb_supports` refuses every view and routine
+    change today. DuckDB has `CREATE OR REPLACE VIEW`, `ALTER VIEW … RENAME TO`,
+    `CREATE OR REPLACE MACRO`, `DROP MACRO [TABLE]` and `COMMENT ON VIEW`/`MACRO [TABLE]`, and no
+    `ALTER MACRO` (measured on 2.0.0), so a renamed macro is a drop and a create. **Trap:**
+    `create_view_sql` and the routine emitter branch on `dialect == Postgres`/`MySql` flags — audit
+    each before turning a change on, as `definition_sql` was.
   - **Open data file:** a CSV, Parquet or JSON file opened in a throwaway in-memory session —
     which the test-only `memory:` target in `db::duckdb` already models. **Trap:** an in-memory
     instance is its data, so it must be held for as long as the session is open, not closed with
     its last operation as a file's is.
   - **Schema compare** between two DuckDB files.
 - **Loose ends:** the read-only half of the seal (`AccessMode::ReadOnly`) has no test, the
-  suites' in-memory instance having no file to open read-only; and *Compare with* is offered on a
-  DuckDB connection with every change refused behind it (*Copy to* is already hidden, through
-  `ddl::supports_table_design`) — it clears itself when the designer lands. A file named
+  suites' in-memory instance having no file to open read-only. The designer offers a column
+  collation, which `ALTER` refuses to change and the rebuild writes, but the reader does not read
+  one back, so a collation set there shows as an edit again on the next open. A file named
   `main.duckdb` makes `main.t` both a schema and a catalog, and its results are not attributed;
   accept the reading where both resolve to the same table, if anyone hits it. The dump carries no
   user type (`CREATE TYPE … AS ENUM`, a `STRUCT` alias): `duckdb_tables().sql` inlines it into each
@@ -103,6 +104,9 @@ DuckDB.
   since there is no savepoint to fence it in; reading such a cell on a fresh connection would see
   none of the tab's uncommitted writes, so it is left an honest loss rather than a wrong answer.
 - **Phase 3:** translate the new strings (`db-refused-duckdb-*`, `connections-duckdb-*`,
+  `ddl-withheld-duckdb-referenced`, `table-problem-sequence-no-default`, and retranslate
+  `ddl-withheld-strands-generated-column`, which no longer names SQLite in `en-GB` now DuckDB
+  shares it,
   `backup-kind-duckdb`, `dump-drop-hint-up-front-no-grants`, `write-rollback-transaction` are
   English in every catalogue but `en-GB`); measure `intel::select_list_subquery_sees_earlier_aliases` (answered `false` unmeasured); the full CI
   bar on every leg, which builds the amalgamation cold (about five minutes on this machine).

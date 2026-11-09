@@ -1364,8 +1364,9 @@ fn identity_wording(dialect: SqlDialect) -> (String, String) {
         SqlDialect::MySql | SqlDialect::Sqlite => {
             (tr!("designer-auto-increment"), "AUTO_INCREMENT")
         }
-        // DuckDB counts a key from a sequence, which its words say; the
-        // designer is not offered on it yet (`ddl::supports_table_design`).
+        // DuckDB counts a key from a sequence, which its words say: the
+        // default is the counter (`ddl::counter_is_a_default`), so the
+        // toggle needs one, and validation says so when it is missing.
         SqlDialect::DuckDb => {
             return (
                 tr!("designer-sequence-default"),
@@ -2726,6 +2727,9 @@ pub(crate) fn table_problem_text(p: &ddl::TableProblem) -> String {
             column = s(column),
             data_type = s(data_type)
         ),
+        P::SequenceNoDefault { column } => {
+            tr!("table-problem-sequence-no-default", column = s(column))
+        }
     }
 }
 
@@ -3187,6 +3191,7 @@ mod word_tests {
                 column: col(),
                 data_type: "VARCHAR(20)".into(),
             },
+            P::SequenceNoDefault { column: col() },
         ];
         for (key, indexes) in [
             (true, vec![ix()]),

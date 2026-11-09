@@ -1736,6 +1736,7 @@ table-problem-check-twice = Две ограничения CHECK носят им�
 table-problem-check-no-predicate = Проверката { $name } няма предикат.
 table-problem-without-rowid-no-key = Таблица WITHOUT ROWID трябва да има първичен ключ.
 table-problem-strict-type = Таблиците STRICT приемат само INT, INTEGER, REAL, TEXT, BLOB или ANY — { $column } е { $data_type }.
+table-problem-sequence-no-default = { $column } counts from a sequence, so its default must name one — nextval('sequence').
 designer-hint-unindexed-fk = Външният ключ { $fk } няма индекс, започващ с колоните му, така че изтриване или промяна на ключ в таблицата, към която сочи, сканира тази.
 designer-no-index = Не е избран индекс. Първичният ключ се задава при колоните.
 designer-columns = Колони
@@ -2582,6 +2583,7 @@ ddl-withheld-tsql-lossy-index = Преизграждането на { $table } �
 ddl-withheld-tsql-encrypted-trigger = Преизграждането на { $table } би премахнало тригера { $trigger }: текстът му е криптиран
 ddl-withheld-tsql-signed-trigger = Преизграждането на { $table } би премахнало подписа на тригера { $trigger }, който не може да бъде възстановен без частния ключ на сертификата
 ddl-withheld-tsql-renamed-trigger = Преизграждането на { $table } под ново име би оставило тригера { $trigger } да посочва старото
+ddl-withheld-duckdb-referenced = { $table } can't be rebuilt while { $by } has a foreign key referencing it — DuckDB neither drops a referenced table nor adds a foreign key back afterwards
 ddl-withheld-partly-read = Индексът { $index } беше прочетен само частично — SQLite пази предиката на частичен индекс и ключ с израз само в собствения CREATE текст на индекса{ $why ->
         [may-name] , а този текст може да посочва { $moved }. Премахнете индекса, за да продължите без него.
         [not-found] , така че не може да бъде създаден от прочетеното. Премахнете индекса, за да продължите без него.

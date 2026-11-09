@@ -47,7 +47,11 @@ nothing said. It is read from `EXTRA` in `db/lib.rs`'s `mysql_column` — the **
 that column answers, beside `auto_increment`, `on update current_timestamp` and
 `stored generated`, and the one that was not being asked — and `definition_sql` writes
 ` INVISIBLE` **last** and on the MySQL family only, since both servers print it at the end of
-the definition and neither PostgreSQL nor SQLite has the concept (`false` on both). The
+the definition and neither PostgreSQL nor SQLite has the concept (`false` on both). That
+"MySQL only", with `ON UPDATE` and the inline `COMMENT`, is asked by name in an exhaustive `match`
+(`mysql_attributes`), not as a `!pg && !sqlite` — the spelling under which DuckDB, the fifth
+engine, was handed an inline `COMMENT '…'` it cannot parse
+(`a_duckdb_column_restates_its_sequence_and_no_mysql_attribute`, under `ddl.rs`). The
 difference from a *switched-off index*, which is answered by marking it `IndexInfo::lossy`, is
 that the model cannot restate the index and can restate the column — so this is a real field and
 the emitter writes the keyword. `IndexColumn` keeps prefix lengths + `DESC`; `ForeignKeyInfo`
@@ -504,13 +508,17 @@ column of `t` that is gone and `other` starts refusing every write. `ddl`'s
 argument against.
 **`TableInfo::referenced_by` is the other engine's version of looking one table over**: the
 foreign keys declared on *other* tables that reference this one, as `InboundForeignKey { schema,
-table, key }`, SQL Server only and empty everywhere else. It exists for `ddl::tsql_rebuild_sql`,
-which drops the table in the middle — a key another table has on it refuses that `DROP TABLE`
-(Msg 3726), so each is dropped first and put back after, pointed at the table as it comes out.
+table, key }`, filled on SQL Server and DuckDB and empty everywhere else. It exists for
+`ddl::tsql_rebuild_sql`, which drops the table in the middle — a key another table has on it
+refuses that `DROP TABLE` (Msg 3726), so each is dropped first and put back after, pointed at the
+table as it comes out. DuckDB's rebuild cannot do that, having no `ADD FOREIGN KEY` to put the key
+back, so there it is what `ddl::duckdb_rebuild_refusals` withholds the plan on, and what
+`ddl::alters_in_place` counts as something depending on the table; `db::duckdb::read_schema`
+calls the linker once the keys are read.
 A self-reference is not in it: that key is the table's own `foreign_keys` and goes down with it.
 `link_inbound_foreign_keys(&mut [TableInfo])` fills it from every table's `foreign_keys`,
 matching `ref_schema`/`ref_table` exactly and taking a key that names no schema to mean its own
-table's; `db::mssql::collect_schema` calls it last, **after** the keys' actions are filled,
+table's; `db::mssql::collect_schema` calls it last on SQL Server, **after** the keys' actions are filled,
 because the rebuild puts the other table's key back as it was, `ON DELETE` and all
 (`inbound_foreign_keys_land_on_the_table_they_reference`). SQLite's reader sets it empty: its
 rebuild drops nothing another table's key points at without `foreign_keys = OFF`.

@@ -118,7 +118,12 @@ foreign-key action dropdown lists
 (`emit_mssql`'s phases are under `mssql.rs`); the reorder arrows appear there too, and an
 identity toggled on an existing column is written, since `supports_column_reorder` says yes now
 and both reach the table rebuild (`ddl::tsql_rebuild_sql`, under `ddl.rs`) — until it existed
-the arrows were off and the identity toggle was withheld in the preview. The Primary key toggle still leaves Nullable as it was, which
+the arrows were off and the identity toggle was withheld in the preview. **It opens on DuckDB
+as well**, the same predicate having gone true there (`ddl::duckdb_supports` and the rebuild,
+under `ddl.rs`); no reorder arrows, `supports_column_reorder` answering no, and the key toggle
+reads *Sequence default* — this file's `identity_wording` DuckDB arm, from `designer-sequence-*`
+— because DuckDB's counter is the column's `DEFAULT nextval(…)` (`ddl::counter_is_a_default`),
+and a tick with no default is refused as `TableProblem::SequenceNoDefault`. The Primary key toggle still leaves Nullable as it was, which
 SQL Server would refuse a key over (Msg 8111); `diff` makes the key's columns `NOT NULL` there
 instead (`ddl::primary_key_implies_not_null`, under `mssql.rs`). A table created from a database row is
 written `[dbo].[t]`: `default_schema` asks `schema::default_namespace` — `public`, `dbo`, or

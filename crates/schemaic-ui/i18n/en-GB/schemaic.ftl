@@ -2022,6 +2022,7 @@ table-problem-check-no-predicate = Check { $name } has no predicate.
 table-problem-without-rowid-no-key = A WITHOUT ROWID table needs a primary key.
 # SQLite: $column of a STRICT table has $data_type, which it doesn't take.
 table-problem-strict-type = STRICT tables take only INT, INTEGER, REAL, TEXT, BLOB or ANY — { $column } is { $data_type }.
+table-problem-sequence-no-default = { $column } counts from a sequence, so its default must name one — nextval('sequence').
 designer-hint-unindexed-fk = Foreign key { $fk } has no index starting with its columns, so a delete or key update on the table it references scans this one.
 designer-no-index = No index selected. The primary key lives on the columns.
 designer-columns = Columns
@@ -3034,6 +3035,8 @@ ddl-withheld-tsql-lossy-index = Rebuilding { $table } would drop the index { $in
 ddl-withheld-tsql-encrypted-trigger = Rebuilding { $table } would drop the trigger { $trigger }: its text is encrypted
 ddl-withheld-tsql-signed-trigger = Rebuilding { $table } would drop the signature on the trigger { $trigger }, which can't be put back without the certificate's private key
 ddl-withheld-tsql-renamed-trigger = Rebuilding { $table } under a new name would leave the trigger { $trigger } naming the old one
+# DuckDB's rebuild of $table: $by has a foreign key referencing it.
+ddl-withheld-duckdb-referenced = { $table } can't be rebuilt while { $by } has a foreign key referencing it — DuckDB neither drops a referenced table nor adds a foreign key back afterwards
 # An index SQLite's pragmas only partly read; $why is may-name (with $moved a
 # ddl-moved-*), not-found, edited or no-text.
 ddl-withheld-partly-read = Index { $index } was only partly read — SQLite keeps a partial index's predicate, and an expression key, only in the index's own CREATE text{ $why ->
@@ -3051,7 +3054,7 @@ ddl-withheld-strands-triggers = This table has { $count ->
 ddl-withheld-strands-other-trigger = { $owner } names { $moved }. A rebuild renames this table underneath that trigger and leaves its SQL exactly as it was, so the trigger would go on naming a column that is gone — SQLite accepts such a trigger and then refuses every write to *that* table. Drop or edit the trigger first, or rename the column with no other change so SQLite's own ALTER TABLE can rewrite it.
 ddl-withheld-trigger-on = Trigger { $name } on { $table }
 ddl-withheld-some-trigger = A trigger on another table
-ddl-withheld-strands-generated-column = Generated column { $column } computes from { $moved }. A rebuild writes the table from the model, and nothing rewrites that expression — SQLite refuses the new table with "no such column" and the whole plan rolls back. Edit or remove { $column } first.
+ddl-withheld-strands-generated-column = Generated column { $column } computes from { $moved }. A rebuild writes the table from the model, and nothing rewrites that expression — the engine refuses the new table over the missing column and the whole plan rolls back. Edit or remove { $column } first.
 # $clauses is the ddl-sqlite-clause-* the declaration carries, the last joined by
 # ddl-sqlite-clauses.
 ddl-withheld-cannot-restate = This table's declaration carries { $clauses }, which Schemaic's model has no field for. A rebuild writes the table back from that model, so the clause would be gone from a table that still looked right — and every write depending on it would behave differently from then on. Change this table with a script instead (Copy DDL is the start of one), or take the clause off first.

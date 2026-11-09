@@ -4,8 +4,8 @@
 with the `parquet` and `json` extensions linked statically), phase 1 and the first part of phase 2
 of the roadmap's *DuckDB as a fifth engine*: it connects, reads, introspects, validates, runs
 batches, scripts and DDL plans, plans a query, lists its settings, backs a file up, writes grid
-edits back, imports a file into a table, dumps to a `.sql` file and holds a Manual tab's
-transaction. It is **embedded, as SQLite is**, so most
+edits back, imports a file into a table, dumps to a `.sql` file, holds a Manual tab's
+transaction and designs tables. It is **embedded, as SQLite is**, so most
 of `sqlite.rs`'s first paragraph holds here unchanged — there is no server, a connection is a
 file (`Db::file`, `connection::is_file_backed`), host/port/user/password/SSH are inert, the one
 database is the file's own catalog (`current_database()`, named after the file), and the driver
@@ -106,7 +106,16 @@ because `duckdb_columns()` reports its expression as the column's *default* (mea
 `CAST((a * 2) AS INTEGER)`) and says nothing else; read as given, it was an ordinary column with a
 default. It arrives as `generated: Some(expr)` with `default: None`, which is what has `edit.rs`
 keep it read-only, as on every engine — `table_facts`, provenance's own column read, makes the same
-join for the same reason. **Macros are DuckDB's user functions and arrive as `RoutineInfo`** — one per name,
+join for the same reason. **The cast round it comes off** (`generated_expression`): DuckDB wraps
+the expression in a cast to the column's type each time it stores one, so restating the text it
+hands back wraps it again — a designer rebuild turned `CAST((a * 2) AS INTEGER)` into
+`CAST(CAST((a * 2) AS INTEGER) AS INTEGER)`, which the designer then read as an edit nobody made.
+Only a cast that spans the whole text and names exactly the column's type is dropped, the scan
+for its closing bracket over `sql::skip_noncode`; anything else is kept as read
+(`a_generated_expression_loses_only_the_cast_duckdb_added`). **Which tables other tables' keys
+point at is linked after the keys are read** (`schema::link_inbound_foreign_keys`, so
+`TableInfo::referenced_by` is filled here as on SQL Server), since the designer's rebuild cannot
+drop such a table and says so. **Macros are DuckDB's user functions and arrive as `RoutineInfo`** — one per name,
 an overload being the same macro to `DROP MACRO`, a table macro's `returns` reading `TABLE`.
 `body` is `duckdb_functions().macro_definition`, the expression or query alone, and a later
 overload is folded into it as `…, (a, b) AS expr` — the form one `CREATE MACRO` declares them all
@@ -131,8 +140,10 @@ running through the connection's interrupt handle, as `sqlite::run_ddl`'s does. 
 token only before it started, which would have had a plan's one long statement hold the preview
 modal open for its whole length with the button reading *Stop*. An interrupt surfaces as an
 ordinary error, so the token is what maps it to `DdlCause::Cancelled`
-(`stop_interrupts_a_running_ddl_statement`, a `CREATE TABLE … AS` counting 10^11 rows). No plan
-from the editors reaches it yet, since `ddl::duckdb_supports` refuses every change. `run_script`
+(`stop_interrupts_a_running_ddl_statement`, a `CREATE TABLE … AS` counting 10^11 rows). The
+table designer's plans reach it now — `ALTER TABLE` one action at a time where the table allows,
+the rebuild where it does not (below) — and nothing from the view or routine editors does yet.
+`run_script`
 is one connection for the whole file and wraps nothing, with SQLite's runtime-flavour choice between
 `block_in_place` and `spawn_blocking`. **A backup is `ATTACH` + `COPY FROM DATABASE` + `DETACH`**
 (`backup_to`, behind `Db::backup_to_file`): every schema, table, view, sequence and macro with its
@@ -286,8 +297,25 @@ an aborted transaction in PostgreSQL's model, **which is the truth here**: an in
 DuckDB's transaction as PostgreSQL's cancel does, the next statement answering *Current
 transaction is aborted* (measured on 2.0; `stop_interrupts_a_manual_tabs_statement` holds Commit to
 reporting the abort).
-**What is not written yet is refused, never faked**: `ddl::duckdb_supports` keeps the designer and
-the view, trigger and routine editors off.
+**The table designer is on, through `core::ddl`'s DuckDB half** — `duckdb_supports`,
+`alters_in_place`, `emit_duckdb` and `duckdb_rebuild_sql`, whose entry under `ddl.rs` has the
+measured refusals behind each. What decides most plans is not the change but the table:
+DuckDB's `ALTER` refuses to rename, retype or tighten a column, drop one or rename the table once
+an index, a key, a check, a generated column or another table's key depends on it, and inside a
+transaction a `DROP INDEX` does not release that, so such a table is rebuilt — made under a
+working name, filled, the original dropped, renamed into place, its indexes and comments after.
+A table another table's key references is refused rather than rebuilt (`DROP TABLE` refuses it,
+and there is no `ADD FOREIGN KEY` to put the key back). The reader's half is pinned by
+`a_read_table_round_trips_to_no_change` — every kind of column and constraint it models diffs
+against its own draft to nothing — and each plan shape is run end to end here, through `diff` (or
+`create`) → `emit` → `run_ddl`, the table read back and diffed against the draft until nothing is
+left between them: `a_plain_table_alters_in_place` (no copy, one action per `ALTER TABLE`),
+`a_keyed_table_is_rebuilt_with_its_rows_indexes_and_comments`,
+`constraints_are_added_and_dropped_by_a_rebuild`, `a_referenced_table_is_not_rebuilt`,
+`a_rebuild_keeps_a_generated_column`, `a_sequence_default_survives_a_rebuild` and
+`a_new_table_is_created_as_drawn`.
+**What is not written yet is refused, never faked**: `ddl::duckdb_supports` keeps the view,
+trigger and routine editors off.
 **A missing file is refused, never created** (`open_target`, `DbRefusal::DuckDbMissing`). DuckDB's
 open creates one, which for a database *client* is the wrong default by some distance: a mistyped
 path would open an empty database that looked like it worked. An empty path is `DuckDbNoFile`, and

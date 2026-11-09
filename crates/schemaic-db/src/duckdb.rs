@@ -51,9 +51,12 @@
 //! `rowid` is never a key — a checkpoint renumbers it.
 //!
 //! **What the roadmap's phase 2 has not reached yet**, refused rather than
-//! faked: the designer (`ddl::duckdb_supports`). DDL plans, `.sql` scripts,
-//! imports and the dump run, and a Manual tab holds a connection of its own
-//! ([`Pinned`]) — with the instance, and a file's lock, for as long as it does.
+//! faked: the view and macro editors (`ddl::duckdb_supports`). The table
+//! designer runs — in place where DuckDB's `ALTER TABLE` can, by rebuilding
+//! the table where it cannot (`ddl::duckdb_rebuild_sql`) — as do DDL plans,
+//! `.sql` scripts, imports and the dump, and a Manual tab holds a connection
+//! of its own ([`Pinned`]) — with the instance, and a file's lock, for as long
+//! as it does.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -1316,15 +1319,16 @@ fn read_schema(conn: &DuckConn) -> Result<DbSchema, DbError> {
         };
         let default: Option<String> = r.get(5).map_err(query_err)?;
         let generated: bool = r.get(7).map_err(query_err)?;
+        let type_name: String = r.get(3).map_err(query_err)?;
         let (default, generated) = if generated {
-            (None, default)
+            (None, default.map(|g| generated_expression(&g, &type_name)))
         } else {
             (default, None)
         };
         tables[k].columns.push(ColumnInfo {
             generated,
             name: r.get(2).map_err(query_err)?,
-            type_name: r.get(3).map_err(query_err)?,
+            type_name,
             nullable: r.get(4).map_err(query_err)?,
             // A key counted from a sequence is DuckDB's auto-number.
             auto_increment: default
@@ -1417,6 +1421,10 @@ fn read_schema(conn: &DuckConn) -> Result<DbSchema, DbError> {
     }
     drop(rows);
     drop(stmt);
+
+    // Which tables other tables' keys point at: the designer's rebuild cannot
+    // drop such a table (`ddl::duckdb_rebuild_sql`), and says so.
+    schemaic_core::schema::link_inbound_foreign_keys(&mut tables);
 
     // Indexes made by `CREATE INDEX`, each with its statement.
     let mut stmt = conn
@@ -1624,6 +1632,56 @@ fn check_expression(text: &str) -> String {
         .to_string()
 }
 
+/// A generated column's expression as written, from the text DuckDB keeps for
+/// it: `CAST((a * 2) AS INTEGER)` → `(a * 2)` on an `INTEGER` column.
+///
+/// **DuckDB wraps the expression in a cast to the column's type each time it
+/// stores one** (measured: `a * 2` reads back as `CAST((a * 2) AS INTEGER)`),
+/// so restating the text it hands back wraps it again — a rebuild turned it
+/// into `CAST(CAST((a * 2) AS INTEGER) AS INTEGER)`, which the designer then
+/// read as an edit nobody made. The outer cast is dropped only when it spans
+/// the whole text and names exactly the column's type; anything else is kept
+/// as read.
+fn generated_expression(text: &str, column_type: &str) -> String {
+    let t = text.trim();
+    let suffix = format!(" AS {column_type})");
+    let Some(inner) = t
+        .get(..5)
+        .filter(|h| h.eq_ignore_ascii_case("CAST("))
+        .and_then(|_| t.strip_suffix(suffix.as_str()))
+        .map(|x| &x[5..])
+    else {
+        return t.to_string();
+    };
+    // The `(` after `CAST` must close at the very end, not earlier: in
+    // `CAST(a AS INTEGER) + CAST(b AS INTEGER)` the suffix matches and the
+    // first cast closes half-way.
+    let b = inner.as_bytes();
+    let (mut depth, mut i) = (0i32, 0);
+    while i < b.len() {
+        if let Some(next) = schemaic_core::sql::skip_noncode(b, i, D) {
+            i = next;
+            continue;
+        }
+        match b[i] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => {
+                depth -= 1;
+                if depth < 0 {
+                    return t.to_string();
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if depth == 0 {
+        inner.trim().to_string()
+    } else {
+        t.to_string()
+    }
+}
+
 // ── Writing ─────────────────────────────────────────────────────────────────
 
 /// Run a DDL plan in one transaction, all or nothing — DuckDB's DDL is
@@ -1641,8 +1699,15 @@ pub(crate) async fn run_ddl(
     cancel: CancellationToken,
 ) -> Result<(), crate::DdlError> {
     use crate::{DdlCause, DdlError};
+    // **The rebuild's working table is ours, not the user's**: an engine
+    // message naming `t_schemaic_rebuild` names an object that exists only
+    // between two statements of the plan, so the name is taken back out
+    // (`ddl::unshadow`), as `sqlite::run_ddl` does.
     let fail = |at: usize, cause: DdlCause| DdlError {
-        cause,
+        cause: match cause {
+            DdlCause::Server(m) => DdlCause::Server(schemaic_core::ddl::unshadow(&m)),
+            other => other,
+        },
         at,
         applied: 0,
     };
@@ -3859,5 +3924,438 @@ mod tests {
                 "42"
             );
         });
+    }
+
+    // ── The table designer ───────────────────────────────────────────────
+
+    /// The cast DuckDB wraps round a generated expression comes off — and
+    /// only that cast, spanning the whole text and naming the column's type.
+    #[test]
+    fn a_generated_expression_loses_only_the_cast_duckdb_added() {
+        let g = generated_expression;
+        assert_eq!(g("CAST((a * 2) AS INTEGER)", "INTEGER"), "(a * 2)");
+        assert_eq!(
+            g("CAST(CAST(x AS BIGINT) AS INTEGER)", "INTEGER"),
+            "CAST(x AS BIGINT)"
+        );
+        // Another type is not the one DuckDB added.
+        assert_eq!(
+            g("CAST((a * 2) AS BIGINT)", "INTEGER"),
+            "CAST((a * 2) AS BIGINT)"
+        );
+        // Two casts side by side: the first closes half-way.
+        assert_eq!(
+            g("CAST(a AS INTEGER) + CAST(b AS INTEGER)", "INTEGER"),
+            "CAST(a AS INTEGER) + CAST(b AS INTEGER)"
+        );
+        // A bracket inside a string is not a bracket.
+        assert_eq!(
+            g("CAST(concat(a, ')') AS VARCHAR)", "VARCHAR"),
+            "concat(a, ')')"
+        );
+        assert_eq!(g("a + 1", "INTEGER"), "a + 1");
+    }
+
+    /// Every cell of `sql`'s result, as displayed.
+    fn cells(db: &Db, sql: &str) -> Vec<Vec<String>> {
+        let rs = rt().block_on(q(db, sql)).unwrap();
+        (0..rs.row_count())
+            .map(|r| {
+                (0..rs.columns.len())
+                    .map(|c| rs.cell(r, c).unwrap().to_value().display())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// `name` as the reader hands it to the designer.
+    fn table_of(db: &Db, name: &str) -> TableInfo {
+        rt().block_on(fetch_schema(db, CancellationToken::new()))
+            .unwrap()
+            .tables
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is gone"))
+    }
+
+    /// The draft `d` describes, as it will read back once applied: every
+    /// object named as it now is.
+    fn rebased(d: &schemaic_core::ddl::TableDraft) -> schemaic_core::ddl::TableDraft {
+        let mut d = d.clone();
+        d.original = Some(d.name.clone());
+        for c in &mut d.columns {
+            c.original = Some(c.info.name.clone());
+        }
+        for ix in &mut d.indexes {
+            ix.original = Some(ix.info.name.clone());
+        }
+        for fk in &mut d.foreign_keys {
+            fk.original = Some(fk.info.name.clone());
+        }
+        for ck in &mut d.check_constraints {
+            ck.original = Some(ck.info.name.clone());
+        }
+        d
+    }
+
+    /// Plan `edit` of `table` through `diff` → `emit`, as the designer does,
+    /// run it through `run_ddl`, and check the table read back is the one the
+    /// draft described — no change left between the two. Hands back the plan.
+    fn designed(
+        db: &Db,
+        table: &str,
+        edit: impl FnOnce(&mut schemaic_core::ddl::TableDraft),
+    ) -> Vec<String> {
+        use schemaic_core::ddl::{TableDraft, diff};
+        let before = table_of(db, table);
+        let mut draft = TableDraft::from_table(&before);
+        edit(&mut draft);
+        let cs = diff(&before, &draft, SqlDialect::DuckDb);
+        assert!(
+            cs.unsupported().is_empty(),
+            "withheld: {:?}",
+            cs.unsupported()
+        );
+        let stmts = cs.emit();
+        assert!(!stmts.is_empty(), "an edit with nothing to run");
+        rt().block_on(db.run_ddl("", &stmts, CancellationToken::new()))
+            .unwrap_or_else(|e| panic!("{e} — plan {stmts:#?}"));
+        let after = table_of(db, &draft.name);
+        let left = diff(&after, &rebased(&draft), SqlDialect::DuckDb);
+        assert!(
+            left.changes.is_empty(),
+            "the table read back differs from the draft: {:#?}\nplan {stmts:#?}",
+            left.changes
+        );
+        stmts
+    }
+
+    /// A table the reader hands the designer is one the designer leaves
+    /// alone: diffing it against its own draft is empty, for every kind of
+    /// column and constraint the reader models.
+    #[test]
+    fn a_read_table_round_trips_to_no_change() {
+        let db = mem("designer_round_trip");
+        seed(
+            &db,
+            "CREATE SEQUENCE s;
+             CREATE TABLE p(id INTEGER PRIMARY KEY, code VARCHAR UNIQUE);
+             CREATE TABLE t(
+                 id INTEGER DEFAULT nextval('s') PRIMARY KEY,
+                 a INTEGER NOT NULL DEFAULT 7,
+                 b VARCHAR DEFAULT 'x',
+                 c DECIMAL(10, 2) CHECK (c > 0),
+                 d INTEGER GENERATED ALWAYS AS (a * 2),
+                 pid INTEGER REFERENCES p(id),
+                 UNIQUE (a, b));
+             CREATE INDEX t_b ON t(b);
+             COMMENT ON TABLE t IS 'things';
+             COMMENT ON COLUMN t.a IS 'the a';",
+        );
+        for name in ["p", "t"] {
+            let t = table_of(&db, name);
+            let cs = schemaic_core::ddl::diff(
+                &t,
+                &schemaic_core::ddl::TableDraft::from_table(&t),
+                SqlDialect::DuckDb,
+            );
+            assert!(cs.changes.is_empty(), "{name}: {:#?}", cs.changes);
+        }
+    }
+
+    /// A table nothing hangs off alters in place, one statement per change —
+    /// DuckDB's `ALTER TABLE` takes one action — with no copy of the rows.
+    #[test]
+    fn a_plain_table_alters_in_place() {
+        let db = mem("designer_in_place");
+        seed(
+            &db,
+            "CREATE TABLE t(a INTEGER, b VARCHAR, gone INTEGER);
+             INSERT INTO t VALUES (1, '10', 0), (2, '20', 0);",
+        );
+        let plan = designed(&db, "t", |d| {
+            d.name = "t2".into();
+            d.comment = Some("renamed".into());
+            d.rename_column(0, "a2");
+            d.columns[0].info.nullable = false;
+            d.columns[0].info.comment = Some("the a".into());
+            d.columns[1].info.type_name = "INTEGER".into();
+            d.columns[1].info.default = Some("5".into());
+            d.columns.retain(|c| c.info.name != "gone");
+            d.columns
+                .push(schemaic_core::ddl::ColumnDraft::new(ColumnInfo {
+                    name: "n".into(),
+                    type_name: "BIGINT".into(),
+                    nullable: true,
+                    default: Some("0".into()),
+                    ..Default::default()
+                }));
+        });
+        assert!(
+            !plan.iter().any(|s| s.starts_with("CREATE TABLE")),
+            "altered in place, not rebuilt: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .filter(|s| s.starts_with("ALTER TABLE"))
+                .all(|s| !s.contains(",\n")),
+            "one action per ALTER TABLE: {plan:#?}"
+        );
+        assert_eq!(
+            cells(&db, "SELECT a2, b + 1, n FROM t2 ORDER BY a2"),
+            vec![vec!["1", "11", "0"], vec!["2", "21", "0"]]
+        );
+    }
+
+    /// A table with an index, a key, a check and a foreign key refuses almost
+    /// every `ALTER` (*entries that depend on it*), so the plan rebuilds it:
+    /// the rows, the index, the constraints and both comments come back.
+    #[test]
+    fn a_keyed_table_is_rebuilt_with_its_rows_indexes_and_comments() {
+        let db = mem("designer_rebuild");
+        seed(
+            &db,
+            "CREATE TABLE p(id INTEGER PRIMARY KEY);
+             INSERT INTO p VALUES (1), (2);
+             CREATE TABLE t(
+                 id INTEGER PRIMARY KEY,
+                 a INTEGER,
+                 b VARCHAR UNIQUE,
+                 c INTEGER CHECK (c > 0),
+                 pid INTEGER REFERENCES p(id));
+             CREATE INDEX t_a ON t(a);
+             COMMENT ON TABLE t IS 'things';
+             COMMENT ON COLUMN t.c IS 'positive';
+             INSERT INTO t VALUES (1, 10, '100', 1, 1), (2, 20, '200', 2, 2);",
+        );
+        let plan = designed(&db, "t", |d| {
+            d.rename_column(1, "a2");
+            d.columns[2].info.type_name = "INTEGER".into();
+        });
+        assert!(
+            plan.iter().any(|s| s.starts_with("CREATE TABLE")),
+            "rebuilt: {plan:#?}"
+        );
+        let t = table_of(&db, "t");
+        assert!(t.indexes.iter().any(|ix| ix.name == "t_a"), "{t:#?}");
+        assert_eq!(t.comment.as_deref(), Some("things"));
+        assert_eq!(t.columns[3].comment.as_deref(), Some("positive"));
+        assert_eq!(t.foreign_keys.len(), 1);
+        assert_eq!(t.check_constraints.len(), 1);
+        assert_eq!(
+            cells(&db, "SELECT sum(a2), sum(b) FROM t"),
+            vec![vec!["30", "300"]]
+        );
+        // And the check still bites.
+        assert!(
+            rt().block_on(q(&db, "INSERT INTO t VALUES (3, 1, '3', 0, 1)"))
+                .is_err()
+        );
+    }
+
+    /// What `ALTER TABLE` has no form of at all — adding a check or a foreign
+    /// key, dropping a unique constraint — is a rebuild too.
+    #[test]
+    fn constraints_are_added_and_dropped_by_a_rebuild() {
+        let db = mem("designer_constraints");
+        seed(
+            &db,
+            "CREATE TABLE p(id INTEGER PRIMARY KEY);
+             INSERT INTO p VALUES (1);
+             CREATE TABLE t(id INTEGER, u INTEGER UNIQUE, pid INTEGER);
+             INSERT INTO t VALUES (1, 1, 1);",
+        );
+        designed(&db, "t", |d| {
+            d.primary_key = vec!["id".into()];
+            d.columns[0].info.primary_key = true;
+            d.columns[0].info.nullable = false;
+            d.indexes.clear();
+            d.check_constraints.push(schemaic_core::ddl::CheckDraft {
+                original: None,
+                info: CheckInfo {
+                    name: "t_u_check".into(),
+                    expression: "(u > 0)".into(),
+                    enforced: true,
+                    validated: true,
+                    ..Default::default()
+                },
+            });
+            d.foreign_keys.push(schemaic_core::ddl::ForeignKeyDraft {
+                original: None,
+                info: ForeignKeyInfo {
+                    name: "t_pid_id_fkey".into(),
+                    columns: vec!["pid".into()],
+                    ref_schema: Some("main".into()),
+                    ref_table: "p".into(),
+                    ref_columns: vec!["id".into()],
+                    ..Default::default()
+                },
+            });
+        });
+        let t = table_of(&db, "t");
+        assert!(t.indexes.iter().all(|ix| ix.is_primary()), "{t:#?}");
+        assert!(
+            rt().block_on(q(&db, "INSERT INTO t VALUES (2, 1, 9)"))
+                .is_err()
+        );
+        assert!(
+            rt().block_on(q(&db, "INSERT INTO t VALUES (2, 0, 1)"))
+                .is_err()
+        );
+    }
+
+    /// A table another table's foreign key references cannot be dropped, so
+    /// it cannot be rebuilt either, and DuckDB has no `ADD FOREIGN KEY` to put
+    /// the reference back: the plan says so instead of failing half-way.
+    #[test]
+    fn a_referenced_table_is_not_rebuilt() {
+        let db = mem("designer_referenced");
+        seed(
+            &db,
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, v INTEGER);
+             CREATE TABLE t(pid INTEGER REFERENCES p(id));",
+        );
+        let before = table_of(&db, "p");
+        assert_eq!(before.referenced_by.len(), 1, "{before:#?}");
+        let mut draft = schemaic_core::ddl::TableDraft::from_table(&before);
+        draft.rename_column(1, "v2");
+        let cs = schemaic_core::ddl::diff(&before, &draft, SqlDialect::DuckDb);
+        assert!(!cs.unsupported().is_empty(), "{:#?}", cs.emit());
+        // Adding a column is still its own statement, and still works.
+        designed(&db, "p", |d| {
+            let mut c = d.columns[1].info.clone();
+            c.name = "w".into();
+            d.columns.push(schemaic_core::ddl::ColumnDraft::new(c));
+        });
+    }
+
+    /// A rebuild the engine refuses half-way names the user's table, never
+    /// the working copy that only exists between two statements of the plan,
+    /// and leaves the table as it was.
+    #[test]
+    fn a_failed_rebuild_names_the_table_not_its_working_copy() {
+        use schemaic_core::ddl::{TableDraft, diff};
+        let db = mem("designer_failed_rebuild");
+        seed(
+            &db,
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v VARCHAR);
+             INSERT INTO t VALUES (1, 'not a number');",
+        );
+        let before = table_of(&db, "t");
+        let mut draft = TableDraft::from_table(&before);
+        draft.columns[1].info.type_name = "INTEGER".into();
+        let cs = diff(&before, &draft, SqlDialect::DuckDb);
+        let err = rt()
+            .block_on(db.run_ddl("", &cs.emit(), CancellationToken::new()))
+            .expect_err("the copy cannot cast the text");
+        let text = err.to_string();
+        assert!(!text.contains("schemaic_rebuild"), "{text}");
+        assert_eq!(cells(&db, "SELECT v FROM t"), vec![vec!["not a number"]]);
+    }
+
+    /// A generated column is not copied — it is computed — and comes back
+    /// generated from the rebuilt table. Renaming the column it reads would
+    /// leave its expression naming nothing, which the plan says up front
+    /// rather than meeting as a rollback.
+    #[test]
+    fn a_rebuild_keeps_a_generated_column() {
+        let db = mem("designer_generated");
+        seed(
+            &db,
+            "CREATE TABLE g(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2), n VARCHAR);
+             INSERT INTO g(id, a, n) VALUES (1, 4, 'x');",
+        );
+        let before = table_of(&db, "g");
+        let mut draft = schemaic_core::ddl::TableDraft::from_table(&before);
+        draft.rename_column(1, "a2");
+        let cs = schemaic_core::ddl::diff(&before, &draft, SqlDialect::DuckDb);
+        assert!(
+            cs.withheld_lines().iter().any(|w| matches!(
+                w,
+                schemaic_core::ddl::Withheld::StrandsGeneratedColumn { column, .. } if column == "b"
+            )),
+            "{:?}",
+            cs.unsupported()
+        );
+        designed(&db, "g", |d| d.rename_column(3, "n2"));
+        assert_eq!(cells(&db, "SELECT b FROM g"), vec![vec!["8"]]);
+    }
+
+    /// A key counted from a sequence keeps counting from it: its default is
+    /// the counter, restated rather than swapped for another engine's word.
+    #[test]
+    fn a_sequence_default_survives_a_rebuild() {
+        let db = mem("designer_sequence");
+        seed(
+            &db,
+            "CREATE SEQUENCE s START 10;
+             CREATE TABLE t(id INTEGER DEFAULT nextval('s') PRIMARY KEY, v VARCHAR);
+             CREATE INDEX t_v ON t(v);
+             INSERT INTO t(v) VALUES ('a');",
+        );
+        designed(&db, "t", |d| d.rename_column(1, "v2"));
+        rt().block_on(q(&db, "INSERT INTO t(v2) VALUES ('b')"))
+            .unwrap();
+        assert_eq!(cells(&db, "SELECT max(id) FROM t"), vec![vec!["11"]]);
+    }
+
+    /// A new table from the designer, with every kind of constraint and an
+    /// index, is created as drawn.
+    #[test]
+    fn a_new_table_is_created_as_drawn() {
+        use schemaic_core::ddl::{ColumnDraft, IndexDraft, TableDraft};
+        let db = mem("designer_new");
+        seed(&db, "CREATE TABLE p(id INTEGER PRIMARY KEY);");
+        let col = |name: &str, ty: &str| {
+            ColumnDraft::new(ColumnInfo {
+                name: name.into(),
+                type_name: ty.into(),
+                nullable: true,
+                ..Default::default()
+            })
+        };
+        let mut draft = TableDraft {
+            name: "n".into(),
+            schema: Some("main".into()),
+            columns: vec![
+                col("id", "INTEGER"),
+                col("v", "VARCHAR"),
+                col("pid", "INTEGER"),
+            ],
+            primary_key: vec!["id".into()],
+            comment: Some("new".into()),
+            ..Default::default()
+        };
+        draft.columns[0].info.primary_key = true;
+        draft.columns[0].info.nullable = false;
+        draft.columns[1].info.comment = Some("value".into());
+        draft.indexes.push(IndexDraft {
+            original: None,
+            info: IndexInfo {
+                name: "n_v".into(),
+                columns: vec![schemaic_core::schema::IndexColumn::plain("v")],
+                ..Default::default()
+            },
+        });
+        draft
+            .foreign_keys
+            .push(schemaic_core::ddl::ForeignKeyDraft {
+                original: None,
+                info: ForeignKeyInfo {
+                    name: "n_pid_id_fkey".into(),
+                    columns: vec!["pid".into()],
+                    ref_schema: Some("main".into()),
+                    ref_table: "p".into(),
+                    ref_columns: vec!["id".into()],
+                    ..Default::default()
+                },
+            });
+        let cs = schemaic_core::ddl::create(&draft, SqlDialect::DuckDb);
+        assert!(cs.unsupported().is_empty(), "{:?}", cs.unsupported());
+        rt().block_on(db.run_ddl("", &cs.emit(), CancellationToken::new()))
+            .unwrap_or_else(|e| panic!("{e} — {:#?}", cs.emit()));
+        let t = table_of(&db, "n");
+        let left = schemaic_core::ddl::diff(&t, &rebased(&draft), SqlDialect::DuckDb);
+        assert!(left.changes.is_empty(), "{:#?}", left.changes);
     }
 }

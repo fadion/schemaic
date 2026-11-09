@@ -13,8 +13,10 @@ siblings, and the MCP server both `schemaic mcp` and the AI panel run; no Floem)
 **DuckDB** (`db::duckdb`, embedded like SQLite) is partway through its roadmap entry — it reads,
 runs scripts and DDL plans, introspects, exports, plans, backs up, imports, dumps to `.sql`, writes
 grid edits back (on provenance read from the statement, never keyed on `rowid`) and holds a Manual
-tab's transaction — pinning the file's instance, and its lock, while it does — and refuses the
-designer until the rest of phase 2 lands, through the same capability predicates.
+tab's transaction — pinning the file's instance, and its lock, while it does — and edits
+**tables** (in place where its `ALTER TABLE` can, through a rebuild where it cannot —
+`ddl::duckdb_rebuild_sql`, decided per table by `ddl::alters_in_place`); it refuses the view and
+macro editors until the rest of phase 2 lands, through the same capability predicates.
 SQLite reads, writes, imports and edits **tables** (through the twelve-step rebuild —
 `ddl::sqlite_rebuild_sql`), **views** and **triggers**, but has **no manual-transaction mode** — a
 statement about SQLite rather than unfinished work (`db::session::Session::open` carries the
@@ -29,7 +31,8 @@ does), creates and drops databases and schemas, and browses, creates, edits, dro
 its **sequences, alias types, synonyms and XML schema collections**. What differs between the
 engines now lives in the *narrow* predicates that decide how an edit is performed rather than
 whether it is offered: `ddl::supports_or_replace_view`, `supports_view_rename`,
-`supports_column_reorder`, `rebuilds_tables`, `renames_indexes_in_place`,
+`supports_column_reorder`, `rebuilds_tables`, `alters_in_place`, `counter_is_a_default`,
+`renames_indexes_in_place`,
 `constraint_takes_include`, `constraint_takes_filter`, `key_clusters_by_default`, `supports_change`, `alter_column_disturbs_checks`,
 `alter_column_disturbs_dependents`, `refreshes_star_dependents`, `bare_reference_is_own_namespace`,
 `ddl_is_transactional`, `catalogue_body_is_unescaped`, `users::revoke_cascades`, `supports_deny`,

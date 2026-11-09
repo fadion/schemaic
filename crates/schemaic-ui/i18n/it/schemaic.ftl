@@ -1739,6 +1739,7 @@ table-problem-check-twice = Due vincoli CHECK si chiamano entrambi { $name }.
 table-problem-check-no-predicate = Il controllo { $name } non ha alcun predicato.
 table-problem-without-rowid-no-key = Una tabella WITHOUT ROWID necessita di una chiave primaria.
 table-problem-strict-type = Le tabelle STRICT accettano solo INT, INTEGER, REAL, TEXT, BLOB o ANY — { $column } è { $data_type }.
+table-problem-sequence-no-default = { $column } counts from a sequence, so its default must name one — nextval('sequence').
 designer-hint-unindexed-fk = La chiave esterna { $fk } non ha alcun indice che inizi con le sue colonne, quindi un'eliminazione o un aggiornamento di chiave sulla tabella a cui fa riferimento esegue una scansione di questa.
 designer-no-index = Nessun indice selezionato. La chiave primaria si trova sulle colonne.
 designer-columns = Colonne
@@ -2585,6 +2586,7 @@ ddl-withheld-tsql-lossy-index = Ricostruire { $table } eliminerebbe l'indice { $
 ddl-withheld-tsql-encrypted-trigger = Ricostruire { $table } eliminerebbe il trigger { $trigger }: il suo testo è crittografato
 ddl-withheld-tsql-signed-trigger = Ricostruire { $table } eliminerebbe la firma sul trigger { $trigger }, che non può essere ripristinata senza la chiave privata del certificato
 ddl-withheld-tsql-renamed-trigger = Ricostruire { $table } con un nuovo nome lascerebbe il trigger { $trigger } con il nome vecchio
+ddl-withheld-duckdb-referenced = { $table } can't be rebuilt while { $by } has a foreign key referencing it — DuckDB neither drops a referenced table nor adds a foreign key back afterwards
 ddl-withheld-partly-read = L'indice { $index } è stato letto solo in parte — SQLite conserva il predicato di un indice parziale, e una chiave con espressione, solo nel testo CREATE dell'indice stesso{ $why ->
         [may-name] , e quel testo potrebbe nominare { $moved }. Elimina l'indice per procedere senza di esso.
         [not-found] , quindi non può essere creato da ciò che è stato letto. Elimina l'indice per procedere senza di esso.

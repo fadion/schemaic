@@ -376,6 +376,11 @@ pub enum TableProblem {
         column: String,
         data_type: String,
     },
+    /// DuckDB: `column` is ticked to count from a sequence and has no default
+    /// naming one ([`counter_is_a_default`]).
+    SequenceNoDefault {
+        column: String,
+    },
 }
 
 impl TableProblem {
@@ -483,6 +488,10 @@ impl TableProblem {
             P::StrictType { column, data_type } => format!(
                 "STRICT tables take only INT, INTEGER, REAL, TEXT, BLOB or ANY — {column} is \
                  {data_type}."
+            ),
+            P::SequenceNoDefault { column } => format!(
+                "{column} counts from a sequence, so its default must name one — \
+                 nextval('sequence')."
             ),
         }
     }
@@ -1075,6 +1084,15 @@ impl TableDraft {
                     out.push(P::StrictType {
                         column: c.info.name.trim().to_string(),
                         data_type: ty.to_string(),
+                    });
+                }
+            }
+        }
+        if counter_is_a_default(dialect) {
+            for c in &self.columns {
+                if c.info.auto_increment && blank_as_none(c.info.default.as_deref()).is_none() {
+                    out.push(P::SequenceNoDefault {
+                        column: c.info.name.trim().to_string(),
                     });
                 }
             }
@@ -6542,6 +6560,9 @@ pub enum Withheld {
     CannotRestate { clauses: Vec<SqliteClause> },
     /// … a virtual table.
     VirtualTable { name: String },
+    /// DuckDB's rebuild of `table`: another table, `by`, has a foreign key
+    /// referencing it.
+    DuckDbReferenced { table: String, by: String },
 }
 
 impl Withheld {
@@ -6649,8 +6670,8 @@ impl Withheld {
             ),
             Withheld::StrandsGeneratedColumn { column, moved } => format!(
                 "Generated column {column} computes from {}. A rebuild writes the table \
-                 from the model, and nothing rewrites that expression — SQLite \
-                 refuses the new table with \"no such column\" and the whole plan \
+                 from the model, and nothing rewrites that expression — the engine \
+                 refuses the new table over the missing column and the whole plan \
                  rolls back. Edit or remove {column} first.",
                 moved.message(),
             ),
@@ -6677,6 +6698,10 @@ impl Withheld {
                  would drop — an FTS5 index would be gone from a table that still held the \
                  text. Change it with a script instead (DROP and CREATE VIRTUAL TABLE), or \
                  edit the tables it indexes."
+            ),
+            Withheld::DuckDbReferenced { table, by } => format!(
+                "{table} can't be rebuilt while {by} has a foreign key referencing it — DuckDB \
+                 neither drops a referenced table nor adds a foreign key back afterwards"
             ),
         }
     }
@@ -8148,12 +8173,19 @@ impl ChangeSet {
             return match self.dialect {
                 // Its own rebuild, with its own list ([`tsql_rebuild_refusals`]).
                 SqlDialect::MsSql => tsql_rebuild_refusals(&r.current, &r.draft),
+                // Its own too: a reference in, or a generated column left
+                // naming a column the plan moves.
+                SqlDialect::DuckDb => duckdb_rebuild_refusals(&r.current)
+                    .into_iter()
+                    .chain(rebuild_strands_a_generated_column(
+                        &r.current,
+                        &r.draft,
+                        SqlDialect::DuckDb,
+                    ))
+                    .collect(),
                 // `diff` raises a rebuild only where `rebuilds_tables`, so the
                 // other two never reach here.
-                SqlDialect::Sqlite
-                | SqlDialect::MySql
-                | SqlDialect::Postgres
-                | SqlDialect::DuckDb => r
+                SqlDialect::Sqlite | SqlDialect::MySql | SqlDialect::Postgres => r
                     .draft
                     .indexes
                     .iter()
@@ -8162,7 +8194,11 @@ impl ChangeSet {
                         IndexReplay::Emit | IndexReplay::Verbatim(_) | IndexReplay::Skip => None,
                     })
                     .chain(rebuild_strands_a_trigger(&r.current, &r.draft))
-                    .chain(rebuild_strands_a_generated_column(&r.current, &r.draft))
+                    .chain(rebuild_strands_a_generated_column(
+                        &r.current,
+                        &r.draft,
+                        SqlDialect::Sqlite,
+                    ))
                     .chain(rebuild_cannot_restate(&r.current))
                     .chain(rebuild_refuses_a_virtual_table(&r.current))
                     .collect(),
@@ -8191,12 +8227,32 @@ impl ChangeSet {
             SqlDialect::Sqlite => self.emit_sqlite(),
             SqlDialect::MsSql => self.emit_mssql(),
             SqlDialect::MySql => self.emit_mysql(),
-            // Unreachable until DuckDB's changes are written: `duckdb_supports`
-            // refuses every one, so no plan holds a DuckDB change to emit.
-            // PostgreSQL's emitter is the closest grammar, and is where the
-            // DuckDB phase of the roadmap starts from.
-            SqlDialect::DuckDb => self.emit_postgres(),
+            SqlDialect::DuckDb => self.emit_duckdb(),
         }
+    }
+
+    /// DuckDB's plan: its rebuild where [`diff`] put one, and otherwise
+    /// PostgreSQL's statements — the grammar DuckDB's is modelled on — for
+    /// the changes [`supports_change`] admits there, and nothing else, each
+    /// `ALTER TABLE` holding one action ([`alter_takes_many_actions`]).
+    ///
+    /// Filtered rather than trusted, as SQLite's is: a change DuckDB cannot
+    /// express emits **nothing**, so a gate that drifts open shows an empty
+    /// preview instead of handing DuckDB a statement it refuses half-way.
+    fn emit_duckdb(&self) -> Vec<String> {
+        if let Some(Change::RebuildTable(r)) = self.changes.iter().find(|c| is_rebuild(c)) {
+            return duckdb_rebuild_sql(&r.current, &r.draft);
+        }
+        let admitted = ChangeSet {
+            changes: self
+                .changes
+                .iter()
+                .filter(|c| supports_change(self.dialect, c))
+                .cloned()
+                .collect(),
+            ..self.clone()
+        };
+        admitted.emit_postgres()
     }
 
     /// SQL Server's plan: the changes [`supports_change`] admits there, and
@@ -9177,12 +9233,17 @@ impl ChangeSet {
                 // statement, emitted below.
             }
         }
-        if !cl.is_empty() {
+        if !cl.is_empty() && alter_takes_many_actions(d) {
             out.push(format!(
                 "ALTER TABLE {}\n  {};",
                 self.qname(),
                 cl.join(",\n  ")
             ));
+        } else {
+            out.extend(
+                cl.iter()
+                    .map(|a| format!("ALTER TABLE {} {a};", self.qname())),
+            );
         }
         // 3. Indexes back on, over the columns that now exist.
         for c in &self.changes {
@@ -11840,12 +11901,10 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
     // "sqlite_autoindex_u_1"` is refused with *object name reserved for internal
     // use*, so every edit of such a table failed outright. Re-declaring it here,
     // from the **draft's** column names, is also what carries it across a rename;
-    // `sqlite_index_replay` leaves these out of the statement list.
-    if sqlite {
-        for ix in &d.indexes {
-            if !is_sqlite_constraint_index(&ix.info) {
-                continue;
-            }
+    // `sqlite_index_replay` leaves these out of the statement list. A DuckDB
+    // unique constraint is declared here too ([`unique_constraint_is_inline`]).
+    for ix in &d.indexes {
+        if unique_constraint_is_inline(dialect, &ix.info) {
             lines.push(format!("  UNIQUE ({})", ix.info.key_sql(dialect)));
         }
     }
@@ -11938,7 +11997,7 @@ fn create_table_sql(d: &TableDraft, dialect: SqlDialect) -> Vec<String> {
         indexes.sort_by_key(|ix| !ix.info.is_tsql_xml_parent());
         for ix in indexes {
             // A SQLite constraint-backed index went into the table body above.
-            if sqlite && is_sqlite_constraint_index(&ix.info) {
+            if unique_constraint_is_inline(dialect, &ix.info) {
                 continue;
             }
             out.push(create_index_sql(&ix.info, &qname, dialect));
@@ -14965,7 +15024,9 @@ pub fn overloads_routines(dialect: SqlDialect) -> bool {
 /// likeliest to have no statement for. Two routes count, because both end at the
 /// same table — `ALTER`ing the column in place (MySQL, PostgreSQL) or rebuilding
 /// the table around it (SQLite, which has no `ALTER` for it and reaches every
-/// such change through [`sqlite_rebuild_sql`]).
+/// such change through [`sqlite_rebuild_sql`]; SQL Server through
+/// [`tsql_rebuild_sql`] where its `ALTER COLUMN` cannot; DuckDB either way, as
+/// the table in front of it allows — [`alters_in_place`]).
 ///
 /// This exists because three menu entries that read as capability questions —
 /// **Edit table**, **Edit column**, **Edit index** — were literal `true`s, left
@@ -15055,12 +15116,83 @@ pub fn supports_column_reorder(dialect: SqlDialect) -> bool {
 /// table** ([`Change::RebuildTable`])? SQLite, whose `ALTER TABLE` does four
 /// things ([`sqlite_rebuild_sql`]), and SQL Server, whose `ALTER COLUMN` cannot
 /// switch an identity, convert a computed column or move one
-/// ([`tsql_rebuild_sql`]). MySQL and PostgreSQL alter in place, and what they
+/// ([`tsql_rebuild_sql`]), and DuckDB, whose `ALTER TABLE` adds no check or
+/// foreign key, drops no constraint, and refuses nearly every change to a
+/// table an index or another table's key depends on ([`duckdb_rebuild_sql`],
+/// [`alters_in_place`]). MySQL and PostgreSQL alter in place, and what they
 /// cannot alter a rebuild would not make possible.
 pub fn rebuilds_tables(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::Sqlite | SqlDialect::MsSql => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::DuckDb => false,
+        SqlDialect::Sqlite | SqlDialect::MsSql | SqlDialect::DuckDb => true,
+        SqlDialect::MySql | SqlDialect::Postgres => false,
+    }
+}
+
+/// Can this set of changes run as `dialect`'s own `ALTER` statements against
+/// `current` as it stands, or must [`diff`] rebuild the table instead?
+///
+/// [`supports_change`] asks about a change on its own; this asks about the
+/// table under it, which only DuckDB makes a difference: its `ALTER TABLE`
+/// refuses to rename, retype or tighten a column, drop one, or rename the
+/// table, once anything depends on the table — an index, a key, a check, a
+/// generated column, another table's foreign key (*Cannot alter entry … because
+/// there are entries that depend on it*, and its siblings; measured on DuckDB
+/// 2.0.0). Dropping the index first is no way round it: inside one transaction
+/// the dependency outlives its `DROP INDEX` (measured). And a rename of the
+/// table after a `CREATE INDEX` the same plan makes meets the index it made.
+/// What still works on such a table — adding a column, setting a default or a
+/// comment, an index made or dropped — stays a statement of its own.
+///
+/// Every other engine answers `true`: whether it can perform a change does not
+/// depend on what hangs off the table.
+pub fn alters_in_place(dialect: SqlDialect, current: &TableInfo, changes: &[Change]) -> bool {
+    match dialect {
+        SqlDialect::DuckDb => {
+            let pinned = !current.indexes.is_empty()
+                || !current.foreign_keys.is_empty()
+                || !current.check_constraints.is_empty()
+                || !current.referenced_by.is_empty()
+                || current.columns.iter().any(|c| c.generated.is_some());
+            let structural = |c: &Change| match c {
+                Change::DropColumn { .. } | Change::RenameTable { .. } => true,
+                Change::AlterColumn { from, to, .. } => {
+                    from.name != to.name
+                        || !types_equal(&from.type_name, &to.type_name, dialect)
+                        || from.nullable != to.nullable
+                }
+                _ => false,
+            };
+            let indexes_made = changes.iter().any(|c| matches!(c, Change::AddIndex(_)));
+            !changes.iter().any(|c| {
+                (pinned && structural(c))
+                    || (indexes_made && matches!(c, Change::RenameTable { .. }))
+            })
+        }
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
+    }
+}
+
+/// Is a column's auto-number **its default** on `dialect` — a
+/// `DEFAULT nextval('s')` naming a sequence — rather than an attribute that
+/// stands in for one? DuckDB's alone: it has no identity or `AUTO_INCREMENT`,
+/// and the reader marks a column auto-numbered by that default. So the column
+/// definition restates the default, and a draft ticked for a counter with no
+/// default behind it is a problem ([`TableProblem::SequenceNoDefault`]): it
+/// would make a column that never counts.
+pub fn counter_is_a_default(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::DuckDb => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// Does `dialect`'s `ALTER TABLE` take a list of actions, or exactly one?
+/// DuckDB's takes one (*Only one ALTER command per statement is supported*),
+/// so [`ChangeSet::emit`] writes each action as a statement of its own there.
+fn alter_takes_many_actions(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => true,
+        SqlDialect::Sqlite | SqlDialect::DuckDb => false,
     }
 }
 
@@ -16957,7 +17089,15 @@ struct MovedColumn {
 /// Through [`repoint_check_column`] like the check arm, so the engine's own
 /// quoting and case rules decide what "names it" means rather than a
 /// substring test.
-fn rebuild_strands_a_generated_column(current: &TableInfo, draft: &TableDraft) -> Option<Withheld> {
+///
+/// DuckDB's rebuild meets the same dead end (*Column "qty" referenced by
+/// generated column does not exist*, measured), so it asks this too, in its
+/// own dialect.
+fn rebuild_strands_a_generated_column(
+    current: &TableInfo,
+    draft: &TableDraft,
+    dialect: SqlDialect,
+) -> Option<Withheld> {
     let moved = moved_columns(current, draft);
     if moved.is_empty() {
         return None;
@@ -16971,8 +17111,7 @@ fn rebuild_strands_a_generated_column(current: &TableInfo, draft: &TableDraft) -
         // edit rather than a reference left dangling.
         let own = c.original.as_deref().unwrap_or(&c.info.name);
         let Some(m) = moved.iter().find(|m| {
-            m.name != own
-                && repoint_check_column(expr, &m.name, &m.name, SqlDialect::Sqlite).is_some()
+            m.name != own && repoint_check_column(expr, &m.name, &m.name, dialect).is_some()
         }) else {
             continue;
         };
@@ -18785,18 +18924,212 @@ fn tsql_supports(change: &Change) -> bool {
     }
 }
 
-/// What [`supports_change`] answers on DuckDB: **nothing yet**.
+/// What [`supports_change`] answers on DuckDB: the table changes its own
+/// `ALTER TABLE`, `CREATE INDEX` and `COMMENT ON` perform, each a statement
+/// of its own, and the rebuild ([`duckdb_rebuild_sql`]) for the rest.
 ///
-/// DuckDB's DDL is close to PostgreSQL's but not the same — no `ALTER TABLE
-/// … ADD CONSTRAINT` for a key or a foreign key once the table exists, no
-/// index rename, no `ALTER INDEX`, a table that anything depends on cannot be
-/// renamed or retyped — and its emitter is the table designer's work (roadmap,
-/// DuckDB phase 2). Until each change is written and run against the engine it
-/// is refused here, which is what keeps the designer, the view, trigger and
-/// routine editors and *Apply* off DuckDB connections: every `supports_*`
-/// editing gate computes from this rather than answering on its own.
-fn duckdb_supports(_change: &Change) -> bool {
-    false
+/// **Refused here, and done by the rebuild instead**, each a fact about DuckDB
+/// 2.0.0 (measured): a check, a foreign key or a primary key added to a table
+/// that exists, and any constraint dropped (*No support for that ALTER TABLE
+/// option*); a column added with a key, a check or an expression (*not
+/// supported yet*), or anywhere but at the end; a column's generated
+/// expression, its collation or its counter changed; an index renamed (no
+/// `ALTER INDEX`). Whether an admitted change also works on the table in front
+/// of it is [`alters_in_place`]'s question, not this one's.
+fn duckdb_supports(change: &Change) -> bool {
+    match change {
+        Change::CreateTable(_)
+        | Change::RebuildTable(_)
+        | Change::DropTable
+        | Change::TruncateTable
+        | Change::RenameTable { .. }
+        | Change::DropColumn { .. }
+        | Change::DropIndex {
+            constraint: None, ..
+        } => true,
+        Change::AddIndex(ix) => ix.constraint.is_none(),
+        Change::AddColumn { column, position } => {
+            position.is_none()
+                && column.generated.is_none()
+                && !column.primary_key
+                && (!column.auto_increment || column.default.is_some())
+        }
+        // The comment alone: engine and collation are MySQL's table options.
+        Change::TableOptions {
+            engine: None,
+            collation: None,
+            comment: Some(_),
+        } => true,
+        // **Admitted when everything that differs is something an `ALTER
+        // COLUMN` writes** — the rename, the type, nullability, the default
+        // and the comment — asked of `columns_equal`, the comparison that
+        // raised the change, as SQL Server's arm asks it.
+        Change::AlterColumn {
+            from,
+            to,
+            position,
+            inline_check,
+        } => {
+            let written = ColumnInfo {
+                name: to.name.clone(),
+                type_name: to.type_name.clone(),
+                nullable: to.nullable,
+                default: to.default.clone(),
+                primary_key: to.primary_key,
+                comment: to.comment.clone(),
+                ..(**from).clone()
+            };
+            position.is_none()
+                && inline_check.is_none()
+                && from.generated.is_none()
+                && to.generated.is_none()
+                && columns_equal(&written, to, SqlDialect::DuckDb)
+        }
+        _ => false,
+    }
+}
+
+/// Why DuckDB's rebuild of `current` cannot run: a foreign key on another
+/// table that references it. `DROP TABLE` refuses a table another one's key
+/// points at (*Could not drop the table because this table is main key table
+/// of the table …*), and with no `ALTER TABLE … ADD FOREIGN KEY` the key could
+/// not be dropped and put back around it as SQL Server's rebuild does. A key of
+/// its own, a self-reference among them, goes down with the table and comes
+/// back with it, so it is not counted ([`crate::schema::link_inbound_foreign_keys`]).
+fn duckdb_rebuild_refusals(current: &TableInfo) -> Vec<Withheld> {
+    let mut by: Vec<&str> = current
+        .referenced_by
+        .iter()
+        .map(|r| r.table.as_str())
+        .collect();
+    by.dedup();
+    by.into_iter()
+        .map(|b| Withheld::DuckDbReferenced {
+            table: current.name.clone(),
+            by: b.to_string(),
+        })
+        .collect()
+}
+
+/// **DuckDB's rebuild**: the table the draft describes, made under a
+/// working name, filled from the current one, which is then dropped, and
+/// renamed into its place — then its indexes and comments, which name the
+/// table by its final name.
+///
+/// It runs inside the one transaction `run_ddl` opens, so a failure at any
+/// step leaves the original as it was. Everything [`diff`] put in the set is
+/// in the draft, which is why the rest of the set is not emitted beside it.
+///
+/// - **Rows are copied by the draft's own identity**: each draft column that
+///   came from a current one (`original`) is filled from it, cast where its
+///   type changed; a new column takes its default. A generated column is never
+///   copied — it is computed, and DuckDB refuses a value for one.
+/// - **A view on the table survives**: DuckDB binds a view's query when it
+///   is read, not when it is made, so dropping the table under it leaves the
+///   view to find the new one (measured).
+/// - **The indexes come after the rename**, since an index's name lives in
+///   the schema and the old table's are only gone once it is.
+pub fn duckdb_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String> {
+    let d = SqlDialect::DuckDb;
+    let q = |s: &str| ddl_ident_in(s, d);
+    let name = if draft.name.trim().is_empty() {
+        current.name.as_str()
+    } else {
+        draft.name.as_str()
+    };
+    let schema = draft.schema.as_deref().or(current.schema.as_deref());
+    // SQLite's suffix, so `unshadow` takes it back out of an engine message.
+    let working = format!("{name}{REBUILD_SUFFIX}");
+    let original = qualified(&current.name, current.schema.as_deref(), d);
+    let staged = qualified(&working, schema, d);
+    let fin = qualified(name, schema, d);
+
+    // The table alone: indexes and comments wait until it has its name.
+    let mut shell = draft.clone();
+    shell.name = working.clone();
+    shell.schema = schema.map(str::to_string);
+    shell.comment = None;
+    shell
+        .indexes
+        .retain(|ix| unique_constraint_is_inline(d, &ix.info));
+    for c in &mut shell.columns {
+        c.info.comment = None;
+    }
+    // The checks follow a renamed column, as SQLite's rebuild makes them do
+    // and for its reason: the predicate is the text last read, naming the
+    // columns as they were, on a table that has them as they will be.
+    let moves: Vec<(&str, &str)> = draft
+        .columns
+        .iter()
+        .filter_map(|c| {
+            let was = c.original.as_deref().filter(|o| **o != c.info.name)?;
+            Some((was, c.info.name.as_str()))
+        })
+        .collect();
+    for ck in &mut shell.check_constraints {
+        if let Some(e) = repoint_check_columns(&ck.info.expression, &moves, d) {
+            ck.info.expression = e;
+        }
+    }
+    let mut out: Vec<String> = create_table_sql(&shell, d);
+
+    let copied: Vec<(String, String)> = draft
+        .columns
+        .iter()
+        .filter(|c| c.info.generated.is_none())
+        .filter_map(|c| {
+            let was = current
+                .columns
+                .iter()
+                .find(|k| Some(&k.name) == c.original.as_ref() && k.generated.is_none())?;
+            let from = if types_equal(&was.type_name, &c.info.type_name, d) {
+                q(&was.name)
+            } else {
+                format!("CAST({} AS {})", q(&was.name), c.info.type_name)
+            };
+            Some((q(&c.info.name), from))
+        })
+        .collect();
+    if !copied.is_empty() {
+        let (into, from): (Vec<String>, Vec<String>) = copied.into_iter().unzip();
+        out.push(format!(
+            "INSERT INTO {staged} ({}) SELECT {} FROM {original};",
+            into.join(", "),
+            from.join(", ")
+        ));
+    }
+    out.push(format!("DROP TABLE {original};"));
+    out.push(format!("ALTER TABLE {staged} RENAME TO {};", q(name)));
+    for ix in &draft.indexes {
+        if !unique_constraint_is_inline(d, &ix.info) && !ix.info.inherited {
+            out.push(create_index_sql(&ix.info, &fin, d));
+        }
+    }
+    if let Some(c) = draft.comment.as_deref().filter(|c| !c.is_empty()) {
+        out.push(format!("COMMENT ON TABLE {fin} IS {};", ddl_string(c, d)));
+    }
+    for c in &draft.columns {
+        if let Some(cm) = c.info.comment.as_deref().filter(|s| !s.is_empty()) {
+            out.push(comment_on_column(&fin, &c.info.name, Some(cm), d));
+        }
+    }
+    out
+}
+
+/// Is `ix` a unique **constraint** that `dialect`'s `CREATE TABLE` declares
+/// in the table body, rather than an index made by a statement of its own?
+///
+/// SQLite's constraint-backed index, whose reserved name cannot be created
+/// ([`is_sqlite_constraint_index`]); and every DuckDB unique constraint, which
+/// the reader models as an index named after the constraint. Made as a
+/// `CREATE UNIQUE INDEX` instead it would be a catalogue index — which then
+/// refuses every later `ALTER` of the table it pins ([`alters_in_place`]).
+fn unique_constraint_is_inline(dialect: SqlDialect, ix: &IndexInfo) -> bool {
+    match dialect {
+        SqlDialect::Sqlite => is_sqlite_constraint_index(ix),
+        SqlDialect::DuckDb => ix.constraint.is_some() && !ix.is_primary(),
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::MsSql => false,
+    }
 }
 
 /// Everything that has to happen to turn `current` into `draft`.
@@ -19456,9 +19789,14 @@ pub fn diff(current: &TableInfo, draft: &TableDraft, target: impl Into<Target>) 
     // as well would add it twice.
     //
     // SQL Server rebuilds the same way, and by the same rule ([`rebuilds_tables`]).
+    //
+    // DuckDB rebuilds by the same rule, and by one more: a change it has a
+    // statement for may still be one it refuses on *this* table
+    // ([`alters_in_place`]).
     if rebuilds_tables(dialect)
         && !changes.is_empty()
-        && changes.iter().any(|c| !supports_change(dialect, c))
+        && (changes.iter().any(|c| !supports_change(dialect, c))
+            || !alters_in_place(dialect, current, &changes))
     {
         changes.insert(
             0,
@@ -22552,6 +22890,254 @@ mod tests {
         assert!(supports_view_editing(MsSql));
         assert!(supports_routine_editing(MsSql));
         assert!(supports_trigger_editing(MsSql));
+    }
+
+    fn duck_col(name: &str, ty: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            type_name: ty.into(),
+            nullable: true,
+            ..Default::default()
+        }
+    }
+
+    /// DuckDB writes what its `ALTER TABLE`, `CREATE INDEX` and `COMMENT ON`
+    /// do, and leaves every constraint change to the rebuild.
+    #[test]
+    fn duckdb_admits_its_own_statements_and_rebuilds_the_rest() {
+        let d = SqlDialect::DuckDb;
+        let a = duck_col("a", "INTEGER");
+        let alter = |to: ColumnInfo| Change::AlterColumn {
+            from: Box::new(a.clone()),
+            to: Box::new(to),
+            position: None,
+            inline_check: None,
+        };
+        for c in [
+            alter(ColumnInfo {
+                name: "b".into(),
+                type_name: "BIGINT".into(),
+                nullable: false,
+                default: Some("1".into()),
+                comment: Some("x".into()),
+                ..a.clone()
+            }),
+            Change::AddColumn {
+                column: Box::new(duck_col("n", "VARCHAR")),
+                position: None,
+            },
+            Change::DropColumn {
+                name: "a".into(),
+                type_name: "INTEGER".into(),
+            },
+            Change::RenameTable { to: "t2".into() },
+            Change::TableOptions {
+                engine: None,
+                collation: None,
+                comment: Some("c".into()),
+            },
+        ] {
+            assert!(supports_change(d, &c), "{c:?}");
+        }
+        for c in [
+            // An expression, a counter with no sequence behind it, a key.
+            Change::AddColumn {
+                column: Box::new(ColumnInfo {
+                    generated: Some("a * 2".into()),
+                    ..duck_col("g", "INTEGER")
+                }),
+                position: None,
+            },
+            Change::AddColumn {
+                column: Box::new(ColumnInfo {
+                    auto_increment: true,
+                    ..duck_col("g", "INTEGER")
+                }),
+                position: None,
+            },
+            alter(ColumnInfo {
+                collation: Some("nocase".into()),
+                ..a.clone()
+            }),
+            Change::AddCheck(Box::new(CheckInfo {
+                name: "ck".into(),
+                expression: "a > 0".into(),
+                ..Default::default()
+            })),
+            Change::DropCheck { name: "ck".into() },
+            Change::DropForeignKey { name: "fk".into() },
+            Change::PrimaryKey {
+                from: Vec::new(),
+                to: vec!["a".into()],
+                drop_constraint: None,
+                clustered: None,
+            },
+        ] {
+            assert!(!supports_change(d, &c), "{c:?}");
+        }
+        assert!(rebuilds_tables(d));
+        assert!(supports_table_design(d));
+    }
+
+    /// The same change alters in place on a table nothing depends on, and is
+    /// rebuilt on one an index pins — DuckDB refuses the `ALTER` there.
+    #[test]
+    fn duckdb_alters_in_place_only_where_nothing_depends_on_the_table() {
+        let d = SqlDialect::DuckDb;
+        let plain = TableInfo {
+            name: "t".into(),
+            schema: Some("main".into()),
+            columns: vec![duck_col("a", "INTEGER"), duck_col("b", "VARCHAR")],
+            ..Default::default()
+        };
+        let mut indexed = plain.clone();
+        indexed.indexes.push(IndexInfo {
+            name: "t_a".into(),
+            columns: vec![IndexColumn::plain("a")],
+            ..Default::default()
+        });
+        let rename = |t: &TableInfo| {
+            let mut draft = TableDraft::from_table(t);
+            draft.rename_column(1, "b2");
+            diff(t, &draft, d)
+        };
+        let native = rename(&plain);
+        assert!(
+            !native
+                .changes
+                .iter()
+                .any(|c| matches!(c, Change::RebuildTable(_)))
+        );
+        assert_eq!(
+            native.emit(),
+            vec![r#"ALTER TABLE "main"."t" RENAME COLUMN "b" TO "b2";"#.to_string()]
+        );
+        let rebuilt = rename(&indexed);
+        assert!(matches!(
+            rebuilt.changes.first(),
+            Some(Change::RebuildTable(_))
+        ));
+        assert!(rebuilt.unsupported().is_empty());
+        let sql = rebuilt.emit();
+        assert!(
+            sql[0].starts_with(r#"CREATE TABLE "main"."t_schemaic_rebuild""#),
+            "{sql:#?}"
+        );
+        assert_eq!(
+            sql[1],
+            r#"INSERT INTO "main"."t_schemaic_rebuild" ("a", "b2") SELECT "a", "b" FROM "main"."t";"#
+        );
+        assert_eq!(sql[2], r#"DROP TABLE "main"."t";"#);
+        assert_eq!(
+            sql[3],
+            r#"ALTER TABLE "main"."t_schemaic_rebuild" RENAME TO "t";"#
+        );
+        assert!(
+            sql[4].starts_with(r#"CREATE INDEX "t_a" ON "main"."t""#),
+            "{sql:#?}"
+        );
+        // Adding a column is a statement of its own even on the pinned table.
+        let mut draft = TableDraft::from_table(&indexed);
+        draft
+            .columns
+            .push(ColumnDraft::new(duck_col("n", "INTEGER")));
+        let added = diff(&indexed, &draft, d);
+        assert_eq!(
+            added.emit(),
+            vec![r#"ALTER TABLE "main"."t" ADD COLUMN "n" INTEGER;"#.to_string()]
+        );
+        // And a plan that makes an index and renames the table is rebuilt: the
+        // rename would meet the index the plan just made.
+        let mut draft = TableDraft::from_table(&plain);
+        draft.name = "t2".into();
+        draft.indexes.push(IndexDraft {
+            original: None,
+            info: IndexInfo {
+                name: "t_b".into(),
+                columns: vec![IndexColumn::plain("b")],
+                ..Default::default()
+            },
+        });
+        assert!(matches!(
+            diff(&plain, &draft, d).changes.first(),
+            Some(Change::RebuildTable(_))
+        ));
+    }
+
+    /// A table another table's key references is refused, by name, rather
+    /// than rebuilt into a `DROP TABLE` the engine refuses.
+    #[test]
+    fn duckdb_will_not_rebuild_a_referenced_table() {
+        let mut t = TableInfo {
+            name: "p".into(),
+            schema: Some("main".into()),
+            columns: vec![duck_col("id", "INTEGER"), duck_col("v", "INTEGER")],
+            ..Default::default()
+        };
+        t.referenced_by.push(crate::schema::InboundForeignKey {
+            schema: Some("main".into()),
+            table: "c".into(),
+            key: ForeignKeyInfo::default(),
+        });
+        let mut draft = TableDraft::from_table(&t);
+        draft.rename_column(1, "v2");
+        let cs = diff(&t, &draft, SqlDialect::DuckDb);
+        assert_eq!(
+            cs.withheld_lines(),
+            vec![Withheld::DuckDbReferenced {
+                table: "p".into(),
+                by: "c".into()
+            }]
+        );
+    }
+
+    /// A column ticked to count from a sequence with no default naming one
+    /// would never count on DuckDB, and the designer says so; on the engines
+    /// whose counter is an attribute the tick alone is enough.
+    #[test]
+    fn a_duckdb_counter_needs_a_default_to_count_from() {
+        let mut draft = TableDraft {
+            name: "t".into(),
+            columns: vec![ColumnDraft::new(ColumnInfo {
+                auto_increment: true,
+                ..duck_col("id", "INTEGER")
+            })],
+            ..Default::default()
+        };
+        assert_eq!(
+            draft.problems(SqlDialect::DuckDb),
+            vec![TableProblem::SequenceNoDefault {
+                column: "id".into()
+            }]
+        );
+        assert!(draft.problems(SqlDialect::Postgres).is_empty());
+        draft.columns[0].info.default = Some("nextval('s')".into());
+        assert!(draft.problems(SqlDialect::DuckDb).is_empty());
+    }
+
+    /// DuckDB's column definition: its counter is the `nextval` default,
+    /// restated, and MySQL's attributes are not written.
+    #[test]
+    fn a_duckdb_column_restates_its_sequence_and_no_mysql_attribute() {
+        let c = ColumnInfo {
+            auto_increment: true,
+            nullable: false,
+            default: Some("nextval('s')".into()),
+            comment: Some("the key".into()),
+            on_update: Some("CURRENT_TIMESTAMP".into()),
+            invisible: true,
+            ..duck_col("id", "INTEGER")
+        };
+        assert_eq!(
+            c.definition_sql(SqlDialect::DuckDb),
+            r#""id" INTEGER NOT NULL DEFAULT nextval('s')"#
+        );
+        // MySQL's counter still replaces the default there.
+        assert!(
+            c.definition_sql(SqlDialect::MySql)
+                .contains("AUTO_INCREMENT")
+        );
+        assert!(!c.definition_sql(SqlDialect::MySql).contains("nextval"));
     }
 
     /// A SQL Server table as the reader gives one: an identity key named

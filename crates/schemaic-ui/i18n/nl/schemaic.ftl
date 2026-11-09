@@ -1739,6 +1739,7 @@ table-problem-check-twice = Twee controlebeperkingen heten allebei { $name }.
 table-problem-check-no-predicate = Controle { $name } heeft geen predicaat.
 table-problem-without-rowid-no-key = Een WITHOUT ROWID-tabel heeft een primaire sleutel nodig.
 table-problem-strict-type = STRICT-tabellen accepteren alleen INT, INTEGER, REAL, TEXT, BLOB of ANY — { $column } is { $data_type }.
+table-problem-sequence-no-default = { $column } counts from a sequence, so its default must name one — nextval('sequence').
 designer-hint-unindexed-fk = Refererende sleutel { $fk } heeft geen index die met zijn kolommen begint, dus een delete of sleutelwijziging op de tabel waarnaar hij verwijst, scant deze tabel.
 designer-no-index = Geen index geselecteerd. De primaire sleutel staat bij de kolommen.
 designer-columns = Kolommen
@@ -2585,6 +2586,7 @@ ddl-withheld-tsql-lossy-index = Het opnieuw opbouwen van { $table } zou de index
 ddl-withheld-tsql-encrypted-trigger = Het opnieuw opbouwen van { $table } zou de trigger { $trigger } verwijderen: de tekst ervan is versleuteld
 ddl-withheld-tsql-signed-trigger = Het opnieuw opbouwen van { $table } zou de handtekening op de trigger { $trigger } verwijderen, en die kan niet worden teruggezet zonder de privésleutel van het certificaat
 ddl-withheld-tsql-renamed-trigger = Het opnieuw opbouwen van { $table } onder een nieuwe naam zou de trigger { $trigger } de oude naam laten noemen
+ddl-withheld-duckdb-referenced = { $table } can't be rebuilt while { $by } has a foreign key referencing it — DuckDB neither drops a referenced table nor adds a foreign key back afterwards
 ddl-withheld-partly-read = Index { $index } is maar deels gelezen — SQLite bewaart het predicaat van een partiële index, en een expressiesleutel, alleen in de eigen CREATE-tekst van de index{ $why ->
         [may-name] , en die tekst kan { $moved } noemen. Verwijder de index om zonder verder te gaan.
         [not-found] , dus hij kan niet worden gemaakt uit wat is gelezen. Verwijder de index om zonder verder te gaan.

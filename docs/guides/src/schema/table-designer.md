@@ -56,7 +56,25 @@ shows every step.
 - **SQLite** rebuilds for most changes, since its `ALTER TABLE` can do very little.
 - **SQL Server** rebuilds to turn identity on or off, to make a column computed or plain, and to
   move a column.
-- **PostgreSQL** can't reorder columns, so there are no move arrows there.
+- **DuckDB** changes a table in place only while nothing depends on it. Once it has an index, a
+  key, a check, a foreign key or a generated column, changing a column's name, type or
+  nullability, dropping a column, or renaming the table rebuilds it. Adding a check, a foreign key or a primary key, or dropping
+  a constraint, rebuilds any table. Adding a column, or changing a default or a comment, still
+  runs in place.
+- **PostgreSQL** and **DuckDB** can't reorder columns, so there are no move arrows there.
+
+On DuckDB, watch for two things:
+
+- *A table another table's foreign key points at can't be rebuilt*: DuckDB won't drop it, and
+  can't add the key back afterwards. The preview lists the change under
+  **This engine can't express part of this plan**, and nothing is applied. Changes that run in
+  place, such as adding a column, still work.
+- *An auto-numbered column is a sequence default.* The toggle reads **Sequence default**, and the
+  column's **Default** has to name the sequence — `nextval('orders_id_seq')` — or the designer
+  stops you at **Preview SQL**.
+
+On SQLite and DuckDB, a rebuild can't rename or drop a column a generated column computes from;
+edit or remove the generated column first.
 
 Other engine-specific fields appear only where the engine has them: **On update** on MySQL; index
 methods on PostgreSQL; partial indexes (**Only rows where**) on PostgreSQL, SQLite and SQL Server;

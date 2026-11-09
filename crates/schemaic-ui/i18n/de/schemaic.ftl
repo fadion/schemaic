@@ -999,6 +999,7 @@ ddl-withheld-tsql-lossy-index = Das Neuaufbauen von { $table } würde den Index 
 ddl-withheld-tsql-encrypted-trigger = Das Neuaufbauen von { $table } würde den Trigger { $trigger } löschen: Sein Text ist verschlüsselt
 ddl-withheld-tsql-signed-trigger = Das Neuaufbauen von { $table } würde die Signatur des Triggers { $trigger } entfernen, die sich ohne den privaten Schlüssel des Zertifikats nicht wiederherstellen lässt
 ddl-withheld-tsql-renamed-trigger = Das Neuaufbauen von { $table } unter neuem Namen würde den Trigger { $trigger } beim alten Namen belassen
+ddl-withheld-duckdb-referenced = { $table } can't be rebuilt while { $by } has a foreign key referencing it — DuckDB neither drops a referenced table nor adds a foreign key back afterwards
 ddl-withheld-partly-read = Der Index { $index } wurde nur teilweise gelesen — SQLite hält das Prädikat eines partiellen Index und einen Ausdrucksschlüssel nur im eigenen CREATE-Text des Index{ $why ->
         [may-name] , und dieser Text nennt womöglich { $moved }. Lösche den Index, um ohne ihn fortzufahren.
         [not-found] , daher lässt er sich aus dem Gelesenen nicht erstellen. Lösche den Index, um ohne ihn fortzufahren.
@@ -2130,6 +2131,7 @@ table-problem-check-twice = Zwei Prüfeinschränkungen heißen beide { $name }.
 table-problem-check-no-predicate = Prüfung { $name } hat keine Bedingung.
 table-problem-without-rowid-no-key = Eine WITHOUT-ROWID-Tabelle braucht einen Primärschlüssel.
 table-problem-strict-type = STRICT-Tabellen nehmen nur INT, INTEGER, REAL, TEXT, BLOB oder ANY — { $column } ist { $data_type }.
+table-problem-sequence-no-default = { $column } counts from a sequence, so its default must name one — nextval('sequence').
 designer-hint-unindexed-fk = Fremdschlüssel { $fk } hat keinen Index, der mit seinen Spalten beginnt, daher durchsucht ein Löschen oder Schlüssel-Update in der referenzierten Tabelle diese hier vollständig.
 designer-no-index = Kein Index ausgewählt. Der Primärschlüssel liegt bei den Spalten.
 designer-columns = Spalten

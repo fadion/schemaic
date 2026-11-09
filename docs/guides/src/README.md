@@ -18,8 +18,8 @@ interface is meant to explain itself, and the guide picks up where it doesn't.
 
 MySQL/MariaDB, PostgreSQL and SQL Server are fully supported. SQLite reads, writes, imports and
 edits tables, views and triggers, but has no manual-transaction mode and no users to manage. DuckDB
-is new: you can query it, browse it, edit a table's rows, import files into it, see plans and back
-it up, but Schemaic doesn't change its structure for you yet. Where
+is new: you can query it, browse it, edit a table's rows and design its tables, import files into
+it, see plans and back it up, but Schemaic doesn't edit its views or macros yet. Where
 an engine can't do something, Schemaic leaves the entry out rather than showing it greyed out — a
 greyed-out entry usually means the connection is marked read-only.
 

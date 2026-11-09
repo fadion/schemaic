@@ -1739,6 +1739,7 @@ table-problem-check-twice = Deux contraintes CHECK s'appellent toutes deux { $na
 table-problem-check-no-predicate = La contrainte CHECK { $name } n'a pas de prédicat.
 table-problem-without-rowid-no-key = Une table WITHOUT ROWID a besoin d'une clé primaire.
 table-problem-strict-type = Les tables STRICT n'acceptent que INT, INTEGER, REAL, TEXT, BLOB ou ANY — { $column } est { $data_type }.
+table-problem-sequence-no-default = { $column } counts from a sequence, so its default must name one — nextval('sequence').
 designer-hint-unindexed-fk = La clé étrangère { $fk } n'a aucun index commençant par ses colonnes : une suppression ou une mise à jour de clé dans la table qu'elle référence parcourt donc celle-ci.
 designer-no-index = Aucun index sélectionné. La clé primaire se définit sur les colonnes.
 designer-columns = Colonnes
@@ -2585,6 +2586,7 @@ ddl-withheld-tsql-lossy-index = Reconstruire { $table } supprimerait l'index { $
 ddl-withheld-tsql-encrypted-trigger = Reconstruire { $table } supprimerait le déclencheur { $trigger } : son texte est chiffré
 ddl-withheld-tsql-signed-trigger = Reconstruire { $table } supprimerait la signature du déclencheur { $trigger }, qui ne peut pas être rétablie sans la clé privée du certificat
 ddl-withheld-tsql-renamed-trigger = Reconstruire { $table } sous un nouveau nom laisserait le déclencheur { $trigger } nommer l'ancien
+ddl-withheld-duckdb-referenced = { $table } can't be rebuilt while { $by } has a foreign key referencing it — DuckDB neither drops a referenced table nor adds a foreign key back afterwards
 ddl-withheld-partly-read = L'index { $index } n'a été lu qu'en partie — SQLite ne garde le prédicat d'un index partiel, et une clé à expression, que dans le texte CREATE de l'index lui-même{ $why ->
         [may-name] , et ce texte peut nommer { $moved }. Supprimez l'index pour continuer sans lui.
         [not-found] {" "}: il ne peut donc pas être créé à partir de ce qui a été lu. Supprimez l'index pour continuer sans lui.

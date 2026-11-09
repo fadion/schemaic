@@ -105,12 +105,15 @@ A DuckDB connection is a database file on this machine, like SQLite's; see
   open, and other programs out of it, until it goes back to **Auto-commit**; and because DuckDB
   has no savepoints, grid edits that fail to save roll back the whole transaction — see
   [Editing data](../results-grid/editing.md#committing);
-- the `duckdb` command-line client in the terminal panel, when it's installed.
+- the `duckdb` command-line client in the terminal panel, when it's installed;
+- the [table designer](../schema/table-designer.md#what-differs-between-engines), **Copy to** and
+  **Compare with**. DuckDB's `ALTER TABLE` refuses most changes to a table that anything depends
+  on, so many changes rebuild the table in one transaction, and a table another table's foreign key
+  points at can't be rebuilt.
 
 *Not yet:*
 
-- the table designer and the view and macro editors, so structure changes are SQL you write and run
-  yourself;
+- the view and macro editors, so changing a view or macro is SQL you write and run yourself;
 - **Restore from file**.
 
 There are no users to manage, as on SQLite. The AI assistant and the command line read only the

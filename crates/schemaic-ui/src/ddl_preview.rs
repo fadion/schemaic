@@ -2382,6 +2382,11 @@ pub(crate) fn withheld_text(w: &schemaic_core::ddl::Withheld) -> String {
             table = table.as_str(),
             trigger = trigger.as_str()
         ),
+        W::DuckDbReferenced { table, by } => tr!(
+            "ddl-withheld-duckdb-referenced",
+            table = table.as_str(),
+            by = by.as_str()
+        ),
         W::PartlyRead { index, why } => {
             let (why, moved) = match why {
                 PartlyReadWhy::MayName(m) => ("may-name", moved_text(m)),
