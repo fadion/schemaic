@@ -210,11 +210,13 @@ pub async fn a_copied_table_has_every_row_and_numbers_on_past_them(target: &'sta
             "float",
         ),
         SqlDialect::Sqlite => ("id INTEGER PRIMARY KEY", "BLOB", "REAL"),
+        SqlDialect::DuckDb => unreachable!("not a leg of this suite"),
     };
     let (bytes, empty) = match dialect {
         SqlDialect::MySql | SqlDialect::Sqlite => ("X'00FF10'", "X''"),
         SqlDialect::Postgres => ("'\\x00ff10'::bytea", "''::bytea"),
         SqlDialect::MsSql => ("0x00FF10", "0x"),
+        SqlDialect::DuckDb => unreachable!("not a leg of this suite"),
     };
     // What each engine can hold: PostgreSQL every non-finite value, SQLite
     // the infinities, MySQL and SQL Server none.
@@ -222,6 +224,7 @@ pub async fn a_copied_table_has_every_row_and_numbers_on_past_them(target: &'sta
         SqlDialect::Postgres => ["'NaN'", "'Infinity'", "'-Infinity'", "0.1"],
         SqlDialect::Sqlite => ["9e999", "-9e999", "0.5", "0.1"],
         SqlDialect::MySql | SqlDialect::MsSql => ["1.5", "-2.25", "0.5", "0.1"],
+        SqlDialect::DuckDb => unreachable!("not a leg of this suite"),
     };
     scratch
         .exec(&format!(
@@ -289,6 +292,7 @@ pub async fn a_copied_table_has_every_row_and_numbers_on_past_them(target: &'sta
         SqlDialect::Postgres => "encode(b, 'hex')",
         SqlDialect::MsSql => "CONVERT(varchar(max), b, 2)",
         SqlDialect::Sqlite => "hex(b)",
+        SqlDialect::DuckDb => unreachable!("not a leg of this suite"),
     };
     let rows_sql = |table: &str| {
         format!(

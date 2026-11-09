@@ -71,6 +71,7 @@ pub async fn a_read_only_session_refuses_a_write_a_select_hides(target: &'static
     let gate_refuses_the_call = match scratch.dialect() {
         SqlDialect::Postgres | SqlDialect::MsSql => true,
         SqlDialect::MySql | SqlDialect::Sqlite => false,
+        SqlDialect::DuckDb => unreachable!("not a leg of this suite"),
     };
     assert_eq!(
         gate.is_err(),

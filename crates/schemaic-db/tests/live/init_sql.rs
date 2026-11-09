@@ -24,7 +24,9 @@ fn setting(dialect: SqlDialect) -> (&'static str, &'static str, &'static str) {
             "SELECT @@session.time_zone",
             "+03:00",
         ),
-        SqlDialect::MsSql | SqlDialect::Sqlite => unreachable!("not a leg of this suite"),
+        SqlDialect::MsSql | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+            unreachable!("not a leg of this suite")
+        }
     }
 }
 
@@ -98,7 +100,9 @@ pub async fn a_refused_init_statement_fails_the_operation(target: &'static Targe
     let bad = match scratch.dialect() {
         SqlDialect::Postgres => "SET statement_timeout = 'banana'",
         SqlDialect::MySql => "SET time_zone = 'Nowhere/Nope'",
-        SqlDialect::MsSql | SqlDialect::Sqlite => unreachable!("not a leg of this suite"),
+        SqlDialect::MsSql | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+            unreachable!("not a leg of this suite")
+        }
     };
     let db = scratch.db.clone().with_init_sql(bad);
     let err = db
