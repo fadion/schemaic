@@ -3813,14 +3813,11 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
                 format_req.set(Some(req));
                 return CommandExecuted::Yes;
             }
-            match command {
-                // Open the Go-to-line popup (autofocuses on mount). An effect
-                // closes the find bar so the two never overlap at the top-right.
-                Some(KeyCommand::GoToLine) => {
-                    goto_open.set(true);
-                    return CommandExecuted::Yes;
-                }
-                _ => {}
+            // Open the Go-to-line popup (autofocuses on mount). An effect
+            // closes the find bar so the two never overlap at the top-right.
+            if command == Some(KeyCommand::GoToLine) {
+                goto_open.set(true);
+                return CommandExecuted::Yes;
             }
         }
         // Enter accepts / Escape rejects the Ctrl+K bar from the editor. Which
