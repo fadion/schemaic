@@ -1590,6 +1590,13 @@ pub enum DbRefusal {
     /// data-file session — a database file the user owns, whose schema only
     /// the previewed DDL path changes.
     DuckDbNotASession,
+    /// A backup's target is the database it copies (`db::staged_backup`).
+    StageOverSource(String),
+    /// A backup's or *New file*'s target is open in this process.
+    StageTargetHeld(String),
+    /// An engine sidecar (`-wal`, `.wal`) stands beside the target and would
+    /// be read into the new file; it is not removed for the user.
+    StageSidecar { sidecar: String, target: String },
 }
 
 impl DbRefusal {
@@ -1636,7 +1643,11 @@ impl DbRefusal {
             | DbRefusal::DuckDbMissing(_)
             | DbRefusal::DuckDbSessionClosed(_)
             | DbRefusal::DuckDbNotADataFile(_)
-            | DbRefusal::DuckDbNotASession => true,
+            | DbRefusal::DuckDbNotASession
+            | DbRefusal::StageOverSource(_)
+            | DbRefusal::StageSidecar { .. } => true,
+            // Free again once what holds it closes.
+            DbRefusal::StageTargetHeld(_) => false,
         }
     }
 
@@ -1807,6 +1818,17 @@ impl DbRefusal {
             DbRefusal::DuckDbNotASession => "A data file opens into an in-memory session, not \
                                              into a database file."
                 .to_string(),
+            DbRefusal::StageOverSource(target) => format!(
+                "{target} is the database being backed up; a backup cannot replace the file it copies"
+            ),
+            DbRefusal::StageTargetHeld(target) => format!(
+                "{target} is open in this app (a running operation or a Manual tab); \
+                 close what holds it before replacing it"
+            ),
+            DbRefusal::StageSidecar { sidecar, target } => format!(
+                "{sidecar} stands beside {target} and would be read into the new file; \
+                 it is not removed for you, since it can hold committed data"
+            ),
         }
     }
 }

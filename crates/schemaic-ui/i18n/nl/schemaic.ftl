@@ -559,6 +559,9 @@ db-refused-duckdb-worker = de DuckDB-worker is mislukt: { $error }
 db-refused-duckdb-session-closed = { $name } is een sessie in het geheugen die niet open is. De gegevens ervan bestonden alleen zolang ze open was — open het gegevensbestand opnieuw.
 db-refused-duckdb-not-a-data-file = { $path } is geen bestand dat Schemaic als gegevens opent. Open een .csv-, .tsv-, .parquet-, .json-, .jsonl- of .ndjson-bestand (voor de tekstsoorten ook een .gz- of .zst-bestand).
 db-refused-duckdb-not-a-session = Een gegevensbestand opent in een sessie in het geheugen, niet in een databasebestand.
+db-refused-stage-over-source = { $target } is de database waarvan een back-up wordt gemaakt; een back-up kan het bestand dat ze kopieert niet vervangen
+db-refused-stage-target-held = { $target } is geopend in deze app (een lopende bewerking of een tabblad in de modus Handmatig); sluit wat het vasthoudt voordat u het vervangt
+db-refused-stage-sidecar = { $sidecar } staat naast { $target } en zou in het nieuwe bestand worden ingelezen; het wordt niet voor u verwijderd, omdat het vastgelegde gegevens kan bevatten
 db-refused-sqlite-sizes-too-large = Tabelgroottes worden alleen gelezen voor een database tot { $cap }: SQLite meet ze door elke pagina van het bestand te lezen, en dit bestand is { $file }.
 
 ## Why a connection could not be made (core's model::ConnectFailure), after

@@ -559,6 +559,9 @@ db-refused-duckdb-worker = работният процес на DuckDB е неу
 db-refused-duckdb-session-closed = { $name } е сесия в паметта, която не е отворена. Данните ѝ съществуваха само докато беше отворена — отворете отново файла с данни.
 db-refused-duckdb-not-a-data-file = { $path } не е файл, който Schemaic отваря като данни. Отворете файл .csv, .tsv, .parquet, .json, .jsonl или .ndjson (за текстовите видове — и .gz или .zst).
 db-refused-duckdb-not-a-session = Файлът с данни се отваря в сесия в паметта, а не във файл на база данни.
+db-refused-stage-over-source = { $target } е базата данни, от която се прави резервно копие; копието не може да замени файла, който копира
+db-refused-stage-target-held = { $target } е отворен в това приложение (текуща операция или раздел в режим Ръчно); затворете това, което го държи, преди да го замените
+db-refused-stage-sidecar = { $sidecar } стои до { $target } и ще бъде прочетен в новия файл; не се премахва вместо вас, защото може да съдържа потвърдени данни
 db-refused-sqlite-sizes-too-large = Размерите на таблиците се четат само за база данни до { $cap }: SQLite ги измерва, като чете всяка страница от файла, а този е { $file }.
 
 ## Why a connection could not be made (core's model::ConnectFailure), after

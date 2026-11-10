@@ -2156,23 +2156,21 @@ where
     if let Some(canonical) = fs.existing(target_path) {
         if source.is_some_and(|s| fs.existing(std::path::Path::new(s)).as_ref() == Some(&canonical))
         {
-            return Err(DbError::Query(format!(
-                "{target} is the database being backed up; a backup cannot replace the file it copies"
+            return Err(DbError::Refused(DbRefusal::StageOverSource(
+                target.to_string(),
             )));
         }
         if fs.held(&canonical) {
-            return Err(DbError::Query(format!(
-                "{target} is open in this app (a running operation or a Manual tab); \
-                 close what holds it before replacing it"
+            return Err(DbError::Refused(DbRefusal::StageTargetHeld(
+                target.to_string(),
             )));
         }
     }
     if let Some(side) = fs.sidecars(target_path).first() {
-        return Err(DbError::Query(format!(
-            "{} stands beside {target} and would be read into the new file; \
-             it is not removed for you, since it can hold committed data",
-            side.display()
-        )));
+        return Err(DbError::Refused(DbRefusal::StageSidecar {
+            sidecar: side.display().to_string(),
+            target: target.to_string(),
+        }));
     }
     let part = schemaic_core::export::part_file(target_path);
     fs.clear(&part)
@@ -4202,8 +4200,15 @@ mod tests {
         .await;
         assert!(!copied.load(std::sync::atomic::Ordering::SeqCst), "copied");
         assert!(fs.calls.lock().unwrap().is_empty(), "{:?}", fs.calls);
+        // **Schemaic's own sentence, not a failed query**: as a `Query` the
+        // form read "Couldn't create old.db: query failed: old.db-wal stands
+        // beside …", naming a query nothing had sent.
         match r {
-            Err(DbError::Query(m)) => m,
+            Err(e @ DbError::Refused(_)) => {
+                let m = e.to_string();
+                assert!(!m.starts_with("query failed"), "{m}");
+                m
+            }
             other => panic!("{other:?}"),
         }
     }

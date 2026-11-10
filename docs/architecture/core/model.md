@@ -182,7 +182,12 @@ failure, DuckDB's — `open_target`'s `DuckDbNoFile`, `DuckDbNotAFile` and `Duck
 open for the other kind of run (`DuckDbSealedElsewhere`), `DuckDbWorker`, and *Open data
 file*'s three — `DuckDbSessionClosed(String)`, a `memory:` target with no session behind it,
 `DuckDbNotADataFile(String)`, a path with no reader, and `DuckDbNotASession`, a data file opened
-into anything but a session — all three standing (under `db::duckdb`) — MySQL's quote-safety and read-only plan refusals, a read-only PostgreSQL session's
+into anything but a session — all three standing (under `db::duckdb`) — the three targets
+`staged_backup` refuses before a backup or *New file* is staged, `StageOverSource(target)`,
+`StageTargetHeld(target)` and `StageSidecar { sidecar, target }` (`db-refused-stage-*`; under
+`schemaic-db`'s backup entry), which were `DbError::Query` until the *New file* form read
+"Couldn't create old.db: query failed: old.db-wal stands beside …", naming a query nothing had
+sent — MySQL's quote-safety and read-only plan refusals, a read-only PostgreSQL session's
 `ShadowedBuiltin { schema, name, operator }` — a schema on its path holding what PostgreSQL could
 pick in a builtin's place, its two wordings `db-refused-shadowed-function` and
 `db-refused-shadowed-operator` in `i18n::db_refusal_text` — `KeyringUnreadable(String)`, the one
@@ -199,8 +204,9 @@ values inside are the user's or the server's, and a `SqliteWorker`'s text is the
 **`stands()` says whether a refusal holds against a retry** — made before the statement ran, for
 a reason asking again unchanged meets again — and it is what the headless front ends read to give
 a refusal the guard's exit 3 rather than a failure's 4 (`NoRows::from_db`, under `cli::query`).
-Four do not stand: `SqliteWorker` and `DuckDbWorker`, the worker thread failing, which a retry
-may not meet; `DuckDbSealedElsewhere`, since the file is free again once the other run ends; and
+Five do not stand: `SqliteWorker` and `DuckDbWorker`, the worker thread failing, which a retry
+may not meet; `DuckDbSealedElsewhere`, since the file is free again once the other run ends;
+`StageTargetHeld`, free again once what holds it closes; and
 `CommitAborted`, a report on a `COMMIT` that was sent. It is matched with no wildcard, so a new
 variant has to be placed on one side rather than inherit whichever a `_` gave it
 (`a_refusal_stands_unless_it_is_a_failure_or_a_report`).

@@ -706,7 +706,8 @@ code-page checks, `sqlite::open_target`'s three refusals, SQLite's "the SQLite w
 (a `Query` once) at each of its six sites, its default-reset refusals and `table_stats`' size
 cap, and DuckDB's — `duckdb::open_target`'s three, a sealed or unsealed instance asked for the
 other kind (`DuckDbSealedElsewhere`), its worker failing, a closed session's target
-(`DuckDbSessionClosed`) and `open_data_file`'s two (under `duckdb.rs`). It renders **as written**, `#[error("{0}")]` with no prefix — `DbRefusal`'s `Display`, its
+(`DuckDbSessionClosed`) and `open_data_file`'s two (under `duckdb.rs`), and `staged_backup`'s
+three (`Stage*`, below). It renders **as written**, `#[error("{0}")]` with no prefix — `DbRefusal`'s `Display`, its
 English: each is already the whole sentence, and "query failed:" in front of "Commit cancelled
 — …" named a failure that was the user's own act. The window words it instead
 (`i18n::db_refusal_text`, from `db_error_shown`); the CLI, the MCP server and the logs keep
@@ -823,7 +824,13 @@ new file would replay on open — the replaced database's tables in a "new" SQLi
 file refused with *WAL does not match database file*. The sidecar is named and never removed: a
 live one can hold another program's committed data. SQLite has no registry, so a SQLite file
 another connection holds is caught only through its sidecar (a WAL-mode file's `-wal`, a writing
-transaction's `-journal`). The file operations and those three questions sit behind a private
+transaction's `-journal`). **Each is a `DbError::Refused`** — `DbRefusal::StageOverSource`,
+`StageTargetHeld` and `StageSidecar`, worded as `db-refused-stage-*` — and not the `Query` they
+were, under which the *New file* form read "Couldn't create old.db: query failed: old.db-wal
+stands beside …", naming a query nothing had sent; `refused`, the helper the three tests below
+share, fails on a message that starts *query failed*. `StageTargetHeld` alone does not stand
+(`DbRefusal::stands`): the file is free once what holds it closes. No headless path reaches
+`staged_backup` today, so no exit code turns on it. The file operations and those three questions sit behind a private
 `StagingFs` trait (`RealFs` in the app) so the order is tested without a file —
 `a_backup_replaces_its_target_only_with_a_whole_copy`,
 `a_copy_that_cannot_replace_its_target_is_kept_and_named`,

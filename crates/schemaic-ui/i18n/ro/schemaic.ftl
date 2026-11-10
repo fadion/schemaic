@@ -566,6 +566,9 @@ db-refused-duckdb-worker = procesul de lucru DuckDB a eșuat: { $error }
 db-refused-duckdb-session-closed = { $name } este o sesiune în memorie care nu este deschisă. Datele ei au existat doar cât a fost deschisă — deschide din nou fișierul de date.
 db-refused-duckdb-not-a-data-file = { $path } nu este un fișier pe care Schemaic îl deschide ca date. Deschide un fișier .csv, .tsv, .parquet, .json, .jsonl sau .ndjson (și unul .gz sau .zst, pentru tipurile text).
 db-refused-duckdb-not-a-session = Un fișier de date se deschide într-o sesiune în memorie, nu într-un fișier de bază de date.
+db-refused-stage-over-source = { $target } este baza de date pentru care se face copia de rezervă; o copie de rezervă nu poate înlocui fișierul pe care îl copiază
+db-refused-stage-target-held = { $target } este deschis în această aplicație (o operație în curs sau o filă în modul Manual); închideți ce îl ține deschis înainte de a-l înlocui
+db-refused-stage-sidecar = { $sidecar } se află lângă { $target } și ar fi citit în fișierul nou; nu este șters în locul dvs., deoarece poate conține date confirmate
 db-refused-sqlite-sizes-too-large = Dimensiunile tabelelor se citesc doar pentru o bază de date de până la { $cap }: SQLite le măsoară citind fiecare pagină a fișierului, iar acesta are { $file }.
 
 ## Why a connection could not be made (core's model::ConnectFailure), after

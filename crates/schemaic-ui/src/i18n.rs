@@ -1278,6 +1278,17 @@ pub fn db_refusal_text(r: &schemaic_core::model::DbRefusal) -> String {
             tr!("db-refused-duckdb-not-a-data-file", path = path.as_str())
         }
         DbRefusal::DuckDbNotASession => tr!("db-refused-duckdb-not-a-session"),
+        DbRefusal::StageOverSource(target) => {
+            tr!("db-refused-stage-over-source", target = target.as_str())
+        }
+        DbRefusal::StageTargetHeld(target) => {
+            tr!("db-refused-stage-target-held", target = target.as_str())
+        }
+        DbRefusal::StageSidecar { sidecar, target } => tr!(
+            "db-refused-stage-sidecar",
+            sidecar = sidecar.as_str(),
+            target = target.as_str()
+        ),
     }
 }
 
@@ -1918,6 +1929,12 @@ mod tests {
             DbRefusal::DuckDbSessionClosed(s("memory:session-3")),
             DbRefusal::DuckDbNotADataFile(s("C:/data/x.xlsx")),
             DbRefusal::DuckDbNotASession,
+            DbRefusal::StageOverSource(s("./shop.duckdb")),
+            DbRefusal::StageTargetHeld(s("app.duckdb")),
+            DbRefusal::StageSidecar {
+                sidecar: s("old.db-wal"),
+                target: s("old.db"),
+            },
         ];
         for auth in [
             AuthMode::Password,

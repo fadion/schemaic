@@ -559,6 +559,9 @@ db-refused-duckdb-worker = procesi ndihmës i DuckDB dështoi: { $error }
 db-refused-duckdb-session-closed = { $name } është një seancë në memorie që nuk është e hapur. Të dhënat e saj ekzistonin vetëm sa ishte e hapur — hapeni sërish skedarin e të dhënave.
 db-refused-duckdb-not-a-data-file = { $path } nuk është skedar që Schemaic e hap si të dhëna. Hapni një skedar .csv, .tsv, .parquet, .json, .jsonl ose .ndjson (edhe një .gz ose .zst, për llojet tekst).
 db-refused-duckdb-not-a-session = Një skedar të dhënash hapet në një seancë në memorie, jo në një skedar baze të dhënash.
+db-refused-stage-over-source = { $target } është baza e të dhënave që po kopjohet; një kopje rezervë nuk mund të zëvendësojë skedarin që kopjon
+db-refused-stage-target-held = { $target } është i hapur në këtë aplikacion (një veprim në vazhdim ose një skedë në modalitetin Manual); mbyllni atë që e mban përpara se ta zëvendësoni
+db-refused-stage-sidecar = { $sidecar } ndodhet pranë { $target } dhe do të lexohej në skedarin e ri; nuk fshihet për ju, sepse mund të përmbajë të dhëna të konfirmuara
 db-refused-sqlite-sizes-too-large = Madhësitë e tabelave lexohen vetëm për një bazë të dhënash deri në { $cap }: SQLite i mat duke lexuar çdo faqe të skedarit, dhe ky është { $file }.
 
 ## Why a connection could not be made (core's model::ConnectFailure), after
