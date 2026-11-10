@@ -36,7 +36,6 @@ have landed.
 1. **DuckDB**, alone. A new engine answers every capability predicate and needs its own read-only
    allowlist, so it gets a release with nothing else in it. Moved ahead of the data and editor
    release by the user on 2026-11-09.
-2. **Charts:** the two chart kinds.
 
 ## Desktop app
 
@@ -44,7 +43,6 @@ have landed.
 
 Each of these is a one-session change.
 
-- **Charts:** add scatter and stacked bar.
 - **A view's and a routine's comment in *Copy DDL* and the dump, on PostgreSQL and SQL Server.**
   Their scripts drop both today — `COMMENT ON VIEW` / `COMMENT ON FUNCTION`, and the
   `MS_Description` property — while a table's is kept. DuckDB's are restated

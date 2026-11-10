@@ -1,6 +1,8 @@
 //! **A chart of a result** — the numbers behind the result grid's *Chart*:
-//! which columns can be plotted, one column's values against another's labels,
-//! a histogram of one column, and the axis a value range is drawn against.
+//! which columns can be plotted, one column's values against another's labels
+//! (summed per a third column's values for a stacked bar), against another
+//! numeric column (a scatter), a histogram of one column, and the axis a value
+//! range is drawn against.
 //!
 //! Pure over a [`ResultSet`], so the view only paints what this answers. Of
 //! the rows **already on screen**: a chart of a capped result is a chart of
@@ -22,19 +24,53 @@ pub enum ChartKind {
     Line,
     /// How one column's values are distributed, in equal-width bins.
     Histogram,
+    /// One dot per row: the value column against a second numeric column,
+    /// both on a numeric axis.
+    Scatter,
+    /// One bar per label, split into segments by a third column's values —
+    /// the shape of a `GROUP BY a, b` read straight in.
+    StackedBar,
 }
 
 impl ChartKind {
-    pub const ALL: [ChartKind; 3] = [ChartKind::Bar, ChartKind::Line, ChartKind::Histogram];
+    pub const ALL: [ChartKind; 5] = [
+        ChartKind::Bar,
+        ChartKind::StackedBar,
+        ChartKind::Line,
+        ChartKind::Scatter,
+        ChartKind::Histogram,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             ChartKind::Bar => "Bar",
             ChartKind::Line => "Line",
             ChartKind::Histogram => "Histogram",
+            ChartKind::Scatter => "Scatter",
+            ChartKind::StackedBar => "Stacked bar",
         }
     }
 }
+
+/// The columns a chart is drawn from. Which of them a kind reads is
+/// [`Plot::of`]'s: `value` always; `label` for a bar, a line or a stacked bar
+/// (`None` numbers the rows); `x` for a scatter's horizontal axis; `by` for a
+/// stacked bar's segments (`None` is one segment per label).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Picks {
+    pub value: usize,
+    pub label: Option<usize>,
+    pub x: Option<usize>,
+    pub by: Option<usize>,
+}
+
+/// The most segments a stacked bar names: past it the rest are summed into
+/// one more, [`OTHER`] — one colour each, and no palette tells more apart.
+pub const MAX_STACKS: usize = 8;
+
+/// The folded segment's name in core's English; the view renames it into the
+/// interface's language ([`Stacked::name_other`]).
+pub const OTHER: &str = "Other";
 
 /// The most bars or points a chart draws: past it they are thinner than a
 /// pixel on any panel the chart fits, and the rest are said rather than drawn.
@@ -120,13 +156,133 @@ pub fn series(rs: &ResultSet, x: Option<usize>, y: usize) -> Series {
             out.skipped += 1;
             continue;
         }
-        let label = match x.and_then(|x| rs.cell(r, x)) {
-            Some(c) if c.tag == CellTag::Null => "NULL".to_string(),
-            Some(c) => c.text().to_string(),
-            None => (r + 1).to_string(),
-        };
-        out.labels.push(label);
+        out.labels.push(label_text(rs, r, x));
         out.values.push(v);
+    }
+    out
+}
+
+/// Row `r`'s label from column `col` — `NULL` for a NULL, its row number
+/// when there is no column.
+fn label_text(rs: &ResultSet, r: usize, col: Option<usize>) -> String {
+    match col.and_then(|c| rs.cell(r, c)) {
+        Some(c) if c.tag == CellTag::Null => "NULL".to_string(),
+        Some(c) => c.text().to_string(),
+        None => (r + 1).to_string(),
+    }
+}
+
+/// Pairs of numbers to draw as a scatter, in row order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Points {
+    pub xs: Vec<f64>,
+    pub ys: Vec<f64>,
+    /// Rows left out: either number missing, or past [`MAX_POINTS`].
+    pub skipped: usize,
+}
+
+/// Column `y`'s values against column `x`'s, one pair per row that has both.
+pub fn points(rs: &ResultSet, x: usize, y: usize) -> Points {
+    let mut out = Points::default();
+    for r in 0..rs.row_count() {
+        let (Some(xv), Some(yv)) = (number(rs, r, x), number(rs, r, y)) else {
+            out.skipped += 1;
+            continue;
+        };
+        if out.xs.len() == MAX_POINTS {
+            out.skipped += 1;
+            continue;
+        }
+        out.xs.push(xv);
+        out.ys.push(yv);
+    }
+    out
+}
+
+/// A stacked bar's numbers: per label, one sum per stack.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Stacked {
+    /// The bars, in the order their label first appears.
+    pub labels: Vec<String>,
+    /// The segments, in the order their value first appears — the last one
+    /// [`OTHER`] when `other`.
+    pub stacks: Vec<String>,
+    /// Whether the last stack is the fold of those past [`MAX_STACKS`].
+    pub other: bool,
+    /// `values[label][stack]`, `0.0` where a label has none of a stack.
+    pub values: Vec<Vec<f64>>,
+    /// Rows left out: a NULL or non-numeric value, or a new label past
+    /// [`MAX_POINTS`].
+    pub skipped: usize,
+}
+
+impl Stacked {
+    /// Names the folded segment `name` — the view's word for [`OTHER`].
+    pub fn name_other(&mut self, name: &str) {
+        if self.other
+            && let Some(last) = self.stacks.last_mut()
+        {
+            *last = name.to_string();
+        }
+    }
+}
+
+/// Column `value` summed per label (column `label`, or the row number) and per
+/// stack (column `by`'s text, or one stack when `None`).
+///
+/// **Summed, not one bar per row**: a stacked bar's rows name the same label
+/// once per segment, so a label is one bar however many rows carry it.
+pub fn stacked(rs: &ResultSet, label: Option<usize>, by: Option<usize>, value: usize) -> Stacked {
+    use std::collections::HashMap;
+    let mut out = Stacked::default();
+    let mut bars: HashMap<String, usize> = HashMap::new();
+    let mut stacks: HashMap<String, usize> = HashMap::new();
+    let mut cells: Vec<(usize, usize, f64)> = Vec::new();
+    for r in 0..rs.row_count() {
+        let Some(v) = number(rs, r, value) else {
+            out.skipped += 1;
+            continue;
+        };
+        let name = label_text(rs, r, label);
+        let bar = match bars.get(&name) {
+            Some(&i) => i,
+            None if out.labels.len() == MAX_POINTS => {
+                out.skipped += 1;
+                continue;
+            }
+            None => {
+                bars.insert(name.clone(), out.labels.len());
+                out.labels.push(name);
+                out.labels.len() - 1
+            }
+        };
+        let key = match by {
+            Some(c) => match rs.cell(r, c) {
+                Some(cell) if cell.tag != CellTag::Null => cell.text().to_string(),
+                _ => "NULL".to_string(),
+            },
+            None => String::new(),
+        };
+        let stack = match stacks.get(&key) {
+            Some(&i) => i,
+            None if stacks.len() == MAX_STACKS => {
+                out.other = true;
+                MAX_STACKS
+            }
+            None => {
+                stacks.insert(key.clone(), out.stacks.len());
+                out.stacks.push(key);
+                out.stacks.len() - 1
+            }
+        };
+        cells.push((bar, stack, v));
+    }
+    if out.other {
+        out.stacks.push(OTHER.to_string());
+    }
+    out.values = vec![vec![0.0; out.stacks.len()]; out.labels.len()];
+    for (bar, stack, v) in cells {
+        out.values[bar][stack] += v;
     }
     out
 }
@@ -342,34 +498,45 @@ fn exponent(v: f64, digits: usize) -> String {
     }
 }
 
-/// What a chart draws: a series of labelled values (a bar or line chart), or
-/// a histogram's bins. The view paints one; the decisions about it — the
+/// What a chart draws: a series of labelled values (a bar or line chart), a
+/// histogram's bins, a scatter's pairs, or a stacked bar's sums. The view
+/// paints one; the decisions about it — the
 /// value axis's range, the labels under the axis, the line beneath the
 /// canvas — are answered here, where a test can see them.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Plot {
     Series(ChartKind, Series),
     Bins(Vec<Bin>),
+    /// A scatter.
+    Points(Points),
+    /// A stacked bar.
+    Stacked(Stacked),
 }
 
 impl Plot {
-    /// Column `value` of `rs` charted as `kind`, labelled by `label` — and how
-    /// many rows it left out.
-    pub fn of(
-        rs: &ResultSet,
-        kind: ChartKind,
-        value: usize,
-        label: Option<usize>,
-    ) -> (Plot, usize) {
+    /// `rs` charted as `kind` from the columns `picks` names — and how many
+    /// rows it left out. A scatter with no `x` has nothing to draw.
+    pub fn of(rs: &ResultSet, kind: ChartKind, picks: Picks) -> (Plot, usize) {
+        let value = picks.value;
         match kind {
             ChartKind::Histogram => {
                 let (bins, skipped) = histogram(rs, value);
                 (Plot::Bins(bins), skipped)
             }
             ChartKind::Bar | ChartKind::Line => {
-                let s = series(rs, label, value);
+                let s = series(rs, picks.label, value);
                 let skipped = s.skipped;
                 (Plot::Series(kind, s), skipped)
+            }
+            ChartKind::Scatter => {
+                let p = picks.x.map(|x| points(rs, x, value)).unwrap_or_default();
+                let skipped = p.skipped;
+                (Plot::Points(p), skipped)
+            }
+            ChartKind::StackedBar => {
+                let s = stacked(rs, picks.label, picks.by, value);
+                let skipped = s.skipped;
+                (Plot::Stacked(s), skipped)
             }
         }
     }
@@ -378,7 +545,25 @@ impl Plot {
         match self {
             Plot::Series(_, s) => s.values.is_empty(),
             Plot::Bins(b) => b.is_empty(),
+            Plot::Points(p) => p.xs.is_empty(),
+            Plot::Stacked(s) => s.labels.is_empty(),
         }
+    }
+
+    /// A scatter's horizontal axis: its first and last tick, the span the
+    /// dots are placed across — `None` for every other kind, whose x is a
+    /// slot per label, and for a scatter whose X values no axis spans.
+    pub fn x_range(&self) -> Option<(f64, f64)> {
+        let Plot::Points(p) = self else { return None };
+        let t = self.x_ticks(p)?;
+        Some((*t.first()?, *t.last()?))
+    }
+
+    fn x_ticks(&self, p: &Points) -> Option<Vec<f64>> {
+        let lo = p.xs.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = p.xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let t = ticks(lo, hi, 5);
+        (!t.is_empty()).then_some(t)
     }
 
     /// Why this cannot be drawn, in the words the modal shows in place of the
@@ -388,9 +573,8 @@ impl Plot {
     /// nothing saying why.
     pub fn undrawable(&self) -> Option<&'static str> {
         let (lo, hi) = self.range();
-        ticks(lo, hi, 5)
-            .is_empty()
-            .then_some("These values are too large to draw.")
+        let x_fails = matches!(self, Plot::Points(_)) && self.x_range().is_none();
+        (ticks(lo, hi, 5).is_empty() || x_fails).then_some("These values are too large to draw.")
     }
 
     /// The value axis's range. A bar or bin stands on 0, so 0 is in it; a
@@ -406,6 +590,25 @@ impl Plot {
             Plot::Bins(b) => (
                 0.0,
                 b.iter().map(|b| b.count).max().unwrap_or(0) as f64,
+                true,
+            ),
+            // A dot is a point, not a bar: it follows its values.
+            Plot::Points(p) => (
+                p.ys.iter().copied().fold(f64::INFINITY, f64::min),
+                p.ys.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                false,
+            ),
+            // Positive segments stack up from 0 and negative ones down from it
+            // (`chart_draw`), so the axis spans each side's tallest total.
+            Plot::Stacked(s) => (
+                s.values
+                    .iter()
+                    .map(|b| b.iter().filter(|v| **v < 0.0).sum::<f64>())
+                    .fold(f64::INFINITY, f64::min),
+                s.values
+                    .iter()
+                    .map(|b| b.iter().filter(|v| **v > 0.0).sum::<f64>())
+                    .fold(f64::NEG_INFINITY, f64::max),
                 true,
             ),
         };
@@ -426,22 +629,35 @@ impl Plot {
                 s.to_string()
             }
         };
+        let slots = |labels: &[String]| -> Vec<(f64, String)> {
+            let n = labels.len();
+            if n == 0 {
+                return Vec::new();
+            }
+            let mut picks = vec![0];
+            if n > 2 {
+                picks.push(n / 2);
+            }
+            if n > 1 {
+                picks.push(n - 1);
+            }
+            picks
+                .into_iter()
+                .map(|i| ((i as f64 + 0.5) / n as f64, cut(&labels[i])))
+                .collect()
+        };
         match self {
-            Plot::Series(_, s) => {
-                let n = s.labels.len();
-                if n == 0 {
+            Plot::Series(_, s) => slots(&s.labels),
+            Plot::Stacked(s) => slots(&s.labels),
+            // A scatter's x is a number line: its ticks, where they fall.
+            Plot::Points(p) => {
+                let Some(t) = self.x_ticks(p) else {
                     return Vec::new();
-                }
-                let mut picks = vec![0];
-                if n > 2 {
-                    picks.push(n / 2);
-                }
-                if n > 1 {
-                    picks.push(n - 1);
-                }
-                picks
-                    .into_iter()
-                    .map(|i| ((i as f64 + 0.5) / n as f64, cut(&s.labels[i])))
+                };
+                let (t0, t1) = (t[0], t[t.len() - 1]);
+                t.iter()
+                    .zip(tick_labels(&t))
+                    .map(|(v, text)| ((v - t0) / (t1 - t0), text))
                     .collect()
             }
             Plot::Bins(b) => {
@@ -469,9 +685,10 @@ pub fn caption(rows: usize, kind: ChartKind, skipped: usize, truncated: bool) ->
     if skipped > 0 {
         match kind {
             ChartKind::Histogram => line.push_str(&format!(" · {skipped} NULL, not drawn")),
-            ChartKind::Bar | ChartKind::Line => line.push_str(&format!(
-                " · {skipped} not drawn (NULL, or past {MAX_POINTS})"
-            )),
+            ChartKind::Bar | ChartKind::Line | ChartKind::Scatter | ChartKind::StackedBar => line
+                .push_str(&format!(
+                    " · {skipped} not drawn (NULL, or past {MAX_POINTS})"
+                )),
         }
     }
     if truncated {
@@ -763,10 +980,10 @@ mod tests {
             &["n"],
             vec![vec![Value::Int(1)], vec![Value::Null], vec![Value::Int(3)]],
         );
-        let (p, skipped) = Plot::of(&r, ChartKind::Histogram, 0, None);
+        let (p, skipped) = Plot::of(&r, ChartKind::Histogram, picks(0));
         assert!(matches!(p, Plot::Bins(_)));
         assert_eq!(skipped, 1);
-        let (p, skipped) = Plot::of(&r, ChartKind::Line, 0, None);
+        let (p, skipped) = Plot::of(&r, ChartKind::Line, picks(0));
         assert!(matches!(p, Plot::Series(ChartKind::Line, _)));
         assert_eq!(skipped, 1);
         assert!(!p.is_empty());
@@ -876,5 +1093,214 @@ mod tests {
         let got = series(&r, None, 0);
         assert_eq!(got.values.len(), MAX_POINTS);
         assert_eq!(got.skipped, 5);
+    }
+
+    fn picks(value: usize) -> Picks {
+        Picks {
+            value,
+            ..Picks::default()
+        }
+    }
+
+    /// A scatter pairs two numeric columns row by row, and leaves out a row
+    /// where either is missing.
+    #[test]
+    fn a_scatter_pairs_two_columns_and_skips_a_row_missing_either() {
+        let r = rs(
+            &["x", "y"],
+            vec![
+                vec![Value::Int(1), Value::Int(10)],
+                vec![Value::Null, Value::Int(20)],
+                vec![Value::Int(3), Value::Null],
+                vec![s("4.5"), s("-2")],
+            ],
+        );
+        let p = points(&r, 0, 1);
+        assert_eq!(p.xs, [1.0, 4.5]);
+        assert_eq!(p.ys, [10.0, -2.0]);
+        assert_eq!(p.skipped, 2);
+        let rows = (0..MAX_POINTS + 3)
+            .map(|i| vec![Value::Int(i as i64), Value::Int(1)])
+            .collect();
+        let long = points(&rs(&["x", "y"], rows), 0, 1);
+        assert_eq!(long.xs.len(), MAX_POINTS);
+        assert_eq!(long.skipped, 3);
+    }
+
+    /// A scatter's value axis follows its values, as a line's does, and its
+    /// labels under the axis are the X axis's ticks, placed where they fall.
+    #[test]
+    fn a_scatter_follows_its_values_and_labels_its_x_ticks() {
+        let p = Plot::Points(Points {
+            xs: vec![100.0, 140.0],
+            ys: vec![1000.0, 1010.0],
+            skipped: 0,
+        });
+        assert_eq!(p.range(), (1000.0, 1010.0), "no zero forced in");
+        let under = p.x_labels();
+        let t = ticks(100.0, 140.0, 5);
+        assert_eq!(under.len(), t.len());
+        assert_eq!(under[0], (0.0, tick_labels(&t)[0].clone()));
+        assert_eq!(under.last().unwrap().0, 1.0);
+        assert!(under.windows(2).all(|w| w[0].0 < w[1].0));
+        assert_eq!(p.x_range(), Some((t[0], *t.last().unwrap())));
+    }
+
+    /// An X axis too wide to draw is said, as a value axis is.
+    #[test]
+    fn a_scatter_with_an_undrawable_x_axis_says_so() {
+        let p = Plot::Points(Points {
+            xs: vec![-f64::MAX, f64::MAX],
+            ys: vec![1.0, 2.0],
+            skipped: 0,
+        });
+        assert!(p.undrawable().is_some());
+        assert_eq!(p.x_range(), None);
+    }
+
+    /// A stacked bar sums each (label, stack) pair — a `GROUP BY a, b` reads
+    /// straight in — keeping labels and stacks in first-seen order.
+    #[test]
+    fn a_stacked_bar_sums_each_label_and_stack_in_first_seen_order() {
+        let r = rs(
+            &["month", "region", "sales"],
+            vec![
+                vec![s("jan"), s("north"), Value::Int(3)],
+                vec![s("jan"), s("south"), Value::Int(4)],
+                vec![s("feb"), s("south"), Value::Int(5)],
+                vec![s("jan"), s("north"), Value::Int(1)],
+                vec![s("feb"), Value::Null, Value::Int(2)],
+                vec![s("mar"), s("north"), Value::Null],
+            ],
+        );
+        let got = stacked(&r, Some(0), Some(1), 2);
+        assert_eq!(got.labels, ["jan", "feb"]);
+        assert_eq!(got.stacks, ["north", "south", "NULL"]);
+        assert!(!got.other);
+        assert_eq!(got.values, [vec![4.0, 4.0, 0.0], vec![0.0, 5.0, 2.0]]);
+        assert_eq!(got.skipped, 1, "the NULL sale");
+    }
+
+    /// Past [`MAX_STACKS`] the rest are one *Other* segment, last.
+    #[test]
+    fn stacks_past_the_cap_fold_into_one_other_segment() {
+        let rows = (0..MAX_STACKS + 3)
+            .map(|i| vec![s("a"), s(&format!("s{i}")), Value::Int(1)])
+            .collect();
+        let got = stacked(&rs(&["l", "by", "v"], rows), Some(0), Some(1), 2);
+        assert_eq!(got.stacks.len(), MAX_STACKS + 1);
+        assert!(got.other);
+        assert_eq!(got.stacks.last().unwrap(), OTHER);
+        assert_eq!(got.values[0][MAX_STACKS], 3.0);
+        let mut named = got.clone();
+        named.name_other("Autres");
+        assert_eq!(named.stacks.last().unwrap(), "Autres");
+        assert_eq!(named.stacks[0], "s0", "only the Other slot is renamed");
+        let mut plain = stacked(
+            &rs(&["l", "v"], vec![vec![s("a"), Value::Int(1)]]),
+            Some(0),
+            Some(0),
+            1,
+        );
+        plain.name_other("Autres");
+        assert_eq!(plain.stacks, ["a"], "no Other slot, nothing renamed");
+    }
+
+    /// Without a *Stack by* column each label is one segment — a bar chart
+    /// that sums its repeated labels.
+    #[test]
+    fn a_stacked_bar_without_a_stack_column_has_one_segment() {
+        let r = rs(
+            &["l", "v"],
+            vec![
+                vec![s("a"), Value::Int(2)],
+                vec![s("a"), Value::Int(3)],
+                vec![s("b"), Value::Int(1)],
+            ],
+        );
+        let got = stacked(&r, Some(0), None, 1);
+        assert_eq!(got.labels, ["a", "b"]);
+        assert_eq!(got.stacks.len(), 1);
+        assert_eq!(got.values, [vec![5.0], vec![1.0]]);
+    }
+
+    /// Past [`MAX_POINTS`] labels, a row with a new one is left out.
+    #[test]
+    fn a_stacked_bar_draws_at_most_the_cap_of_labels() {
+        let rows = (0..MAX_POINTS + 2)
+            .map(|i| vec![Value::Int(i as i64), Value::Int(1)])
+            .collect();
+        let got = stacked(&rs(&["l", "v"], rows), Some(0), None, 1);
+        assert_eq!(got.labels.len(), MAX_POINTS);
+        assert_eq!(got.skipped, 2);
+    }
+
+    /// Positive segments stack up from zero and negative ones down from it, so
+    /// the axis spans the tallest of each.
+    #[test]
+    fn a_stacked_range_spans_the_positive_and_negative_totals() {
+        let p = Plot::Stacked(Stacked {
+            labels: vec!["a".into(), "b".into()],
+            stacks: vec!["x".into(), "y".into()],
+            other: false,
+            values: vec![vec![3.0, 4.0], vec![-2.0, -5.0]],
+            skipped: 0,
+        });
+        assert_eq!(p.range(), (-7.0, 7.0));
+        let up = Plot::Stacked(Stacked {
+            labels: vec!["a".into()],
+            stacks: vec!["x".into()],
+            other: false,
+            values: vec![vec![3.0]],
+            skipped: 0,
+        });
+        assert_eq!(up.range(), (0.0, 3.0), "a bar stands on zero");
+        assert_eq!(up.x_labels(), [(0.5, "a".to_string())]);
+    }
+
+    #[test]
+    fn plot_of_answers_each_new_kind_from_its_picks() {
+        let r = rs(
+            &["l", "x", "y"],
+            vec![
+                vec![s("a"), Value::Int(1), Value::Int(2)],
+                vec![s("b"), Value::Null, Value::Int(3)],
+            ],
+        );
+        let (p, skipped) = Plot::of(
+            &r,
+            ChartKind::Scatter,
+            Picks {
+                value: 2,
+                x: Some(1),
+                ..Picks::default()
+            },
+        );
+        assert!(matches!(&p, Plot::Points(pt) if pt.xs == [1.0]));
+        assert_eq!(skipped, 1);
+        // A scatter with no X column has nothing to draw.
+        assert!(Plot::of(&r, ChartKind::Scatter, picks(2)).0.is_empty());
+        let (p, _) = Plot::of(
+            &r,
+            ChartKind::StackedBar,
+            Picks {
+                value: 2,
+                label: Some(0),
+                by: Some(0),
+                ..Picks::default()
+            },
+        );
+        assert!(matches!(&p, Plot::Stacked(st) if st.stacks == ["a", "b"]));
+        assert_eq!(
+            caption(2, ChartKind::Scatter, 1, false),
+            caption(2, ChartKind::Bar, 1, false)
+        );
+    }
+
+    #[test]
+    fn every_kind_has_a_label_and_is_listed() {
+        assert_eq!(ChartKind::ALL.len(), 5);
+        assert_eq!(ChartKind::Scatter.label(), "Scatter");
+        assert_eq!(ChartKind::StackedBar.label(), "Stacked bar");
     }
 }

@@ -109,5 +109,5 @@ and **Live monitor…**. They dim when the result doesn't come from a single tab
   database.
 - [Copying and exporting](exporting.md) — the clipboard, the file formats, and exporting every row
   of a capped result.
-- [Charts](chart.md) — a bar, line or histogram of the result.
+- [Charts](chart.md) — a bar, stacked bar, line, scatter or histogram of the result.
 - [Comparing results](compare.md) — what changed between two runs of a query.

@@ -1,8 +1,9 @@
 # `core/chart.rs`
 
 `chart.rs` — **the numbers behind a result's *Chart*** (`ui/chart_view.rs`): which columns can
-be plotted, one column's values against another's labels, a histogram of one column, and the
-axis a range is drawn against. Pure over a `ResultSet`, so the view only paints what this
+be plotted, one column's values against another's labels, against a second numeric column, or
+summed per label and per a third column's segments, a histogram of one column, and the axis a
+range is drawn against. Pure over a `ResultSet`, so the view only paints what this
 answers — and over **the rows already read**, never a fetch of its own: a chart of a capped
 result is a chart of the rows read, which the modal says under it.
 **A number is a cell whose *text* reads as one** — trimmed, parsed as a finite `f64`; a NULL, a
@@ -16,7 +17,8 @@ least one non-NULL (`a_column_is_numeric_when_every_value_reads_as_a_number`), s
 nothing but NULLs is not offered. `picker_labels(names, reserved)` is the modal's pickers' name
 per column, no two alike and none equal to a reserved option: the first of a name stays bare, a
 repeat takes its 1-based position (`id (3)`).
-`ChartKind::{Bar, Line, Histogram}` (`ALL`, `label`). `series(rs, x: Option<usize>, y)` →
+`ChartKind::{Bar, Line, Histogram, Scatter, StackedBar}` (`label`; `ALL` in the *Chart* picker's
+order — Bar, Stacked bar, Line, Scatter, Histogram). `series(rs, x: Option<usize>, y)` →
 `Series { labels, values, skipped }`, in row order: `y`'s numbers labelled by `x`'s text,
 `"NULL"` for a NULL label, and the 1-based row number with no `x`; `skipped` counts the rows left
 out, a NULL or non-numeric value **and** everything past `MAX_POINTS` (2,000 — past it a bar is
@@ -26,8 +28,24 @@ thinner than a pixel on any panel the chart fits), so the modal can say how many
 skipped)` over `bins(values)`: equal-width bins, how many by Sturges' rule (`⌈log₂ n⌉ + 1`,
 clamped to 50), each `[lo, hi)` with **the last one closed** so the maximum lands in it, and a
 flat column one bin holding everything (`a_histogram_bins_every_value_and_closes_its_last_bin`).
-A histogram takes every numeric row — the cap is `series`' alone — so its `skipped` is only the
-NULLs and non-numbers.
+A histogram takes every numeric row — the cap is the other kinds' alone — so its `skipped` is
+only the NULLs and non-numbers.
+`points(rs, x, y)` → `Points { xs, ys, skipped }` is a scatter's: one pair per row with a number
+in **both** columns, a row missing either skipped, under the same `MAX_POINTS` cap
+(`a_scatter_pairs_two_columns_and_skips_a_row_missing_either`). `stacked(rs, label, by, value)`
+→ `Stacked { labels, stacks, other, values, skipped }` is a stacked bar's, and it **sums** rather
+than drawing a bar per row: `values[label][stack]` adds up every row's value for that pair, labels
+and stacks each in the order they first appear and `0.0` where a label has none of a stack,
+because a stacked bar's rows name the same label once per segment — so a `GROUP BY a, b` result
+reads straight in (`a_stacked_bar_sums_each_label_and_stack_in_first_seen_order`). A NULL label
+or segment reads `"NULL"`, and no `by` is one segment per label
+(`a_stacked_bar_without_a_stack_column_has_one_segment`). At most `MAX_STACKS` (8) segments are
+named — one colour each, and no palette tells more apart — and every later one is summed into one
+more, `OTHER`, last, with `other` set (`stacks_past_the_cap_fold_into_one_other_segment`);
+`OTHER` is core's English, which `Stacked::name_other` renames into the view's language and
+leaves alone when nothing was folded. **The cap here is on bars, not rows**: a row whose label is
+new once `MAX_POINTS` labels exist is skipped, while a row adding to a label already there still
+counts (`a_stacked_bar_draws_at_most_the_cap_of_labels`).
 `ticks(lo, hi, want)` is the value axis: a step of 1, 2 or 5 × 10ᵏ, the first at least the raw
 `(hi − lo) / want`, covering the range from `floor(lo / step)` up past `hi`. **Each tick is
 counted, `(first + i) × step`, never accumulated**, the step is never finer than four times the
@@ -37,15 +55,30 @@ that adding never moved, and the loop grew its vector on the UI thread until mem
 (`ticks_terminate_at_extreme_magnitudes`). A flat range is widened by 1 either side so it still
 gets an axis, and there are always at least two ticks; a non-finite bound gets none
 (`ticks_are_round_and_cover_the_range`).
-`Plot::{Series(kind, Series), Bins(Vec<Bin>)}` is what is drawn — laid out by `chart_draw.rs`
-below, for the canvas and the saved file alike — `Plot::of(rs, kind,
-value, label)` → `(Plot, skipped)`. `Plot::range` is the value axis's range: **a bar or a bin
-stands on 0, so 0 is in it; a line follows its values** (`a_line_range_does_not_force_zero`) —
-which is exactly what routes a narrow band of large numbers into `ticks`. `Plot::x_labels` is
-first, middle and last with where each sits across the plot, cut at 18 characters, a histogram's
-being its edges and midpoint (`x_labels_are_first_middle_and_last`); and `caption(rows, kind,
-skipped, truncated)` the line under the canvas, a histogram's skipped count being NULLs alone, so
-it never names the series' cap (`a_histogram_caption_does_not_mention_the_point_cap`).
+`Plot::{Series(kind, Series), Bins(Vec<Bin>), Points(Points), Stacked(Stacked)}` is what is drawn
+— laid out by `chart_draw.rs` below, for the canvas and the saved file alike — `Plot::of(rs, kind,
+picks: Picks)` → `(Plot, skipped)`. `Picks { value, label, x, by }` names every column any kind
+may read, and which of them a kind reads is `of`'s: `value` always, `label` for a bar, a line or a
+stacked bar (`None` numbering the rows), `x` for a scatter's horizontal axis — a scatter with none
+has nothing to draw — and `by` for a stacked bar's segments, `None` being one segment
+(`plot_of_answers_each_new_kind_from_its_picks`). `Plot::range` is the value axis's range: **a
+bar or a bin stands on 0, so 0 is in it; a line follows its values**
+(`a_line_range_does_not_force_zero`) — which is exactly what routes a narrow band of large numbers
+into `ticks` — and so does a scatter, a dot being a point rather than a bar
+(`a_scatter_follows_its_values_and_labels_its_x_ticks`). **A stacked bar spans its most negative
+and most positive totals separately**, each bar's negative segments summed apart from its positive
+ones, with 0 always in: `chart_draw.rs` stacks the two sides away from zero in opposite
+directions, so a bar's net total would not reach the ends of its segments
+(`a_stacked_range_spans_the_positive_and_negative_totals`). `Plot::x_range` is a scatter's
+horizontal axis — the first and last of `ticks` over its X values, the span its dots are placed
+across — and `None` for every other kind, whose x is a slot per label. `Plot::x_labels` is first,
+middle and last with where each sits across the plot, cut at 18 characters — a stacked bar's from
+its labels as a series' are — a histogram's being its edges and midpoint
+(`x_labels_are_first_middle_and_last`), and a scatter's **every X tick** at its position,
+labelled as one axis by `tick_labels`; and `caption(rows, kind, skipped, truncated)` the line
+under the canvas, a histogram's skipped count being NULLs alone, so it never names the series' cap
+(`a_histogram_caption_does_not_mention_the_point_cap`) — a scatter's and a stacked bar's name it,
+as a series' does.
 `tick_label(v)` prints at most two decimals with
 trailing zeros dropped, `-0` as `0`, and shortens `≥ 1e4`/`1e6`/`1e9` to `k`/`m`/`b`
 (`tick_labels_drop_noise_and_shorten_large_values`) — the x-axis's form. **The value axis is
@@ -60,4 +93,6 @@ characters across the extreme ranges). **A range the axis cannot hold is said**:
 none for a range whose step overflows or whose top it cannot reach (values at or near
 `±f64::MAX`), and `Plot::undrawable` is the note the modal shows in the canvas's place — it
 painted nothing, and near `MAX` drew the line above the plot
-(`a_range_too_large_to_draw_has_no_axis_and_says_so`).
+(`a_range_too_large_to_draw_has_no_axis_and_says_so`). A scatter has two axes to fail, so its
+`undrawable` answers the same words when `x_range` cannot be built either
+(`a_scatter_with_an_undrawable_x_axis_says_so`).

@@ -1053,6 +1053,17 @@ chart-row-number = Row number
 chart-kind-bar = Bar
 chart-kind-line = Line
 chart-kind-histogram = Histogram
+chart-kind-scatter = Scatter
+chart-kind-stacked-bar = Stacked bar
+# A scatter's picker for the column on its horizontal axis.
+chart-caption-x = X axis
+# A stacked bar's picker for the column whose values split each bar.
+chart-caption-stack-by = Stack by
+# That picker's entry for "no column — one segment per bar".
+chart-stack-none = None
+# The legend's name for the segments past the most a stacked bar names, summed.
+chart-other = Other
+chart-no-pairs = No row has a number in both columns.
 chart-save-tip = Save the chart…
 chart-save-dialog = Save chart
 # The saved file's suggested name, before its extension.

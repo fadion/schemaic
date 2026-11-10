@@ -1,6 +1,6 @@
 # `ui/chart_view.rs`
 
-`chart_view.rs` — the **Chart** modal (`chart_overlay`): a bar, line or histogram of the result
+`chart_view.rs` — the **Chart** modal (`chart_overlay`): a bar, stacked bar, line, scatter or histogram of the result
 on screen, over `core::chart`, opened by setting `overlay.chart` to a `ChartTarget { rs:
 Arc<ResultSet>, title }` (re-exported as `schemaic_ui::ChartTarget`; the app creates the signal
 beside `used_by`) from the results strip's chart icon (*Data grid*), which titles it *"Chart —
@@ -9,24 +9,36 @@ title, the pickers with a save icon at the row's right end, the chart, a split f
 status line on the left and **Close** on the right, and Escape and the backdrop closing it. The modal
 is keyed on the `Arc`'s pointer, so charting
 another result rebuilds it and nothing else does.
-**Three pickers**: *Chart* — the kind, a `settings::focusable_dropdown`, tab 10; *Values* — the
+**The pickers**: *Chart* — the kind, a `settings::focusable_dropdown`, tab 10; *Values* — the
 numeric columns only (`chart::numeric_columns`, read once per open), a
 `table_designer::focusable_owned_dropdown`, tab 20, starting on the **last** numeric column; and
-*Labels* — *Row number* or any column, a `table_designer::focusable_indexed_dropdown` told the
-pick by position (`after_none_row`), so a column named like the interface's *Row number* is
-still that column; tab 30, starting on the first column that is not the
-value, and not built at all for a histogram, whose labels are its bins — a `dyn_container` on the
-kind rather than `s.hide()`, since a hidden picker would still be a Tab stop. A picked name maps
+after them what the kind reads besides, `extra_of(kind)` → `Extra`
+(`each_kind_shows_the_pickers_it_reads`), built in a `dyn_container` on the kind rather than
+hidden with `s.hide()`, since a hidden picker would still be a Tab stop. A histogram has none, its
+labels being its bins. A bar and a line have *Labels* — *Row number* or any column, a
+`table_designer::focusable_indexed_dropdown` told the pick by position (`after_none_row`), so a
+column named like the interface's *Row number* is still that column; tab 30, starting on the
+first column that is not the value. A scatter has **X axis** in its place, at the same tab 30: an
+owned dropdown of the numeric columns, starting on the first one other than the value column — the
+value column itself when it is the only one. A stacked bar has *Labels* and beside it **Stack
+by**, tab 35: an indexed dropdown of *None* (`chart-stack-none`, one segment per label) and every
+column, starting on the first column that is neither the value nor the label. The five choices are
+signals of the open's scope, carried to `controls` in one `Pickers`, so a picker a kind does not
+show keeps its pick and switching back finds it where it was. A picked name maps
 back to its column by name, so the names are `chart::picker_labels`' — distinct, a repeated
 name or one equal to *Row number* taking its 1-based position (`id (3)`); with the result's
 raw names a self-join's second `id` could not be picked, the lookup answering the first
-(`repeated_column_names_get_distinct_picker_labels`). The body is a `dyn_container` keyed on `(kind, value, label)`: *"No column of numbers to
+(`repeated_column_names_get_distinct_picker_labels`). The body is a `dyn_container` keyed on `(kind, value, label, x, by)`: *"No column of numbers to
 chart in this result."* where there is none, *"Every value in that column is NULL."* where the
-series or the bins came back empty, and otherwise the canvas, 360 high, with one faint line under
+series, the stacks or the bins came back empty, *"No row has a number in both columns."*
+(`chart-no-pairs`) where a scatter's pairs did — its empty chart is about two columns, not one —
+and otherwise the canvas, 360 high, with one faint line under
 it, `chart::caption` — *"N rows · K not drawn (NULL, or past 2000) · the rows read, not the whole
 result"*, the middle clause when anything was skipped (a histogram's reading *"K NULL, not
 drawn"*, since it has no cap) and the last when the result is `truncated`. What is drawn is a
-`chart::Plot` (`Plot::of`), whose range and under-axis labels the canvas asks rather than
+`chart::Plot` from `plot_of` — `Plot::of` with a stacked bar's folded segment renamed to
+`chart-other` through `Stacked::name_other`, one function for the canvas and the export so the
+file names it as the screen does — whose range and under-axis labels the canvas asks rather than
 decides.
 **The canvas is a painted view, `ChartCanvas`** — floem 0.2 has no plotting, so it is a custom
 `View` with a `paint` of its own, as the frozen header's `Hatch` (*Data grid*) and the ER
@@ -37,15 +49,21 @@ theme::scaled)` and text measured at `theme::font_hint` by floem's own `TextLayo
 measurer keeps what it builds**: each layout, shaped in the ticks' colour, goes onto a list, and
 the tick labels are drawn from that list by position — so a tick label is shaped once per paint,
 not once to measure and again to draw. That rests on `layout`'s stated call order (ticks first,
-in order; `chart_draw.rs` above), and only the at most three labels under the axis are laid out
-again, in their own colour. The export measures through `measure`, the same `TextLayout` at the
+in order; `chart_draw.rs` above), and only the labels under the axis and a legend's names are
+laid out again, in their own colour. The export measures through `measure`, the same `TextLayout` at the
 file's size. The value axis is `chart::ticks` over the drawn range — a
 bar's or a histogram's range always includes 0 — with grid lines in `theme::border` and the
 tick labels drawn with `cx.draw_text`, so the axis is the app's face at the app's scale; the
 gutter is the widest label. Bars, or a 2px polyline (with a dot per point while there are at
-most 60), or contiguous histogram bins, all in `theme::accent`; a zero line over the marks; and
-three labels under the axis — first, middle and last, cut at 18 characters, a histogram's being
-its edges and midpoint as tick labels. **Every colour is read at paint time**, so a theme
+most 60), or contiguous histogram bins, or a scatter's dots at `chart_draw::DOT_OPACITY`, all in
+`theme::accent`, a scatter adding a vertical grid line per X tick; or a stacked bar's segments,
+each in `chart_draw::stack_fill`'s answer — the accent for a single stack, otherwise
+`stack_palette()`, the eight `CONN_COLOR_PRESETS` reordered so that neighbouring stacks differ
+most in hue (blue, orange, green, purple, amber, teal, pink, red), and the folded *Other* segment
+in `theme::text_faint` — with a legend of rounded swatches in the same colours and the names in
+`theme::text_dim`. A zero line over the marks; and the labels under the axis — first, middle and
+last, cut at 18 characters, a histogram's being its edges and midpoint as tick labels and a
+scatter's its X ticks, thinned by `layout` where they would touch. **Every colour is read at paint time**, so a theme
 switch repaints in the new one, and the text helper takes its colour as `fn() -> Color` for the
 same reason the themable-colour invariant gives.
 **Saving is the Live Monitor's export control, not a pair of buttons** — a feature wanted this
@@ -53,7 +71,7 @@ rarely kept out of the footer, and a bare glyph with no background or border sit
 better than a boxed toolbar control. It is built as `monitor_view.rs`'s Export is:
 `widgets::toolbar_icon` with the `DOWNLOAD` icon (muted, the text colour on hover) and the
 tooltip *"Save the chart…"*, inside `widgets::in_ring_button` at `EXPORT_TAB` (40) — so it **is**
-a stop in the modal's Tab ring, after the three pickers, and Enter or Space opens its menu.
+a stop in the modal's Tab ring, after the pickers, and Enter or Space opens its menu.
 `controls` takes it as its final argument and puts a `flex_grow` spacer before it, in a row that
 is `width_full` and `items_center`, so the icon sits at the row's right end. It stands under a
 blank caption with the pickers' own gap, so the row's centring puts its middle on the
@@ -70,7 +88,7 @@ written immediately before `popup_menu`, and pressing the icon again closes its 
 shared popup outlives this modal and its entries hold this scope's signals. Every exit — ✕,
 Escape, the backdrop, **Close** — routes through `close`. That does not cover the one exit
 that bypasses it, a new target replacing this one under an open menu, which disposes the scope
-with the menu still up; so the `save` an entry calls reads `kind`, `value` and `label` with
+with the menu still up; so the `save` an entry calls reads all five pickers' signals with
 `try_get_untracked` and does nothing when any is gone, since a bare read of a disposed signal
 panics. The entries reuse the ER diagram's formats (`export_doc` answers `None` for the four text ones,
 since a chart is a picture) and its default name, `file_stem("<title> chart", fmt)`. **The
@@ -82,10 +100,12 @@ what the user was looking at when they clicked. It is laid out at a **fixed** 80
 a zoomed UI is the same picture as one saved at 100%; a PNG is that at 2× (`EXPORT_PNG_SCALE`)
 — `a_saved_chart_is_a_png_of_the_export_size_and_an_svg` pins the pixel size. The colours are
 the live theme's (`erd_view::hex`, `pub(crate)` for this), on `bg_panel`, the colour the canvas
-sits on. The SVG is built on the UI thread, because its labels are measured by floem's font
+sits on, with `stack_palette()` and `text_faint` filling `SvgColors::stacks` and `other` as the
+canvas fills its segments (`a_stacked_bar_names_its_other_segment_and_saves_in_the_palette`). The SVG is built on the UI thread, because its labels are measured by floem's font
 system, and that is affordable because the document is **bounded whatever the result's size**:
-a series draws at most `chart::MAX_POINTS` (2,000) marks and a histogram at most 50 bins
-(`export_doc`'s comment). The PNG's rasterise is left to the worker as
+a series or a scatter draws at most `chart::MAX_POINTS` (2,000) marks, a stacked bar at most
+that many bars of at most `MAX_STACKS + 1` (9) segments each, and a histogram at most 50 bins
+(`export_doc`'s comment, which names the series and histogram bounds only). The PNG's rasterise is left to the worker as
 `ErdDoc::Raster` (under `erd_view.rs`). The write is the ER diagram's own writer,
 `TabActions::export_erd`, which `modals.rs` passes into `chart_overlay` — off the UI thread,
 through `persist::write_file_atomic` — rather than a second one, and the dialog and the reading
@@ -98,7 +118,7 @@ outcome arms are `save_document`'s, spelled out, `Cancelled` saying nothing. A c
 fades after `NOTICE_LINGER` (4 s, the diagram's) behind a sequence
 number, and a failure stays; the notice is reached through `try_get_untracked`, because the
 completion can land after the modal closed and disposed its scope. **A notice is about the
-chart it was said of**: an effect over `kind`, `value` and `label` clears it when a picker
+chart it was said of**: an effect over all five choices clears it when a picker
 changes — skipping its first run, which is the build, not a change — or *"Nothing to save."*
 would stand, as a failure does, over a column that can now be saved.
 **Its own words are the catalogue's** (`chart-*`), **Close** `dialog-close`,
@@ -110,7 +130,9 @@ a same-named column steps aside for are all one language. The line under the can
 `caption_text`, `chart::caption`'s clauses as `chart-caption-*` messages
 (`english_captions_every_chart_as_core_does`), and the note in place of an undrawable range
 `chart-too-large`, held to `Plot::undrawable`'s English by a test — the view asks `undrawable`
-only whether it is `Some`, and `chart::caption` is now read by tests alone. Its *"Saved {name}"* and
+only whether it is `Some`, and `chart::caption` is now read by tests alone. The folded segment's
+`chart-other` is held to `chart::OTHER` the same way, in
+`a_stacked_bar_names_its_other_segment_and_saves_in_the_palette`. Its *"Saved {name}"* and
 that notice's *the file* fallback are not `chart-*`: they are `save_document`'s `erd-saved` and
 `erd-unnamed-file`, shared with the diagram, so they are translated with `erd_view.rs`.
 Mounted in the workspace group directly after `used_by_overlay`, counted by

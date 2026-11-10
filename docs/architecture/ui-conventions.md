@@ -517,8 +517,9 @@
     `transcript::TurnStats::summary_with(marks, took)` for the AI footer's token counts (its
     duration worded by `took`, as `history::outcome_line_with(entry, took, rows)` words a history
     row's), `chart_draw::layout(…,
-    figures, measure)` for the tick labels and a histogram's bin edges under the axis — never a
-    series' labels, which are the label column's data (`only_a_histogram_s_edges_take_the_marks`)
+    figures, measure)` for the tick labels and a histogram's bin edges or a scatter's X ticks under
+    the axis — never a series' labels, which are the label column's data
+    (`only_a_histogram_s_edges_take_the_marks`, `a_scatter_places_each_dot_on_both_axes`)
     — and `format::apply(fmt, v, marks)`, *Grouped* and *Bytes* being how a value is shown. The
     chart's SVG and PNG carry the marks, the file being a picture of the chart on screen.
     `edit::GridCells` gained `marks`, so the find bar matches the digits painted. **Ctrl+C, the

@@ -1,4 +1,4 @@
-//! **Chart** — a bar, line or histogram of the result on screen
+//! **Chart** — a bar, stacked bar, line, scatter or histogram of the result on screen
 //! (`core::chart`), raised from the results strip's chart icon.
 //!
 //! Of the rows already read: the modal says how many those are, and a capped
@@ -65,7 +65,31 @@ fn chart_kind_label(kind: ChartKind) -> String {
         ChartKind::Bar => tr!("chart-kind-bar"),
         ChartKind::Line => tr!("chart-kind-line"),
         ChartKind::Histogram => tr!("chart-kind-histogram"),
+        ChartKind::Scatter => tr!("chart-kind-scatter"),
+        ChartKind::StackedBar => tr!("chart-kind-stacked-bar"),
     }
+}
+
+/// A stacked bar's segment colours, in stack order: the connection colour
+/// presets — saturated mid-tones chosen to read on both themes — taken so
+/// that neighbouring stacks differ most in hue. Read at paint time, as every
+/// theme colour is.
+fn stack_palette() -> Vec<floem::peniko::Color> {
+    // Blue, orange, green, purple, amber, teal, pink, red.
+    [5, 1, 3, 6, 2, 4, 7, 0]
+        .iter()
+        .map(|&i| (crate::CONN_COLOR_PRESETS[i].2)())
+        .collect()
+}
+
+/// `rs` charted as `kind` from `picks`, its folded stack named in the
+/// interface's language — the canvas's plot and the export's alike.
+fn plot_of(rs: &ResultSet, kind: ChartKind, picks: chart::Picks) -> (Plot, usize) {
+    let (mut drawn, skipped) = Plot::of(rs, kind, picks);
+    if let Plot::Stacked(s) = &mut drawn {
+        s.name_other(&tr!("chart-other"));
+    }
+    (drawn, skipped)
 }
 
 /// The line under the canvas — core's `chart::caption` in the interface's
@@ -75,7 +99,7 @@ fn caption_text(rows: usize, kind: ChartKind, skipped: usize, truncated: bool) -
     if skipped > 0 {
         parts.push(match kind {
             ChartKind::Histogram => tr!("chart-caption-skipped-null", skipped = skipped),
-            ChartKind::Bar | ChartKind::Line => tr!(
+            ChartKind::Bar | ChartKind::Line | ChartKind::Scatter | ChartKind::StackedBar => tr!(
                 "chart-caption-skipped",
                 skipped = skipped,
                 max = chart::MAX_POINTS
@@ -88,7 +112,7 @@ fn caption_text(rows: usize, kind: ChartKind, skipped: usize, truncated: bool) -
     parts.join(" · ")
 }
 
-/// The save icon's place in the Tab ring: after the three pickers (10, 20, 30).
+/// The save icon's place in the Tab ring: after the pickers (10, 20, 30, 35).
 const EXPORT_TAB: u32 = 40;
 
 /// How long a "Saved …" stays in the footer — the ER diagram's linger.
@@ -107,8 +131,9 @@ const EXPORT_PNG_SCALE: f32 = 2.0;
 /// `drawn` as the document `fmt` saves — `None` when there is nothing to
 /// draw. The SVG is built here, on the UI thread, because its labels are
 /// measured by floem's font system — and it is bounded whatever the result's
-/// size: a series draws at most [`chart::MAX_POINTS`] marks and a histogram
-/// at most 50 bins. A PNG's rasterise is left to the worker.
+/// size: a series or a scatter draws at most [`chart::MAX_POINTS`] marks, a
+/// stacked bar at most that many bars of [`chart::MAX_STACKS`]` + 1` segments,
+/// and a histogram at most 50 bins. A PNG's rasterise is left to the worker.
 fn export_doc(drawn: &Plot, fmt: ErdExportFormat) -> Option<crate::ErdDoc> {
     let scene = chart_draw::layout(
         drawn,
@@ -128,6 +153,8 @@ fn export_doc(drawn: &Plot, fmt: ErdExportFormat) -> Option<crate::ErdDoc> {
         under_text: hex(theme::text_dim()),
         mark: hex(theme::accent()),
         zero: hex(theme::text_faint()),
+        stacks: stack_palette().into_iter().map(hex).collect(),
+        other: hex(theme::text_faint()),
     };
     let svg = chart_draw::to_svg(&scene, &colors, f64::from(EXPORT_FONT), EXPORT_PAD);
     match fmt {
@@ -179,16 +206,39 @@ pub(crate) fn chart_overlay(overlay: OverlayUi, export: crate::ErdExportFn) -> i
             // the measure usually follows its labels — and the label column on
             // the first column that is not it.
             let kind = RwSignal::new(ChartKind::Bar);
-            let value = RwSignal::new(numeric.last().copied());
-            let label =
-                RwSignal::new((0..names.len()).find(|c| Some(*c) != numeric.last().copied()));
+            let first_value = numeric.last().copied();
+            let value = RwSignal::new(first_value);
+            let first_label = (0..names.len()).find(|c| Some(*c) != first_value);
+            let label = RwSignal::new(first_label);
+            // A scatter's X starts on another numeric column — the value
+            // column itself when it is the only one — and a stacked bar's
+            // segments on the first column that is neither of the other two.
+            let x = RwSignal::new(
+                numeric
+                    .iter()
+                    .copied()
+                    .find(|c| Some(*c) != first_value)
+                    .or(first_value),
+            );
+            let by = RwSignal::new(
+                (0..names.len()).find(|c| Some(*c) != first_value && Some(*c) != first_label),
+            );
+            let picks = move || (kind.get(), value.get(), label.get(), x.get(), by.get());
 
             let body = {
                 let rs = rs.clone();
-                dyn_container(
-                    move || (kind.get(), value.get(), label.get()),
-                    move |(k, v, l)| chart_body(&rs, k, v, l),
-                )
+                dyn_container(picks, move |(k, v, l, x, by)| {
+                    chart_body(
+                        &rs,
+                        k,
+                        v.map(|value| chart::Picks {
+                            value,
+                            label: l,
+                            x,
+                            by,
+                        }),
+                    )
+                })
                 .style(|s| s.width_full())
             };
             let title = modal_title_owned(
@@ -226,7 +276,7 @@ pub(crate) fn chart_overlay(overlay: OverlayUi, export: crate::ErdExportFn) -> i
             // pickers clears it, or "Nothing to save." would still stand over
             // a column that can be saved.
             create_effect(move |prev: Option<()>| {
-                let _ = (kind.get(), value.get(), label.get());
+                let _ = picks();
                 if prev.is_some() {
                     notice.set(None);
                 }
@@ -243,15 +293,23 @@ pub(crate) fn chart_overlay(overlay: OverlayUi, export: crate::ErdExportFn) -> i
                     // the target replaced under an open menu disposes it without
                     // a `close` — and a bare read of a disposed signal panics.
                     // Nothing to save for a chart that is gone.
-                    let (Some(k), Some(v), Some(l)) = (
+                    let (Some(k), Some(v), Some(l), Some(x), Some(by)) = (
                         kind.try_get_untracked(),
                         value.try_get_untracked(),
                         label.try_get_untracked(),
+                        x.try_get_untracked(),
+                        by.try_get_untracked(),
                     ) else {
                         return;
                     };
-                    let doc = v.and_then(|v| {
-                        let (drawn, _) = Plot::of(&rs, k, v, l);
+                    let doc = v.and_then(|value| {
+                        let picks = chart::Picks {
+                            value,
+                            label: l,
+                            x,
+                            by,
+                        };
+                        let (drawn, _) = plot_of(&rs, k, picks);
                         export_doc(&drawn, fmt)
                     });
                     let Some(doc) = doc else {
@@ -328,9 +386,13 @@ pub(crate) fn chart_overlay(overlay: OverlayUi, export: crate::ErdExportFn) -> i
             let controls = controls(
                 &names,
                 &numeric,
-                kind,
-                value,
-                label,
+                Pickers {
+                    kind,
+                    value,
+                    label,
+                    x,
+                    by,
+                },
                 ring.clone(),
                 export_button,
             );
@@ -397,17 +459,56 @@ pub(crate) fn chart_overlay(overlay: OverlayUi, export: crate::ErdExportFn) -> i
     })
 }
 
-/// The three pickers — kind, value column, label column (not for a
-/// histogram) — and the export icon after them.
-fn controls(
-    names: &[String],
-    numeric: &[usize],
+/// The modal's choices, each a signal the pickers write and the body reads.
+#[derive(Clone, Copy)]
+struct Pickers {
     kind: RwSignal<ChartKind>,
     value: RwSignal<Option<usize>>,
     label: RwSignal<Option<usize>>,
+    /// A scatter's X column.
+    x: RwSignal<Option<usize>>,
+    /// A stacked bar's segment column; `None` is one segment.
+    by: RwSignal<Option<usize>>,
+}
+
+/// Which of the pickers after the value column a kind shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Extra {
+    /// None: a histogram's labels are its bins.
+    Nothing,
+    /// The label column.
+    Labels,
+    /// A scatter's X column, in place of the labels.
+    XAxis,
+    /// The label column and the segment column.
+    LabelsAndStacks,
+}
+
+fn extra_of(kind: ChartKind) -> Extra {
+    match kind {
+        ChartKind::Histogram => Extra::Nothing,
+        ChartKind::Bar | ChartKind::Line => Extra::Labels,
+        ChartKind::Scatter => Extra::XAxis,
+        ChartKind::StackedBar => Extra::LabelsAndStacks,
+    }
+}
+
+/// The pickers — kind, value column, and what the kind reads besides
+/// ([`Extra`]) — and the export icon after them.
+fn controls(
+    names: &[String],
+    numeric: &[usize],
+    p: Pickers,
     ring: FocusRing,
     export: AnyView,
 ) -> AnyView {
+    let Pickers {
+        kind,
+        value,
+        label,
+        x,
+        by,
+    } = p;
     let caption = |s: String| text(s).style(crate::widgets::form_label_style);
     let col_w = || theme::scaled(200.0);
     // A picked name → its column; `names` are distinct, so two columns the
@@ -431,32 +532,77 @@ fn controls(
             move |picked| value.set(lookup(&picked)),
         )
     };
-    // A histogram's labels are its bins, so the picker is not there at all —
-    // built or not rather than hidden, since a hidden control is still a stop
-    // in the modal's Tab ring.
+    // The pickers a kind does not read are not there at all — built or not
+    // rather than hidden, since a hidden control is still a stop in the
+    // modal's Tab ring.
     let row_number = row_number();
     let mut label_options = vec![row_number.clone()];
     label_options.extend(names.iter().cloned());
-    let label_ring = ring.clone();
-    let label_group = dyn_container(
-        move || kind.get() == ChartKind::Histogram,
-        move |histogram| {
-            if histogram {
-                return empty().into_any();
-            }
+    let mut by_options = vec![tr!("chart-stack-none")];
+    by_options.extend(names.iter().cloned());
+    let x_options: Vec<String> = numeric.iter().map(|&c| names[c].clone()).collect();
+    let extra_ring = ring.clone();
+    let labelled = move |title: String, field: AnyView| {
+        v_stack((caption(title), field))
+            .style(|s| s.flex_col().gap(theme::scaled(6.0)))
+            .into_any()
+    };
+    let extra_group = dyn_container(
+        move || extra_of(kind.get()),
+        move |extra| {
+            let ring = extra_ring.clone();
             // Told apart by position, not by text: a column named exactly
             // like *Row number* is still that column.
-            let field = crate::table_designer::focusable_indexed_dropdown(
-                move || label.get().map_or(0, |c| c + 1),
-                label_options.clone(),
-                col_w,
-                label_ring.clone(),
-                30,
-                move |picked| label.set(crate::table_designer::after_none_row(picked)),
-            );
-            v_stack((caption(tr!("chart-caption-labels")), field))
-                .style(|s| s.flex_col().gap(theme::scaled(6.0)))
-                .into_any()
+            let label_field = || {
+                labelled(
+                    tr!("chart-caption-labels"),
+                    crate::table_designer::focusable_indexed_dropdown(
+                        move || label.get().map_or(0, |c| c + 1),
+                        label_options.clone(),
+                        col_w,
+                        ring.clone(),
+                        30,
+                        move |picked| label.set(crate::table_designer::after_none_row(picked)),
+                    )
+                    .into_any(),
+                )
+            };
+            match extra {
+                Extra::Nothing => empty().into_any(),
+                Extra::Labels => label_field(),
+                Extra::XAxis => {
+                    let lookup = lookup.clone();
+                    labelled(
+                        tr!("chart-caption-x"),
+                        crate::table_designer::focusable_owned_dropdown(
+                            move || x.get().map(name_of).unwrap_or_default(),
+                            x_options.clone(),
+                            col_w,
+                            ring.clone(),
+                            30,
+                            move |picked| x.set(lookup(&picked)),
+                        )
+                        .into_any(),
+                    )
+                }
+                Extra::LabelsAndStacks => {
+                    let stacks = labelled(
+                        tr!("chart-caption-stack-by"),
+                        crate::table_designer::focusable_indexed_dropdown(
+                            move || by.get().map_or(0, |c| c + 1),
+                            by_options.clone(),
+                            col_w,
+                            ring.clone(),
+                            35,
+                            move |picked| by.set(crate::table_designer::after_none_row(picked)),
+                        )
+                        .into_any(),
+                    );
+                    h_stack((label_field(), stacks))
+                        .style(|s| s.gap(theme::scaled(16.0)).items_center())
+                        .into_any()
+                }
+            }
         },
     );
     h_stack((
@@ -468,7 +614,7 @@ fn controls(
         .style(|s| s.flex_col().gap(theme::scaled(6.0))),
         v_stack((caption(tr!("chart-caption-values")), value_field))
             .style(|s| s.flex_col().gap(theme::scaled(6.0))),
-        label_group,
+        extra_group,
         // Pushed to the row's right end, and centred on the **dropdowns**
         // rather than the row: under a blank caption, the pickers' own
         // caption and gap, so the row's centring puts the icon's middle on
@@ -482,12 +628,7 @@ fn controls(
 }
 
 /// The canvas and the line under it — or why there is nothing to draw.
-fn chart_body(
-    rs: &ResultSet,
-    kind: ChartKind,
-    value: Option<usize>,
-    label: Option<usize>,
-) -> AnyView {
+fn chart_body(rs: &ResultSet, kind: ChartKind, picks: Option<chart::Picks>) -> AnyView {
     let note = |msg: String| {
         container(text(msg).style(|s| s.color(theme::text_dim()).font_size(theme::font_body())))
             .style(|s| {
@@ -498,12 +639,17 @@ fn chart_body(
             })
             .into_any()
     };
-    let Some(v) = value else {
+    let Some(picks) = picks else {
         return note(tr!("chart-no-numbers"));
     };
-    let (drawn, skipped) = Plot::of(rs, kind, v, label);
+    let (drawn, skipped) = plot_of(rs, kind, picks);
     if drawn.is_empty() {
-        return note(tr!("chart-all-null"));
+        // A scatter needs both of a row's numbers, so its empty chart is
+        // about pairs rather than one column.
+        return note(match drawn {
+            Plot::Points(_) => tr!("chart-no-pairs"),
+            _ => tr!("chart-all-null"),
+        });
     }
     // Said, where the canvas would otherwise paint nothing.
     if drawn.undrawable().is_some() {
@@ -523,7 +669,7 @@ fn chart_body(
 }
 
 /// The painted chart: grid lines and value labels on the left, the marks,
-/// and three labels under the axis. Colours are read at paint time, so a
+/// the labels under the axis, and a stacked bar's legend. Colours are read at paint time, so a
 /// theme switch repaints in the new ones.
 struct ChartCanvas {
     id: ViewId,
@@ -579,12 +725,18 @@ impl View for ChartCanvas {
             grid.move_to((p.x0, *y));
             grid.line_to((p.x1, *y));
         }
+        for x in &scene.vgrid {
+            grid.move_to((*x, p.y0));
+            grid.line_to((*x, p.y1));
+        }
         cx.stroke(&grid, theme::border(), &Stroke::new(1.0));
         for (l, text) in scene.ticks.iter().zip(&shaped) {
             cx.draw_text(text, Point::new(l.left, l.top));
         }
 
         let mark = theme::accent();
+        let palette = stack_palette();
+        let other = theme::text_faint();
         match &scene.marks {
             chart_draw::Marks::Line { points, dots } => {
                 let mut path = BezPath::new();
@@ -608,6 +760,18 @@ impl View for ChartCanvas {
                     cx.fill(&rect(b), mark, 0.0);
                 }
             }
+            chart_draw::Marks::Dots(points) => {
+                let dot = mark.multiply_alpha(chart_draw::DOT_OPACITY as f32);
+                for &pt in points {
+                    cx.fill(&Circle::new(pt, chart_draw::DOT_RADIUS), dot, 0.0);
+                }
+            }
+            chart_draw::Marks::Stacks(segments) => {
+                for (stack, b) in segments {
+                    let fill = *chart_draw::stack_fill(&scene, *stack, &palette, &mark, &other);
+                    cx.fill(&rect(b), fill, 0.0);
+                }
+            }
         }
         // The zero line, over the marks.
         cx.stroke(
@@ -620,6 +784,16 @@ impl View for ChartCanvas {
             cx.draw_text(
                 &layout(&l.text, font, theme::text_dim),
                 Point::new(l.left, l.top),
+            );
+        }
+        // A stacked bar's legend: a swatch in each stack's colour, its name
+        // beside it.
+        for e in &scene.legend {
+            let fill = *chart_draw::stack_fill(&scene, e.stack, &palette, &mark, &other);
+            cx.fill(&rect(&e.swatch).to_rounded_rect(2.0), fill, 0.0);
+            cx.draw_text(
+                &layout(&e.label.text, font, theme::text_dim),
+                Point::new(e.label.left, e.label.top),
             );
         }
     }
@@ -713,6 +887,60 @@ mod tests {
         };
         assert!(svg.starts_with("<svg"), "{svg}");
         assert_eq!(svg.matches("<rect").count(), 3, "background + two bars");
+    }
+
+    /// The folded segment is named in the interface's words, which are core's
+    /// in English — and a saved stacked bar draws each segment and its legend
+    /// swatch in the palette.
+    #[test]
+    fn a_stacked_bar_names_its_other_segment_and_saves_in_the_palette() {
+        use schemaic_core::model::{Column, ResultBuilder, Value};
+        let mut b = ResultBuilder::new(
+            ["l", "by", "v"]
+                .iter()
+                .map(|n| Column {
+                    name: n.to_string(),
+                    type_name: String::new(),
+                    origin: None,
+                })
+                .collect(),
+        );
+        for i in 0..chart::MAX_STACKS + 2 {
+            b.push_row(&[
+                Value::Str("a".into()),
+                Value::Str(format!("s{i}")),
+                Value::Int(1),
+            ]);
+        }
+        let rs = b.finish();
+        let picks = chart::Picks {
+            value: 2,
+            label: Some(0),
+            by: Some(1),
+            ..chart::Picks::default()
+        };
+        let (drawn, _) = plot_of(&rs, ChartKind::StackedBar, picks);
+        let Plot::Stacked(s) = &drawn else {
+            panic!("a stacked bar");
+        };
+        assert_eq!(s.stacks.last().map(String::as_str), Some(chart::OTHER));
+        assert_eq!(tr!("chart-other"), chart::OTHER);
+
+        let svg = export_doc(&drawn, ErdExportFormat::Svg)
+            .and_then(crate::ErdDoc::into_text)
+            .expect("an SVG");
+        let first = crate::erd_view::hex(stack_palette()[0]);
+        assert_eq!(svg.matches(&format!("fill=\"{first}\"")).count(), 2);
+    }
+
+    /// Each kind shows the pickers it reads, and no other.
+    #[test]
+    fn each_kind_shows_the_pickers_it_reads() {
+        assert!(extra_of(ChartKind::Histogram) == Extra::Nothing);
+        assert!(extra_of(ChartKind::Bar) == Extra::Labels);
+        assert!(extra_of(ChartKind::Line) == Extra::Labels);
+        assert!(extra_of(ChartKind::Scatter) == Extra::XAxis);
+        assert!(extra_of(ChartKind::StackedBar) == Extra::LabelsAndStacks);
     }
 
     /// Only the two pictures are offered; a text format is no chart.
