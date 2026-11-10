@@ -31,7 +31,12 @@ rather than replacing the first.
 **Two quoters for the two readers, as the one-quoter invariant has it.** `create_view_sql` is
 executed SQL, so the name goes through `export::ident_sql` and the path through
 `export::sql_literal` — a Windows path's `\` kept and `o'brien` doubled
-(`the_view_reads_the_file_with_its_path_as_a_literal`); `select_sql` is the tab's text, which the
+(`the_view_reads_the_file_with_its_path_as_a_literal`). **A file name is not a glob**: DuckDB's
+readers glob their argument before they try the literal file, so `a[1].csv` read `a1.csv`'s rows
+when both were there (probed on 2.0.0), and `sales*.csv` every sales file where `*` is legal in a
+name. `path_literal` writes each `[`, `*` and `?` as the one-character class `[[]`, `[*]`, `[?]`,
+which matches only itself, before `sql_literal` quotes it
+(`glob_characters_in_the_path_are_read_literally`); `select_sql` is the tab's text, which the
 user reads, so it quotes through `ident_if_needed` and `SELECT * FROM sales` stays bare
 (`the_tab_selects_from_the_view_quoting_only_when_needed`). **`create_view_sql` is a plain `CREATE
 VIEW` on purpose**: it is the one generated statement run without the preview, and only ever
@@ -52,6 +57,9 @@ the change's author — taking `read_csv` or `read_csv_auto`, `delim` or `sep`, 
 (`a_csv_body_reads_back_written_or_reprinted`); a `read_csv_auto` body is written back as
 `read_csv`. **It answers `None` for any body carrying what it does not model** — `columns = …`, a
 two-character delimiter, a list of files, a filter, an alias, a projection
-(`a_body_the_form_would_rewrite_lossily_is_not_read`) — and that is the gate, not a gap: the form
+(`a_body_the_form_would_rewrite_lossily_is_not_read`), and a path that globs on purpose, any `[`,
+`*` or `?` outside the three escapes, which the form would rewrite into a literal read; the
+escapes themselves are undone, so `CsvView::path` is the file's own name
+(`an_escaped_path_reads_back_and_a_real_glob_is_not_offered`) — and that is the gate, not a gap: the form
 writes the whole call again, so a body it had half read would lose what the user wrote by hand,
 and the menu entry is offered only where this answers `Some`.

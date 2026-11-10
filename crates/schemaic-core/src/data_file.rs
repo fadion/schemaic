@@ -101,8 +101,60 @@ pub fn create_view_sql(name: &str, path: &str, kind: DataFileKind) -> String {
         "CREATE VIEW {} AS SELECT * FROM {}({})",
         ident_sql(name, D),
         kind.reader(),
-        sql_literal(&Value::Str(path.to_string()), D)
+        path_literal(path)
     )
+}
+
+/// `path` as the literal a DuckDB reader reads **as that one file**.
+///
+/// The readers glob their argument before they try the literal file, so a
+/// `[`, `*` or `?` in a file's name matched other files: `a[1].csv` read
+/// `a1.csv`'s rows when both were there (probed on 2.0.0). Each is written as
+/// a one-character class — `[[]`, `[*]`, `[?]` — which matches only itself.
+fn path_literal(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for c in path.chars() {
+        match c {
+            '[' | '*' | '?' => {
+                escaped.push('[');
+                escaped.push(c);
+                escaped.push(']');
+            }
+            _ => escaped.push(c),
+        }
+    }
+    sql_literal(&Value::Str(escaped), D)
+}
+
+/// [`path_literal`]'s escape undone: the file a reader's argument names, or
+/// `None` when it is a glob — any `[`, `*` or `?` not in one of the three
+/// one-character classes — which the options form would rewrite into a
+/// literal read of a file of that name.
+fn unescape_path(arg: &str) -> Option<String> {
+    let mut out = String::with_capacity(arg.len());
+    let mut rest = arg;
+    while let Some(c) = rest.chars().next() {
+        match c {
+            '[' => {
+                let mut it = rest.chars();
+                it.next();
+                let (Some(m), Some(']')) = (it.next(), it.next()) else {
+                    return None;
+                };
+                if !matches!(m, '[' | '*' | '?') {
+                    return None;
+                }
+                out.push(m);
+                rest = &rest[1 + m.len_utf8() + 1..];
+            }
+            '*' | '?' => return None,
+            _ => {
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+    }
+    Some(out)
 }
 
 /// The delimiter a CSV view reads with: DuckDB's sniffer's guess, or one of
@@ -180,7 +232,7 @@ pub struct CsvView {
 /// body [`create_view_sql`] opens with.
 pub fn csv_view_body(path: &str, options: CsvReadOptions) -> String {
     let lit = |s: &str| sql_literal(&Value::Str(s.to_string()), D);
-    let mut args = vec![lit(path)];
+    let mut args = vec![path_literal(path)];
     if let Some(c) = options.delimiter.char() {
         args.push(format!("delim = {}", lit(&c.to_string())));
     }
@@ -200,7 +252,8 @@ pub fn csv_view_body(path: &str, options: CsvReadOptions) -> String {
 /// `read_csv`: DuckDB has made the one an alias of the other.
 ///
 /// `None` for any other body, **and for one carrying an option this does not
-/// model** (`columns = …`, a two-character delimiter, a second file): the
+/// model** (`columns = …`, a two-character delimiter, a second file, a glob
+/// rather than [`path_literal`]'s escaped file name): the
 /// options form writes the whole call again, so offering it there would drop
 /// what the user wrote by hand.
 pub fn csv_view_of(body: &str) -> Option<CsvView> {
@@ -227,7 +280,10 @@ pub fn csv_view_of(body: &str) -> Option<CsvView> {
             _ => return None,
         }
     }
-    Some(CsvView { path, options })
+    Some(CsvView {
+        path: unescape_path(&path)?,
+        options,
+    })
 }
 
 /// The query the session's tab opens with.
@@ -366,6 +422,50 @@ mod tests {
             "SELECT * FROM read_csv(['/d/a.csv', '/d/b.csv'])",
             "SELECT * FROM t",
             "not sql",
+        ] {
+            assert_eq!(csv_view_of(body), None, "{body}");
+        }
+    }
+
+    /// **A file name is not a glob.** DuckDB's readers glob their argument
+    /// before trying the literal file, so `a[1].csv` read `a1.csv`'s rows
+    /// (probed on 2.0.0) and, where `*` and `?` are legal, `sales*.csv` read
+    /// every sales file. Each metacharacter is written as a one-character
+    /// class, which DuckDB reads as the character itself.
+    #[test]
+    fn glob_characters_in_the_path_are_read_literally() {
+        assert_eq!(
+            create_view_sql("a", "C:\\d\\a[1].csv", DataFileKind::Csv),
+            "CREATE VIEW \"a\" AS SELECT * FROM read_csv('C:\\d\\a[[]1].csv')"
+        );
+        assert_eq!(
+            create_view_sql("s", "/d/sales*?.parquet", DataFileKind::Parquet),
+            "CREATE VIEW \"s\" AS SELECT * FROM read_parquet('/d/sales[*][?].parquet')"
+        );
+        assert_eq!(
+            csv_view_body("/d/Report [Q1].csv", CsvReadOptions::default()),
+            "SELECT * FROM read_csv('/d/Report [[]Q1].csv')"
+        );
+    }
+
+    /// The escape round-trips through the options form, and a body that
+    /// globs on purpose is a read the form would rewrite into a literal one,
+    /// so it is not offered.
+    #[test]
+    fn an_escaped_path_reads_back_and_a_real_glob_is_not_offered() {
+        let path = "C:\\d\\a[1]*?.csv";
+        assert_eq!(
+            csv_view_of(&csv_view_body(path, CsvReadOptions::default())),
+            Some(CsvView {
+                path: path.into(),
+                options: CsvReadOptions::default()
+            })
+        );
+        for body in [
+            "SELECT * FROM read_csv('/d/*.csv')",
+            "SELECT * FROM read_csv('/d/a?.csv')",
+            "SELECT * FROM read_csv('/d/a[12].csv')",
+            "SELECT * FROM read_csv('/d/a[.csv')",
         ] {
             assert_eq!(csv_view_of(body), None, "{body}");
         }
