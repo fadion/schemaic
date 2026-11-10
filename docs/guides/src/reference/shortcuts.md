@@ -74,7 +74,8 @@ You can edit it by hand while the app is closed. Write <kbd>Ctrl</kbd> even on m
 `toggle-schema`, `toggle-ai`, `toggle-terminal`, `format-code`, `format-statement`,
 `make-single-line` and `go-to-line`.
 
-If something in the file can't be applied, Schemaic lists it in a notice at startup and that
+Your changes go inside `"bindings"`; anything written beside it is not read, and the startup
+notice says so (the file keeps it). If something in the file can't be applied, Schemaic lists it in a notice at startup and that
 command keeps its default — or, where two commands end up with the same key, one of them is left
 with none, and the notice says which. The entry stays in the file, so the notice comes back at
 every start until you fix it by hand or assign, clear or reset that command in the

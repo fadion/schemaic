@@ -288,6 +288,7 @@ keymap-refusal-altgr = Aici Ctrl+Alt este AltGr, care scrie caractere precum @ s
 
 keymap-problems = Unele modificări de scurtături din keymap.json nu au putut fi aplicate:
 keymap-problem-unknown = • „{ $id }” nu este o comandă cunoscută de această versiune.
+keymap-problem-unknown-key = • „{ $key }” este în afara „bindings”, așa că această versiune nu îl citește. Modificările scurtăturilor se scriu în „bindings”.
 keymap-problem-unreadable = • { $command }: „{ $keys }” nu este o combinație de taste, așa că rămâne tasta implicită.
 keymap-problem-refused = • { $command }: { $keys } nu poate fi folosită, așa că rămâne tasta implicită. { $reason }
 keymap-problem-fixed = • { $command }: { $keys } este folosită de { $holder }, care nu poate fi schimbată, așa că rămâne tasta implicită.

@@ -209,6 +209,7 @@ fn problem_text(problem: &schemaic_core::keymap::Problem) -> String {
     use schemaic_core::keymap::Problem;
     match problem {
         Problem::UnknownCommand(id) => tr!("keymap-problem-unknown", id = id.clone()),
+        Problem::UnknownKey(key) => tr!("keymap-problem-unknown-key", key = key.clone()),
         Problem::Unreadable { command, text, .. } => tr!(
             "keymap-problem-unreadable",
             command = command_label(*command),

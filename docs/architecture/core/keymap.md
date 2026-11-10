@@ -77,7 +77,7 @@ and deletion there, floem's macOS keymap binds it so, and it is the platform's c
 Ctrl+← that is already refused elsewhere
 (`on_macos_option_with_an_arrow_or_a_delete_key_edits_text`). Option+Home and Option+Enter are not
 editing keys and stay free.
-**`keymap.json` (`FILE`; `KeymapFile { bindings }`) holds only what the user changed**, by command
+**`keymap.json` (`FILE`; `KeymapFile { bindings, other }`) holds only what the user changed**, by command
 id, so a command they never touched follows its default and a default changed in a later release
 still reaches them. A cleared command is `null`, which is a different thing from absent
 (`the_file_holds_only_what_moved_and_a_cleared_command_as_null`); a command moved back to its
@@ -100,7 +100,12 @@ while its command was off the default, so `Ctrl+Banana` for Open SQL file surviv
 came back on *Reset to default*, and the startup notice with it — and with Reset disabled on a
 command already on its default, the modal's only way out was Clear, a restart, then Reset
 (`a_kept_entry_leaves_the_file_once_the_user_sets_that_commands_key`). An unknown id is no
-command to set, so it stays for as long as the file does. **What the file names wins
+command to set, so it stays for as long as the file does. **So does a top-level key beside
+`bindings`**: `KeymapFile::other` (`#[serde(flatten)]`) reads every other key, `load` reports each
+as `Problem::UnknownKey` and carries it in `Keymap`'s private `other`, and `to_file` writes it back
+as read. Dropped, a file written by hand without the `bindings` wrapper loaded as an empty keymap
+with no notice and the next save wrote over it, as it would a later build's field
+(`a_top_level_key_this_build_does_not_read_is_reported_and_kept`). **What the file names wins
 over a default**: a file moving New tab to Ctrl+P takes Ctrl+P from Find anywhere, reported as a
 `Conflict`, rather than leaving New tab unbound
 (`what_the_file_names_wins_over_a_default_and_the_loss_is_reported`); between two entries of the

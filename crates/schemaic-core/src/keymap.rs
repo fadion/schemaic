@@ -513,6 +513,12 @@ pub enum Verdict {
 pub struct KeymapFile {
     #[serde(default)]
     pub bindings: BTreeMap<String, Option<String>>,
+    /// Every other top-level key, read and written back untouched — entries
+    /// written by hand without the `bindings` wrapper, or a later build's
+    /// field — and reported ([`Problem::UnknownKey`]). Dropped, they went
+    /// unnoticed and the next save wrote over them.
+    #[serde(flatten)]
+    pub other: BTreeMap<String, serde_json::Value>,
 }
 
 /// An entry of `keymap.json` that could not be kept, and why. The entry is
@@ -521,6 +527,8 @@ pub struct KeymapFile {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Problem {
     UnknownCommand(String),
+    /// A top-level key beside `bindings` this build does not read.
+    UnknownKey(String),
     Unreadable {
         command: Command,
         text: String,
@@ -556,6 +564,9 @@ pub struct Keymap {
     /// [`clear`](Keymap::clear), [`reset`](Keymap::reset)): what they said
     /// since replaces what the file said.
     kept: BTreeMap<String, Option<String>>,
+    /// The file's top-level keys beside `bindings`, written back as read
+    /// ([`KeymapFile::other`]).
+    other: BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for Keymap {
@@ -573,6 +584,7 @@ impl Keymap {
                 .map(|&c| (c, Some(c.default_chord())))
                 .collect(),
             kept: BTreeMap::new(),
+            other: BTreeMap::new(),
         }
     }
 
@@ -589,8 +601,14 @@ impl Keymap {
         let mut map = Keymap {
             bindings: BTreeMap::new(),
             kept: BTreeMap::new(),
+            other: file.other.clone(),
         };
-        let mut problems = Vec::new();
+        let mut problems: Vec<Problem> = file
+            .other
+            .keys()
+            .cloned()
+            .map(Problem::UnknownKey)
+            .collect();
         let mut named: BTreeMap<Command, Option<Chord>> = BTreeMap::new();
         for (id, text) in &file.bindings {
             let Some(command) = Command::from_id(id) else {
@@ -693,7 +711,10 @@ impl Keymap {
                 bindings.insert(command.id().to_string(), chord.map(|c| c.to_string()));
             }
         }
-        KeymapFile { bindings }
+        KeymapFile {
+            bindings,
+            other: self.other.clone(),
+        }
     }
 
     /// How many commands `other` binds differently — what an import of it
@@ -818,6 +839,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.map(str::to_string)))
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -1299,6 +1321,33 @@ mod tests {
         assert!(map.is_default(Command::OpenFile));
         // …and goes back out on save, for the user (or a later build) to fix.
         assert_eq!(map.to_file(), f);
+    }
+
+    /// **A key beside `bindings` is reported and kept, not dropped.** A file
+    /// written by hand without the `bindings` wrapper parsed as an empty
+    /// keymap with no notice, and the next save wrote `{"bindings":{…}}` over
+    /// it; a later build's field beside `bindings` went the same way.
+    #[test]
+    fn a_top_level_key_this_build_does_not_read_is_reported_and_kept() {
+        let text = r#"{"new-tab": "Ctrl+N", "close-tab": null, "bindings": {"open-file": "Ctrl+Shift+O"}}"#;
+        let f: KeymapFile = serde_json::from_str(text).unwrap();
+        let (map, problems) = Keymap::load(&f, &[]);
+        assert_eq!(
+            problems,
+            [
+                Problem::UnknownKey("close-tab".into()),
+                Problem::UnknownKey("new-tab".into()),
+            ]
+        );
+        // The bindings it does read still apply…
+        assert_eq!(map.chord(Command::OpenFile), Some(chord("Ctrl+Shift+O")));
+        // …and a save writes the unread keys back as they were.
+        let out = map.to_file();
+        assert_eq!(out, f);
+        let back: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(back["new-tab"], "Ctrl+N");
+        assert_eq!(back["close-tab"], serde_json::Value::Null);
     }
 
     #[test]

@@ -284,6 +284,7 @@ keymap-refusal-altgr = Qui Ctrl+Alt è AltGr, che su molti layout di tastiera di
 
 keymap-problems = Alcune modifiche alle scorciatoie in keymap.json non sono state applicate:
 keymap-problem-unknown = • “{ $id }” non è un comando che questa versione conosce.
+keymap-problem-unknown-key = • “{ $key }” è fuori da “bindings”, quindi questa versione non lo legge. Le modifiche alle scorciatoie vanno dentro “bindings”.
 keymap-problem-unreadable = • { $command }: “{ $keys }” non è una combinazione di tasti, quindi resta quello predefinito.
 keymap-problem-refused = • { $command }: { $keys } non si può usare, quindi resta quello predefinito. { $reason }
 keymap-problem-fixed = • { $command }: { $keys } è usato da { $holder }, che non si può cambiare, quindi resta quello predefinito.

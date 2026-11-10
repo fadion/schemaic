@@ -284,6 +284,7 @@ keymap-refusal-altgr = Strg+Alt ist hier AltGr, das auf vielen Tastaturbelegunge
 
 keymap-problems = Einige Tastenkürzel-Änderungen in keymap.json konnten nicht übernommen werden:
 keymap-problem-unknown = • „{ $id }“ ist kein Befehl, den diese Version kennt.
+keymap-problem-unknown-key = • „{ $key }“ steht außerhalb von „bindings“ und wird von dieser Version nicht gelesen. Tastenkürzel gehören in „bindings“.
 keymap-problem-unreadable = • { $command }: „{ $keys }“ ist keine Tastenkombination, daher bleibt die Standardtaste.
 keymap-problem-refused = • { $command }: { $keys } kann nicht verwendet werden, daher bleibt die Standardtaste. { $reason }
 keymap-problem-fixed = • { $command }: { $keys } gehört zu { $holder } und kann nicht geändert werden, daher bleibt die Standardtaste.

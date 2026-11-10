@@ -284,6 +284,7 @@ keymap-refusal-altgr = Ici, Ctrl+Alt est AltGr, qui tape des caractères comme @
 
 keymap-problems = Certaines modifications de raccourcis dans keymap.json n'ont pas pu être appliquées :
 keymap-problem-unknown = • « { $id } » n'est pas une commande connue de cette version.
+keymap-problem-unknown-key = • « { $key } » est en dehors de « bindings », donc cette version ne le lit pas. Les changements de raccourcis vont dans « bindings ».
 keymap-problem-unreadable = • { $command } : « { $keys } » n'est pas une combinaison de touches, la touche par défaut est donc conservée.
 keymap-problem-refused = • { $command } : { $keys } ne peut pas être utilisé, la touche par défaut est donc conservée. { $reason }
 keymap-problem-fixed = • { $command } : { $keys } est utilisé par { $holder }, qui ne peut pas être modifié, la touche par défaut est donc conservée.

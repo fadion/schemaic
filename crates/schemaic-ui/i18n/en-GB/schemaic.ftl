@@ -319,6 +319,7 @@ keymap-refusal-altgr = Ctrl+Alt is AltGr here, which types characters such as @ 
 
 keymap-problems = Some of the shortcut changes in keymap.json could not be applied:
 keymap-problem-unknown = • “{ $id }” is no command this version knows.
+keymap-problem-unknown-key = • “{ $key }” is outside “bindings”, so this version does not read it. Shortcut changes go inside “bindings”.
 keymap-problem-unreadable = • { $command }: “{ $keys }” is not a key combination, so it keeps its default.
 keymap-problem-refused = • { $command }: { $keys } can't be used, so it keeps its default. { $reason }
 keymap-problem-fixed = • { $command }: { $keys } is used by { $holder }, which can't be changed, so it keeps its default.

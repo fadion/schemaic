@@ -284,6 +284,7 @@ keymap-refusal-altgr = Ctrl+Alt is hier AltGr, waarmee veel toetsenbordindelinge
 
 keymap-problems = Sommige sneltoetswijzigingen in keymap.json konden niet worden toegepast:
 keymap-problem-unknown = • ‘{ $id }’ is geen opdracht die deze versie kent.
+keymap-problem-unknown-key = • ‘{ $key }’ staat buiten ‘bindings’, dus deze versie leest het niet. Wijzigingen in sneltoetsen horen in ‘bindings’.
 keymap-problem-unreadable = • { $command }: ‘{ $keys }’ is geen toetscombinatie, dus de standaardtoets blijft.
 keymap-problem-refused = • { $command }: { $keys } kan niet worden gebruikt, dus de standaardtoets blijft. { $reason }
 keymap-problem-fixed = • { $command }: { $keys } wordt gebruikt door { $holder }, dat niet kan worden gewijzigd, dus de standaardtoets blijft.

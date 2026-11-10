@@ -284,6 +284,7 @@ keymap-refusal-altgr = Тук Ctrl+Alt е AltGr, с който много кла
 
 keymap-problems = Някои промени на клавишни комбинации в keymap.json не можаха да бъдат приложени:
 keymap-problem-unknown = • „{ $id }“ не е команда, позната на тази версия.
+keymap-problem-unknown-key = • „{ $key }“ е извън „bindings“, затова тази версия не го чете. Промените в клавишните комбинации се записват в „bindings“.
 keymap-problem-unreadable = • { $command }: „{ $keys }“ не е клавишна комбинация, затова остава клавишът по подразбиране.
 keymap-problem-refused = • { $command }: { $keys } не може да се използва, затова остава клавишът по подразбиране. { $reason }
 keymap-problem-fixed = • { $command }: { $keys } се използва от { $holder }, което не може да се променя, затова остава клавишът по подразбиране.

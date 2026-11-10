@@ -284,6 +284,7 @@ keymap-refusal-altgr = Aquí Ctrl+Alt es AltGr, que escribe caracteres como @ o 
 
 keymap-problems = Algunos cambios de atajos en keymap.json no se pudieron aplicar:
 keymap-problem-unknown = • «{ $id }» no es un comando que conozca esta versión.
+keymap-problem-unknown-key = • «{ $key }» está fuera de «bindings», así que esta versión no lo lee. Los cambios de atajos van dentro de «bindings».
 keymap-problem-unreadable = • { $command }: «{ $keys }» no es una combinación de teclas, así que conserva la predeterminada.
 keymap-problem-refused = • { $command }: no se puede usar { $keys }, así que conserva la predeterminada. { $reason }
 keymap-problem-fixed = • { $command }: { $keys } lo usa { $holder }, que no se puede cambiar, así que conserva la predeterminada.

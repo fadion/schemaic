@@ -284,6 +284,7 @@ keymap-refusal-altgr = Këtu Ctrl+Alt është AltGr, që në shumë paraqitje ta
 
 keymap-problems = Disa ndryshime shkurtoresh në keymap.json nuk mund të zbatoheshin:
 keymap-problem-unknown = • “{ $id }” nuk është një komandë që e njeh ky version.
+keymap-problem-unknown-key = • “{ $key }” është jashtë “bindings”, ndaj ky version nuk e lexon. Ndryshimet e shkurtoreve shkojnë brenda “bindings”.
 keymap-problem-unreadable = • { $command }: “{ $keys }” nuk është kombinim tastesh, prandaj mbetet tasti parazgjedhur.
 keymap-problem-refused = • { $command }: { $keys } nuk mund të përdoret, prandaj mbetet tasti parazgjedhur. { $reason }
 keymap-problem-fixed = • { $command }: { $keys } përdoret nga { $holder }, i cili nuk mund të ndryshohet, prandaj mbetet tasti parazgjedhur.
