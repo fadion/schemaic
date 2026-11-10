@@ -468,7 +468,17 @@ held-back case is now `compare.rs`'s own tests'.
 editor, DuckDB having no triggers, through `ddl::duckdb_supports`.
 **A missing file is refused, never created** (`open_target`, `DbRefusal::DuckDbMissing`). DuckDB's
 open creates one, which for a database *client* is the wrong default by some distance: a mistyped
-path would open an empty database that looked like it worked. An empty path is `DuckDbNoFile`, and
+path would open an empty database that looked like it worked. **Making one is a separate,
+deliberate act** — the connection form's *New file*, `schemaic_db::create_duckdb_file` over
+`create_file` — and until it existed Schemaic could not start a DuckDB database at all: an empty
+file is no way round the refusal, DuckDB calling it "not a valid DuckDB database file".
+`create_file` refuses a path that exists (it only ever sees the `.part` sibling `staged_backup` has
+cleared, *db/overview.md*), opens it with the app's own `config(false, false)`, so no extension
+is loaded, and runs `CHECKPOINT` on a blocking thread, so the file holds a whole, empty catalogue
+before the rename puts it in place. No committed test makes one, since that needs a file; it was
+checked once on real files by a throwaway test — a new path and a path holding junk each became
+a writable database, with no `.part` left — and the staging it rests on is
+`a_backup_replaces_its_target_only_with_a_whole_copy`'s. An empty path is `DuckDbNoFile`, and
 `:memory:` and a MotherDuck `md:`/`motherduck:` name are `DuckDbNotAFile` — the first a database
 that dies with each operation's instance, the second needing an extension this build does not
 fetch (`a_missing_file_is_refused_not_created`, `names_that_are_not_a_file_are_refused`, whose

@@ -48,10 +48,14 @@ See [Signing in and TLS](sign-in.md).
 
 ## DuckDB files
 
-Type the path in **Database file**, or press **Browse…** inside the field to pick it.
+Type the path in **Database file**, or press **Browse…** inside the field to pick it. To start a
+new database, press **New file** inside the field instead: choose where to save it, and Schemaic
+creates an empty DuckDB database there and fills in the path. If you choose a file that already
+exists and agree to replace it, it becomes a new, empty database — though if creating it fails,
+the old file is left as it was, and the reason shows under the field.
 
-- *The file must already exist.* Schemaic never creates a DuckDB database, so a mistyped path is
-  refused rather than turned into an empty one. Create the file with DuckDB first. An in-memory
+- *The file must already exist.* Connecting never creates a DuckDB database, so a mistyped path
+  is refused rather than turned into an empty one; use **New file** for that. An in-memory
   database (`:memory:`) and a MotherDuck name (`md:…`) are refused too. To query a CSV, Parquet
   or JSON file in an in-memory session instead, see [Querying a data file](data-file.md).
 - *The file is open only while something runs.* Between statements Schemaic lets go of it, so

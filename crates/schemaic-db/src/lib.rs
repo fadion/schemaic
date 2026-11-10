@@ -2109,10 +2109,20 @@ where
     }
     fs.publish(&part, target_path).map_err(|e| {
         DbError::Query(format!(
-            "the backup is complete in {}, but it could not replace {target}: {e}",
+            "{} is complete, but it could not replace {target}: {e}",
             part.display()
         ))
     })
+}
+
+/// Create an **empty DuckDB database** at `path` — the connection form's *New
+/// file*, since a connection never creates the file it names
+/// (`duckdb::open_target` refuses a missing one, and an empty file is no
+/// database). Through [`staged_backup`] for the reason a backup is: the save
+/// dialog asks before replacing a file, and a yes there is honoured only once
+/// the new database is whole, so a failed create leaves the old file as it was.
+pub async fn create_duckdb_file(path: &str) -> Result<(), DbError> {
+    staged_backup(&RealFs, path, duckdb::create_file).await
 }
 
 impl Db {

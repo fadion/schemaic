@@ -5873,6 +5873,10 @@ pub struct ConnImportUi {
     pub done: RwSignal<Option<String>>,
 }
 
+/// [`ConnActions::create_duckdb_file`]: make a file at a path, then answer
+/// with `Ok` or why not.
+pub type CreateFile = Rc<dyn Fn(String, Rc<dyn Fn(Result<(), String>)>)>;
+
 /// Connection-management callbacks (owned by the app).
 pub struct ConnActions {
     pub switch_conn: Rc<dyn Fn(u64)>,
@@ -5890,6 +5894,10 @@ pub struct ConnActions {
     /// Test the draft's host + credentials (opens a throwaway connection/tunnel
     /// and pings); the result lands in [`ConnUi::conn_test`].
     pub test_conn: Rc<dyn Fn()>,
+    /// Create an empty DuckDB database at a path — the DuckDB form's *New
+    /// file* (`schemaic_db::create_duckdb_file`) — answering on the UI thread
+    /// with `Ok` or the reason it could not be made.
+    pub create_duckdb_file: CreateFile,
     /// Re-run the active connection's health check. Nothing re-checks on a
     /// timer, so this is how a recovered server gets noticed without switching
     /// connections — it's what the header's "Not connected" retry calls.

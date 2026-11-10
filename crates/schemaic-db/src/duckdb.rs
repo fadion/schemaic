@@ -2446,6 +2446,24 @@ pub(crate) async fn backup_to(db: &Db, target: String) -> Result<(), DbError> {
     with_conn(db, move |conn| copy_into(conn, &target)).await
 }
 
+/// Make an empty DuckDB database at `path`, which must not exist — the
+/// staging sibling `create_duckdb_file` clears. Opened with the app's own
+/// configuration (extensions not loaded) and checkpointed, so the file holds
+/// a whole, empty catalogue before anything renames it into place.
+pub(crate) async fn create_file(path: String) -> Result<(), DbError> {
+    tokio::task::spawn_blocking(move || {
+        if std::path::Path::new(&path).exists() {
+            return Err(DbError::Query(format!("{path} already exists")));
+        }
+        let connect_err = |e: duckdb::Error| DbError::Connect(format!("{path}: {e}"));
+        let conn = DuckConn::open_with_flags(&path, config(false, false).map_err(connect_err)?)
+            .map_err(connect_err)?;
+        conn.execute_batch("CHECKPOINT").map_err(query_err)
+    })
+    .await
+    .map_err(|e| DbError::Query(e.to_string()))?
+}
+
 /// The file's catalog copied whole into the attached database `alias`.
 fn copy_database(conn: &DuckConn, alias: &str) -> Result<(), DbError> {
     let src = schemaic_core::export::ident_sql(&catalog(conn)?, D);

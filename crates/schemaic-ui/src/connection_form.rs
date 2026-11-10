@@ -236,6 +236,26 @@ fn path_field(
     ring: FocusRing,
     tabindex: u32,
 ) -> impl IntoView {
+    path_field_with(label_text, sig, dialog_title, ring, tabindex, None)
+}
+
+/// A second button inside a [`path_field_with`], after Browse: its label and
+/// what it does.
+struct ExtraButton {
+    label: String,
+    action: Rc<dyn Fn()>,
+}
+
+/// [`path_field`] with an optional second button after Browse, at `tabindex +
+/// 2` — the DuckDB file's *New file*.
+fn path_field_with(
+    label_text: String,
+    sig: RwSignal<String>,
+    dialog_title: String,
+    ring: FocusRing,
+    tabindex: u32,
+    extra: Option<ExtraButton>,
+) -> impl IntoView {
     use floem::file::FileDialogOptions;
     use floem::file_action::open_file;
 
@@ -243,9 +263,10 @@ fn path_field(
     // beside it, the button stood shorter than the field it fills in
     // (GitHub #19). A cancelled dialog leaves the field alone.
     let ring_browse = ring.clone();
+    let extra = extra.map(Rc::new);
     let browse = Rc::new(move || {
         let dialog_title = dialog_title.clone();
-        field_button(
+        let browse = field_button(
             tr!("connections-browse"),
             ring_browse.clone(),
             tabindex + 1,
@@ -258,7 +279,22 @@ fn path_field(
                     }
                 })
             },
-        )
+        );
+        match &extra {
+            None => browse,
+            Some(x) => {
+                let action = x.action.clone();
+                let more = field_button(
+                    x.label.clone(),
+                    ring_browse.clone(),
+                    tabindex + 2,
+                    move || action(),
+                );
+                h_stack((browse, more))
+                    .style(|s| s.flex_row().items_center().gap(theme::scaled(4.0)))
+                    .into_any()
+            }
+        }
     });
 
     v_stack((
@@ -835,6 +871,7 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
     let duplicate_conn = actions.duplicate_conn.clone();
     let delete_conn = actions.delete_conn.clone();
     let test_conn = actions.test_conn.clone();
+    let create_duckdb_file = actions.create_duckdb_file.clone();
     // The list's right-click menu goes through the app-wide popup channel, like
     // every other menu — it is rendered at the workspace root, which is the only
     // surface painted above this modal's panel.
@@ -1212,6 +1249,7 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
                 save_conn.clone(),
                 delete_conn.clone(),
                 test_conn.clone(),
+                create_duckdb_file.clone(),
                 conn_test,
                 save_flash,
                 test_flash,
@@ -1876,18 +1914,64 @@ fn file_fields(
     dialog: String,
     hint: String,
     names_a_file: fn(&str) -> bool,
+    // DuckDB's *New file*: a connection never creates the file it names, so
+    // this is the one way to start a database from the form. `None` on SQLite.
+    create: Option<crate::CreateFile>,
 ) -> impl IntoView {
+    // Why the last *New file* failed, until the path changes again.
+    let create_failed: RwSignal<Option<String>> = RwSignal::new(None);
+    create_effect(move |_| {
+        draft.file.track();
+        create_failed.set(None);
+    });
     let refused = move || draft.file.with(|f| !names_a_file(f));
-    // The SSH key's and TLS certificates' control: a path editable by hand, with
-    // Browse inside it as its own stop right after the path (61). It was a
-    // second copy of `path_field` until GitHub #19 moved the button in.
+    let bad = move || refused() || create_failed.with(Option::is_some);
+    let extra = create.map(|create| ExtraButton {
+        label: tr!("connections-new-file"),
+        action: Rc::new(move || {
+            use floem::file::{FileDialogOptions, FileSpec};
+            let opts = FileDialogOptions::new()
+                .title(tr!("connections-duckdb-new-file-dialog"))
+                .default_name("database.duckdb")
+                .allowed_types(vec![FileSpec {
+                    name: crate::i18n::tr_static!("backup-kind-duckdb"),
+                    extensions: &["duckdb"],
+                }]);
+            let create = create.clone();
+            floem::action::save_as(opts, move |file| {
+                let Some(path) = file.and_then(|f| f.path.first().cloned()) else {
+                    return; // The dialog was dismissed.
+                };
+                let path = path.to_string_lossy().to_string();
+                let shown = path.clone();
+                // The dialog has asked before replacing a file, so a path that
+                // exists is made over (`create_duckdb_file` stages it).
+                create(
+                    path.clone(),
+                    Rc::new(move |res: Result<(), String>| match res {
+                        Ok(()) => draft.file.set(path.clone()),
+                        Err(why) => create_failed.set(Some(tr!(
+                            "connections-new-file-failed",
+                            path = shown.clone(),
+                            why = why
+                        ))),
+                    }),
+                );
+            });
+        }),
+    });
+    // The database file: a path editable by hand — the control the SSH key and
+    // TLS certificates share — with Browse inside it as its own stop right after
+    // the path (61), and DuckDB's New file after it (62). It was a second copy
+    // of `path_field` until GitHub #19 moved the button in.
     v_stack((
-        path_field(
+        path_field_with(
             tr!("connections-database-file"),
             draft.file,
             dialog,
             ring,
             60,
+            extra,
         ),
         label(move || {
             if refused() {
@@ -1895,6 +1979,8 @@ fn file_fields(
                     "db-refused-duckdb-not-a-file",
                     name = draft.file.with(|f| f.trim().to_string())
                 )
+            } else if let Some(why) = create_failed.get() {
+                why
             } else {
                 hint.clone()
             }
@@ -1902,7 +1988,7 @@ fn file_fields(
         .style(move |s| {
             crate::widgets::form_hint_style(s)
                 .width_full()
-                .apply_if(refused(), |s| s.color(theme::error()))
+                .apply_if(bad(), |s| s.color(theme::error()))
         }),
     ))
     .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
@@ -1914,6 +2000,8 @@ fn conn_form(
     save_conn: Rc<dyn Fn()>,
     delete_conn: Rc<dyn Fn(u64)>,
     test_conn: Rc<dyn Fn()>,
+    // The DuckDB file block's *New file* (`ConnActions::create_duckdb_file`).
+    create_duckdb_file: crate::CreateFile,
     conn_test: RwSignal<crate::TestState>,
     save_flash: RwSignal<bool>,
     test_flash: RwSignal<bool>,
@@ -2038,6 +2126,7 @@ fn conn_form(
                 tr!("connections-database-file-dialog"),
                 tr!("connections-sqlite-hint"),
                 |_| true,
+                None,
             )
             .into_any(),
             DbKind::DuckDb => file_fields(
@@ -2046,6 +2135,7 @@ fn conn_form(
                 tr!("connections-duckdb-file-dialog"),
                 tr!("connections-duckdb-hint"),
                 schemaic_core::connection::duckdb_names_a_file,
+                Some(create_duckdb_file.clone()),
             )
             .into_any(),
             _ => server_fields(draft, ring_engine.clone()).into_any(),

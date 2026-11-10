@@ -652,7 +652,8 @@ trigger and routine bodies, and the snippet editor's body — a snippet carries 
 than a dialect, so `snippet::body_dialect` picks one for it.
 **`FieldCfg::button` is a labelled button inside a single-line field**, right-aligned — Import
 Connections' *Add* and `connection_form::path_field`'s *Browse…* (GitHub #19), each built with
-`widgets::field_button`. Beside the field, as a `control_button`, it stood shorter than the box
+`widgets::field_button` — or two of them in an `h_stack`, the DuckDB file's *Browse…* and *New
+file* (`path_field_with`). Beside the field, as a `control_button`, it stood shorter than the box
 it serves; inside, its height is the field's. That is the difference from `FieldCfg::trailing`,
 whose fixed 16px box holds the AI panel's send icon: this one is in flow beside the editor but
 stretched to the row (`align_self(Stretch)`), and negative margins reach back through the box's

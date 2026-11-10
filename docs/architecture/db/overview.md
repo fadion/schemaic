@@ -806,8 +806,8 @@ engines' copies refuse a target that exists, and Windows' save dialog had alread
 risking the file: the sibling is cleared first of a fragment an earlier backup left, a failed copy
 is discarded and never touches the target, and `std::fs::rename` replaces an existing target on
 Windows as elsewhere. A whole copy that cannot be renamed in — the target held open — is **kept**,
-and the error names it ("the backup is complete in …, but it could not replace …"), since it is
-the one good copy there is. The engines' own refusals stay: they now only ever see the `.part`
+and the error names it ("… is complete, but it could not replace …"), since it is the one good
+copy there is — worded with no engine and no purpose, a new DuckDB file sharing it. The engines' own refusals stay: they now only ever see the `.part`
 path. The three file operations sit behind a private `StagingFs` trait (`RealFs` in the app) so
 the order is tested without a file — `a_backup_replaces_its_target_only_with_a_whole_copy`,
 `a_copy_that_cannot_replace_its_target_is_kept_and_named`. **It keeps half of
@@ -818,6 +818,11 @@ rename — so nothing under the target's name is ever wider than the file it rep
 half it cannot keep: the engine creates the sibling itself (DuckDB's `ATTACH` refuses a file that
 exists, even an empty one), so there is no `create_new` and the copy has the default mode while it
 is being written, as a backup always had.
+**`create_duckdb_file` is its third caller** — a free function, not a `Db` method, since there is
+no connection yet: the connection form's *New file* makes an empty DuckDB database
+(`duckdb::create_file`, *db/duckdb.md*) through the same staging, because its save dialog has
+asked "Replace?" too, and a yes is honoured only once the new database is whole — a failed create
+leaves the old file as it was.
 **`Db::fetch_blob` is the binary-cell panel's whole backend** — one connection, one `SELECT`, one
 row, like everything else here. `Ok(None)` means the cell is SQL `NULL` **or** the row is gone,
 and both are "there are no bytes to show" rather than an error the panel would have to phrase.
