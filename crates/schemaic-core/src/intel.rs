@@ -19057,15 +19057,36 @@ pub fn star_from_table_function(
     if !plain {
         return None;
     }
+    let relation = &select.from[0].relation;
     let TableFactor::Table {
         name,
         alias: None,
         args: Some(args),
         ..
-    } = &select.from[0].relation
+    } = relation
     else {
         return None;
     };
+    // The same print-back test for the source itself: a `TABLESAMPLE`, a
+    // `WITH ORDINALITY` or a time-travel version prints *inside* `from[0]`,
+    // so the statement's own print-back carried it on both sides. Written as
+    // a struct literal without `..` on purpose — a field the parser grows
+    // fails to compile here rather than being dropped by the rewrite.
+    let bare = TableFactor::Table {
+        name: name.clone(),
+        alias: None,
+        args: Some(args.clone()),
+        with_hints: Vec::new(),
+        version: None,
+        with_ordinality: false,
+        partitions: Vec::new(),
+        json_path: None,
+        sample: None,
+        index_hints: Vec::new(),
+    };
+    if bare.to_string() != relation.to_string() {
+        return None;
+    }
     let [part] = name.0.as_slice() else {
         return None;
     };

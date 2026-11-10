@@ -187,7 +187,11 @@ schema-qualified function or a second statement, and — **asked as the `SELECT`
 the `SELECT` itself: a `WHERE`, a `GROUP BY`, a `QUALIFY`, a `WINDOW`, an alias, a join. A list
 was the first spelling and let `GROUP BY ALL`, `QUALIFY` and `WINDOW` through, which the caller's
 rewrite would have dropped; the printed form covers whatever clause the parser grows next
-(`star_from_table_function_tests`). It is what `data_file::csv_view_of` reads an *Open
+(`star_from_table_function_tests`). **The source is asked the same way**: a `TABLESAMPLE`, a
+`WITH ORDINALITY` or a version prints *inside* the one source, so it passed the statement's
+print-back on both sides; the source must also print as a bare `f(args)` rebuilt by an
+exhaustive struct literal, so a field the parser grows is a compile error there rather than a
+clause the rewrite drops (`a_body_the_form_would_rewrite_lossily_is_not_read`). It is what `data_file::csv_view_of` reads an *Open
 data file* view's `read_csv` call back with — here rather than a scan of the body in
 `data_file.rs`, as the invariant on structure-aware analysis has it.
 **`clause_context` takes the last clause keyword within the caret's paren**, not across the

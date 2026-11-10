@@ -420,6 +420,10 @@ mod tests {
             "SELECT * FROM read_csv('/d/x.csv', columns = {'a': 'INT'})",
             "SELECT * FROM read_csv('/d/x.csv', delim = '::')",
             "SELECT * FROM read_csv(['/d/a.csv', '/d/b.csv'])",
+            // A sample or an ordinality prints inside the source, so the
+            // whole statement's print-back still matched.
+            "SELECT * FROM read_csv('/d/x.csv') TABLESAMPLE System(50.0 PERCENT)",
+            "SELECT * FROM read_csv('/d/x.csv') WITH ORDINALITY",
             "SELECT * FROM t",
             "not sql",
         ] {
