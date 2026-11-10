@@ -229,8 +229,15 @@ however many macros want it, and only when one does. An `EXPORT DATABASE` of the
 would write every table's rows, so it never runs there: an in-memory database is `ATTACH`ed
 under a name unique to the process and the call, `COPY FROM DATABASE <catalog> TO <scratch>
 (SCHEMA)` copies the catalog into it without rows — a macro whole, defaults and all (measured on
-2.0.0) — and that empty copy is exported to a fresh directory under the system temp directory,
+2.0.0) — and that empty copy is exported into a child of a directory **this call made**,
 whose `schema.sql` is read before the scratch database is `DETACH`ed and the directory removed.
+That directory is created exclusively under the system temp directory with a random suffix
+(`fresh_private_dir` over `make_private_dir`: `DirBuilder::create`, owner-only `0700` on Unix),
+retried under a new name when one is taken and never adopted: the name was the pid and a
+counter, so on a shared `/tmp` another user could pre-make it, read the world-readable schema,
+swap `schema.sql` between export and read (their `CREATE MACRO` then became the real macro's
+overloads), and have whatever else they put there deleted with it
+(`the_export_directory_is_made_fresh_or_not_at_all`).
 Nothing is written to the user's file. **The directory is not a choice**: DuckDB 2.0.0 has no
 in-memory filesystem to export to (`memory://` is read as a relative path), which makes this one
 of the workspace's sanctioned filesystem exceptions — in the app at every such read, and in every

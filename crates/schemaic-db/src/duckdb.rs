@@ -1873,7 +1873,17 @@ fn read_macro_defaults(conn: &DuckConn) -> Option<Vec<ExportedMacro>> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tag = format!("schemaic_macro_defaults_{}_{n}", std::process::id());
-    let dir = std::env::temp_dir().join(&tag);
+    // A directory of this process's own, made exclusively and owner-only, and
+    // the export a child of it: the schema text never sits where another user
+    // on a shared temp directory can read it, plant it, or have it deleted.
+    let own = fresh_private_dir(&std::env::temp_dir(), make_private_dir, || {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(n);
+        format!("{tag}_{:016x}", h.finish())
+    })
+    .ok()?;
+    let dir = own.join("export");
     let src = schemaic_core::export::ident_sql(&catalog(conn).ok()?, D);
     let alias = schemaic_core::export::ident_sql(&tag, D);
     let path = schemaic_core::export::sql_literal(
@@ -1889,8 +1899,43 @@ fn read_macro_defaults(conn: &DuckConn) -> Option<Vec<ExportedMacro>> {
         .ok()
         .and_then(|()| std::fs::read_to_string(dir.join("schema.sql")).ok());
     let _ = conn.execute_batch(&format!("DETACH {alias}"));
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&own);
     Some(exported_macros(&exported?))
+}
+
+/// Make a directory under `base` that did not exist, named by `name` —
+/// retried with the next name while the one tried is taken, never adopted,
+/// and given up after a few. `make` must fail with `AlreadyExists` for a path
+/// that is there (`make_private_dir`); any other failure ends the attempt.
+/// A parameter, so the rule is tested without a file.
+fn fresh_private_dir(
+    base: &std::path::Path,
+    mut make: impl FnMut(&std::path::Path) -> std::io::Result<()>,
+    mut name: impl FnMut() -> String,
+) -> std::io::Result<std::path::PathBuf> {
+    for _ in 0..8 {
+        let path = base.join(name());
+        match make(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+}
+
+/// Create `path` and nothing above it, refusing one that exists, owner-only
+/// on Unix (`0700`) — the `.part` policy `persist::create_part` keeps.
+fn make_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    let b = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut b = b;
+        b.mode(0o700);
+        b
+    };
+    b.create(path)
 }
 
 /// A macro's overloads written as one `CREATE MACRO` declares them, after the
@@ -3937,6 +3982,45 @@ mod tests {
         assert_eq!(n.cell(0, 0).unwrap().to_value(), Value::Int(0));
         // And the next operation is not left inside that transaction.
         assert!(rt.block_on(q(&db, "INSERT INTO t VALUES (2)")).is_ok());
+    }
+
+    /// **The macro export's directory is one this process made**: a name
+    /// already there — another user's, pre-made in a shared temp directory —
+    /// is never written into, read back or emptied; the next name is tried,
+    /// and any other failure ends the attempt.
+    #[test]
+    fn the_export_directory_is_made_fresh_or_not_at_all() {
+        use std::io::{Error, ErrorKind};
+        let base = std::path::Path::new("tmp");
+        let mut tried = Vec::new();
+        let mut names = ["taken", "free"].into_iter().map(String::from);
+        let made = fresh_private_dir(
+            base,
+            |p| {
+                tried.push(p.to_path_buf());
+                if p.ends_with("taken") {
+                    Err(Error::from(ErrorKind::AlreadyExists))
+                } else {
+                    Ok(())
+                }
+            },
+            || names.next().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(made, base.join("free"));
+        assert_eq!(tried, [base.join("taken"), base.join("free")]);
+        let denied = fresh_private_dir(
+            base,
+            |_| Err(Error::from(ErrorKind::PermissionDenied)),
+            || "x".to_string(),
+        );
+        assert!(denied.is_err());
+        let always_taken = fresh_private_dir(
+            base,
+            |_| Err(Error::from(ErrorKind::AlreadyExists)),
+            || "x".to_string(),
+        );
+        assert!(always_taken.is_err(), "it gives up rather than reuse one");
     }
 
     /// **A Stop that lands before the statement starts stops it.** A cancel
