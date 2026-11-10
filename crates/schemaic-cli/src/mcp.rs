@@ -12,10 +12,23 @@
 //!   - `describe_table` — one table's DDL, foreign keys, and — where the
 //!     connection sends rows — a few sample rows.
 //!   - `search_objects` — tables, views and columns by part of their name.
+//!   - `compare_schemas` — the migration plan between two databases' schemas,
+//!     as DDL to read. Runs nothing.
 //!   - `propose_table_change` — check a schema change and show the DDL it would
 //!     produce, for the AI panel to turn into a preview. Runs nothing.
 //!   - `propose_sql` — what the write guard says of a statement the model means
 //!     to offer, for the AI panel's code block to Insert or Run. Runs nothing.
+//!   - `top_statements` — the statements the server spent most time on, from
+//!     its statistics source; a text that carries a credential is withheld.
+//!     Reads row data: other people's statements hold their literals.
+//!   - `index_health` — unused, duplicate and prefix-redundant indexes, held to
+//!     the row cap, and on SQL Server the optimiser's missing indexes.
+//!   - `table_sizes` — the largest tables and indexes of one database.
+//!   - `current_locks` — the locks sessions hold and wait for. Reads row data:
+//!     a MySQL lock row names the locked record's key values.
+//!
+//! The list is [`McpTool::ALL`]'s, in its order; a tool added there belongs
+//! here too.
 //!
 //! The split between the schema tools is deliberate: enriching every table
 //! with keys makes each entry bigger, so the broad listings stay cheap and the
