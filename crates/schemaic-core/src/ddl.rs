@@ -19511,8 +19511,11 @@ fn duckdb_rebuild_refusals(current: &TableInfo) -> Vec<Withheld> {
 ///
 /// - **Rows are copied by the draft's own identity**: each draft column that
 ///   came from a current one (`original`) is filled from it, cast where its
-///   type changed; a new column takes its default. A generated column is never
-///   copied — it is computed, and DuckDB refuses a value for one.
+///   type changed; a new column takes its default. A generated column in the
+///   *draft* is never written — it is computed, and DuckDB refuses a value for
+///   one — but a generated *source* is read like any other, so one the draft
+///   makes plain keeps the values it computed (measured on 2.0: reading a
+///   generated column in the `SELECT` is accepted).
 /// - **A view on the table survives**: DuckDB binds a view's query when it
 ///   is read, not when it is made, so dropping the table under it leaves the
 ///   view to find the new one (measured).
@@ -19570,7 +19573,7 @@ pub fn duckdb_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
             let was = current
                 .columns
                 .iter()
-                .find(|k| Some(&k.name) == c.original.as_ref() && k.generated.is_none())?;
+                .find(|k| Some(&k.name) == c.original.as_ref())?;
             let from = if types_equal(&was.type_name, &c.info.type_name, d) {
                 q(&was.name)
             } else {

@@ -1031,7 +1031,10 @@ working table has the name taken back out by `unshadow`, as on SQLite):
 with the draft's columns, primary key, unique constraints, foreign keys and checks, the checks
 repointed across column renames as SQLite's rebuild repoints them; `INSERT … SELECT` from the
 original by each draft column's `original`, `CAST` where the type changed, a new column left to
-its default and a generated column never copied, DuckDB refusing a value for one; `DROP TABLE`
+its default and a generated column in the draft never written, DuckDB refusing a value for one —
+while a generated *source* column is read like any other, so one the draft makes plain keeps the
+values it computed (it was skipped as a source too, and every row's value was NULL after the
+commit — `a_generated_column_made_stored_keeps_its_values`); `DROP TABLE`
 of the original; `ALTER TABLE … RENAME TO` the **draft's** name, so a table rename is inside the
 rebuild as on SQL Server; then the indexes and the table's and columns' `COMMENT ON` — the
 indexes **after** the rename, an index's name living in the schema, where the old table's are

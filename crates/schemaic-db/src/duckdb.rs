@@ -5483,6 +5483,22 @@ mod tests {
         assert_eq!(cells(&db, "SELECT b FROM g"), vec![vec!["8"]]);
     }
 
+    /// **A generated column made plain keeps its values**: the rebuild reads
+    /// the computed ones as the source — reading a generated column is fine,
+    /// only writing one is refused. The copy left it out, and every row's
+    /// value was NULL after the commit, with nothing in the plan saying so.
+    #[test]
+    fn a_generated_column_made_stored_keeps_its_values() {
+        let db = mem("designer_generated_stored");
+        seed(
+            &db,
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, g INTEGER GENERATED ALWAYS AS (a * 2));
+             INSERT INTO t(id, a) VALUES (1, 4);",
+        );
+        designed(&db, "t", |d| d.columns[2].info.generated = None);
+        assert_eq!(cells(&db, "SELECT g FROM t"), vec![vec!["8"]]);
+    }
+
     /// A key counted from a sequence keeps counting from it: its default is
     /// the counter, restated rather than swapped for another engine's word.
     #[test]
