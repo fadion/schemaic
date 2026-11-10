@@ -498,6 +498,16 @@ name, T-SQL's `$1.50` money and `$action` `MERGE`'s), `?` before a digit on SQLi
 `@`/`@@` on MySQL and SQLite, MySQL's also before a quote, so `@'q v'` is one `Kind::Quoted`.
 PostgreSQL's `@` is an operator and is left alone
 (`a_native_parameter_or_variable_keeps_its_sigil`).
+**A multi-byte operator is kept whole by a table per engine** (`ops`, longest first, the first
+match winning), except on PostgreSQL, whose operators are composed out of its operator characters
+by its own rule (`operators_are_composable`), so no table could be complete there. **DuckDB's set
+is fixed and its table was not**: it lacked the regex family its PostgreSQL scanner takes (`~*`,
+`!~`, `!~*`), the GLOB operator `~~~` and the array distances `<->`/`<=>`, so Format code wrote
+`a < -> b` and `a <= > b` (syntax errors), `'a' ~~ ~ 'b'` (a LIKE of a bitwise NOT) and `! ~` (a
+factorial) into the buffer (`every_duckdb_operator_survives_formatting`). `operator_table` exposes
+the table so `schemaic-db/tests/duckdb_lists.rs` can run every DuckDB entry through `format_sql`
+and then the linked engine, which must answer the formatted text as it answers the original — a
+new entry without a sample expression there fails it.
 **What the input had between two tokens** is read where the layout depends on it: the token
 stream does not carry it, so `Fmt` holds `src` and `between` slices the gap out of it, every
 token being a slice of `src`.

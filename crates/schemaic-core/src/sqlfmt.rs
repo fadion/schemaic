@@ -1505,13 +1505,25 @@ fn ops(dialect: SqlDialect) -> &'static [&'static str] {
             "::", "||",
         ],
         // DuckDB's set is fixed (no `CREATE OPERATOR`): casts, JSON arrows,
-        // `==`, integer division and power, the list and pattern operators,
-        // and `:=` for a named argument.
+        // `==`, integer division and power, the list and pattern operators
+        // (`~~~` is GLOB; `~*`, `!~`, `!~*` the regex family its PostgreSQL
+        // scanner takes), the array distances `<->` and `<=>`, and `:=` for a
+        // named argument. Longest first, since the first match wins.
+        // `tests/duckdb_lists.rs` in `schemaic-db` runs every entry through
+        // the formatter and the linked engine.
         SqlDialect::DuckDb => &[
-            "!~~*", "~~*", "!~~", "->>", "::", "->", ">=", "<=", "<>", "!=", "==", "||", "<<",
-            ">>", "**", "//", "^@", "@>", "<@", "&&", "~~", ":=",
+            "!~~*", "~~*", "!~~", "~~~", "!~*", "<->", "<=>", "->>", "::", "->", ">=", "<=", "<>",
+            "!=", "==", "||", "<<", ">>", "**", "//", "^@", "@>", "<@", "&&", "~~", "!~", "~*",
+            ":=",
         ],
     }
+}
+
+/// The multi-byte operators the formatter keeps whole on `dialect` — [`ops`],
+/// for the engine-checked test that runs DuckDB's through the linked engine
+/// (`schemaic-db`'s `tests/duckdb_lists.rs`), as its builtin catalogue is.
+pub fn operator_table(dialect: SqlDialect) -> &'static [&'static str] {
+    ops(dialect)
 }
 
 /// Does `dialect` let an operator be **composed** out of its operator
@@ -6244,6 +6256,22 @@ mod tests {
         ] {
             let out = super::format_sql(&format!("{sql} t"), "    ", d);
             assert!(out.starts_with(sql), "{out}");
+        }
+    }
+
+    /// **A DuckDB operator survives Format code byte for byte.** The table
+    /// lacked the regex family DuckDB's PostgreSQL scanner takes, its GLOB
+    /// operator and the array distances, so the longest-match tokenizer cut
+    /// `a <-> b` into `a < -> b` (a syntax error) and `'a' ~~~ 'b'` into a
+    /// LIKE of a bitwise NOT — each measured on 2.0.0.
+    #[test]
+    fn every_duckdb_operator_survives_formatting() {
+        for op in [
+            "<->", "<=>", "~*", "!~*", "!~", "~~~", "!~~*", "~~*", "!~~", "^@",
+        ] {
+            let sql = format!("SELECT a {op} b FROM t");
+            let out = super::format_sql(&sql, "    ", SqlDialect::DuckDb);
+            assert!(out.contains(&format!("a {op} b")), "{op}: {out}");
         }
     }
 }
