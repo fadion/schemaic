@@ -48,7 +48,8 @@ settings can do that for you) or give its path in *CLI path*.
 - *A newer `dsh`* — before each conversation and each one-off request, Schemaic checks which
   tools `dsh` would have. If a newer version brings one this version of Schemaic doesn't know,
   the assistant is disabled with a message saying so: update Schemaic, or choose another agent
-  CLI.
+  CLI. If instead a tool Schemaic switches off is found switched on, the message says to start a
+  new conversation, which writes Schemaic's settings for `dsh` afresh.
 
 Its replies arrive a step at a time rather than word by word.
 

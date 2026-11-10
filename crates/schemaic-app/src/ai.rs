@@ -1345,10 +1345,17 @@ async fn dsh_seal_refusal(
         return unchecked(why);
     }
     let rows = schemaic_ai::harness::dsh_unsealed_rows(&dump);
-    match rows.is_empty() {
-        true => None,
-        false => Some(tr!("ai-deepseek-unsealed", rows = rows.join(", "))),
+    if rows.is_empty() {
+        return None;
     }
+    // A row the overlay names, left on, is the overlay not taking effect —
+    // not a CLI with tools Schemaic has never heard of, which is the other
+    // message's account.
+    let rows = rows.join(", ");
+    Some(match schemaic_ai::harness::dsh_overlay_overridden(&dump) {
+        true => tr!("ai-deepseek-overlay-overridden", rows = rows),
+        false => tr!("ai-deepseek-unsealed", rows = rows),
+    })
 }
 
 /// The working directory a one-shot runs in — or why it cannot run.

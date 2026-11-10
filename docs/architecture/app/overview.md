@@ -984,7 +984,13 @@ boots nothing and calls no model (measured: 0.2 s) — in the turn's working dir
 `inherited_env_to_clear()` and given exactly the environment the run will get, so what it reads is
 the composition the run would mount. It refuses when the dump fails, when it does not show itself
 to be the headless profile (`harness::dsh_dump_is_headless`), or when `harness::dsh_unsealed_rows`
-lists anything (`ai-deepseek-seal-unchecked`, `ai-deepseek-unsealed`, the latter naming the rows).
+lists anything (`ai-deepseek-seal-unchecked`, or one of two messages naming the rows). **Which
+of the two turns on whether a live row is one the overlay disables by id**
+(`harness::dsh_overlay_overridden`): then the overlay did not take — it was changed, or a layer
+after it won — and `ai-deepseek-overlay-overridden` says to start a new conversation, which
+writes it afresh; only otherwise is it `ai-deepseek-unsealed`'s CLI with tools this version does
+not know. Hand-deleting one `disabled: true` from the live overlay got the second for `tool-bash`,
+which Schemaic knows and switches off, and sent the user to update an app that was not behind.
 It is a spawn like the others, so it asks `spawn_refusal`, sets `AGENT_CHILD_ENV` and a working
 directory and hides its console, and it is held to a 30-second ceiling. The session task asks it
 **per turn**, with the launch that turn resolves, and a refusal is that turn's `pump.fail`: each

@@ -1843,6 +1843,27 @@ pub fn dsh_overlay_yaml(o: &DshOverlay<'_>) -> String {
 /// [`DSH_TOOL_ROWS`]: the overlay can only disable ids it has heard of, and
 /// this is what notices one it has not.
 pub fn dsh_unsealed_rows(dump: &str) -> Vec<String> {
+    unsealed(dump)
+        .into_iter()
+        .map(|(id, name)| match id.is_empty() {
+            true => name,
+            false => format!("{id} ({name})"),
+        })
+        .collect()
+}
+
+/// Is a row of [`dsh_unsealed_rows`] one the overlay disables **by id** — a
+/// [`DSH_TOOL_ROWS`] entry left on? Then the overlay did not take effect
+/// (edited, or overridden by a layer composed after it), which is a different
+/// thing to tell the user from a CLI with a tool Schemaic has never heard of.
+pub fn dsh_overlay_overridden(dump: &str) -> bool {
+    unsealed(dump)
+        .iter()
+        .any(|(id, _)| DSH_TOOL_ROWS.contains(&id.as_str()))
+}
+
+/// The unsealed rows as `(id, name)` — see [`dsh_unsealed_rows`].
+fn unsealed(dump: &str) -> Vec<(String, String)> {
     struct Row {
         indent: usize,
         id: String,
@@ -1913,10 +1934,7 @@ pub fn dsh_unsealed_rows(dump: &str) -> Vec<String> {
             let foreign = !n.is_empty() && !n.starts_with("@deepseek-ai/");
             tool || n.ends_with("/tools") || mcp || foreign
         })
-        .map(|r| match r.id.is_empty() {
-            true => r.name,
-            false => format!("{} ({})", r.id, r.name),
-        })
+        .map(|r| (r.id, r.name))
         .collect()
 }
 
@@ -6017,6 +6035,21 @@ mod deepseek_tests {
             dsh_unsealed_rows(&dump),
             vec!["tool-new (@deepseek-ai/dsh-tool-terminal)".to_string()]
         );
+    }
+
+    /// **A row the overlay disables, live anyway, is the overlay not taking
+    /// effect** — changed, or overridden by a layer after it — not a newer
+    /// CLI. The refusal blamed "tools this version of Schemaic does not know
+    /// about" for `tool-bash`, which it knows and switches off by name.
+    #[test]
+    fn a_known_tool_row_left_on_means_the_overlay_did_not_take() {
+        let known = "- id: tool-bash\n  name: '@deepseek-ai/dsh-tool-bash'\n";
+        assert!(dsh_overlay_overridden(known));
+        let new = "- id: tool-new\n  name: '@deepseek-ai/dsh-tool-terminal'\n";
+        assert!(!dsh_overlay_overridden(new));
+        assert!(!dsh_overlay_overridden(SEALED_DUMP));
+        // Both at once: the overlay not taking is what to say first.
+        assert!(dsh_overlay_overridden(&format!("{new}{known}")));
     }
 
     /// A `!!js` expression is evaluated at boot and cannot be read here, so

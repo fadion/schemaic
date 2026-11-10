@@ -250,7 +250,13 @@ something only once `dsh_dump_is_headless` has found the `@deepseek-ai/dsh-headl
 every headless composition carries
 (`only_a_dump_of_the_headless_profile_can_vouch_for_the_seal`). Checked against real dumps: the
 sealed profile answered empty, and one with only the sign-in rows patched listed all fourteen
-tool rows that were live. `ai::dsh_seal_refusal` runs the dump and asks both (under
+tool rows that were live. **`dsh_overlay_overridden` asks the same reading a narrower
+question**: is any live row's id in `DSH_TOOL_ROWS` — a row the overlay disables by id, left on?
+That is the overlay not taking effect (edited, or overridden by a layer composed after it), not a
+build with a tool nobody here has heard of, and the two are told apart to the user; a dump with
+both is the first (`a_known_tool_row_left_on_means_the_overlay_did_not_take`). Both are read
+through one private `unsealed`, which returns the live rows as `(id, name)` pairs.
+`ai::dsh_seal_refusal` runs the dump and asks all three (under
 `app/overview.md`).
 Codex and Antigravity are both `Restricted`, each by its own lever: Codex by
 `sandbox_mode="read-only"`, Antigravity by `--sandbox`. Both

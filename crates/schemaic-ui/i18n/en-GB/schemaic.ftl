@@ -4799,6 +4799,7 @@ ai-refused-no-deepseek-home = Schemaic could not write the overlay that keeps De
 ai-inline-no-deepseek-home = Couldn't write DeepSeek Harness's private home and overlay, so the generation was not started (without them the CLI would run with every built-in tool).
 # $rows lists the plugins that would still give the model a tool, by id and package name.
 ai-deepseek-unsealed = DeepSeek Harness would still have tools Schemaic did not switch off ({ $rows }), so the assistant is disabled. This build of the CLI has tools this version of Schemaic does not know about: update Schemaic, or choose another agent CLI.
+ai-deepseek-overlay-overridden = DeepSeek Harness would still have tools Schemaic switches off ({ $rows }), so the assistant is disabled. Schemaic's overlay turns those off, so it was changed during this conversation or did not take effect: start a new conversation, which writes it afresh.
 ai-deepseek-seal-unchecked = Schemaic could not check which tools DeepSeek Harness would have ({ $error }), so the assistant is disabled.
 ai-launch-failed-turn = Couldn't launch the `{ $bin }` CLI ({ $error }). Ensure { $cli } is installed, or give it a path in Settings → AI.
 ai-launch-failed-session = Couldn't launch the `{ $bin }` CLI ({ $error }). Ensure { $cli } is installed (or set its path in Settings → AI).
