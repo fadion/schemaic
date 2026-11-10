@@ -251,9 +251,12 @@ a CTE, a derived table, a wildcard with options and a qualifier that may be a st
 `core::intel`) — and proves it against the catalogue, and **any doubt about the relation
 attributes the whole result to nothing**, since a wrong origin is an `UPDATE` of another row or
 another table while a missing one is only a read-only grid. The doubts: the connection is no
-longer on `home` (a `USE` of an attached database would have a bare name mean another file); for a
-bare name, `search_path` is set or a temporary table or view has that name, either of which has
-DuckDB resolve it elsewhere; a qualifier is also a catalog's name (`duckdb_databases()`), which
+longer on `home` (a `USE` of an attached database would have a bare name mean another file); a
+temporary table or view has that name, **qualified or not** — the temporary catalog has a schema
+`main` too, which DuckDB searches first, so `SELECT * FROM main.p` read a temporary `p`'s rows
+while its columns were attributed to the file's `p`, and a commit rewrote the real row (the check
+was once the bare name's alone); for a bare name, `search_path` is set, which has DuckDB resolve it
+elsewhere; a qualifier is also a catalog's name (`duckdb_databases()`), which
 DuckDB could read either way; the relation is not a base table of that schema — a view's rows
 belong to whatever it reads; and a wildcard's result columns are not the table's, in order and by
 name. **The catalog refusal has a known casualty**: a file named `main.duckdb` is the catalog

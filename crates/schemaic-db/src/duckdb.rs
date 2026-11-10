@@ -770,9 +770,11 @@ struct ColFacts {
 ///
 /// - the connection is still on the file's own catalog (`home`) — a `USE` of
 ///   an attached database would have the bare name mean another file;
+/// - no temporary relation has the name, qualified or not — the temporary
+///   catalog has a schema `main` that DuckDB searches first, so even `main.p`
+///   would resolve to it;
 /// - a bare name is read in `current_schema()`, and only with `search_path`
-///   unset and no temporary relation of that name, either of which would have
-///   DuckDB resolve it elsewhere;
+///   unset, which would have DuckDB resolve it elsewhere;
 /// - the relation is a **base table** of that schema (a view is not: its rows
 ///   belong to whatever it reads);
 /// - a wildcard's columns are the table's, in order and by name.
@@ -815,6 +817,22 @@ fn attribute(
     if one("SELECT current_database()", &[])?.as_str() != home {
         return None;
     }
+    // A temporary relation of the name shadows it **qualified or not**: the
+    // temporary catalog has a schema `main` too, which DuckDB searches first,
+    // so `main.p` read the temporary rows while the write named the file's.
+    let shadows: i64 = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM duckdb_tables() \
+                      WHERE database_name = 'temp' AND lower(table_name) = lower(?1)) \
+                  + (SELECT count(*) FROM duckdb_views() \
+                      WHERE database_name = 'temp' AND lower(view_name) = lower(?1))",
+            [&source.name],
+            |r| r.get(0),
+        )
+        .ok()?;
+    if shadows > 0 {
+        return None;
+    }
     let schema = match &source.qualifier {
         // A qualifier that is also a catalog's name is DuckDB's to read either
         // way; refuse rather than guess which.
@@ -837,19 +855,6 @@ fn attribute(
         }
         None => {
             if !one("SELECT current_setting('search_path')", &[])?.is_empty() {
-                return None;
-            }
-            let shadows: i64 = conn
-                .query_row(
-                    "SELECT (SELECT count(*) FROM duckdb_tables() \
-                              WHERE database_name = 'temp' AND lower(table_name) = lower(?1)) \
-                          + (SELECT count(*) FROM duckdb_views() \
-                              WHERE database_name = 'temp' AND lower(view_name) = lower(?1))",
-                    [&source.name],
-                    |r| r.get(0),
-                )
-                .ok()?;
-            if shadows > 0 {
                 return None;
             }
             one("SELECT current_schema()", &[])?
@@ -3947,6 +3952,20 @@ mod tests {
             "{:?}",
             origins(&rs)
         );
+        // **A qualified name is shadowed too**: DuckDB reads `main.p` in the
+        // temporary catalog first, whose schema is also `main`, so the grid
+        // showed the temporary rows and a commit rewrote the real table's.
+        for shadow in [
+            "CREATE TEMP TABLE p AS SELECT * FROM main.p",
+            "CREATE TEMP VIEW p AS SELECT * FROM memory.main.p",
+        ] {
+            let rs = batch(&[shadow, "SELECT * FROM main.p"]);
+            assert!(
+                rs.columns.iter().all(|c| c.origin.is_none()),
+                "{shadow}: {:?}",
+                origins(&rs)
+            );
+        }
     }
 
     fn edit(set: Vec<(&str, CellEdit)>, id: i64) -> schemaic_core::model::RowEdit {
