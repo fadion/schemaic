@@ -2969,7 +2969,10 @@ perf-sizes-indexes = Grootste indexen
 perf-sizes-no-index-sizes = Deze engine rapporteert indexgroottes per tabel, niet per index.
 perf-sizes-no-indexes = Deze database heeft geen indexen om te meten.
 perf-sizes-not-reported = Deze engine rapporteert geen tabel- of indexgroottes, alleen geschatte aantallen rijen.
-perf-rows-estimate = ~{ $shown } rijen
+perf-rows-estimate = { $n ->
+    [one] ~{ $shown } rij
+   *[other] ~{ $shown } rijen
+}
 
 ## Edit snippet modal (snippet_edit.rs)
 

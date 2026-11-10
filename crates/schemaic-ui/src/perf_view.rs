@@ -517,8 +517,12 @@ fn statement_row(ctx: &PerfCtx, dialect: SqlDialect, s: &StatementStat) -> AnyVi
     };
     let sql = s.query.clone();
     let overlay = ctx.overlay;
+    // **Clipped in a box of its own two lines.** A text view paints every line
+    // it wraps to whatever its `max_height`, so a statement wrapping to a third
+    // line drew it over the figures below; the row's own clip is too far out
+    // to stop that.
     v_stack((
-        text(shown).style(move |s| {
+        container(text(shown).style(move |s| {
             s.font_family(MONO_FAMILY.to_string())
                 .font_size(font_body())
                 .color(if withheld {
@@ -527,8 +531,17 @@ fn statement_row(ctx: &PerfCtx, dialect: SqlDialect, s: &StatementStat) -> AnyVi
                     theme::text()
                 })
                 .width_full()
-                .max_height((font_body() as f64) * 1.4 * 2.0)
                 .line_height(1.4)
+        }))
+        .clip()
+        // A column, as the row it sits in: in a `container`'s default row the
+        // text measured to its whole length and was cut on the right instead
+        // of wrapping.
+        .style(|s| {
+            s.flex_col()
+                .width_full()
+                .min_width(0.0)
+                .max_height((font_body() as f64) * 1.4 * 2.0)
         }),
         text(figures).style(|s| s.font_size(font_hint()).color(theme::text_faint())),
     ))
@@ -853,7 +866,7 @@ fn sizes_list(
     rows.extend(tables.iter().map(|e| {
         let rows_text = e
             .rows
-            .map(|r| tr!("perf-rows-estimate", shown = i18n::count(r as usize)));
+            .map(|r| tr!("perf-rows-estimate", n = r, shown = i18n::count(r as usize)));
         size_row(
             table_name(e.schema.as_deref(), &e.table),
             e.bytes,
@@ -986,6 +999,17 @@ fn footer(
 #[cfg(test)]
 mod tests {
     use crate::i18n::tr;
+
+    /// **A single estimated row is a row.** The sizes list printed
+    /// "~1 rows" for a one-row table: the message had no plural.
+    #[test]
+    fn a_row_estimate_of_one_is_singular() {
+        assert_eq!(tr!("perf-rows-estimate", n = 1, shown = "1"), "~1 row");
+        assert_eq!(
+            tr!("perf-rows-estimate", n = 4200, shown = "4.2k"),
+            "~4.2k rows"
+        );
+    }
 
     /// **The view dates its usage line, as the CLI does**, and names a
     /// primary's standbys; without a date it keeps the old sentence, and an

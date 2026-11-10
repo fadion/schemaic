@@ -82,7 +82,11 @@ that is what the MCP tool tells an agent about the same server
 `enable_sql()` has a statement it follows under *To turn it on, run this in a query tab:*, in
 mono, with a copy icon beside it (tooltip *Copy*) — copied to the clipboard, never run from here. A source that is on
 and has recorded nothing says so. Each statement row is `history::preview`'s one flowing line,
-held to two lines by a `max_height` and `clip()`, with its figures under it joined by middle
+held to two lines by a `container(…).clip()` of its own whose `max_height` is two lines
+(`font_body() × 1.4 × 2`) — **the clip belongs on that box, not the text**: a text view paints
+every line it wraps to whatever its own `max_height`, so a statement wrapping to three lines drew
+its third over the figures caption below, and the row's own `clip()` is too far out to stop it
+(*Floem 0.2 gotchas*) — with its figures under it joined by middle
 dots — total, mean, calls, rows where the source counts them, and the database where it records
 one. A figure of a millisecond and up is `i18n::took` over `history::took` of the rounded value;
 below one it is `perf-sub-ms` at two places, because rounded it would read `0 ms`, where a lookup
@@ -122,7 +126,9 @@ where reported; under them is the usage caution, or — where `usage_counted` is
 saying no index can be called unused. The missing-index section is drawn only where
 `supports_missing_index_hints(dialect)`: its read's error, *None recorded.*, or the suggestions
 with their uses and estimated improvement and a closing line to check each against the indexes
-above. Sizes lists the largest tables, with an estimated row count where there is one, then the
+above. Sizes lists the largest tables, with an estimated row count where there is one — a plural
+on `$n` (`perf-rows-estimate`, `shown` the abbreviated figure), which printed *~1 rows* without
+one (`a_row_estimate_of_one_is_singular`) — then the
 largest indexes; with that list empty it says **which empty** it is — the engine reports index
 sizes per table, or the database has no indexes — from `PerfData::Sizes::per_table`, which the
 app fills from `workload::index_sizes_per_table_only`, as the MCP `table_sizes` reply does.

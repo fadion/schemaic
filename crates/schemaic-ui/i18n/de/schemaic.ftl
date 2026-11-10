@@ -2840,7 +2840,10 @@ perf-sizes-indexes = Größte Indizes
 perf-sizes-no-index-sizes = Diese Engine meldet Indexgrößen pro Tabelle, nicht pro Index.
 perf-sizes-no-indexes = Diese Datenbank hat keine Indizes, deren Größe sich zeigen ließe.
 perf-sizes-not-reported = Diese Engine meldet keine Tabellen- oder Indexgrößen, nur geschätzte Zeilenzahlen.
-perf-rows-estimate = ~{ $shown } Zeilen
+perf-rows-estimate = { $n ->
+    [one] ~{ $shown } Zeile
+   *[other] ~{ $shown } Zeilen
+}
 snippet-edit-title = Snippet bearbeiten — { $name }
 snippet-edit-name = Name
 snippet-edit-name-placeholder = Name des Snippets

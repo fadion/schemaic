@@ -2966,7 +2966,10 @@ perf-sizes-indexes = Índices más grandes
 perf-sizes-no-index-sizes = Este motor informa de los tamaños de índice por tabla, no por índice.
 perf-sizes-no-indexes = Esta base de datos no tiene índices cuyo tamaño mostrar.
 perf-sizes-not-reported = Este motor no informa de tamaños de tabla ni de índice, solo de filas estimadas.
-perf-rows-estimate = ~{ $shown } filas
+perf-rows-estimate = { $n ->
+    [one] ~{ $shown } fila
+   *[other] ~{ $shown } filas
+}
 
 ## Edit snippet modal (snippet_edit.rs)
 

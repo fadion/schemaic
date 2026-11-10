@@ -823,6 +823,15 @@
   *scrolls* a value a hair too wide to keep the caret in view, so the cliff is now a pixel or two of
   scroll rather than a lost digit. Leave the couple of px of slack anyway: the caret is drawn past
   the last digit, and the slack is what keeps it inside.
+- **A `max_height` on a wrapping `text` does not stop it painting.** The view is held to the
+  height, but every line it wraps to is still drawn, spilling over whatever sits below. To cap
+  wrapped text at N lines, put it in a `container(…).clip()` whose `max_height` is N lines
+  (`font_size × line_height × N`); a `clip()` further out, on the row, still lets it paint over its
+  siblings inside that row. **That container must be a `flex_col` with `min_width(0)`**: in a
+  `container`'s default row the text measured to its whole length and was cut off on the right
+  rather than wrapping — one line, not N. The Performance view's statement rows drew a third line
+  over their figures caption before the box, and one cut line in the first try at it
+  (`perf_view::statement_row`, `ui/perf_view.md`).
 - **SQL editor padding is a no-op; inset via a wrapper.** The editor is a scroll view — its own
   `padding_*` is ignored. Wrap it in a container carrying the border + padding (`editor_box`); the
   editor fills it flush. Top padding shifts the content origin, so `points_of_offset`-anchored

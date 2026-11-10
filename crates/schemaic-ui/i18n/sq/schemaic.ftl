@@ -2969,7 +2969,10 @@ perf-sizes-indexes = Indeksët më të mëdhenj
 perf-sizes-no-index-sizes = Ky motor raporton madhësitë e indeksëve për tabelë, jo për indeks.
 perf-sizes-no-indexes = Kjo bazë të dhënash nuk ka indeksë për t'u matur.
 perf-sizes-not-reported = Ky motor nuk raporton madhësi tabelash ose indeksesh, vetëm vlerësime të rreshtave.
-perf-rows-estimate = ~{ $shown } rreshta
+perf-rows-estimate = { $n ->
+    [one] ~{ $shown } rresht
+   *[other] ~{ $shown } rreshta
+}
 
 ## Edit snippet modal (snippet_edit.rs)
 
