@@ -1335,21 +1335,27 @@ async fn collect_table_stats(conn: &mut Conn, database: &str) -> Result<SchemaSt
     )
 }
 
-/// When the server started, as it renders a `DATETIME`: `NOW()` less the
-/// `Uptime` status, which `SHOW GLOBAL STATUS` answers on MySQL and MariaDB
-/// alike (the `GLOBAL_STATUS` tables moved between them). `None` on any
-/// failure.
+/// When the server started, in its local time with the offset from UTC
+/// (`stats::with_utc_offset`): `NOW()` less the `Uptime` status, which
+/// `SHOW GLOBAL STATUS` answers on MySQL and MariaDB alike (the
+/// `GLOBAL_STATUS` tables moved between them), and the offset as `NOW()` less
+/// `UTC_TIMESTAMP()` in the same statement, so the two are one instant. The
+/// offset is today's, so a start on the far side of a DST change is out by
+/// that hour; the zone named is still the right one. `None` on any failure.
 async fn server_start(conn: &mut Conn) -> Option<String> {
     let (_, uptime): (String, String) = conn
         .query_first("SHOW GLOBAL STATUS LIKE 'Uptime'")
         .await
         .ok()??;
     let secs: u64 = uptime.trim().parse().ok()?;
-    conn.query_first::<String, _>(format!(
-        "SELECT DATE_FORMAT(NOW() - INTERVAL {secs} SECOND, '%Y-%m-%d %H:%i:%s')"
-    ))
-    .await
-    .ok()?
+    let (local, offset): (String, i64) = conn
+        .query_first(format!(
+            "SELECT DATE_FORMAT(NOW() - INTERVAL {secs} SECOND, '%Y-%m-%d %H:%i:%s'), \
+             TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW())"
+        ))
+        .await
+        .ok()??;
+    Some(schemaic_core::stats::with_utc_offset(&local, offset))
 }
 
 /// One partition's figures: `(table, partition, rows, data bytes, index

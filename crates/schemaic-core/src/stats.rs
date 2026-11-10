@@ -636,12 +636,29 @@ pub struct SchemaStats {
 pub struct UsageScope {
     /// When the counters began, as the server renders it: PostgreSQL's
     /// `pg_stat_database.stats_reset`, MySQL's start (from `Uptime`), SQL
-    /// Server's `sqlserver_start_time`. `None` where the server does not say.
+    /// Server's `sqlserver_start_time` — each with its offset from UTC (the
+    /// latter two through [`with_utc_offset`]'s spelling). `None` where the
+    /// server does not say.
     pub since: Option<String>,
     /// Standbys streaming from this server (PostgreSQL's
     /// `pg_stat_replication`), whose reads it does not count. `None` where
     /// not asked.
     pub standbys: Option<u32>,
+}
+
+/// A server-local time with its offset from UTC, as `2026-11-10 20:40:33
+/// +01:00` — SQL Server's own rendering of a `datetimeoffset`, so every engine's
+/// usage date reads alike. `offset_secs` is local minus UTC, rounded to the
+/// minute.
+///
+/// **A date with no zone is an hour off for a reader in another one.** MySQL's
+/// start (`NOW()` less `Uptime`) and SQL Server's `sqlserver_start_time` are
+/// the server's local time, and the usage line printed them bare: against a
+/// container on UTC, a restart at 20:40 read as 20:40 on a clock showing 21:40.
+pub fn with_utc_offset(local: &str, offset_secs: i64) -> String {
+    let sign = if offset_secs < 0 { '-' } else { '+' };
+    let minutes = (offset_secs.abs() + 30) / 60;
+    format!("{local} {sign}{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
 impl SchemaStats {
@@ -1252,6 +1269,18 @@ impl std::fmt::Display for Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_local_time_carries_its_offset_from_utc() {
+        let t = "2026-11-10 20:40:33";
+        assert_eq!(with_utc_offset(t, 0), "2026-11-10 20:40:33 +00:00");
+        assert_eq!(with_utc_offset(t, 3600), "2026-11-10 20:40:33 +01:00");
+        assert_eq!(with_utc_offset(t, 19_800), "2026-11-10 20:40:33 +05:30");
+        assert_eq!(with_utc_offset(t, -16_200), "2026-11-10 20:40:33 -04:30");
+        // Local minus UTC read a second apart rounds to the minute.
+        assert_eq!(with_utc_offset(t, 3599), "2026-11-10 20:40:33 +01:00");
+        assert_eq!(with_utc_offset(t, -3601), "2026-11-10 20:40:33 -01:00");
+    }
 
     fn idx(name: &str, scans: Option<u64>) -> IndexStats {
         IndexStats {

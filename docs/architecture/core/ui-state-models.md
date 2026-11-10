@@ -760,7 +760,18 @@ tested (they share `history.rs`'s shape; a new one belongs here, not in the UI):
   the index usage counts began, as the server renders it — PostgreSQL's
   `pg_stat_database.stats_reset`, MySQL's start from `NOW()` less `Uptime` (asked only where
   `performance_schema` counted anything), SQL Server's `sqlserver_start_time` — and, on
-  PostgreSQL, how many standbys stream from the server uncounted (`pg_stat_replication`). Each
+  PostgreSQL, how many standbys stream from the server uncounted (`pg_stat_replication`).
+  **Every engine's date carries its offset from UTC** (`2026-11-10 20:40:33 +01:00`). PostgreSQL's
+  `timestamptz` always did; MySQL's start and SQL Server's `sqlserver_start_time` are server-local
+  and were printed bare, so against a container on UTC a restart at 20:40 read as 20:40 on a clock
+  showing 21:40. MySQL's `server_start` now reads the start and `TIMESTAMPDIFF(SECOND,
+  UTC_TIMESTAMP(), NOW())` in one statement, so both are one instant, and spells them through
+  `with_utc_offset` (local minus UTC, rounded to the minute —
+  `a_local_time_carries_its_offset_from_utc`), which copies SQL Server's own style-120 rendering of a
+  `datetimeoffset`; SQL Server converts through `TODATETIMEOFFSET(…, DATEPART(TZOFFSET,
+  SYSDATETIMEOFFSET()))` (measured on 2022 and 2025). **Both offsets are today's**, not the one in
+  force at the start, so a start on the far side of a DST change is out by that hour — the zone
+  named is still the right one. Each
   reader degrades to `None` (an Azure SQL Database has no `dm_os_sys_info`), and `cli::perf::
   usage_note` dates its caveat by it and names the standbys, so an "unused" finding ten minutes
   after a restart, or on a primary whose reports run on a standby, says how little it saw

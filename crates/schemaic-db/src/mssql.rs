@@ -3796,7 +3796,13 @@ pub(crate) async fn fetch_table_stats(
     // has none: either is a note without a date, not a failed read.
     let since = query_rows(
         &mut client,
-        "SELECT CONVERT(varchar(19), sqlserver_start_time, 120) FROM sys.dm_os_sys_info",
+        // With the instance's offset from UTC, as `stats::with_utc_offset`
+        // spells one: the start time is the server's local `datetime`, and a
+        // bare one read an hour off on a clock in another zone. The offset
+        // is today's, so a start on the far side of a DST change is out by
+        // that hour; the zone is still the right one to name.
+        "SELECT CONVERT(varchar(26), TODATETIMEOFFSET(sqlserver_start_time, \
+         DATEPART(TZOFFSET, SYSDATETIMEOFFSET())), 120) FROM sys.dm_os_sys_info",
     )
     .await
     .ok()
