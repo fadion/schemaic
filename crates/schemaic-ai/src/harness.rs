@@ -1838,17 +1838,43 @@ pub fn dsh_unsealed_rows(dump: &str) -> Vec<String> {
             None => v.trim_matches('"').to_string(),
         }
     }
+    fn key(row: &mut Row, t: &str) {
+        if let Some(v) = t.strip_prefix("id:") {
+            row.id = unquote(v);
+        } else if let Some(v) = t.strip_prefix("name:") {
+            row.name = unquote(v);
+        } else if let Some(v) = t.strip_prefix("disabled:") {
+            row.disabled = v.trim() == "true";
+        }
+    }
+    // A `- key: …` item opens a row **whichever key it starts with** — the
+    // dump keeps a row's authored key order, and dsh's READMEs write rows
+    // `- name: …` with no `id` — but only at the depth of the first one: a
+    // list inside a row's config is not a row.
+    fn opens(t: &str) -> Option<&str> {
+        let item = t.strip_prefix("- ")?;
+        let (k, _) = item.split_once(':')?;
+        (!k.is_empty()
+            && k.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+        .then_some(item)
+    }
     let mut rows: Vec<Row> = Vec::new();
+    let mut depth: Option<usize> = None;
     for line in dump.lines() {
         let indent = line.len() - line.trim_start().len();
         let t = line.trim_start();
-        if let Some(rest) = t.strip_prefix("- id:") {
-            rows.push(Row {
+        if let Some(item) = opens(t)
+            && *depth.get_or_insert(indent) == indent
+        {
+            let mut row = Row {
                 indent,
-                id: unquote(rest),
+                id: String::new(),
                 name: String::new(),
                 disabled: false,
-            });
+            };
+            key(&mut row, item);
+            rows.push(row);
             continue;
         }
         // A key of the row most recently opened, at exactly its own depth —
@@ -1857,11 +1883,7 @@ pub fn dsh_unsealed_rows(dump: &str) -> Vec<String> {
         if indent != row.indent + 2 {
             continue;
         }
-        if let Some(v) = t.strip_prefix("name:") {
-            row.name = unquote(v);
-        } else if let Some(v) = t.strip_prefix("disabled:") {
-            row.disabled = v.trim() == "true";
-        }
+        key(row, t);
     }
     rows.into_iter()
         .filter(|r| !r.disabled)
@@ -1873,7 +1895,10 @@ pub fn dsh_unsealed_rows(dump: &str) -> Vec<String> {
             let foreign = !n.is_empty() && !n.starts_with("@deepseek-ai/");
             tool || n.ends_with("/tools") || mcp || foreign
         })
-        .map(|r| format!("{} ({})", r.id, r.name))
+        .map(|r| match r.id.is_empty() {
+            true => r.name,
+            false => format!("{} ({})", r.id, r.name),
+        })
         .collect()
 }
 
@@ -1887,7 +1912,10 @@ pub fn dsh_unsealed_rows(dump: &str) -> Vec<String> {
 /// evidence the rest was read.
 pub fn dsh_dump_is_headless(dump: &str) -> bool {
     dump.lines().any(|l| {
-        l.trim_start()
+        let t = l.trim_start();
+        // A row may open on its `name` too (`dsh_unsealed_rows`).
+        t.strip_prefix("- ")
+            .unwrap_or(t)
             .strip_prefix("name:")
             .map(|v| v.trim().trim_matches('\'') == "@deepseek-ai/dsh-headless")
             .unwrap_or(false)
@@ -5956,6 +5984,9 @@ mod deepseek_tests {
         let real =
             format!("{SEALED_DUMP}- id: headless-runner\n  name: '@deepseek-ai/dsh-headless'\n");
         assert!(dsh_dump_is_headless(&real));
+        let name_first =
+            format!("{SEALED_DUMP}- name: '@deepseek-ai/dsh-headless'\n  id: headless-runner\n");
+        assert!(dsh_dump_is_headless(&name_first));
     }
 
     /// **The point of checking by name**: a tool plugin a later build adds,
@@ -5990,6 +6021,27 @@ mod deepseek_tests {
         assert_eq!(dsh_unsealed_rows(other_mcp).len(), 1);
         let foreign = "- id: x\n  name: 'some-plugin'\n";
         assert_eq!(dsh_unsealed_rows(foreign).len(), 1);
+    }
+
+    /// **A row is a row whichever key it starts with.** The dump prints a
+    /// row's keys in their authored order, and dsh's own READMEs write rows
+    /// `- name: …` with no `id`; only `- id:` opened one, so a tool written
+    /// either way passed as sealed. A list nested in a row's config is not a
+    /// row.
+    #[test]
+    fn a_row_that_starts_with_its_name_or_has_no_id_is_found() {
+        let dump = "- id: headless-runner\n  name: '@deepseek-ai/dsh-headless'\n\
+            - name: '@deepseek-ai/dsh-tool-bash'\n  id: tool-bash2\n\
+            - name: '@deepseek-ai/dsh-tool-present'\n\
+            - name: '@deepseek-ai/dsh-tool-web'\n  disabled: true\n\
+            - id: mcp-schemaic\n  name: '@deepseek-ai/dsh-mcp-client'\n  config:\n    servers:\n    - name: 'some-plugin'\n      args:\n      - '--x'\n";
+        assert_eq!(
+            dsh_unsealed_rows(dump),
+            vec![
+                "tool-bash2 (@deepseek-ai/dsh-tool-bash)".to_string(),
+                "@deepseek-ai/dsh-tool-present".to_string(),
+            ]
+        );
     }
 
     #[test]

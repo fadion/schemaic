@@ -239,7 +239,12 @@ through and the call-timeout policy), or ends in `/tools`, or is an MCP client o
 `disabled: true` counts, since a `!!js` expression is evaluated at boot and cannot be read here,
 and a `disabled` inside the row's `config` is not the row's
 (`a_tool_plugin_the_overlay_never_named_is_found`, `only_a_literal_row_level_disable_counts`,
-`a_foreign_server_or_plugin_is_found`). **No rows is not the same as no tools**: an empty dump, a
+`a_foreign_server_or_plugin_is_found`). **A row opens on any `- key:` item at the plugin list's
+depth, whichever key comes first**: the dump keeps a row's authored key order and dsh's own READMEs
+write rows `- name: …` with no `id`, and opening only on `- id:` let a tool written either way
+pass as sealed; a list nested in a row's config sits deeper and is no row, and an id-less row is
+reported by its name alone (`a_row_that_starts_with_its_name_or_has_no_id_is_found`;
+`dsh_dump_is_headless` reads a `- name:` line too). **No rows is not the same as no tools**: an empty dump, a
 usage error printed in its place and a changed dump format all have none, so the answer means
 something only once `dsh_dump_is_headless` has found the `@deepseek-ai/dsh-headless` runner row
 every headless composition carries
