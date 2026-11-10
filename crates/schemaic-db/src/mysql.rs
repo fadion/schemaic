@@ -1315,13 +1315,41 @@ async fn collect_table_stats(conn: &mut Conn, database: &str) -> Result<SchemaSt
         Err(e) => return Err(qerr(e)),
     };
 
-    Ok(map_mysql_stats(
-        rows,
-        &idx_rows,
-        &usage,
-        freshness,
-        &partition_rows,
+    // When the usage counts began: performance_schema's live in memory and
+    // start again with the server, so its start — `NOW()` less `Uptime` — is
+    // what an "unused" finding is unused since (a `TRUNCATE` of the summary
+    // since then is the note's "or statistics reset"). Asked only where there
+    // are counts, and degrades to saying nothing.
+    let since = if usage.is_empty() {
+        None
+    } else {
+        server_start(conn).await
+    };
+    Ok(
+        map_mysql_stats(rows, &idx_rows, &usage, freshness, &partition_rows).with_usage(
+            schemaic_core::stats::UsageScope {
+                since,
+                standbys: None,
+            },
+        ),
+    )
+}
+
+/// When the server started, as it renders a `DATETIME`: `NOW()` less the
+/// `Uptime` status, which `SHOW GLOBAL STATUS` answers on MySQL and MariaDB
+/// alike (the `GLOBAL_STATUS` tables moved between them). `None` on any
+/// failure.
+async fn server_start(conn: &mut Conn) -> Option<String> {
+    let (_, uptime): (String, String) = conn
+        .query_first("SHOW GLOBAL STATUS LIKE 'Uptime'")
+        .await
+        .ok()??;
+    let secs: u64 = uptime.trim().parse().ok()?;
+    conn.query_first::<String, _>(format!(
+        "SELECT DATE_FORMAT(NOW() - INTERVAL {secs} SECOND, '%Y-%m-%d %H:%i:%s')"
     ))
+    .await
+    .ok()?
 }
 
 /// One partition's figures: `(table, partition, rows, data bytes, index

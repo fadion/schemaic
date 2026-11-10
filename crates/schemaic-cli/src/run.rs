@@ -2405,7 +2405,7 @@ async fn indexes(
     if let Err(exit) = emit_rows(&crate::perf::index_health_result(&findings), out) {
         return exit;
     }
-    warn(crate::perf::usage_note(&stats));
+    warn(&crate::perf::usage_note(&stats));
     if wl::supports_missing_index_hints(dialect) {
         hint("`schemaic indexes --missing` lists the indexes the optimiser recorded as missing");
     }

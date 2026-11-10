@@ -322,15 +322,35 @@ pub fn suggestions(
         .collect()
 }
 
-/// The caveat every index answer carries: what "unused" can and cannot mean.
-pub fn usage_note(stats: &SchemaStats) -> &'static str {
-    if wl::usage_counted(stats) {
-        "Usage counts run from the server's last restart or statistics reset, so an index used \
-         only by a monthly job can look unused. Check before dropping one."
-    } else {
-        "This server reported no index usage counts (performance_schema off, or not granted), \
-         so no index can be called unused — only duplicates and prefixes are shown."
+/// The caveat every index answer carries: what "unused" can and cannot mean —
+/// since when, where the server says ([`schemaic_core::stats::UsageScope`]),
+/// and on which server, where standbys read beside it.
+pub fn usage_note(stats: &SchemaStats) -> String {
+    if !wl::usage_counted(stats) {
+        return "This server reported no index usage counts (performance_schema off, or not \
+                granted), so no index can be called unused — only duplicates and prefixes are \
+                shown."
+            .to_string();
     }
+    let scope = stats.usage();
+    let mut note = match &scope.since {
+        Some(since) => format!(
+            "Usage counts run since {since}, the server's last restart or statistics reset, so \
+             an index used only by a monthly job can look unused. Check before dropping one."
+        ),
+        None => "Usage counts run from the server's last restart or statistics reset, so an \
+                 index used only by a monthly job can look unused. Check before dropping one."
+            .to_string(),
+    };
+    match scope.standbys {
+        Some(n) if n > 0 => note.push_str(&format!(
+            " This server has {n} {} streaming from it, whose reads it does not count: an index \
+             only queries there use reads as unused here, and dropping it drops it there too.",
+            if n == 1 { "standby" } else { "standbys" }
+        )),
+        _ => {}
+    }
+    note
 }
 
 /// A line the CLI writes to stderr beside its rows.
@@ -771,5 +791,41 @@ mod tests {
     #[test]
     fn the_usage_note_says_when_nothing_was_counted() {
         assert!(usage_note(&SchemaStats::default()).contains("no index usage counts"));
+    }
+
+    /// **"Unused since when", and on which server** (S6.1-L1-05): a count of
+    /// zero ten minutes after a restart, or on a primary whose reports run on
+    /// a standby, is no reason to drop an index, and the answer must say so.
+    #[test]
+    fn the_usage_note_dates_the_counts_and_names_the_standbys() {
+        let counted = stats_of(vec![schemaic_core::stats::TableStats {
+            table: "t".into(),
+            indexes: vec![schemaic_core::stats::IndexStats {
+                name: "ix".into(),
+                scans: Some(0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }]);
+        let plain = usage_note(&counted);
+        assert!(
+            plain.contains("last restart or statistics reset"),
+            "{plain}"
+        );
+        let dated = usage_note(
+            &counted
+                .clone()
+                .with_usage(schemaic_core::stats::UsageScope {
+                    since: Some("2026-11-10 08:00:00".into()),
+                    standbys: Some(2),
+                }),
+        );
+        assert!(dated.contains("since 2026-11-10 08:00:00"), "{dated}");
+        assert!(dated.contains("2 standbys"), "{dated}");
+        let one = usage_note(&counted.with_usage(schemaic_core::stats::UsageScope {
+            since: None,
+            standbys: Some(1),
+        }));
+        assert!(one.contains("1 standby "), "{one}");
     }
 }

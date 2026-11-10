@@ -756,7 +756,17 @@ tested (they share `history.rs`'s shape; a new one belongs here, not in the UI):
   and once `dbstat` answered it would have been `true` for every engine — a constant with a
   function's name on it, which is the failure the capability rule names — so it was deleted,
   with `PropertiesState::Unsupported` and the app's two early returns behind it, rather than
-  kept. `RowCount::{Exact,Estimate}` stops an estimate
+  kept. **`SchemaStats` carries a `UsageScope` beside its tables** (`with_usage`/`usage`): when
+  the index usage counts began, as the server renders it — PostgreSQL's
+  `pg_stat_database.stats_reset`, MySQL's start from `NOW()` less `Uptime` (asked only where
+  `performance_schema` counted anything), SQL Server's `sqlserver_start_time` — and, on
+  PostgreSQL, how many standbys stream from the server uncounted (`pg_stat_replication`). Each
+  reader degrades to `None` (an Azure SQL Database has no `dm_os_sys_info`), and `cli::perf::
+  usage_note` dates its caveat by it and names the standbys, so an "unused" finding ten minutes
+  after a restart, or on a primary whose reports run on a standby, says how little it saw
+  (S6.1-L1-05; measured on PostgreSQL 16, MariaDB 10.11, MySQL 8 and SQL Server 2022/2025). The
+  *Performance* view does not show it yet: its `PerfData::Indexes` is built in the app and carries
+  only `counted`. `RowCount::{Exact,Estimate}` stops an estimate
   from printing as a fact, `Freshness` says *why* a figure may be stale (MySQL caches
   `information_schema` stats for `information_schema_stats_expiry`, a day by default;
   PostgreSQL's `reltuples` is only as fresh as the last `ANALYZE`), and `IndexStats::is_unused`

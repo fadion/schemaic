@@ -144,8 +144,10 @@ Four commands read what the app's [Performance](../schema/performance.md) view a
   why on stderr and exits 2, with `hint: to turn it on, run:` and the statement where one does it.
   It never runs it. SQLite and DuckDB keep no statistics, so it exits 2 there too.
 - *Usage counts start again* when the server restarts or its statistics are reset, so an index
-  `indexes` calls unused may only be unused lately. The note on stderr says so, or that the server
-  keeps no counts and only duplicates and prefixes are listed.
+  `indexes` calls unused may only be unused lately. The note on stderr says so, with the time the
+  counting began where the server reports it, or that the server keeps no counts and only
+  duplicates and prefixes are listed. On a PostgreSQL server with standbys it adds that their
+  reads aren't counted: an index only queries there use looks unused here.
 - *Missing indexes.* On SQL Server, `indexes --missing` lists the indexes the optimiser recorded
   as missing instead, with a `ddl` column holding the `CREATE INDEX` for each. Elsewhere it exits 2.
 - *Index sizes.* MySQL and MariaDB size indexes per table, not per index, so `sizes --indexes`

@@ -3789,7 +3789,24 @@ pub(crate) async fn fetch_table_stats(
             }
         })
         .collect();
-    Ok(SchemaStats::new(tables))
+    // `sys.dm_db_index_usage_stats` starts again with the instance (and when
+    // the database goes offline or auto-closes, which the note's "or reset"
+    // covers), so the instance's start is what an "unused" finding is unused
+    // since. `dm_os_sys_info` wants VIEW SERVER STATE and Azure SQL Database
+    // has none: either is a note without a date, not a failed read.
+    let since = query_rows(
+        &mut client,
+        "SELECT CONVERT(varchar(19), sqlserver_start_time, 120) FROM sys.dm_os_sys_info",
+    )
+    .await
+    .ok()
+    .and_then(|rows| rows.first().and_then(|r| r.first().cloned().flatten()));
+    Ok(
+        SchemaStats::new(tables).with_usage(schemaic_core::stats::UsageScope {
+            since,
+            standbys: None,
+        }),
+    )
 }
 
 /// Every user session, with the request it is running if any, projected in

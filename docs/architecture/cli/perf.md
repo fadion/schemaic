@@ -42,7 +42,12 @@ the advice on rather than try it; nothing runs it
 every `index_health` answer ends with, chosen by `workload::usage_counted`: where usage was
 counted, that the counts run from the last restart or statistics reset, so an index only a
 monthly job uses can look unused; where nothing was, that no index can be called unused and only
-duplicates and prefixes are shown (`the_usage_note_says_when_nothing_was_counted`).
+duplicates and prefixes are shown (`the_usage_note_says_when_nothing_was_counted`). **It dates
+the counts where the server says when they began**, from `SchemaStats::usage()`'s `since`
+("Usage counts run since …"), and on a PostgreSQL primary with standbys adds that their reads are
+not counted here and that a drop replicates to them — the MCP tool's description tells the model
+to say "unused since …", and the answer had no date to give
+(`the_usage_note_dates_the_counts_and_names_the_standbys`).
 **And how a `schemaic` performance command exits is decided here**, as a pure function of what its
 read returned — `statements_outcome(report, dialect)`, `sizes_outcome(stats, dialect, database,
 of_indexes, limit)` and `locks_outcome(list)`, each a `perf::Outcome`: the rows (`None` when there

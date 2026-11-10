@@ -2068,8 +2068,27 @@ pub(crate) async fn fetch_table_stats(db: &Db, database: &str) -> Result<SchemaS
             }
         })
         .collect();
-    Ok(SchemaStats::new(tables))
+    // When this database's counters were last reset, and how many standbys
+    // read beside it uncounted — what an "unused" finding is unused since,
+    // and where. Degrades to saying neither: a figure, not the read.
+    let usage = query_all_optional(&client, PG_USAGE_SCOPE_SQL)
+        .await
+        .unwrap_or_default()
+        .first()
+        .map(|r| schemaic_core::stats::UsageScope {
+            since: opt(r, 0),
+            standbys: num(r, 1).and_then(|n| u32::try_from(n).ok()),
+        })
+        .unwrap_or_default();
+    Ok(SchemaStats::new(tables).with_usage(usage))
 }
+
+/// `pg_stat_database.stats_reset` (`NULL` until a reset, which leaves the
+/// epoch unsaid) and the count of `pg_stat_replication` rows, the standbys
+/// streaming from this server — whose index reads its `idx_scan` never sees.
+const PG_USAGE_SCOPE_SQL: &str = "SELECT stats_reset::text, \
+            (SELECT count(*) FROM pg_catalog.pg_stat_replication) \
+     FROM pg_catalog.pg_stat_database WHERE datname = current_database()";
 
 /// `pg_stat_statements`, ranked — the PostgreSQL half of
 /// [`Db::fetch_top_statements`].

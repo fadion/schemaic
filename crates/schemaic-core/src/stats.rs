@@ -622,6 +622,26 @@ pub struct SchemaStats {
     /// answer *"no statistics for this table"* for every row, silently. Build one
     /// through [`SchemaStats::new`].
     by_name: HashMap<String, Vec<usize>>,
+    /// When and where the indexes' usage counts were counted.
+    usage: UsageScope,
+}
+
+/// **When and where an index's usage count was counted** — what an "unused"
+/// finding is unused *since*, and on which server.
+///
+/// A count of zero ten minutes after SQL Server restarted, or on a primary
+/// whose reports run on a standby, came back as "drop it" with nothing to
+/// say how little it had seen.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UsageScope {
+    /// When the counters began, as the server renders it: PostgreSQL's
+    /// `pg_stat_database.stats_reset`, MySQL's start (from `Uptime`), SQL
+    /// Server's `sqlserver_start_time`. `None` where the server does not say.
+    pub since: Option<String>,
+    /// Standbys streaming from this server (PostgreSQL's
+    /// `pg_stat_replication`), whose reads it does not count. `None` where
+    /// not asked.
+    pub standbys: Option<u32>,
 }
 
 impl SchemaStats {
@@ -631,7 +651,22 @@ impl SchemaStats {
         for (i, t) in tables.iter().enumerate() {
             by_name.entry(t.table.clone()).or_default().push(i);
         }
-        Self { tables, by_name }
+        Self {
+            tables,
+            by_name,
+            usage: UsageScope::default(),
+        }
+    }
+
+    /// These statistics with their usage counts' [`UsageScope`].
+    pub fn with_usage(mut self, usage: UsageScope) -> Self {
+        self.usage = usage;
+        self
+    }
+
+    /// When and where the usage counts were counted.
+    pub fn usage(&self) -> &UsageScope {
+        &self.usage
     }
 
     /// Find one table's stats. Matches on namespace **and** name, because

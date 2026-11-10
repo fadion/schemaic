@@ -1854,7 +1854,7 @@ async fn index_health(db: &Db, database: Option<&str>) -> (String, bool) {
     let findings = wl::index_health(&schema.tables, &stats);
     let mut out = format_findings(&findings, database);
     out.push_str("\n\n");
-    out.push_str(crate::perf::usage_note(&stats));
+    out.push_str(&crate::perf::usage_note(&stats));
     let dialect = dialect_of(db);
     if wl::supports_missing_index_hints(dialect) {
         out.push_str("\n\nMissing indexes the optimiser recorded since the last restart:\n");
