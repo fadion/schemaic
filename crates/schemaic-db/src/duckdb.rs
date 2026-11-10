@@ -94,7 +94,7 @@ fn query_err(e: duckdb::Error) -> DbError {
 // ── One statement, by DuckDB's own count ────────────────────────────────────
 
 /// A parse-only DuckDB connection, on an in-memory database of its own that
-/// holds nothing and never runs a statement: what [`one_statement`] asks.
+/// holds nothing and never runs a statement: what [`statement_count`] asks.
 struct Parser {
     /// Held for the process, so `con` always has its database.
     _db: duckdb::ffi::duckdb_database,
@@ -107,7 +107,7 @@ struct Parser {
 unsafe impl Send for Parser {}
 
 /// The process's [`Parser`], opened on first use; `None` when DuckDB would not
-/// open one, which [`one_statement`] answers by refusing.
+/// open one, which [`statement_count`] answers by refusing.
 static PARSER: LazyLock<Mutex<Option<Parser>>> = LazyLock::new(|| {
     use duckdb::ffi;
     let mut db: ffi::duckdb_database = std::ptr::null_mut();
