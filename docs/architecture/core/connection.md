@@ -57,8 +57,13 @@ MotherDuck path carries its token and the refusal reaches the log, stderr and th
 (`a_duckdb_path_naming_no_file_is_named_by_its_scheme_alone`).
 **`duckdb_catalog_name` is the catalogue a DuckDB file opens as** — the one database every
 operation on it runs in: the file's name up to its **first** dot, after either path separator
-(a saved path may be Windows' on any machine), trimmed, case kept, and `None` where
-`duckdb_names_a_file` says no or the name would be empty (`.duckdb`). The rule is DuckDB's and was
+(a saved path may be Windows' on any machine), trimmed, case kept, **leading dots skipped**
+(`.hidden.duckdb` opens as `hidden`, `.duckdb` as `duckdb`), and `_db` added to a stem that is
+`main`, `system` or `temp` in any case (`Temp.duckdb` opens as `Temp_db`; such a name is
+interned for the process rather than sliced) — both measured on 2.0.0, and both once answered
+`None` or the reserved name, so `schemaic exec` asked for a database the form has no field for
+and MCP marked a default its own list lacked — and `None` where `duckdb_names_a_file` says no or
+the name would be empty. The rule is DuckDB's and was
 measured on 2.0.0 through `schemaic databases` — `a.b.duckdb` opens as `a`, `noext` as `noext`,
 `x.db` as `x`, `My File.duckdb` as `My File`, `UPPER.DuckDB` as `UPPER`, `dash-name.duckdb` and
 `1lead.duckdb` as themselves (`a_duckdb_files_catalogue_is_its_name_up_to_the_first_dot`). It is

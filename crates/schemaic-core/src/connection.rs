@@ -2553,15 +2553,44 @@ pub fn duckdb_scheme(file: &str) -> Option<&'static str> {
 /// DuckDB's rule, measured on 2.0.0: the file's name **up to its first dot**
 /// — `a.b.duckdb` opens as `a`, `noext` as `noext` — case kept. Either
 /// separator ends a folder, since a saved path may be Windows' on any
-/// machine. A slice of `file`, so a caller holding the path can lend it.
+/// machine. Mostly a slice of `file`, so a caller holding the path can lend
+/// it.
+///
+/// **Two more of DuckDB's rules, measured the same way**: leading dots are
+/// skipped (`.hidden.duckdb` opens as `hidden`, `.duckdb` as `duckdb`), and a
+/// stem that is one of DuckDB's own catalogs' names, in any case, gets `_db`
+/// (`temp.duckdb` opens as `temp_db`, `Temp.duckdb` as `Temp_db`) — so the
+/// CLI and the MCP endpoint named a database the file does not have, or none.
+/// Such a name is not a slice of `file`; it is interned for the process, one
+/// string per spelling of the three words.
 pub fn duckdb_catalog_name(file: &str) -> Option<&str> {
     let f = file.trim();
     if f.is_empty() || !duckdb_names_a_file(f) {
         return None;
     }
     let name = f.rsplit(['/', '\\']).next().unwrap_or(f);
+    let name = name.trim_start_matches('.');
     let stem = name.split('.').next().unwrap_or(name);
-    (!stem.is_empty()).then_some(stem)
+    if stem.is_empty() {
+        return None;
+    }
+    if ["main", "system", "temp"]
+        .iter()
+        .any(|w| stem.eq_ignore_ascii_case(w))
+    {
+        static RENAMED: std::sync::LazyLock<
+            std::sync::Mutex<std::collections::HashSet<&'static str>>,
+        > = std::sync::LazyLock::new(Default::default);
+        let renamed = format!("{stem}_db");
+        let mut set = RENAMED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = set.get(renamed.as_str()) {
+            return Some(s);
+        }
+        let s: &'static str = Box::leak(renamed.into_boxed_str());
+        set.insert(s);
+        return Some(s);
+    }
+    Some(stem)
 }
 
 /// Is this engine's whole target **a file on this machine** rather than a
@@ -4768,6 +4797,16 @@ mod tests {
             ("/home/a/sales.duckdb", "sales"),
             ("sales.duckdb", "sales"),
             (" sales.duckdb ", "sales"),
+            // Leading dots are skipped, and a stem that is one of DuckDB's own
+            // catalogs' names gets `_db` — each measured on 2.0.0.
+            (r"C:\data\.hidden.duckdb", "hidden"),
+            (r"C:\data\..x.duckdb", "x"),
+            (r"C:\data\.duckdb", "duckdb"),
+            (r"C:\data\temp.duckdb", "temp_db"),
+            (r"C:\data\Temp.duckdb", "Temp_db"),
+            (r"C:\data\main.duckdb", "main_db"),
+            (r"C:\data\system.duckdb", "system_db"),
+            (r"C:\data\temporal.duckdb", "temporal"),
         ] {
             assert_eq!(duckdb_catalog_name(file), Some(name), "{file}");
         }
@@ -4776,7 +4815,7 @@ mod tests {
             "memory:session-1",
             ":memory:",
             "md:x",
-            r"C:\data\.duckdb",
+            r"C:\data\...",
             r"C:\data\",
         ] {
             assert_eq!(duckdb_catalog_name(file), None, "{file}");
