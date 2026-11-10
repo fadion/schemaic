@@ -2576,6 +2576,11 @@ fn conn_form(
             },
         ),
         move || {
+            // A DuckDB path naming no file is not saved, and no saved tick
+            // flashes for it: the hint under the path says why.
+            if !draft.to_connection(0).can_be_saved() {
+                return;
+            }
             (save)();
             // The same generation guard the Test flash beside this one already
             // has, and for the same reason: unguarded, a second Save inside

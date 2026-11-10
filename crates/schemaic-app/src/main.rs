@@ -13415,6 +13415,12 @@ fn app_view(
             // nothing yet to invalidate.
             let previous = connections.with_untracked(|cs| cs.iter().find(|c| c.id == id).cloned());
             let conn = draft.to_connection(id);
+            // A DuckDB path that names no file is not saved: the form says why
+            // under the path, and the Save button does nothing for it
+            // (`Connection::can_be_saved`).
+            if !conn.can_be_saved() {
+                return;
+            }
             if !previous.as_ref().is_some_and(|p| p.ticks_read_only(&conn)) {
                 // A created connection: the form now edits it.
                 draft.id.set(Some(id));

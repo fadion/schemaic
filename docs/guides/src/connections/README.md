@@ -60,7 +60,8 @@ says which.
 
 - *The file must already exist.* Connecting never creates a DuckDB database, so a mistyped path
   is refused rather than turned into an empty one; use **New file** for that. An in-memory
-  database (`:memory:`) and a MotherDuck name (`md:…`) are refused too. To query a CSV, Parquet
+  database (`:memory:`) and a MotherDuck name (`md:…`) are refused too, and **Save** doesn't save
+  a connection whose path is one of them. To query a CSV, Parquet
   or JSON file in an in-memory session instead, see [Querying a data file](data-file.md).
 - *The file is open only while something runs.* Between statements Schemaic lets go of it, so
   another program, such as the `duckdb` command-line client, can open it. While that program

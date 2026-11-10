@@ -42,14 +42,19 @@ startup falls back as for any id that names nothing (`startup_active_id`) — be
 data is in this process alone and after a restart it would be a connection to nothing
 (`a_save_leaves_the_data_sessions_out`). The app's save and its connection export both write
 through `to_save` (under `app/main.rs`), and the session save drops a session's query tabs by
-the same question (`persist::SavedTabsFile::without_session_queries`). **A `memory:` path typed into the connection form** is
-not refused at Save — it answers `is_data_session` like a session's, so it is never written, and
-connecting is refused in the closed-session words (`DuckDbSessionClosed`), or, should it name a
-session this process holds, reaches that session's database — but the form says so as it is typed:
+the same question (`persist::SavedTabsFile::without_session_queries`). **A DuckDB path that names
+no file is not saved** (`Connection::can_be_saved`, asked by the form's Save button and by the
+app's `save_conn`): a `memory:` path typed into the form answered `is_data_session` like a
+session's, so the connection was left out of `connections.json` at the next save and its query
+tabs dropped at quit, and an `md:` path wrote a MotherDuck token into the file in plain text
+(`a_duckdb_connection_naming_no_file_is_not_saved`). The form says why as the path is typed:
 **`duckdb_names_a_file`** is false for it, for `:memory:` and for a MotherDuck `md:` name, and the
 form shows `db-refused-duckdb-not-a-file` under the path in place of the hint. `db::duckdb::open_target`
-asks the same function for the spellings it refuses at a connect, a `memory:` target there being a
-session's own (`a_duckdb_path_names_a_file_unless_it_names_memory_or_motherduck`).
+asks the same question for the spellings it refuses at a connect, a `memory:` target there being a
+session's own (`a_duckdb_path_names_a_file_unless_it_names_memory_or_motherduck`), and **its
+refusal names only the scheme** — `duckdb_scheme`, `md:` rather than the path — since a
+MotherDuck path carries its token and the refusal reaches the log, stderr and the AI model
+(`a_duckdb_path_naming_no_file_is_named_by_its_scheme_alone`).
 **`duckdb_catalog_name` is the catalogue a DuckDB file opens as** — the one database every
 operation on it runs in: the file's name up to its **first** dot, after either path separator
 (a saved path may be Windows' on any machine), trimmed, case kept, and `None` where

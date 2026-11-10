@@ -1870,6 +1870,16 @@ impl Connection {
         is_duckdb(&self.db_type) && self.file.trim_start().starts_with("memory:")
     }
 
+    /// May the connection form **save** this connection as typed? Not a
+    /// DuckDB one whose file names no file ([`duckdb_names_a_file`]): a
+    /// `memory:` path made it a data session — left out of
+    /// `connections.json` at the next save and its query tabs dropped at
+    /// quit — and an `md:` one wrote a MotherDuck token into the file in
+    /// plain text. The form says why under the path as it is typed.
+    pub fn can_be_saved(&self) -> bool {
+        !is_duckdb(&self.db_type) || duckdb_names_a_file(&self.file)
+    }
+
     /// The connections a save writes: all but the data sessions, which hold
     /// their data in this process alone and would be a connection to nothing
     /// after a restart.
@@ -2517,11 +2527,22 @@ pub fn is_duckdb(db_type: &str) -> bool {
 /// same text at a connect (a `memory:` target there being a session's own).
 /// Empty answers yes: a missing path is its own refusal.
 pub fn duckdb_names_a_file(file: &str) -> bool {
+    duckdb_scheme(file).is_none()
+}
+
+/// The scheme a DuckDB `file` names **instead of a file** — `:memory:`,
+/// `memory:`, `md:`, `motherduck:` — or `None` for a path. What a refusal of
+/// such a path names, **and all it names**: a MotherDuck path carries its
+/// access token (`md:db?motherduck_token=…`), and the refusal reaches the
+/// log, the CLI's stderr and, through the MCP tools, the AI model.
+pub fn duckdb_scheme(file: &str) -> Option<&'static str> {
     let f = file.trim().to_ascii_lowercase();
-    !(f == ":memory:"
-        || f.starts_with("memory:")
-        || f.starts_with("md:")
-        || f.starts_with("motherduck:"))
+    if f == ":memory:" {
+        return Some(":memory:");
+    }
+    ["memory:", "md:", "motherduck:"]
+        .into_iter()
+        .find(|s| f.starts_with(s))
 }
 
 /// The catalogue a DuckDB `file` opens as — the database every operation on
@@ -4759,6 +4780,53 @@ mod tests {
             r"C:\data\",
         ] {
             assert_eq!(duckdb_catalog_name(file), None, "{file}");
+        }
+    }
+
+    /// **A DuckDB path that names no file is not saved**: a `memory:` one
+    /// became a data session — left out of `connections.json`, its tabs
+    /// dropped at quit — and an `md:` one wrote a MotherDuck token into the
+    /// file in plain text. Every other engine, and an empty path (its own
+    /// refusal), saves.
+    #[test]
+    fn a_duckdb_connection_naming_no_file_is_not_saved() {
+        let duck = |file: &str| Connection {
+            db_type: "DuckDB".into(),
+            file: file.into(),
+            ..Connection::new_blank(1, "d".into(), None)
+        };
+        for f in [
+            "memory:scratch",
+            ":memory:",
+            "md:x?motherduck_token=t",
+            "MotherDuck:x",
+        ] {
+            assert!(!duck(f).can_be_saved(), "{f}");
+        }
+        for f in [r"C:\data\shop.duckdb", "", "/home/a/x.duckdb"] {
+            assert!(duck(f).can_be_saved(), "{f}");
+        }
+        let mysql = Connection {
+            db_type: "MySQL".into(),
+            file: "memory:x".into(),
+            ..Connection::new_blank(2, "m".into(), None)
+        };
+        assert!(mysql.can_be_saved());
+    }
+
+    /// **A refusal names the scheme, never the rest of the path**: a
+    /// MotherDuck path carries its token, and the refusal reaches the log,
+    /// the CLI's stderr and the AI model.
+    #[test]
+    fn a_duckdb_path_naming_no_file_is_named_by_its_scheme_alone() {
+        for (f, scheme) in [
+            ("md:analytics?motherduck_token=eyJsecret", Some("md:")),
+            ("MotherDuck:x?motherduck_token=t", Some("motherduck:")),
+            (":memory:", Some(":memory:")),
+            ("memory:s", Some("memory:")),
+            (r"C:\data\shop.duckdb", None),
+        ] {
+            assert_eq!(duckdb_scheme(f), scheme, "{f}");
         }
     }
 

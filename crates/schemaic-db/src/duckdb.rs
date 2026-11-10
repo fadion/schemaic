@@ -240,9 +240,12 @@ fn open_target(
     if let Some(name) = f.strip_prefix("memory:") {
         return Ok((format!("memory:{name}"), Target::Memory));
     }
-    // The form's own answer (`memory:` was taken above, as a session's).
-    if !schemaic_core::connection::duckdb_names_a_file(f) {
-        return Err(DbError::Refused(DbRefusal::DuckDbNotAFile(f.to_string())));
+    // The form's own answer (`memory:` was taken above, as a session's),
+    // naming the scheme alone: a MotherDuck path carries its token.
+    if let Some(scheme) = schemaic_core::connection::duckdb_scheme(f) {
+        return Err(DbError::Refused(DbRefusal::DuckDbNotAFile(
+            scheme.to_string(),
+        )));
     }
     let path = std::path::Path::new(f);
     if !is_file(path) {
@@ -3664,6 +3667,13 @@ mod tests {
             open_target("  ", |_| true),
             Err(DbError::Refused(DbRefusal::DuckDbNoFile))
         ));
+        // The refusal names the scheme alone: a MotherDuck path carries its
+        // token, and the refusal reaches the log, stderr and the AI model.
+        let r = open_target("md:analytics?motherduck_token=eyJsecret", |_| true);
+        assert!(
+            matches!(&r, Err(DbError::Refused(DbRefusal::DuckDbNotAFile(s))) if s == "md:"),
+            "{r:?}"
+        );
     }
 
     /// A data-file session's database lives exactly as long as its
