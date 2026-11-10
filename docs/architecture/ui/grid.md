@@ -859,7 +859,9 @@ It used to be a run of `if`s in `text_editor_keys`, each reading signals another
 so the order — which *is* the behaviour — had no test. The keymap's global commands and Ctrl+1–9
 (`nav.handle`, the window root's own `NavKeys`), then the editor's own commands — Format code,
 Format statement, Make single line and Go to line, resolved in `Context::Editor` wherever the
-user has bound them — and the Ctrl+K verdict stay ahead of it in the closure, and Ctrl+Space
+user has bound them, the three formats' requests read from `FormatReq::for_command`
+(`each_format_command_asks_for_its_own_request`, `other_commands_ask_for_nothing`; swapping two
+arms inline passed every test once `format_chord` went) — and the Ctrl+K verdict stay ahead of it in the closure, and Ctrl+Space
 onwards after it. The handler builds a `KeyCtx` — the key as an `EdKey` (←, Home, End, PgUp and PgDn are one
 `Move`), the modifiers, which bars and offers are up, the *shown* ghost's offset
 (`inline_diff::shown_ghost`, below), `lone_caret`, and whether the caret ends its line, which it

@@ -636,6 +636,58 @@ pub enum FormatReq {
     SingleLine,
 }
 
+impl FormatReq {
+    /// The request a keymap command makes of the editor, or `None` for one
+    /// that is no format — the editor's key handler asks this, so which
+    /// command formats what is answered, and tested, in one place.
+    pub fn for_command(command: schemaic_core::keymap::Command) -> Option<FormatReq> {
+        use schemaic_core::keymap::Command;
+        match command {
+            Command::FormatCode => Some(FormatReq::Code),
+            Command::FormatStatement => Some(FormatReq::Statement),
+            Command::MakeSingleLine => Some(FormatReq::SingleLine),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod format_req_tests {
+    use super::FormatReq;
+    use schemaic_core::keymap::Command;
+
+    /// Each format command asks for its own request — the key→request half
+    /// `format_chord`'s tests pinned until the keymap replaced it; swapping
+    /// two arms in the handler passed every test.
+    #[test]
+    fn each_format_command_asks_for_its_own_request() {
+        assert_eq!(
+            FormatReq::for_command(Command::FormatCode),
+            Some(FormatReq::Code)
+        );
+        assert_eq!(
+            FormatReq::for_command(Command::FormatStatement),
+            Some(FormatReq::Statement)
+        );
+        assert_eq!(
+            FormatReq::for_command(Command::MakeSingleLine),
+            Some(FormatReq::SingleLine)
+        );
+    }
+
+    #[test]
+    fn other_commands_ask_for_nothing() {
+        for &c in Command::ALL {
+            if !matches!(
+                c,
+                Command::FormatCode | Command::FormatStatement | Command::MakeSingleLine
+            ) {
+                assert_eq!(FormatReq::for_command(c), None, "{c:?}");
+            }
+        }
+    }
+}
+
 /// One level of Format's indentation, from the editor's tab-width and
 /// soft-tabs settings.
 fn indent_unit() -> String {
@@ -3755,21 +3807,13 @@ pub(crate) fn query_pane(p: QueryPaneParams) -> impl IntoView {
             let command = crate::shortcuts::chord_of(key, physical, mods).and_then(|chord| {
                 crate::shortcuts::keymap().with_untracked(|m| m.resolve(chord, Context::Editor))
             });
+            // Through `format_req`, the palette's and the menu's path, so the
+            // three cannot disagree about what each one does.
+            if let Some(req) = command.and_then(FormatReq::for_command) {
+                format_req.set(Some(req));
+                return CommandExecuted::Yes;
+            }
             match command {
-                // Through `format_req`, the palette's and the menu's path, so
-                // the three cannot disagree about what each one does.
-                Some(KeyCommand::FormatCode) => {
-                    format_req.set(Some(FormatReq::Code));
-                    return CommandExecuted::Yes;
-                }
-                Some(KeyCommand::FormatStatement) => {
-                    format_req.set(Some(FormatReq::Statement));
-                    return CommandExecuted::Yes;
-                }
-                Some(KeyCommand::MakeSingleLine) => {
-                    format_req.set(Some(FormatReq::SingleLine));
-                    return CommandExecuted::Yes;
-                }
                 // Open the Go-to-line popup (autofocuses on mount). An effect
                 // closes the find bar so the two never overlap at the top-right.
                 Some(KeyCommand::GoToLine) => {
