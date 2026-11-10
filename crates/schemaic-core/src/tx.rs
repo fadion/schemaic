@@ -127,6 +127,11 @@ pub enum StmtOutcome {
     /// savepoint-isolated one is exactly what the savepoint exists to prevent.
     /// Reporting the second as the first tells the user their work is lost and
     /// offers only the action that loses it.
+    ///
+    /// **DuckDB reaches it without a savepoint**, having none: a statement it
+    /// refused before touching the transaction (a parser error) leaves the
+    /// transaction alive, which the session confirms with the aborted-block
+    /// probe before reporting this (`Session`'s run, in `schemaic-db`).
     FailedIsolated,
     /// The user cancelled it (`KILL QUERY` / PG cancel request).
     Cancelled,

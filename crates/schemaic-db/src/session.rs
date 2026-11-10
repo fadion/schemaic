@@ -942,6 +942,21 @@ impl Session {
         // over the same leading keyword. `tx::failure_committed` consults the
         // text first, so the round trip is only paid on a statement that could
         // possibly have committed — and only on one that failed.
+        // **DuckDB aborts a transaction on most failures, not on all**: a
+        // parser error is raised before the transaction is touched (and
+        // `duckdb::prepare_one` refuses unparsed text before the connection
+        // sees it), so a typo left it alive and committable while the fold
+        // read PostgreSQL's aborted state — Commit hidden, and the only way
+        // on discarding the tab's work. So the server is asked, with the
+        // probe `commit` asks, and a live transaction reports the failure as
+        // one that left it untouched.
+        if out.stmt == StmtOutcome::Failed
+            && matches!(&*guard, Backend::DuckDb { .. })
+            && self.in_tx.load(Ordering::SeqCst)
+            && !Session::block_is_aborted(&mut guard).await
+        {
+            out.stmt = StmtOutcome::FailedIsolated;
+        }
         if matches!(out.stmt, StmtOutcome::Failed | StmtOutcome::Cancelled) {
             let engine = self.tx_engine();
             if tx::implicit_commit(engine, sql) {

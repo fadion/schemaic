@@ -5216,6 +5216,38 @@ mod tests {
         assert_eq!(names(&db, &rt), ["1:uno:x"]);
     }
 
+    /// **A typo does not take a Manual tab's Commit away.** DuckDB raises a
+    /// parser error before the transaction is touched, so it is still alive
+    /// and committable; the session folded every failure to PostgreSQL's
+    /// aborted state, so the pill read aborted, Commit was hidden and the only
+    /// way on discarded the tab's work. A failure that does abort — a missing
+    /// table — still says so.
+    #[test]
+    fn a_parser_error_leaves_a_manual_transaction_committable() {
+        use schemaic_core::tx::TxState;
+        let db = provenance_db("manual-typo");
+        let engine = crate::session::tx_engine_of(crate::Engine::DuckDb);
+        let rt = rt();
+        rt.block_on(async {
+            let s = crate::Session::open(&db, None).await.unwrap();
+            let mut state = TxState::Idle;
+            for sql in ["INSERT INTO p (id, name) VALUES (2, 'work')", "SELEC 1"] {
+                let out = tab_run(&s, sql).await;
+                state = state.on_statement(engine, sql, out.stmt);
+            }
+            assert!(state.can_commit(), "{state:?}");
+            s.commit().await.unwrap();
+        });
+        assert_eq!(names(&db, &rt), ["1:one:x", "2:work:x"]);
+        rt.block_on(async {
+            let s = crate::Session::open(&db, None).await.unwrap();
+            let out = tab_run(&s, "SELECT * FROM nosuch").await;
+            let state = TxState::begun().on_statement(engine, "SELECT * FROM nosuch", out.stmt);
+            assert!(!state.can_commit(), "{:?} → {state:?}", out.stmt);
+            s.rollback().await.unwrap();
+        });
+    }
+
     /// **A Manual tab's grid write names the table's catalog**, so what the
     /// tab did to its connection since the read — a `USE` of an attached
     /// database holding a table of the same name, a temporary table of that

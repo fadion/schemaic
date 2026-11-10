@@ -4,9 +4,11 @@
 Four engines of the five: **SQLite has no manual mode**. DuckDB's pinned `Session` holds a
 blocking connection and, with it, the file's instance and lock (under `db::duckdb`);
 `tx_engine_of` maps it to PostgreSQL's model (a failed statement aborts the transaction; DDL rolls
-back — measured on 2.0), and `offers_manual_mode`'s read-only-transaction answer for it is yes,
+back — measured on 2.0) — except that a parser error does not abort it, so the session probes
+after a DuckDB failure and reports a live transaction's as `FailedIsolated`, keeping Commit
+offered (the one way a DuckDB statement reaches that variant) — and `offers_manual_mode`'s read-only-transaction answer for it is yes,
 `BEGIN TRANSACTION READ ONLY` refusing writes by their effect. **What DuckDB lacks is a
-`SAVEPOINT`**, so its grid commit in a Manual tab can never be `FailedIsolated`: a failed batch
+`SAVEPOINT`**, so its *grid commit* in a Manual tab can never be `FailedIsolated`: a failed batch
 rolls the whole transaction back and is reported `StmtOutcome::FailedAndRolledBack` (below), and
 its reads are never fenced. On SQLite the status-bar segment offering it
 is hidden on such a connection and `Session::open` refuses one — not because SQLite lacks

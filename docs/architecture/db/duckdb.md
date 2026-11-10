@@ -408,7 +408,14 @@ is `READ ONLY`, which refuses a write by its effect, and a Manual tab runs nothi
 (`a_read_only_manual_tab_refuses_a_write`). A failed statement aborts the transaction, as on
 PostgreSQL — `session::tx_engine_of` maps DuckDB to that model, measured on 2.0 — so
 `Session::commit` probes `SELECT 1` first, as it does there, and reports the abort rather than a
-commit of nothing (`commit_after_a_failed_statement_reports_the_abort`); the tab's statements are
+commit of nothing (`commit_after_a_failed_statement_reports_the_abort`). **Not every failure
+aborts, though**: a parser error is raised before the transaction is touched (and `prepare_one`
+refuses text DuckDB cannot parse before the connection sees it), and folding it to the aborted
+state hid Commit over a healthy transaction and left only Rollback, which discarded the tab's
+work. So after a failed statement inside a transaction the session asks the same `SELECT 1`
+probe, and a live transaction reports the failure as `StmtOutcome::FailedIsolated`, which leaves
+it open and committable; a catalog or constraint error still aborts and still says so
+(`a_parser_error_leaves_a_manual_transaction_committable`). The tab's statements are
 one transaction no other connection sees until Commit (`a_manual_tab_holds_its_writes_until_commit`).
 `Session::alive` answers yes without asking: there is no connection in this process to lose.
 **DuckDB has no `SAVEPOINT`** (2.0: a parser error), and two things follow from it. **A failed grid
