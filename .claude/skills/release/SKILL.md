@@ -23,6 +23,31 @@ git status --short
 The tree must be clean. Uncommitted work means the user has something in flight:
 stop and ask rather than sweeping it into the release.
 
+Next, sync with the remote, **before** the local checks, since they must run on
+the tree that is actually going to be pushed:
+
+```bash
+git fetch origin --tags
+```
+
+```bash
+git rev-list --left-right --count HEAD...origin/main
+```
+
+The two numbers are how far local is ahead of the remote and how far behind it.
+If it is behind and not ahead, fast-forward. If both numbers are non-zero, the
+branches have diverged: stop and ask the user whether to merge or rebase, and
+resolve any conflict before going on. Also look at what tags the fetch brought
+in. A release cut on another machine moves the version this one has to beat.
+This step exists because v0.39.0 was released from elsewhere while 111 commits
+built up here on a stale `main`, and the first sign of it was this phase's own
+fetch.
+
+After a merge, confirm nothing was lost. Every file changed on only one side
+should be byte-identical to that side. For the files both sides touched, every
+line either side added should be in the merged file, apart from the lines the
+conflict resolution deliberately rewrote.
+
 Then confirm the tree is green locally. Run **all five** — this list mirrors
 `.github/workflows/ci.yml`, so check it against that file rather than against
 memory, and add anything CI has grown since. A local bar narrower than CI's is
@@ -69,7 +94,8 @@ grep -n '^version' Cargo.toml
 ```
 
 The new version must be greater than the current one, and the tag must not
-already exist (`git tag --list vX.Y.Z`). If either is off, stop and ask.
+already exist (`git tag --list vX.Y.Z`, after the fetch above, so the check
+also sees tags pushed from other machines). If either is off, stop and ask.
 
 Finally, check whether the range being shipped has been reviewed. If
 `review/release-<last-tag>/findings.md` doesn't exist — or exists but its
