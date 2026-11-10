@@ -973,13 +973,19 @@ pub async fn a_partly_read_index_says_so_and_is_emitted_whole(target: &'static T
     let t = scratch.qualified("t");
     scratch
         .exec(&format!(
-            "CREATE TABLE {t} (a INTEGER, b INTEGER, c INTEGER)"
+            "CREATE TABLE {t} (a INTEGER, b INTEGER, c INTEGER, s TEXT)"
         ))
         .await;
     for sql in [
         format!("CREATE INDEX ix_inc ON {t} (a, b) INCLUDE (c)"),
         format!("CREATE UNIQUE INDEX ix_nd ON {t} (b) NULLS NOT DISTINCT"),
         format!("CREATE INDEX ix_ff ON {t} (c) WITH (fillfactor=70)"),
+        // A key collated apart from its column (`pg_index.indcollation`),
+        // which the per-column read has no field for: read whole, it was
+        // the plain `ix_s`'s twin, so index health called one a duplicate
+        // and a dump restored it without its `COLLATE`.
+        format!("CREATE INDEX ix_coll ON {t} (s COLLATE \"C\")"),
+        format!("CREATE INDEX ix_s ON {t} (s)"),
     ] {
         scratch.exec(&sql).await;
     }
@@ -1001,7 +1007,13 @@ pub async fn a_partly_read_index_says_so_and_is_emitted_whole(target: &'static T
     );
     assert_eq!(inc.include, vec!["c".to_string()], "{}", target.name);
     assert!(!inc.lossy, "{}: ix_inc was still withheld", target.name);
-    for name in ["ix_nd", "ix_ff"] {
+    let plain = current.indexes.iter().find(|i| i.name == "ix_s");
+    assert!(
+        plain.is_some_and(|i| !i.lossy),
+        "{}: ix_s, collated as its column, was withheld",
+        target.name
+    );
+    for name in ["ix_nd", "ix_ff", "ix_coll"] {
         let ix = current
             .indexes
             .iter()
@@ -1029,7 +1041,12 @@ pub async fn a_partly_read_index_says_so_and_is_emitted_whole(target: &'static T
     // And the emitted DDL keeps what the model has no field for — the dump path,
     // which reaches `create_ddl` with no edit anywhere.
     let ddl_text = current.create_ddl(dialect);
-    for clause in ["INCLUDE (\"c\")", "NULLS NOT DISTINCT", "fillfactor"] {
+    for clause in [
+        "INCLUDE (\"c\")",
+        "NULLS NOT DISTINCT",
+        "fillfactor",
+        "COLLATE \"C\"",
+    ] {
         assert!(
             ddl_text.contains(clause),
             "{}: emitted DDL dropped {clause}:\n{ddl_text}",

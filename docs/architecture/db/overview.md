@@ -588,7 +588,12 @@ join it dropped every `INCLUDE` position before `pg_attribute` was consulted, an
 `k.ord > ix.indnkeyatts AS included` marks each row the fold sends to the list (under `lib.rs`).
 The live `a_partly_read_index_says_so_and_is_emitted_whole` reads `ix_inc (a, b) INCLUDE (c)` as
 key `[a, b]`, list `[c]` and not lossy, its dump round trip still passing, while `ix_nd` and
-`ix_ff` stay lossy. **`NULLS NOT DISTINCT`
+`ix_ff` stay lossy. **A key collated apart from its column is lossy too** — an `indcollation`
+entry, non-zero, that differs from the key column's `attcollation`. The model's key column is its
+name, so `(email COLLATE case_insensitive)` read as the plain `(email)`: index health called the
+pair duplicates (and dropping a unique case-insensitive one loosens the table), and a dump
+restored it without its `COLLATE`. The live test's `ix_coll (s COLLATE "C")` is lossy and comes
+back from the round trip with its `COLLATE "C"`, while `ix_s (s)` is not lossy. **`NULLS NOT DISTINCT`
 cannot be asked of the catalogue at all**, and that is the load-bearing part:
 `pg_index.indnullsnotdistinct` is PostgreSQL **15**, the server parses the whole statement before
 it runs it, and naming a column a 13 or 14 has not fails the *entire* introspection — both are

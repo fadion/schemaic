@@ -1826,6 +1826,13 @@ type InSchema<T> = (String, T);
 /// **An `INCLUDE` on a constraint's index stays lossy**: the model holds a
 /// primary key as a column list and a unique constraint is restated as
 /// `ADD CONSTRAINT … UNIQUE`, and neither restatement carries one.
+///
+/// **So is a key collated apart from its column** (`indcollation` against
+/// `attcollation`): the model's key column is its name, so
+/// `(email COLLATE case_insensitive)` read as the plain `(email)` — index
+/// health called the two duplicates, dropping a unique case-insensitive one
+/// loosened the table, and a dump restored it without its `COLLATE`. Lossy,
+/// it is kept out of the comparison and emitted as the server's own text.
 fn index_list_sql() -> String {
     format!(
         "SELECT n.nspname, c.relname, \
@@ -1840,7 +1847,12 @@ fn index_list_sql() -> String {
                  OR EXISTS (SELECT 1 FROM pg_catalog.unnest(ix.indoption::int2[]) AS p(opt) \
                              WHERE opt NOT IN (0, 3)) \
                  OR (ix.indnatts > ix.indnkeyatts AND pgc.conname IS NOT NULL) \
-                 OR ic.reloptions IS NOT NULL) AS lossy, \
+                 OR ic.reloptions IS NOT NULL \
+                 OR EXISTS (SELECT 1 FROM pg_catalog.unnest(ix.indcollation::oid[]) \
+                                     WITH ORDINALITY AS cl(coll, cord) \
+                              JOIN pg_attribute ca ON ca.attrelid = ix.indrelid \
+                                                  AND ca.attnum = ix.indkey[cl.cord - 1] \
+                             WHERE cl.coll <> 0 AND cl.coll <> ca.attcollation)) AS lossy, \
                 pg_catalog.pg_get_indexdef(ix.indexrelid, k.ord::int, true) AS keydef, \
                 COALESCE((o.opt & 1) <> 0, false) AS descending, \
                 pg_catalog.pg_get_indexdef(ix.indexrelid) AS idxdef, \
