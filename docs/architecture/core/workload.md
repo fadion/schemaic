@@ -78,7 +78,18 @@ statement list would be guessing.
 `IndexStats::is_unused` — a *counted* zero, never a primary key or a unique index — with four
 exclusions. An unused index **backing a foreign key** is left out, because MySQL requires one and
 refuses to drop it while the key stands, so naming it is advice the server will refuse
-(`an_unused_index_backing_a_foreign_key_is_left_alone`). **A clustered index**
+(`an_unused_index_backing_a_foreign_key_is_left_alone`) — either `IndexInfo::foreign`, set on an
+exact column match, or **the last index whose leading whole columns serve a key**
+(`last_to_serve_a_foreign_key` over `serves_foreign_key`): InnoDB accepts any such index and
+refuses (1553) to drop the last one, so sakila's `inventory.idx_store_id_film_id`, serving
+`fk_inventory_store (store_id)`, was reported
+(`the_only_index_serving_a_foreign_key_by_its_prefix_is_left_alone`, which also shows a wider idle
+index still reported once a narrower one serves the key). **A partition's copy of its parent's
+index** (`IndexInfo::inherited`) is never reported unused either: PostgreSQL lists every partition
+as a table with its own counts, so each cold partition's clone came back Unused, and `DROP INDEX`
+on it is refused while the parent's index stands
+(`an_unread_partitions_copy_of_a_parents_index_is_left_alone`). A partitioned parent's own index
+has no counts of its own and is never reported. **A clustered index**
 (`IndexInfo::clustered == Some(true)`, SQL Server's `CLUSTERED`, through `is_clustered`) is never
 reported at all — not unused, not a duplicate, not redundant — because it is the table itself in
 key order: dropping it leaves a heap and rebuilds every other index, and SQL Server counts its
@@ -93,7 +104,7 @@ dropped every index on the column
 (`the_index_a_finding_names_as_its_stand_in_is_not_reported_unused`). **Usage decides which of a
 pair is named**, which is what keeps that last exclusion from hiding the right advice:
 `table_overlaps` takes an `idle` predicate — would this index be reported unused on its own count,
-`is_unused` and neither backing a foreign key nor clustered — and asks it below wherever it chooses
+`is_unused` and neither backing a foreign key, clustered nor a partition's copy — and asks it below wherever it chooses
 between two indexes. `Duplicate { of }` is the same key
 compared `IndexColumn` by `IndexColumn` — so a prefix length, a direction, an expression or a
 collation is a difference — with the same predicate, the same method (`btree` named and unnamed

@@ -53,7 +53,10 @@ Where two indexes overlap, the one listed is the one you could drop:
 - An index a finding names as the one to keep is never listed as unused itself, so dropping
   everything listed never takes both of a pair.
 
-On SQL Server the clustered index is never listed: it is the table itself, in key order.
+On SQL Server the clustered index is never listed: it is the table itself, in key order. An
+unread index is not listed as unused when the server would refuse to drop it: the last index a
+foreign key can use (on MySQL and MariaDB, any index that starts with the key's columns), or a
+PostgreSQL partition's copy of an index on its partitioned table.
 
 On SQL Server a second list, **Missing indexes the optimiser recorded since the last restart**,
 shows the indexes the optimiser wished it had, with how often and how much it expected to gain.

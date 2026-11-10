@@ -418,6 +418,34 @@ fn is_clustered(ix: &IndexInfo) -> bool {
     ix.clustered == Some(true)
 }
 
+/// Can `ix` serve the foreign key over `fk_cols` — are the key's columns its
+/// leading ones, in order, each whole? InnoDB accepts any such index for a
+/// key, not only one over exactly its columns.
+fn serves_foreign_key(ix: &IndexInfo, fk_cols: &[String]) -> bool {
+    !fk_cols.is_empty()
+        && ix.columns.len() >= fk_cols.len()
+        && ix
+            .columns
+            .iter()
+            .zip(fk_cols)
+            .all(|(c, f)| !c.expression && c.prefix.is_none() && c.name.eq_ignore_ascii_case(f))
+}
+
+/// Is `ix` the **only** index of `t` that serves one of its foreign keys
+/// ([`serves_foreign_key`])? MySQL refuses (1553) to drop the last index a
+/// key can use, and `IndexInfo::foreign` is set on an exact column match
+/// only, so an unread `(store_id, film_id)` serving a key on `store_id` was
+/// advice the server refuses.
+fn last_to_serve_a_foreign_key(t: &TableInfo, ix: &IndexInfo) -> bool {
+    t.foreign_keys.iter().any(|fk| {
+        serves_foreign_key(ix, &fk.columns)
+            && !t
+                .indexes
+                .iter()
+                .any(|o| o.name != ix.name && serves_foreign_key(o, &fk.columns))
+    })
+}
+
 /// Of two identical indexes, the one to keep: the primary key, then the
 /// clustered one, then a unique one or one backing a constraint (dropping
 /// those changes what the table accepts), then one backing a foreign key, then
@@ -509,9 +537,11 @@ fn table_overlaps(t: &TableInfo, idle: &dyn Fn(&str) -> bool) -> Vec<(String, In
 /// Every index in one database worth a look: the unused ones the stats
 /// counted, and the duplicate and redundant ones the definitions show.
 ///
-/// **An unused index that backs a foreign key is left out.** MySQL requires
+/// **An unused index that backs a foreign key is left out** — one over exactly
+/// its columns, or the last whose leading columns serve it. MySQL requires
 /// one, and refuses to drop it while the key stands; telling someone to drop
-/// it is advice the server will refuse. Views are skipped — their "indexes" are
+/// it is advice the server will refuse. So is a partition's copy of its
+/// parent's index ([`IndexInfo::inherited`]). Views are skipped — their "indexes" are
 /// a materialised view's on PostgreSQL, whose cost is the refresh, a different
 /// question.
 ///
@@ -525,10 +555,17 @@ pub fn index_health(tables: &[TableInfo], stats: &SchemaStats) -> Vec<IndexFindi
             .and_then(|i| i.bytes)
     };
     // Would `ix` be reported unused on its own count? Not a key or a unique
-    // index (`is_unused`), not one backing a foreign key, not the clustered one.
+    // index (`is_unused`), not one backing a foreign key — exactly, or as the
+    // last index whose leading columns serve one — not the clustered one, and
+    // not a partition's copy of its parent's index, which PostgreSQL refuses
+    // to drop while the parent's stands and which every cold partition of a
+    // table partitioned by day would add a row for.
     let idle = |def: Option<&TableInfo>, ix: &IndexStats| {
-        let info = def.and_then(|t| t.indexes.iter().find(|i| i.name == ix.name));
-        ix.is_unused() && !info.is_some_and(|i| i.foreign || is_clustered(i))
+        let info = def.and_then(|t| Some((t, t.indexes.iter().find(|i| i.name == ix.name)?)));
+        ix.is_unused()
+            && !info.is_some_and(|(t, i)| {
+                i.foreign || is_clustered(i) || i.inherited || last_to_serve_a_foreign_key(t, i)
+            })
     };
     let mut unused = Vec::new();
     let mut overlaps = Vec::new();
@@ -1153,6 +1190,65 @@ mod tests {
             vec![istat("fk_customer", Some(0), Some(500))],
         )]);
         assert!(index_health(&defs, &stats).is_empty());
+    }
+
+    /// **A partition's copy of its parent's index is not reported unused.**
+    /// PostgreSQL lists each partition as a table with its own counts, so
+    /// every cold partition's clone came back Unused — and `DROP INDEX` on one
+    /// is refused while the parent's index stands.
+    #[test]
+    fn an_unread_partitions_copy_of_a_parents_index_is_left_alone() {
+        let mut clone = ix("events_2023_note_idx", &["note"]);
+        clone.inherited = true;
+        let defs = vec![table("events_2023", vec![clone])];
+        let stats = SchemaStats::new(vec![tstat(
+            "events_2023",
+            vec![istat("events_2023_note_idx", Some(0), Some(8192))],
+        )]);
+        assert!(index_health(&defs, &stats).is_empty());
+    }
+
+    fn with_fk(mut t: TableInfo, cols: &[&str]) -> TableInfo {
+        t.foreign_keys.push(crate::schema::ForeignKeyInfo {
+            name: "fk".into(),
+            columns: cols.iter().map(|c| c.to_string()).collect(),
+            ref_table: "store".into(),
+            ref_columns: vec!["id".into()],
+            ..Default::default()
+        });
+        t
+    }
+
+    /// **The last index serving a foreign key by its leftmost prefix stays.**
+    /// InnoDB accepts any index whose leading columns are the key's, and
+    /// refuses (1553) to drop the last one; `IndexInfo::foreign` is set on an
+    /// exact match only, so `ix_px (p, x)` serving FK `(p)` was reported.
+    #[test]
+    fn the_only_index_serving_a_foreign_key_by_its_prefix_is_left_alone() {
+        let defs = vec![with_fk(
+            table("inventory", vec![ix("ix_px", &["p", "x"])]),
+            &["p"],
+        )];
+        let stats = SchemaStats::new(vec![tstat(
+            "inventory",
+            vec![istat("ix_px", Some(0), None)],
+        )]);
+        assert!(index_health(&defs, &stats).is_empty());
+        // With a second index serving the key, the idle wider one may go.
+        let mut p = ix("ix_p", &["p"]);
+        p.foreign = true;
+        let defs = vec![with_fk(
+            table("inventory", vec![p, ix("ix_px", &["p", "x"])]),
+            &["p"],
+        )];
+        let stats = SchemaStats::new(vec![tstat(
+            "inventory",
+            vec![istat("ix_p", Some(3), None), istat("ix_px", Some(0), None)],
+        )]);
+        assert_eq!(
+            problems(&index_health(&defs, &stats)),
+            vec![("ix_px", &IndexProblem::Unused)]
+        );
     }
 
     #[test]
