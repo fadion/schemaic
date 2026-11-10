@@ -10,7 +10,7 @@ on `TurnSpec::mcp_config` for a turn and on `InlineSpec::overlay` for a one-shot
 three variables the child gets — `DSH_HOME`, `DSH_PERMISSION_MODE=read-only` and
 `DSH_TELEMETRY_MODE=DISABLED` — and `env_remove()` the two it must not inherit. `dump_args(overlay)`
 is the `--profile headless --patch <overlay> --dump-config` that `ai::dsh_seal_refusal` runs before
-a session's first turn and before every one-shot (under `app/overview.md`). `sweep` collects the
+every turn of a session and before every one-shot (under `app/overview.md`). `sweep` collects the
 homes of instances that are gone, through `opencode::sweep_instances`, called from `main.rs` after
 `copilot::sweep` on the same background thread.
 **The seal is the overlay; the isolation is this directory, and they are two answers because a

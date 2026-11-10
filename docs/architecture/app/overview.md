@@ -976,7 +976,7 @@ goes through `spawn_blocking` as Antigravity's registration does, and a failure 
 no-database-tools note rather than a refusal — the calls would be refused anyway, and the
 permissions file that makes the session safe was already written. It is owed only when the
 workspace configures a server (`CursorWorkspace::has_server`).
-**DeepSeek's seal is re-earned before the first turn, and a failure there answers every turn.**
+**DeepSeek's seal is re-earned before every turn.**
 The overlay disables tool plugins by id, so a dsh update that adds one under a new id would be live
 while the panel says `Sealed`. `dsh_seal_refusal(launch, seal_env, overlay, cwd)` runs the same
 launch with `deepseek::dump_args` — `--profile headless --patch <overlay> --dump-config`, which
@@ -987,8 +987,10 @@ to be the headless profile (`harness::dsh_dump_is_headless`), or when `harness::
 lists anything (`ai-deepseek-seal-unchecked`, `ai-deepseek-unsealed`, the latter naming the rows).
 It is a spawn like the others, so it asks `spawn_refusal`, sets `AGENT_CHILD_ENV` and a working
 directory and hides its console, and it is held to a 30-second ceiling. The session task asks it
-once, after the degraded-tools note, and holds the answer as `sealed_refusal`: every question then
-gets `pump.fail` with it, as the constraint refusal answers every turn rather than the first.
+**per turn**, with the launch that turn resolves, and a refusal is that turn's `pump.fail`: each
+turn starts whatever dsh is installed at that moment, and asked once when the session opened, a
+dsh update mid-session could mount a tool plugin no dump had seen while the panel still said
+`Sealed`.
 **One-shots ask it too**, before anything is spawned: `InlinePlan::seal_check` carries the launch,
 the isolation's environment and the overlay, and `run_inline` refuses on its answer, removing the
 generation's working directory as it goes. Checked against real dumps: the sealed composition

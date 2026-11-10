@@ -2218,7 +2218,7 @@ pub(crate) fn start_ai_session(
             .and_then(|h| h.mcp_config())
             .or(dsh_home.as_ref().map(|h| h.overlay()))
             .map(|p| p.to_string_lossy().into_owned());
-        // What `dsh_seal_refusal` dumps once, before the first turn.
+        // What `dsh_seal_refusal` dumps before every turn.
         let dsh_check = dsh_home
             .as_ref()
             .map(|h| (seal_env.clone(), h.overlay().to_path_buf()));
@@ -2280,17 +2280,6 @@ pub(crate) fn start_ai_session(
             if let Some(why) = degraded {
                 pump.note(why);
             }
-            // **DeepSeek's seal, re-earned before the first turn** against the
-            // composed profile — see `dsh_seal_refusal`. A refusal answers every
-            // turn of the session, as the constraint refusal does, rather than
-            // the first one only.
-            let sealed_refusal = match &dsh_check {
-                Some((env, overlay)) => {
-                    let launch = crate::agent_cli::launch(harness, &bin);
-                    dsh_seal_refusal(&launch, env, overlay, &child_cwd).await
-                }
-                None => None,
-            };
             let mut thread: Option<String> = None;
             while let Some(msg) = rx.recv().await {
                 let prompt = match msg {
@@ -2300,9 +2289,18 @@ pub(crate) fn start_ai_session(
                     // pressed stop on an idle panel.
                     SessionMsg::Interrupt => continue,
                 };
-                if let Some(why) = &sealed_refusal {
-                    pump.fail(why.clone());
-                    continue;
+                // **DeepSeek's seal, re-earned before every turn** against the
+                // composed profile — see `dsh_seal_refusal`. Per turn, as the
+                // launch below is: each turn starts whatever dsh is installed
+                // now, and an update mid-session can mount a tool plugin the
+                // dump that opened the session never saw. A dump is ~0.2 s and
+                // calls no model.
+                if let Some((env, overlay)) = &dsh_check {
+                    let launch = crate::agent_cli::launch(harness, &bin);
+                    if let Some(why) = dsh_seal_refusal(&launch, env, overlay, &child_cwd).await {
+                        pump.fail(why);
+                        continue;
+                    }
                 }
                 let spec = schemaic_ai::harness::TurnSpec {
                     prompt,
