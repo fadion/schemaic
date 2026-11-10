@@ -961,8 +961,8 @@ chart-caption-rows = { $n ->
     [one] { $n } ред
    *[other] { $n } реда
 }
-chart-caption-skipped-null = { $skipped } NULL, не са изобразени
-chart-caption-skipped = { $skipped } не са изобразени (NULL или след { $max })
+chart-caption-skipped-null = { $skipped } не са изобразени (NULL, NaN или безкрайност)
+chart-caption-skipped = { $skipped } не са изобразени (NULL, NaN, безкрайност или след { $max })
 chart-caption-truncated = прочетените редове, а не целият резултат
 
 ## Schema editors — shared

@@ -1085,8 +1085,8 @@ chart-caption-rows = { $n ->
     [one] { $n } row
    *[other] { $n } rows
 }
-chart-caption-skipped-null = { $skipped } NULL, not drawn
-chart-caption-skipped = { $skipped } not drawn (NULL, or past { $max })
+chart-caption-skipped-null = { $skipped } not drawn (NULL, NaN or infinite)
+chart-caption-skipped = { $skipped } not drawn (NULL, NaN, infinite or past { $max })
 chart-caption-truncated = the rows read, not the whole result
 
 ## Schema editors — shared

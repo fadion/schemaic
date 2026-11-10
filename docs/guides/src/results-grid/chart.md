@@ -43,7 +43,7 @@ bar split by region. A legend under the chart names each segment's colour.
 
 A chart draws the rows the grid has read, not the whole table: for a capped result, it is a chart
 of the first rows. The caption under it says how many rows it drew and what it left out — NULLs,
-and for every kind but a histogram anything past the first 2,000 points.
+NaN and infinite values, and for every kind but a histogram anything past the first 2,000 points.
 
 If the result has no numeric column, the chart says so:
 **No column of numbers to chart in this result.**

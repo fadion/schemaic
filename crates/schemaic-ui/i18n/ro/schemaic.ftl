@@ -983,8 +983,8 @@ chart-caption-rows = { $n ->
     [few] { $n } rânduri
    *[other] { $n } de rânduri
 }
-chart-caption-skipped-null = { $skipped } NULL, nedesenate
-chart-caption-skipped = { $skipped } nedesenate (NULL sau peste { $max })
+chart-caption-skipped-null = { $skipped } nedesenate (NULL, NaN sau infinit)
+chart-caption-skipped = { $skipped } nedesenate (NULL, NaN, infinit sau peste { $max })
 chart-caption-truncated = rândurile citite, nu întregul rezultat
 
 ## Schema editors — shared

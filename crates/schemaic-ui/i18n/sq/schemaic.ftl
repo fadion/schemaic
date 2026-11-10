@@ -958,8 +958,8 @@ chart-caption-rows = { $n ->
     [one] { $n } rresht
    *[other] { $n } rreshta
 }
-chart-caption-skipped-null = { $skipped } NULL, të pavizatuara
-chart-caption-skipped = { $skipped } të pavizatuara (NULL, ose përtej { $max })
+chart-caption-skipped-null = { $skipped } të pavizatuara (NULL, NaN ose pafundësi)
+chart-caption-skipped = { $skipped } të pavizatuara (NULL, NaN, pafundësi ose përtej { $max })
 chart-caption-truncated = rreshtat e lexuar, jo i gjithë rezultati
 
 ## Schema editors — shared

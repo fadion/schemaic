@@ -693,16 +693,18 @@ impl Plot {
 
 /// The line under the canvas: how many rows the result holds, how many were
 /// not drawn and why, and whether those are all the rows. A series leaves out
-/// a NULL or a row past [`MAX_POINTS`]; a histogram bins every number, so it
-/// has no cap to name.
+/// a NULL, a NaN or an infinity, and a row past [`MAX_POINTS`]; a histogram
+/// bins every finite number, so it has no cap to name.
 pub fn caption(rows: usize, kind: ChartKind, skipped: usize, truncated: bool) -> String {
     let mut line = format!("{} {}", rows, crate::text::plural(rows, "row", "rows"));
     if skipped > 0 {
         match kind {
-            ChartKind::Histogram => line.push_str(&format!(" · {skipped} NULL, not drawn")),
+            ChartKind::Histogram => {
+                line.push_str(&format!(" · {skipped} not drawn (NULL, NaN or infinite)"))
+            }
             ChartKind::Bar | ChartKind::Line | ChartKind::Scatter | ChartKind::StackedBar => line
                 .push_str(&format!(
-                    " · {skipped} not drawn (NULL, or past {MAX_POINTS})"
+                    " · {skipped} not drawn (NULL, NaN, infinite or past {MAX_POINTS})"
                 )),
         }
     }
@@ -976,7 +978,7 @@ mod tests {
     #[test]
     fn a_histogram_caption_does_not_mention_the_point_cap() {
         let h = caption(10, ChartKind::Histogram, 3, false);
-        assert_eq!(h, "10 rows · 3 NULL, not drawn");
+        assert_eq!(h, "10 rows · 3 not drawn (NULL, NaN or infinite)");
         assert!(!h.contains(&MAX_POINTS.to_string()));
         assert_eq!(
             caption(1, ChartKind::Bar, 0, false),
@@ -985,8 +987,19 @@ mod tests {
         );
         assert_eq!(
             caption(2_005, ChartKind::Line, 5, true),
-            "2005 rows · 5 not drawn (NULL, or past 2000) · the rows read, not the whole result"
+            "2005 rows · 5 not drawn (NULL, NaN, infinite or past 2000) · the rows read, not the whole result"
         );
+    }
+
+    /// **A NaN or an infinity is named as such.** The caption used to blame
+    /// "NULL, or past 2000" for the two cells a `float8` column skipped as NaN
+    /// and Infinity — neither of which it was.
+    #[test]
+    fn a_caption_names_nan_and_infinity_among_what_it_left_out() {
+        for kind in [ChartKind::Bar, ChartKind::Scatter, ChartKind::Histogram] {
+            let c = caption(4, kind, 2, false);
+            assert!(c.contains("NaN") && c.contains("infinite"), "{kind:?}: {c}");
+        }
     }
 
     #[test]

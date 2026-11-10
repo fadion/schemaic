@@ -1727,8 +1727,12 @@ pub(crate) fn form_gap() -> f64 {
 /// pixels right of the heading above it and of the buttons below it. A modal that
 /// insets its content by hand is the drift this exists to stop.
 pub(crate) fn modal_pad_h() -> f64 {
-    theme::scaled(14.0)
+    theme::scaled(MODAL_PAD_H)
 }
+
+/// [`modal_pad_h`] unscaled — for a sum of widths a test checks against a
+/// modal's room, which must read the padding rather than copy it.
+pub(crate) const MODAL_PAD_H: f64 = 14.0;
 
 /// The caption above a control, and the explanatory line under one.
 ///

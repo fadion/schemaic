@@ -42,9 +42,22 @@ pub struct ChartTarget {
     pub title: String,
 }
 
+/// The modal's width, unscaled.
+const PANEL_W: f64 = 760.0;
+/// The chart-kind picker's width, unscaled.
+const KIND_W: f64 = 140.0;
+/// A column picker's width, unscaled — sized so the widest row (a stacked
+/// bar's four pickers and the export icon) fits the panel.
+const COL_W: f64 = 150.0;
+/// The gap between the picker row's controls, unscaled.
+const ROW_GAP: f64 = 16.0;
+/// Room the export icon takes at the row's end, unscaled — generous.
+#[cfg(test)]
+const EXPORT_ALLOWANCE_W: f64 = 28.0;
+
 /// Modal width and the canvas's height.
 fn panel_w() -> f64 {
-    theme::scaled(760.0)
+    theme::scaled(PANEL_W)
 }
 fn canvas_h() -> f64 {
     theme::scaled(360.0)
@@ -510,7 +523,7 @@ fn controls(
         by,
     } = p;
     let caption = |s: String| text(s).style(crate::widgets::form_label_style);
-    let col_w = || theme::scaled(200.0);
+    let col_w = || theme::scaled(COL_W);
     // A picked name → its column; `names` are distinct, so two columns the
     // result names alike are two choices.
     let lookup = {
@@ -599,7 +612,7 @@ fn controls(
                         .into_any(),
                     );
                     h_stack((label_field(), stacks))
-                        .style(|s| s.gap(theme::scaled(16.0)).items_center())
+                        .style(|s| s.gap(theme::scaled(ROW_GAP)).items_center())
                         .into_any()
                 }
             }
@@ -609,7 +622,7 @@ fn controls(
         v_stack((
             caption(tr!("chart-caption-kind")),
             focusable_dropdown(kind, ChartKind::ALL, chart_kind_label, ring, 10)
-                .style(|s| s.width(theme::scaled(140.0))),
+                .style(|s| s.width(theme::scaled(KIND_W))),
         ))
         .style(|s| s.flex_col().gap(theme::scaled(6.0))),
         v_stack((caption(tr!("chart-caption-values")), value_field))
@@ -623,7 +636,7 @@ fn controls(
         v_stack((caption(" ".to_string()), export))
             .style(|s| s.flex_col().items_center().gap(theme::scaled(6.0))),
     ))
-    .style(|s| s.gap(theme::scaled(16.0)).items_center().width_full())
+    .style(|s| s.gap(theme::scaled(ROW_GAP)).items_center().width_full())
     .into_any()
 }
 
@@ -810,6 +823,19 @@ fn measure(text: &str, size: f32) -> (f64, f64) {
 mod tests {
     use super::*;
     use schemaic_core::chart::Series;
+
+    /// **The widest picker row fits inside the modal.** A stacked bar shows
+    /// four pickers — kind, values, labels, stack by — and the export icon;
+    /// at three 200px column pickers that row needed ~848px of the 732px
+    /// inside a 760px panel's padding, so *Stack by* ran past the modal's edge
+    /// and the icon sat outside it. Unscaled widths: every one is multiplied
+    /// by the same UI scale.
+    #[test]
+    fn the_stacked_bar_picker_row_fits_the_panel() {
+        let row = KIND_W + 3.0 * COL_W + EXPORT_ALLOWANCE_W + 5.0 * ROW_GAP;
+        let inside = PANEL_W - 2.0 * crate::widgets::MODAL_PAD_H;
+        assert!(row <= inside, "row {row} > room {inside}");
+    }
 
     /// English names each chart kind as core's `ChartKind::label` does.
     #[test]

@@ -81,7 +81,9 @@ and an ellipsis — the legend's cut too; `short_label_cuts_past_eighteen_charac
 its labels as a series' are — a histogram's being its edges and midpoint
 (`x_labels_are_first_middle_and_last`), and a scatter's **every X tick** at its position,
 labelled as one axis by `tick_labels`; and `caption(rows, kind, skipped, truncated)` the line
-under the canvas, a histogram's skipped count being NULLs alone, so it never names the series' cap
+under the canvas, naming NULL, NaN and infinity among what was left out
+(`a_caption_names_nan_and_infinity_among_what_it_left_out`), a histogram's skipped count being
+those alone, so it never names the series' cap
 (`a_histogram_caption_does_not_mention_the_point_cap`) — a scatter's and a stacked bar's name it,
 as a series' does.
 `tick_label(v)` prints at most two decimals with

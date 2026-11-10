@@ -958,8 +958,8 @@ chart-caption-rows = { $n ->
     [one] { $n } rij
    *[other] { $n } rijen
 }
-chart-caption-skipped-null = { $skipped } NULL, niet getekend
-chart-caption-skipped = { $skipped } niet getekend (NULL, of voorbij { $max })
+chart-caption-skipped-null = { $skipped } niet getekend (NULL, NaN of oneindig)
+chart-caption-skipped = { $skipped } niet getekend (NULL, NaN, oneindig of voorbij { $max })
 chart-caption-truncated = de gelezen rijen, niet het hele resultaat
 
 ## Schema editors — shared

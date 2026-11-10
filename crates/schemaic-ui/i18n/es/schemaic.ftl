@@ -958,8 +958,8 @@ chart-caption-rows = { $n ->
     [one] { $n } fila
    *[other] { $n } filas
 }
-chart-caption-skipped-null = { $skipped } NULL, sin dibujar
-chart-caption-skipped = { $skipped } sin dibujar (NULL, o más allá de { $max })
+chart-caption-skipped-null = { $skipped } sin dibujar (NULL, NaN o infinito)
+chart-caption-skipped = { $skipped } sin dibujar (NULL, NaN, infinito o más allá de { $max })
 chart-caption-truncated = las filas leídas, no el resultado completo
 
 ## Schema editors — shared

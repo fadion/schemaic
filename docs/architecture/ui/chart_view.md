@@ -22,7 +22,15 @@ first column that is not the value. A scatter has **X axis** in its place, at th
 owned dropdown of the numeric columns, starting on the first one other than the value column — the
 value column itself when it is the only one. A stacked bar has *Labels* and beside it **Stack
 by**, tab 35: an indexed dropdown of *None* (`chart-stack-none`, one segment per label) and every
-column, starting on the first column that is neither the value nor the label. The five choices are
+column, starting on the first column that is neither the value nor the label. **That is the widest
+row, and the widths are sized to it**: `KIND_W` (140) for *Chart*, `COL_W` (150) for each column
+picker, `ROW_GAP` (16) between controls, all unscaled, in a `PANEL_W` (760) modal. At the 200 the
+column pickers had, kind, three column pickers, the export icon and five gaps summed to 848 against
+the 732 inside the panel's padding, so *Stack by* ran past the modal's right edge and the icon sat
+outside the dialog. `the_stacked_bar_picker_row_fits_the_panel` pins the sum, with a
+`cfg(test)` `EXPORT_ALLOWANCE_W` (28) for the icon and `widgets::MODAL_PAD_H` (14), the unscaled
+value `modal_pad_h` itself scales — read, not copied, so a change to the padding moves the sum too.
+Widening a picker, or giving a kind a fifth, is a change to that sum. The five choices are
 signals of the open's scope, carried to `controls` in one `Pickers`, so a picker a kind does not
 show keeps its pick and switching back finds it where it was. A picked name maps
 back to its column by name, so the names are `chart::picker_labels`' — distinct, a repeated
@@ -33,9 +41,13 @@ chart in this result."* where there is none, *"Every value in that column is NUL
 series, the stacks or the bins came back empty, *"No row has a number in both columns."*
 (`chart-no-pairs`) where a scatter's pairs did — its empty chart is about two columns, not one —
 and otherwise the canvas, 360 high, with one faint line under
-it, `chart::caption` — *"N rows · K not drawn (NULL, or past 2000) · the rows read, not the whole
-result"*, the middle clause when anything was skipped (a histogram's reading *"K NULL, not
-drawn"*, since it has no cap) and the last when the result is `truncated`. What is drawn is a
+it, `chart::caption` — *"N rows · K not drawn (NULL, NaN, infinite or past 2000) · the rows read,
+not the whole result"*, the middle clause when anything was skipped (a histogram's reading *"K not
+drawn (NULL, NaN or infinite)"*, since it has no cap) and the last when the result is `truncated`.
+NaN and the infinities are named because a non-finite cell is skipped rather than disqualifying
+its column (`core/chart.rs`); the caption went on saying *"NULL, or past 2000"* after that, so a
+`float8` column's NaN and Infinity cells were blamed on neither of the two things it named
+(`a_caption_names_nan_and_infinity_among_what_it_left_out`). What is drawn is a
 `chart::Plot` from `plot_of` — `Plot::of` with a stacked bar's folded segment renamed to
 `chart-other` through `Stacked::name_other`, one function for the canvas and the export so the
 file names it as the screen does — whose range and under-axis labels the canvas asks rather than
