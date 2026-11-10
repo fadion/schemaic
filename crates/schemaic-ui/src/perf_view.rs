@@ -610,6 +610,28 @@ fn editable(ctx: &PerfCtx, t: &PerfTarget, schema: Option<&str>, table: &str) ->
         })
 }
 
+/// Is a finding's *Drop* offered — its table loaded in the tree on this
+/// connection ([`editable`]'s question) **and holding that index**
+/// ([`drop_offered`])?
+fn droppable(ctx: &PerfCtx, t: &PerfTarget, f: &IndexFinding) -> bool {
+    ctx.conn.active_conn.get_untracked() == t.conn_id
+        && t.database.as_deref().is_some_and(|db| {
+            let loaded =
+                crate::table_designer::loaded_table(ctx.schema, db, f.schema.as_deref(), &f.table);
+            drop_offered(loaded.as_ref(), &f.index)
+        })
+}
+
+/// Does the tree's copy of the table hold the index a finding names? The
+/// findings come from a fresh read, the drop's draft from the tree's model:
+/// an index made since the tree loaded the table (the duplicate the user
+/// just created by hand, most often) is not in the draft, so removing it
+/// changed nothing, the diff was empty and *Drop* did nothing, silently.
+/// Offered only where it would act.
+fn drop_offered(loaded: Option<&schemaic_core::schema::TableInfo>, index: &str) -> bool {
+    loaded.is_some_and(|t| t.indexes.iter().any(|ix| ix.name == index))
+}
+
 fn indexes_list(
     ctx: &PerfCtx,
     t: &PerfTarget,
@@ -692,7 +714,7 @@ fn finding_row(ctx: &PerfCtx, t: &PerfTarget, f: &IndexFinding) -> AnyView {
             .flex_grow(1.0_f32)
             .min_width(0.0)
     });
-    let action: AnyView = if editable(ctx, t, f.schema.as_deref(), &f.table) {
+    let action: AnyView = if droppable(ctx, t, f) {
         let (conn, schema_ui, ddl) = (ctx.conn, ctx.schema, ctx.ddl);
         let database = t.database.clone().unwrap_or_default();
         let (schema, table, index) = (f.schema.clone(), f.table.clone(), f.index.clone());
@@ -947,6 +969,25 @@ fn footer(
 #[cfg(test)]
 mod tests {
     use crate::i18n::tr;
+
+    /// **A Drop is offered only where it would act.** The tree's copy of a
+    /// table that lacks the index (made since it loaded) gave an empty diff,
+    /// and the click did nothing and said nothing.
+    #[test]
+    fn a_drop_is_offered_only_for_an_index_the_loaded_table_holds() {
+        use schemaic_core::schema::{IndexInfo, TableInfo};
+        let t = TableInfo {
+            name: "t".into(),
+            indexes: vec![IndexInfo {
+                name: "ix_a".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(super::drop_offered(Some(&t), "ix_a"));
+        assert!(!super::drop_offered(Some(&t), "ix_dup"));
+        assert!(!super::drop_offered(None, "ix_a"));
+    }
 
     /// **Performance and Users never open on another server's database.**
     /// Every opener passed the focused tab's `active_db` as it was, whatever

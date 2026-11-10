@@ -66,8 +66,9 @@ Each is one estimate: check it against the indexes above it before creating one.
 The bin icon on a finding (**Drop index**), and the plus icon on a missing index
 (**Create index**), open the SQL preview, where you
 read the statement and apply it. Both appear only for tables the schema tree has loaded for this
-connection. If one is missing, expand the database in the tree, then press **Refresh** in the
-view.
+connection, and **Drop index** only for an index the tree already shows. If one is missing,
+expand the database in the tree (or refresh it, for an index made since), then press **Refresh**
+in the view.
 
 ## Sizes
 

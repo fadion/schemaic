@@ -110,7 +110,11 @@ nothing; and it reads the **active** connection's tree and takes the active conn
 dialect (`edit_ctx`), so after a switch a same-named table on another server would be the one
 previewed — the case `copy_table_view` refuses with a sentence. The question is asked when the
 list is built, not live. The draft is seeded from the tree's model, not from the `fetch_schema`
-the findings came from. Findings are worded per `IndexProblem` with their size (`i18n::bytes`)
+the findings came from, **so a finding's *Drop* also needs the tree's table to hold that index**
+(`droppable` over the pure `drop_offered`): an index made since the tree loaded the table — the
+duplicate the user just created by hand — was not in the draft, `retain` removed nothing, the
+diff was empty and the press did nothing and said nothing
+(`a_drop_is_offered_only_for_an_index_the_loaded_table_holds`). Findings are worded per `IndexProblem` with their size (`i18n::bytes`)
 where reported; under them is the usage caution, or — where `usage_counted` is false — the line
 saying no index can be called unused. The missing-index section is drawn only where
 `supports_missing_index_hints(dialect)`: its read's error, *None recorded.*, or the suggestions
