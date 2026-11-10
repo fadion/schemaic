@@ -6242,8 +6242,10 @@ pub fn read_only_heads(dialect: SqlDialect) -> &'static [&'static str] {
         // No `EXPLAIN`: a T-SQL plan is `SET SHOWPLAN_XML ON`, session state.
         SqlDialect::MsSql => &["SELECT", "WITH"],
         // DuckDB reads with a leading `FROM` too, and `DESCRIBE`/`SUMMARIZE`
-        // are queries over a relation. `EXPLAIN ANALYZE` runs its statement,
-        // which the shared deny list's `ANALYZE` refuses.
+        // are queries over a relation, as are the `PIVOT`/`UNPIVOT`
+        // statements (a `CREATE TABLE … AS PIVOT` is headed by `CREATE`).
+        // `EXPLAIN ANALYZE` runs its statement, which the shared deny list's
+        // `ANALYZE` refuses.
         SqlDialect::DuckDb => &[
             "SELECT",
             "WITH",
@@ -6253,6 +6255,8 @@ pub fn read_only_heads(dialect: SqlDialect) -> &'static [&'static str] {
             "DESCRIBE",
             "SUMMARIZE",
             "EXPLAIN",
+            "PIVOT",
+            "UNPIVOT",
         ],
     }
 }
@@ -6565,7 +6569,11 @@ pub fn contains_write(sql: &str, dialect: SqlDialect) -> bool {
         match words.first().map(|s| s.as_str()) {
             None => continue, // empty / comment-only statement
             Some(head) => {
-                if !matches!(
+                // The heads every engine's guard has always read as reads,
+                // and this engine's own — `read_only_heads`, so a head the
+                // unattended gate admits is never a write to the editor
+                // (DuckDB's `FROM t` and `SUMMARIZE t` were).
+                let read_head = matches!(
                     head,
                     "SELECT"
                         | "SHOW"
@@ -6575,7 +6583,8 @@ pub fn contains_write(sql: &str, dialect: SqlDialect) -> bool {
                         | "WITH"
                         | "VALUES"
                         | "TABLE"
-                ) {
+                ) || read_only_heads(dialect).contains(&head);
+                if !read_head {
                     return true;
                 }
                 if words.iter().zip(&called).any(|(w, &c)| {
@@ -10876,6 +10885,51 @@ mod tests {
         // A column that merely shares a reader's name is still refused — the
         // gate over-blocks a name rather than under-block a call.
         assert!(gate("SELECT read_csv FROM t", d).is_err());
+    }
+
+    /// **DuckDB's own reads are reads to the write guard too.** `FROM t`,
+    /// `SUMMARIZE t` and `PIVOT t ON a` were writes to `contains_write`, so a
+    /// read-only DuckDB connection refused them as modifying data while
+    /// `schemaic query` on the same connection ran them.
+    #[test]
+    fn duckdb_reads_are_not_writes_to_the_editor() {
+        let d = SqlDialect::DuckDb;
+        let read_only = GuardPolicy {
+            dialect: d,
+            read_only: true,
+            confirm_writes: true,
+            no_database: false,
+        };
+        for sql in [
+            "FROM t",
+            "FROM t SELECT a",
+            "SUMMARIZE t",
+            "PIVOT t ON a USING sum(b)",
+            "UNPIVOT t ON a, b INTO NAME k VALUE v",
+        ] {
+            assert!(!super::contains_write(sql, d), "{sql}");
+            assert_eq!(
+                run_verdict(&[sql.to_string()], read_only),
+                RunVerdict::Allow,
+                "{sql}"
+            );
+        }
+        // Still a write behind a read head, and a head another engine lacks
+        // is no read there.
+        assert!(super::contains_write("FROM t; DELETE FROM t", d));
+        assert!(super::contains_write("SUMMARIZE t", SqlDialect::Postgres));
+    }
+
+    /// (S4-L6-01) **Every head the unattended gate admits is a read to the
+    /// write guard**, on every engine — the two lists drifted apart once.
+    #[test]
+    fn every_read_only_head_is_a_read_to_contains_write() {
+        for d in EVERY_DIALECT {
+            for head in read_only_heads(d) {
+                let sql = format!("{head} x");
+                assert!(!super::contains_write(&sql, d), "{d:?}: {sql}");
+            }
+        }
     }
 
     /// **DuckDB's writers in its own catalogue are refused, and logged.**

@@ -145,9 +145,15 @@ which `read_only_reason` both tests against and builds its rejection message fro
 (`SHOW search_path` is real SQL there, while `DESCRIBE` isn't — psql's `\d` is a client command
 rather than a statement), `SELECT/EXPLAIN/WITH` on SQLite, and `SELECT/WITH` on SQL Server,
 whose plan is `SET SHOWPLAN_XML ON` — session state, not a head; and on DuckDB
-`SELECT/WITH/FROM/VALUES/SHOW/DESCRIBE/SUMMARIZE/EXPLAIN`, since DuckDB reads with a leading
-`FROM` and `DESCRIBE` and `SUMMARIZE` are queries over a relation — its `EXPLAIN ANALYZE` runs
-the statement, and the shared deny list's `ANALYZE` refuses it. One shared list was wrong in both
+`SELECT/WITH/FROM/VALUES/SHOW/DESCRIBE/SUMMARIZE/EXPLAIN/PIVOT/UNPIVOT`, since DuckDB reads with
+a leading `FROM` and `DESCRIBE`, `SUMMARIZE` and the `PIVOT` statements are queries over a
+relation — its `EXPLAIN ANALYZE` runs the statement, and the shared deny list's `ANALYZE` refuses
+it. **`contains_write` reads every one of them as a read too** — its fixed heads
+(`SELECT/SHOW/DESCRIBE/DESC/EXPLAIN/WITH/VALUES/TABLE`) plus this engine's `read_only_heads`.
+They were the fixed heads alone, so a read-only DuckDB connection refused `FROM t` and
+`SUMMARIZE t` as modifying data, a writable one asked to confirm each, and Analyze was withheld,
+while `schemaic query` ran the same text (`duckdb_reads_are_not_writes_to_the_editor`,
+`every_read_only_head_is_a_read_to_contains_write`). One shared list was wrong in both
 directions at once for a third engine: it waved `SHOW TABLES` through to SQLite, which has no
 such syntax, so the model got a raw parser error instead of being told the engine has no such
 thing, and a rejection named heads that connection couldn't use — which a model will keep
