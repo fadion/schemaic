@@ -1142,11 +1142,45 @@ impl SchemaComparison {
                     })
                 })
         };
+        // **A created routine a created view calls goes ahead of the views**
+        // (release review S5-L1-03): a view's body is bound at `CREATE` on
+        // DuckDB, PostgreSQL and MySQL alike, and the kinds' own order put
+        // every view before every function, so a new view over a new macro
+        // failed at Apply (*Scalar Function with name zz does not exist*) and
+        // the next compare offered the same plan. Decided by mention, as the
+        // dump's `routine_slots` does, never by flipping the kinds: a
+        // PostgreSQL `LANGUAGE sql` body may name a view, the reverse edge, so
+        // a routine whose own body names a view the plan creates stays where
+        // it was.
+        let right_views: Vec<&TableInfo> = right.tables.iter().filter(|t| t.is_view).collect();
+        let called_by_a_view = |e: &CompareEntry| {
+            matches!(e.kind, CompareKind::Function | CompareKind::Procedure)
+                && matches!(e.status, ObjectStatus::OnlyRight | ObjectStatus::Differing)
+                && right_views.iter().any(|v| {
+                    v.view_definition
+                        .as_deref()
+                        .is_some_and(|d| mentions(d, &e.name))
+                })
+                && !right
+                    .routines
+                    .iter()
+                    .filter(|r| r.name == e.name && r.schema == e.schema)
+                    .any(|r| right_views.iter().any(|v| mentions(&r.body, &v.name)))
+        };
         entries.sort_by_cached_key(|e| {
             let ph = if late_replace(e) {
                 3
             } else {
                 phase(e.kind, e.status)
+            };
+            // Within the views' rank, the routines they call come first.
+            let (kr, after_its_routines) = if called_by_a_view(e) {
+                (kind_rank(CompareKind::View, e.status), 0u8)
+            } else {
+                (
+                    kind_rank(e.kind, e.status),
+                    u8::from(e.kind == CompareKind::View),
+                )
             };
             let name = names.key(&display_name(e.schema.as_deref(), &e.name));
             // Tables and views carry a dependency rank; every other kind ties
@@ -1165,7 +1199,7 @@ impl SchemaComparison {
                 ObjectStatus::OnlyLeft if ranked => drops.get(&name).copied().unwrap_or(0),
                 _ => 0,
             };
-            (ph, kind_rank(e.kind, e.status), rank, e.key())
+            (ph, kr, after_its_routines, rank, e.key())
         });
 
         // ── name clashes between a table being dropped and one being created ─
@@ -3696,6 +3730,42 @@ mod tests {
 
     fn mysql(left: DbSchema, right: DbSchema) -> SchemaComparison {
         SchemaComparison::of(&left, &right, SqlDialect::MySql)
+    }
+
+    /// **A created function a created view calls is planned before the
+    /// views**, by mention; one whose own body names a view the plan creates
+    /// keeps the kinds' order, the reverse edge a PostgreSQL `LANGUAGE sql`
+    /// body can carry.
+    #[test]
+    fn a_created_routine_goes_ahead_of_the_views_that_call_it() {
+        let func = |name: &str, body: &str| {
+            std::sync::Arc::new(RoutineInfo {
+                name: name.into(),
+                kind: RoutineKind::Function,
+                body: body.into(),
+                ..Default::default()
+            })
+        };
+        let left = schema_of(vec![table("keep", &[("a", "integer")])]);
+        let mut right = schema_of(vec![
+            table("keep", &[("a", "integer")]),
+            view("aa", "SELECT zz(a) AS q FROM keep"),
+            view("ab", "SELECT yy() AS n"),
+        ]);
+        right.routines = vec![func("zz", "x + 1"), func("yy", "SELECT count(*) FROM aa")];
+        let c = SchemaComparison::of(&left, &right, SqlDialect::Postgres);
+        let order: Vec<String> = keys(&c)
+            .into_iter()
+            .filter(|k| !k.contains("keep"))
+            .collect();
+        let at = |k: &str| {
+            order
+                .iter()
+                .position(|o| o.contains(k))
+                .unwrap_or_else(|| panic!("{k} in {order:?}"))
+        };
+        assert!(at(":zz") < at(":aa"), "{order:?}");
+        assert!(at(":aa") < at(":yy"), "{order:?}");
     }
 
     /// **A MariaDB sequence is not a table, and the plan must not offer one.**

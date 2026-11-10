@@ -6626,6 +6626,29 @@ mod tests {
         assert_eq!(cells(&dst, "SELECT nextval('s2')"), vec![vec!["5"]]);
     }
 
+    /// **A new macro comes before the new view that calls it.** DuckDB binds
+    /// a view's body at `CREATE`, and the plan created views ahead of macros
+    /// — the kinds' own order — so Apply failed (*Scalar Function with name
+    /// zz does not exist*) and offered the same plan again.
+    #[test]
+    fn a_compare_creates_a_macro_before_the_view_that_calls_it() {
+        let dst = mem("compare_macro_view_dst");
+        let src = mem("compare_macro_view_src");
+        seed(&dst, "CREATE TABLE keep(a INTEGER);");
+        seed(
+            &src,
+            "CREATE TABLE keep(a INTEGER);
+             CREATE MACRO zz(x) AS x + 1;
+             CREATE VIEW aa AS SELECT zz(a) AS q FROM keep;
+             CREATE VIEW ab AS SELECT * FROM aa;",
+        );
+        let stmts = compared(&dst, &src).plan(|_| true).emit();
+        rt().block_on(dst.run_ddl("", &stmts, CancellationToken::new()))
+            .unwrap_or_else(|e| panic!("{e} — plan {stmts:#?}"));
+        let again = compared(&dst, &src).plan(|_| true).emit();
+        assert!(again.is_empty(), "still: {again:#?}");
+    }
+
     /// A column's collation is read back from the table's stored statement —
     /// the only place DuckDB keeps it — so one set in the designer is not an
     /// edit again on the next open, and a rebuild that leaves it alone keeps

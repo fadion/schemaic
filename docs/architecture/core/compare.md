@@ -210,7 +210,15 @@ through to their names — `CREATE VIEW a_totals AS … FROM z_detail` above the
 `z_detail`, which is the ERROR 1146 that half exists to prevent
 (`a_view_is_created_after_the_view_its_body_selects_from`). The rank lookup covers
 `CompareKind::Table | View` across `OnlyRight | Differing | OnlyLeft`; every other kind ties at
-zero and falls through to the name. The ordinal is in the sort key because the alphabetical
+zero and falls through to the name. **A created or altered routine that a view on the right
+calls takes the views' ordinal and sorts ahead of them** (`called_by_a_view`, by `mentions` of
+its name in a view's definition, as the dump's `routine_slots` decides): the declaration order
+put every view before every function, and a view's body is bound at `CREATE`, so a new DuckDB
+view over a new macro failed at Apply (*Scalar Function with name zz does not exist*) and the
+next compare offered the same plan. A routine whose own body names a view on the right keeps
+the kinds' order, the reverse edge a PostgreSQL `LANGUAGE sql` body can carry
+(`a_created_routine_goes_ahead_of_the_views_that_call_it`; end to end on DuckDB,
+`a_compare_creates_a_macro_before_the_view_that_calls_it`). The ordinal is in the sort key because the alphabetical
 fallback **is not a dependency
 order**: sorting a phase on `key` alone put `domain:` ahead of `enum:` and emitted
 `CREATE DOMAIN … AS app.mood` above the statement creating `mood`, and `trigger:` ahead of
