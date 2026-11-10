@@ -511,14 +511,22 @@ owner or grant (`access::drop_resets_table_access`), because `UpFront`'s promise
 and permissions back at the end is SQL Server's. **A sequence is not among the up-front drops**
 — its position is state, and a table outside the file may draw from it — so where the file
 drops up front, with Structure and *Drop before create* on, the objects loop writes it `CREATE
-SEQUENCE IF NOT EXISTS` and a replay meets it standing, counter kept. **And a counter can only go
-back as its start**: DuckDB has no `setval` and no `ALTER SEQUENCE … RESTART`, so where
-`counter_restarts_as_start` says so and the file carries rows, the sequence is created from
-`SequenceInfo::continued()` — its start moved to the value the source hands out next, wrapping
-where it cycles, and a used-up one that does not cycle keeping its last, whose collision then
-refuses loudly as the source's exhausted sequence does. Created at its declared start, a
+SEQUENCE IF NOT EXISTS` and a replay meets it standing, counter kept. **A counter goes back two
+ways on DuckDB**, which has no `ALTER SEQUENCE … RESTART` but does have `setval` (this said it had
+neither). Where `counter_restarts_as_start` says so and the file carries rows, the sequence is
+created from `SequenceInfo::continued()` — its start moved to the value the source hands out next,
+wrapping where it cycles, and a used-up one that does not cycle keeping its last, whose collision
+then refuses loudly as the source's exhausted sequence does. Created at its declared start, a
 `nextval` default after a restore handed out a key the rows already held and the first insert
 failed on the primary key. Without the rows it keeps its declared start, having nothing to clear.
+And **after the rows, `sequence_advance_sql` sets each such sequence to the source's last value
+— only forward**: a replay onto an older copy of the database meets its sequence standing (the
+`IF NOT EXISTS`), its counter behind the restored rows, so the `START` never applied and the first
+insert drew a key they held. The statement is guarded by `duckdb_sequences()`'s `last_value`
+(or `start_value - increment_by` for one never used), so a target already past the source keeps
+its place; `setval` is not transactional, so a restore that fails afterwards leaves only a gap
+(`a_replay_onto_an_older_copy_moves_its_counters_past_the_rows`). It goes in the *Key sequences*
+section beside PostgreSQL's `sequence_resync_sql`.
 **A macro is dropped up front as a macro of its own kind**, `DROP MACRO [TABLE] IF EXISTS`
 (`RoutineInfo::object_keyword`, under `schema.rs`), where the section wrote the `DROP FUNCTION
 IF EXISTS` its `RoutineKind` spells. That worked on a lone macro (measured on 2.0.0), so no

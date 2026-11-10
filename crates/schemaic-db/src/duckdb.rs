@@ -5207,6 +5207,39 @@ mod tests {
         assert_eq!(next_key(&src), (9, 101), "{file}");
     }
 
+    /// **A replay onto an older copy moves its sequences on past the rows.**
+    /// The file creates a sequence only where it is missing, so a target
+    /// whose counter stood behind the dumped rows kept it there, and the
+    /// first insert through the default drew a key the restored rows held.
+    /// DuckDB has `setval`, so the file moves each counter on after the rows
+    /// — never back.
+    #[test]
+    fn a_replay_onto_an_older_copy_moves_its_counters_past_the_rows() {
+        use schemaic_core::script::ExecEnd;
+        let src = mem("dump-older-src");
+        seed(&src, DUMP_FIXTURE);
+        let file = dump_file(&src, schemaic_core::dump::DumpOptions::default());
+        let dst = mem("dump-older-dst");
+        seed(
+            &dst,
+            "CREATE SCHEMA other;
+             CREATE SEQUENCE seq_id START 5 INCREMENT BY 2;
+             CREATE SEQUENCE other.oseq START 100;",
+        );
+        assert_eq!(restore_file(&dst, &file), ExecEnd::Done, "{file}");
+        assert_eq!(next_key(&dst), (9, 101), "{file}");
+        // And never back: a target already past the source keeps its place.
+        let ahead = mem("dump-ahead-dst");
+        seed(
+            &ahead,
+            "CREATE SCHEMA other;
+             CREATE SEQUENCE seq_id START 51 INCREMENT BY 2;
+             CREATE SEQUENCE other.oseq START 500;",
+        );
+        assert_eq!(restore_file(&ahead, &file), ExecEnd::Done, "{file}");
+        assert_eq!(next_key(&ahead), (51, 500), "{file}");
+    }
+
     /// **Without One transaction a replay stops at the first table a key
     /// points at, before dropping it** — the drop beside its `CREATE` meets
     /// the referencing table still standing — and leaves that table as it

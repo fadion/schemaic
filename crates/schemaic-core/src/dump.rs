@@ -940,15 +940,18 @@ pub fn drops_up_front(dialect: SqlDialect) -> bool {
     fk_guard_sql(dialect).is_none() && drop_cascade(dialect).is_empty()
 }
 
-/// Is a sequence's `START WITH` the only way a file can put its counter back
-/// — so a dump that carries rows creates it starting at the value the source
-/// hands out next ([`crate::schema::SequenceInfo::continued`])?
+/// Does a dump that carries rows create a sequence starting at the value the
+/// source hands out next ([`crate::schema::SequenceInfo::continued`]), rather
+/// than at its declared start?
 ///
-/// **DuckDB's**: it has no `setval` and no `ALTER SEQUENCE … RESTART`, so a
-/// sequence created at its declared start handed out keys the restored rows
-/// already held, and the first insert after a restore failed on the primary
-/// key. DuckDB's own `duckdb_sequences().sql` restates the counter the same
-/// way. PostgreSQL moves a key's sequence on after the rows
+/// **DuckDB's**: it has no `ALTER SEQUENCE … RESTART`, so a sequence created
+/// at its declared start handed out keys the restored rows already held, and
+/// the first insert after a restore failed on the primary key. DuckDB's own
+/// `duckdb_sequences().sql` restates the counter the same way. **It does have
+/// `setval`**, which this once said it did not: the `START` covers a sequence
+/// the file creates, and [`sequence_advance_sql`] moves one a replay finds
+/// already standing on after the rows — the older copy whose counter stood
+/// behind them. PostgreSQL moves a key's sequence on after the rows
 /// ([`sequence_resync_sql`]), SQL Server takes the used range
 /// (`TsqlObject::restart_sql`), and MariaDB restarts its sequence table
 /// (`TableInfo::sequence_restart_sql`).
@@ -1532,6 +1535,45 @@ pub fn sequence_resync_sql(t: &TableInfo, dialect: SqlDialect) -> Vec<String> {
             )
         })
         .collect()
+}
+
+/// The statement that moves sequence `s` on to where the source's counter
+/// stands, **after the rows**, or `None` where the file needs none.
+///
+/// **DuckDB's**, whose file creates a sequence starting where the source's
+/// goes on ([`counter_restarts_as_start`]) — and only where it is missing,
+/// so a replay onto an older copy of the database met its sequence standing
+/// with the counter behind the restored rows, and the first insert through
+/// the default drew a key they held. DuckDB has `setval` (2.0: `setval(s, v)`
+/// makes the next `nextval` `v + increment`), so this sets the source's last
+/// value — **only forward**: a target whose counter is already past it keeps
+/// its place, read off `duckdb_sequences()`, since moving one back would hand
+/// out keys again. `setval` is not transactional (release review, measured on
+/// 2.0: a rolled-back `setval` stays), so a restore
+/// that fails after it leaves the counter moved on, which costs only a gap.
+/// `None` for a sequence never used, which starts where the source's does.
+pub fn sequence_advance_sql(
+    s: &crate::schema::SequenceInfo,
+    dialect: SqlDialect,
+) -> Option<String> {
+    match dialect {
+        SqlDialect::DuckDb => {}
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => {
+            return None;
+        }
+    }
+    let last = s.last_value?;
+    let name = crate::schema::qualified_ident(&s.name, s.schema.as_deref(), dialect);
+    let lit = |t: &str| crate::schema::ddl_string(t, dialect);
+    let behind = if s.increment < 0 { ">" } else { "<" };
+    Some(format!(
+        "SELECT setval({}, {last}) WHERE coalesce((SELECT coalesce(last_value, start_value - increment_by) \
+         FROM duckdb_sequences() WHERE database_name = current_database() AND schema_name = {} \
+         AND sequence_name = {}), {last}) {behind} {last};",
+        lit(&name),
+        lit(s.schema.as_deref().unwrap_or("main")),
+        lit(&s.name),
+    ))
 }
 
 /// Does `fk`, declared on `owner`, point at `cand`?
@@ -3533,6 +3575,9 @@ pub fn plan(
     // in place — MySQL 8's — whose grants that `DROP` revokes and the file's
     // end gives back (`access::RoutineGrant`).
     let mut regranted: Vec<(String, crate::schema::RoutineKind)> = Vec::new();
+    // The sequences whose counter the file moves on after the rows
+    // ([`sequence_advance_sql`]), written in the key counters' section.
+    let mut advanced: Vec<String> = Vec::new();
     // **A replay where nothing is dropped up front** — every engine but the
     // one that drops up front — meets each standalone object the file
     // carries still standing, and a bare `CREATE` stopped it at the first
@@ -3630,6 +3675,7 @@ pub fn plan(
                         crate::schema::ObjectItem::Sequence(s)
                             if opts.data && counter_restarts_as_start(dialect) =>
                         {
+                            advanced.extend(sequence_advance_sql(s, dialect));
                             s.continued().create_sql(dialect)
                         }
                         _ => o.create_sql(dialect),
@@ -4172,6 +4218,7 @@ pub fn plan(
         let resync: Vec<String> = order
             .iter()
             .flat_map(|&i| sequence_resync_sql(&schema.tables[i], dialect))
+            .chain(advanced)
             .collect();
         if !resync.is_empty() {
             steps.push(DumpStep::Text("-- Key sequences".to_string()));
@@ -7416,6 +7463,48 @@ mod tests {
             panic!("{:?}", p.steps[0])
         };
         assert!(h.contains("sqlcmd -x"), "{h}");
+    }
+
+    /// **Only DuckDB's file moves a sequence on after the rows**, only one
+    /// the source has used, and only forward — the comparison turned round
+    /// for a descending one.
+    #[test]
+    fn a_duckdb_sequence_is_moved_on_only_forward() {
+        let s = crate::schema::SequenceInfo {
+            name: "s".into(),
+            schema: Some("main".into()),
+            last_value: Some(7),
+            increment: 2,
+            ..Default::default()
+        };
+        let sql = sequence_advance_sql(&s, SqlDialect::DuckDb).unwrap();
+        assert!(
+            sql.starts_with("SELECT setval('\"main\".\"s\"', 7) WHERE"),
+            "{sql}"
+        );
+        assert!(sql.ends_with("< 7;"), "{sql}");
+        let down = crate::schema::SequenceInfo {
+            increment: -1,
+            ..s.clone()
+        };
+        assert!(
+            sequence_advance_sql(&down, SqlDialect::DuckDb)
+                .unwrap()
+                .ends_with("> 7;")
+        );
+        let unused = crate::schema::SequenceInfo {
+            last_value: None,
+            ..s.clone()
+        };
+        assert_eq!(sequence_advance_sql(&unused, SqlDialect::DuckDb), None);
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            assert_eq!(sequence_advance_sql(&s, d), None, "{d:?}");
+        }
     }
 
     /// **DuckDB reads what its driver cannot carry as DuckDB's own text**,

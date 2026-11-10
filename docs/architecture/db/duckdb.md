@@ -359,8 +359,10 @@ drops everything up front as SQL Server's does — but with no key drops, DuckDB
 TABLE … DROP CONSTRAINT`: the referencing table is dropped before the one it references, and its
 keys go with it. Each table's captured text, comments and keys inline, is created and filled in
 turn, its indexes are built after every table's rows, a schema other than `main` is created if
-missing, and a sequence restarts at the value the source hands out next, DuckDB having no
-`setval` to move it on with. The round trip is tested for real on in-memory instances, through
+missing, and a sequence is created starting at the value the source hands out next — and, after
+the rows, moved on to it with `setval` where a replay found it already standing behind them, only
+ever forward (`dump::sequence_advance_sql`; this said DuckDB had no `setval`, and it does, though
+not transactionally). The round trip is tested for real on in-memory instances, through
 `plan`, `render_rows`, the script splitter and `run_script` as *Export* and *Run SQL file* run
 them: a fixture of two schemas, two sequences behind key defaults, a check, a unique constraint,
 a foreign key, two indexes, a view, a macro, table and column comments and `DATE`, `JSON`, list
