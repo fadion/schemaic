@@ -230,7 +230,13 @@ pub fn layout(
         Plot::Stacked(s) if s.stacks.len() > 1 => s
             .stacks
             .iter()
-            .map(|name| (name.clone(), measure(name)))
+            // Cut as the axis labels are: an entry first on its row is never
+            // wrapped, so a long name would run past the canvas's edge.
+            .map(|name| {
+                let name = crate::chart::short_label(name);
+                let size = measure(&name);
+                (name, size)
+            })
             .collect(),
         _ => Vec::new(),
     };
@@ -933,6 +939,27 @@ mod tests {
             );
             assert!(e.label.top + e.label.h <= 400.0, "{e:?}");
         }
+    }
+
+    /// **A long stack name is shortened, not run off the canvas.** An entry
+    /// first on its row was never moved or cut, so a 70-character name ran
+    /// past the right edge of the view and of the exported file.
+    #[test]
+    fn a_long_stack_name_stays_inside_the_canvas() {
+        let long = "z".repeat(70);
+        let s = layout(
+            &stacked(&[&long, "b"], false, vec![vec![1.0, 2.0]]),
+            300.0,
+            400.0,
+            &Metrics::BASE,
+            &mut measure,
+        )
+        .expect("drawable");
+        assert_eq!(s.legend.len(), 2);
+        for e in &s.legend {
+            assert!(e.label.left + e.label.w <= 300.0, "{e:?}");
+        }
+        assert_eq!(s.legend[0].label.text, crate::chart::short_label(&long));
     }
 
     /// The legend is measured last, after the labels under the axis.

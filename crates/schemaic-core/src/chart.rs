@@ -90,7 +90,11 @@ fn number(rs: &ResultSet, row: usize, col: usize) -> Option<f64> {
 }
 
 /// The columns that can be plotted: every non-NULL cell reads as a number,
-/// and at least one is not NULL.
+/// and at least one is a finite one.
+///
+/// **A NaN or an infinity is a number no axis can hold, not a text**: it
+/// leaves the column eligible and is skipped where it would be drawn, as a
+/// NULL is. One such cell used to take the whole column out of every picker.
 pub fn numeric_columns(rs: &ResultSet) -> Vec<usize> {
     (0..rs.col_count())
         .filter(|&c| {
@@ -100,14 +104,25 @@ pub fn numeric_columns(rs: &ResultSet) -> Vec<usize> {
                 if cell.tag == CellTag::Null {
                     continue;
                 }
-                if number(rs, r, c).is_none() {
-                    return false;
+                match cell.text().trim().parse::<f64>() {
+                    Ok(v) if v.is_finite() => any = true,
+                    Ok(_) => {}
+                    Err(_) => return false,
                 }
-                any = true;
             }
             any
         })
         .collect()
+}
+
+/// A name cut to what an axis label or a legend entry has room for: past 18
+/// characters, its first 17 and an ellipsis.
+pub fn short_label(s: &str) -> String {
+    if s.chars().count() > 18 {
+        format!("{}…", s.chars().take(17).collect::<String>())
+    } else {
+        s.to_string()
+    }
 }
 
 /// The pickers' name for each column, one per column and no two alike — the
@@ -235,8 +250,10 @@ impl Stacked {
 pub fn stacked(rs: &ResultSet, label: Option<usize>, by: Option<usize>, value: usize) -> Stacked {
     use std::collections::HashMap;
     let mut out = Stacked::default();
-    let mut bars: HashMap<String, usize> = HashMap::new();
-    let mut stacks: HashMap<String, usize> = HashMap::new();
+    // Keyed on `None` for a NULL, so a NULL and the text `'NULL'` — drawn
+    // alike — are still summed apart.
+    let mut bars: HashMap<Option<String>, usize> = HashMap::new();
+    let mut stacks: HashMap<Option<String>, usize> = HashMap::new();
     let mut cells: Vec<(usize, usize, f64)> = Vec::new();
     for r in 0..rs.row_count() {
         let Some(v) = number(rs, r, value) else {
@@ -244,24 +261,28 @@ pub fn stacked(rs: &ResultSet, label: Option<usize>, by: Option<usize>, value: u
             continue;
         };
         let name = label_text(rs, r, label);
-        let bar = match bars.get(&name) {
+        let name_key = match label.and_then(|c| rs.cell(r, c)) {
+            Some(c) if c.tag == CellTag::Null => None,
+            _ => Some(name.clone()),
+        };
+        let bar = match bars.get(&name_key) {
             Some(&i) => i,
             None if out.labels.len() == MAX_POINTS => {
                 out.skipped += 1;
                 continue;
             }
             None => {
-                bars.insert(name.clone(), out.labels.len());
+                bars.insert(name_key, out.labels.len());
                 out.labels.push(name);
                 out.labels.len() - 1
             }
         };
         let key = match by {
             Some(c) => match rs.cell(r, c) {
-                Some(cell) if cell.tag != CellTag::Null => cell.text().to_string(),
-                _ => "NULL".to_string(),
+                Some(cell) if cell.tag != CellTag::Null => Some(cell.text().to_string()),
+                _ => None,
             },
-            None => String::new(),
+            None => Some(String::new()),
         };
         let stack = match stacks.get(&key) {
             Some(&i) => i,
@@ -271,7 +292,7 @@ pub fn stacked(rs: &ResultSet, label: Option<usize>, by: Option<usize>, value: u
             }
             None => {
                 stacks.insert(key.clone(), out.stacks.len());
-                out.stacks.push(key);
+                out.stacks.push(key.unwrap_or_else(|| "NULL".to_string()));
                 out.stacks.len() - 1
             }
         };
@@ -622,13 +643,7 @@ impl Plot {
     /// The labels under the x axis — first, middle and last — each with where
     /// it sits across the plot, `0.0..=1.0`.
     pub fn x_labels(&self) -> Vec<(f64, String)> {
-        let cut = |s: &str| -> String {
-            if s.chars().count() > 18 {
-                format!("{}…", s.chars().take(17).collect::<String>())
-            } else {
-                s.to_string()
-            }
-        };
+        let cut = short_label;
         let slots = |labels: &[String]| -> Vec<(f64, String)> {
             let n = labels.len();
             if n == 0 {
@@ -1302,5 +1317,68 @@ mod tests {
         assert_eq!(ChartKind::ALL.len(), 5);
         assert_eq!(ChartKind::Scatter.label(), "Scatter");
         assert_eq!(ChartKind::StackedBar.label(), "Stacked bar");
+    }
+
+    /// **A NaN or an infinity is a number no axis can hold, not a text.**
+    /// One such cell took the whole column out of every picker, the scatter's
+    /// X axis included; now it is left out as a NULL is, and counted.
+    #[test]
+    fn a_nan_or_infinite_cell_is_skipped_not_disqualifying() {
+        let r = rs(
+            &["v", "w"],
+            vec![
+                vec![Value::Float(1.0), Value::Float(f64::INFINITY)],
+                vec![Value::Float(2.0), Value::Float(f64::NEG_INFINITY)],
+                vec![Value::Float(f64::NAN), Value::Null],
+            ],
+        );
+        // `w` holds no finite number at all: nothing to draw.
+        assert_eq!(numeric_columns(&r), [0]);
+        let s = series(&r, None, 0);
+        assert_eq!(s.values, [1.0, 2.0]);
+        assert_eq!(s.skipped, 1);
+        // A text column still is not a number.
+        let t = rs(&["t"], vec![vec![s_("1")], vec![s_("x")]]);
+        assert!(numeric_columns(&t).is_empty());
+    }
+
+    fn s_(v: &str) -> Value {
+        s(v)
+    }
+
+    /// **A NULL is not the text `NULL`.** Summing by key put a NULL label and
+    /// a literal `'NULL'` into one bar, and the same for a stack.
+    #[test]
+    fn a_null_label_or_stack_is_not_the_text_null() {
+        let r = rs(
+            &["label", "by", "v"],
+            vec![
+                vec![Value::Null, s("a"), Value::Int(5)],
+                vec![s("NULL"), s("a"), Value::Int(3)],
+                vec![s("x"), Value::Null, Value::Int(1)],
+                vec![s("x"), s("NULL"), Value::Int(2)],
+            ],
+        );
+        let st = stacked(&r, Some(0), Some(1), 2);
+        assert_eq!(st.labels, ["NULL", "NULL", "x"]);
+        assert_eq!(st.stacks, ["a", "NULL", "NULL"]);
+        assert_eq!(
+            st.values,
+            [
+                vec![5.0, 0.0, 0.0],
+                vec![3.0, 0.0, 0.0],
+                vec![0.0, 1.0, 2.0]
+            ]
+        );
+    }
+
+    /// Long names are cut to the axis labels' length, with an ellipsis.
+    #[test]
+    fn short_label_cuts_past_eighteen_characters() {
+        assert_eq!(short_label("north"), "north");
+        assert_eq!(short_label(&"x".repeat(18)), "x".repeat(18));
+        let cut = short_label(&"y".repeat(70));
+        assert_eq!(cut.chars().count(), 18);
+        assert!(cut.ends_with('…'));
     }
 }

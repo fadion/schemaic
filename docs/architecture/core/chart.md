@@ -12,9 +12,12 @@ non-number and a NaN are not — rather than one whose wire tag says so, because
 and are the columns most worth charting. The cost of asking the text is the other direction: a
 `varchar` column that happens to hold only digits is offered too. Unlike `aggregate.rs` this is
 plain `f64`, not fixed-point — nothing here prints a cell's value back, only a position and a
-tick. `numeric_columns(rs)` is every column whose non-NULL cells all read as numbers, with at
-least one non-NULL (`a_column_is_numeric_when_every_value_reads_as_a_number`), so a column of
-nothing but NULLs is not offered. `picker_labels(names, reserved)` is the modal's pickers' name
+tick. `numeric_columns(rs)` is every column whose non-NULL cells all parse as numbers, with at
+least one finite (`a_column_is_numeric_when_every_value_reads_as_a_number`), so a column of
+nothing but NULLs is not offered. **A NaN or an infinity parses but is no number an axis can
+hold**: it keeps the column eligible and is skipped where it would be drawn, counted as a NULL is
+— one such cell used to take the whole column out of every picker, the scatter's X axis included
+(`a_nan_or_infinite_cell_is_skipped_not_disqualifying`). `picker_labels(names, reserved)` is the modal's pickers' name
 per column, no two alike and none equal to a reserved option: the first of a name stays bare, a
 repeat takes its 1-based position (`id (3)`).
 `ChartKind::{Bar, Line, Histogram, Scatter, StackedBar}` (`label`; `ALL` in the *Chart* picker's
@@ -38,7 +41,8 @@ than drawing a bar per row: `values[label][stack]` adds up every row's value for
 and stacks each in the order they first appear and `0.0` where a label has none of a stack,
 because a stacked bar's rows name the same label once per segment — so a `GROUP BY a, b` result
 reads straight in (`a_stacked_bar_sums_each_label_and_stack_in_first_seen_order`). A NULL label
-or segment reads `"NULL"`, and no `by` is one segment per label
+or segment reads `"NULL"` — drawn so, but **keyed apart** from the text `'NULL'`, now that rows
+are summed by key (`a_null_label_or_stack_is_not_the_text_null`) — and no `by` is one segment per label
 (`a_stacked_bar_without_a_stack_column_has_one_segment`). At most `MAX_STACKS` (8) segments are
 named — one colour each, and no palette tells more apart — and every later one is summed into one
 more, `OTHER`, last, with `other` set (`stacks_past_the_cap_fold_into_one_other_segment`);
@@ -72,7 +76,8 @@ directions, so a bar's net total would not reach the ends of its segments
 (`a_stacked_range_spans_the_positive_and_negative_totals`). `Plot::x_range` is a scatter's
 horizontal axis — the first and last of `ticks` over its X values, the span its dots are placed
 across — and `None` for every other kind, whose x is a slot per label. `Plot::x_labels` is first,
-middle and last with where each sits across the plot, cut at 18 characters — a stacked bar's from
+middle and last with where each sits across the plot, cut at 18 characters by `short_label` (17
+and an ellipsis — the legend's cut too; `short_label_cuts_past_eighteen_characters`) — a stacked bar's from
 its labels as a series' are — a histogram's being its edges and midpoint
 (`x_labels_are_first_middle_and_last`), and a scatter's **every X tick** at its position,
 labelled as one axis by `tick_labels`; and `caption(rows, kind, skipped, truncated)` the line

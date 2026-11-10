@@ -21,7 +21,10 @@ inside the box (`labels_under_the_axis_stay_inside_the_box`). A scatter also has
 a vertical grid line per X tick. A stacked bar of more than one stack has `Scene::legend`, a
 `LegendEntry { stack, swatch, label }` per stack, flowed left to right from the plot's left edge
 under the labels and wrapped at its right one, **its rows' height taken off the plot's** so it
-stays inside the box (`a_wide_legend_wraps_onto_more_rows`); a single stack is a bar chart and
+stays inside the box (`a_wide_legend_wraps_onto_more_rows`). Each name is measured **after
+`chart::short_label` cuts it**, as the axis labels are, because an entry first on its row is never
+wrapped and a long one ran past the canvas and out of the exported file
+(`a_long_stack_name_stays_inside_the_canvas`); a single stack is a bar chart and
 has none, the plot keeping its full height. `Scene::other_stack` is the folded *Other* segment's
 index. `stack_fill(scene, stack, palette, mark, other)` is **the one answer to a segment's or a
 swatch's colour**, generic over the colour type so the canvas asks it in `Color`s and the export in
