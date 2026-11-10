@@ -54,7 +54,9 @@ new database, press **New file** inside the field instead: choose where to save 
 creates an empty database there and fills in the path. SQLite's **New file** works the same way.
 If you choose a file that already
 exists and agree to replace it, it becomes a new, empty database — though if creating it fails,
-the old file is left as it was, and the reason shows under the field.
+the old file is left as it was, and the reason shows under the field. A file Schemaic has open
+itself, or one with a `-wal`, `-journal` or `.wal` file beside it, isn't replaced; the reason
+says which.
 
 - *The file must already exist.* Connecting never creates a DuckDB database, so a mistyped path
   is refused rather than turned into an empty one; use **New file** for that. An in-memory

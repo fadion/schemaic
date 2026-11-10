@@ -44,6 +44,11 @@ On SQLite and DuckDB you can pick an existing file to replace it. The copy is wr
 the old file as it was. If the finished copy can't take its place — the file is open in another
 program, say — it stays as `<name>.part`, and the error names it.
 
+Three files can't be replaced, and the backup says why before it starts: the database you're
+backing up, a DuckDB file Schemaic itself has open (a Manual tab on it, say), and a file with a
+`-wal`, `-journal` or `.wal` file beside it, which the new copy would read in when it opens. That
+last file isn't removed for you, since it can hold another program's unsaved work.
+
 ## Restoring
 
 Right-click a database, choose **Restore from file** and pick the file. You're asked to confirm

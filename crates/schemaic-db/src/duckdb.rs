@@ -319,6 +319,21 @@ fn instance_with(db: &Db, make_memory: bool) -> Result<Arc<Instance>, DbError> {
     Ok(inst)
 }
 
+/// Does this process hold an instance open on the file at `canonical` — an
+/// operation running on it, or a Manual tab's pinned connection? The
+/// registry's keys are canonical paths ([`open_target`]). A backup or *New
+/// file* must not replace such a file: on Unix the rename succeeds under the
+/// open descriptor, and the instance's later commits go into a file no path
+/// names.
+pub(crate) fn holds(canonical: &std::path::Path) -> bool {
+    let key = canonical.to_string_lossy();
+    INSTANCES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key.as_ref())
+        .is_some_and(|w| w.strong_count() > 0)
+}
+
 /// An **Open data file** session: a throwaway in-memory database, open for as
 /// long as this value is held.
 ///

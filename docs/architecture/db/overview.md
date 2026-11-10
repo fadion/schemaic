@@ -813,9 +813,22 @@ is discarded and never touches the target, and `std::fs::rename` replaces an exi
 Windows as elsewhere. A whole copy that cannot be renamed in — the target held open — is **kept**,
 and the error names it ("… is complete, but it could not replace …"), since it is the one good
 copy there is — worded with no engine and no purpose, a new DuckDB file sharing it. The engines' own refusals stay: they now only ever see the `.part`
-path. The three file operations sit behind a private `StagingFs` trait (`RealFs` in the app) so
-the order is tested without a file — `a_backup_replaces_its_target_only_with_a_whole_copy`,
-`a_copy_that_cannot_replace_its_target_is_kept_and_named`. **It keeps half of
+path. **Three targets are refused before anything is staged**, because a rename succeeds on
+Unix under an open descriptor and the replaced file is not the end of it: the backup's own
+**source**, compared by canonical path (its later writes would go into a file no path names); a
+file **an instance in this process holds** (`duckdb::holds` — a Manual tab's pinned connection or
+a running operation, whose later commits are lost the same way); and a target with an engine
+**sidecar** beside it (`sidecar_paths`: SQLite's `-wal`/`-journal`, DuckDB's `.wal`), which the
+new file would replay on open — the replaced database's tables in a "new" SQLite file, a DuckDB
+file refused with *WAL does not match database file*. The sidecar is named and never removed: a
+live one can hold another program's committed data. SQLite has no registry, so a SQLite file
+another connection holds is caught only through its sidecar (a WAL-mode file's `-wal`, a writing
+transaction's `-journal`). The file operations and those three questions sit behind a private
+`StagingFs` trait (`RealFs` in the app) so the order is tested without a file —
+`a_backup_replaces_its_target_only_with_a_whole_copy`,
+`a_copy_that_cannot_replace_its_target_is_kept_and_named`,
+`a_backup_onto_its_own_source_is_refused`, `a_target_this_process_holds_open_is_refused`,
+`a_target_with_a_sidecar_is_refused_and_the_sidecar_named`. **It keeps half of
 `persist::create_part`'s policy** (security review S31): the sibling is cleared with
 `remove_file`, which unlinks a planted link rather than following it, and on Unix `RealFs::publish`
 gives the finished copy the replaced target's permissions, or `0600` for a new file, *before* the

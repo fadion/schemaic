@@ -2040,9 +2040,18 @@ pub const CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 /// because nobody is waiting on a timer for them to give up.
 pub const WORKLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The three file operations a staged backup needs — a seam, so the order
-/// they run in is tested without a file ([`staged_backup`]).
+/// The file operations and questions a staged backup needs — a seam, so the
+/// order they run in, and what refuses a target first, is tested without a
+/// file ([`staged_backup`]).
 trait StagingFs {
+    /// `path`'s canonical form, or `None` where nothing is there to name.
+    fn existing(&self, path: &std::path::Path) -> Option<std::path::PathBuf>;
+    /// Does this process hold the file at `canonical` open — a DuckDB
+    /// instance on it ([`duckdb::holds`])?
+    fn held(&self, canonical: &std::path::Path) -> bool;
+    /// The engines' sidecars beside `target` that exist: SQLite's `-wal` and
+    /// `-journal`, DuckDB's `.wal`.
+    fn sidecars(&self, target: &std::path::Path) -> Vec<std::path::PathBuf>;
     /// Remove whatever sits at the staging path: a fragment a failed backup
     /// left. The engines' copies refuse a target that exists.
     fn clear(&self, part: &std::path::Path) -> std::io::Result<()>;
@@ -2056,6 +2065,18 @@ trait StagingFs {
 struct RealFs;
 
 impl StagingFs for RealFs {
+    fn existing(&self, path: &std::path::Path) -> Option<std::path::PathBuf> {
+        std::fs::canonicalize(path).ok()
+    }
+    fn held(&self, canonical: &std::path::Path) -> bool {
+        duckdb::holds(canonical)
+    }
+    fn sidecars(&self, target: &std::path::Path) -> Vec<std::path::PathBuf> {
+        sidecar_paths(target)
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect()
+    }
     fn clear(&self, part: &std::path::Path) -> std::io::Result<()> {
         match std::fs::remove_file(part) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
@@ -2084,6 +2105,22 @@ impl StagingFs for RealFs {
     }
 }
 
+/// The sidecars an embedded engine keeps beside a database file, whether or
+/// not they exist: SQLite's `-wal` and `-journal`, DuckDB's `.wal`. A file
+/// replaced while one stands beside it opens with the old one replayed into
+/// it — the old tables in a "new" SQLite file, a DuckDB file refused with
+/// *WAL does not match database file*.
+fn sidecar_paths(target: &std::path::Path) -> Vec<std::path::PathBuf> {
+    ["-wal", "-journal", ".wal"]
+        .iter()
+        .map(|s| {
+            let mut name = target.as_os_str().to_os_string();
+            name.push(s);
+            std::path::PathBuf::from(name)
+        })
+        .collect()
+}
+
 /// Run `copy` into `target`'s `.part` sibling ([`schemaic_core::export::part_file`]),
 /// then rename it over `target`.
 ///
@@ -2094,12 +2131,49 @@ impl StagingFs for RealFs {
 /// target is touched only by the rename of a whole copy, a failed copy is
 /// removed and leaves the target as it was, and a copy that cannot be renamed
 /// in — the target held open elsewhere — is kept and named in the error.
-async fn staged_backup<F, Fut>(fs: &impl StagingFs, target: &str, copy: F) -> Result<(), DbError>
+///
+/// **Three targets are refused before anything is staged**: `source` itself
+/// (a backup's own database), a file an instance in this process holds, and
+/// one with an engine sidecar beside it ([`sidecar_paths`]) — see the checks
+/// below for why each.
+async fn staged_backup<F, Fut>(
+    fs: &impl StagingFs,
+    target: &str,
+    source: Option<&str>,
+    copy: F,
+) -> Result<(), DbError>
 where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<(), DbError>>,
 {
     let target_path = std::path::Path::new(target);
+    // **What the target is, before anything touches it.** A rename over the
+    // source, or over a file an instance here holds, succeeds on Unix under
+    // the open descriptor, and that connection's later commits go into a file
+    // no path names; a sidecar left beside the replaced file is replayed into
+    // the new one when it opens. Refused, not worked around: the sidecar may
+    // hold another program's committed data.
+    if let Some(canonical) = fs.existing(target_path) {
+        if source.is_some_and(|s| fs.existing(std::path::Path::new(s)).as_ref() == Some(&canonical))
+        {
+            return Err(DbError::Query(format!(
+                "{target} is the database being backed up; a backup cannot replace the file it copies"
+            )));
+        }
+        if fs.held(&canonical) {
+            return Err(DbError::Query(format!(
+                "{target} is open in this app (a running operation or a Manual tab); \
+                 close what holds it before replacing it"
+            )));
+        }
+    }
+    if let Some(side) = fs.sidecars(target_path).first() {
+        return Err(DbError::Query(format!(
+            "{} stands beside {target} and would be read into the new file; \
+             it is not removed for you, since it can hold committed data",
+            side.display()
+        )));
+    }
     let part = schemaic_core::export::part_file(target_path);
     fs.clear(&part)
         .map_err(|e| DbError::Query(format!("{}: {e}", part.display())))?;
@@ -2122,7 +2196,7 @@ where
 /// dialog asks before replacing a file, and a yes there is honoured only once
 /// the new database is whole, so a failed create leaves the old file as it was.
 pub async fn create_duckdb_file(path: &str) -> Result<(), DbError> {
-    staged_backup(&RealFs, path, duckdb::create_file).await
+    staged_backup(&RealFs, path, None, duckdb::create_file).await
 }
 
 /// [`create_duckdb_file`] for SQLite — an **empty SQLite database** at `path`,
@@ -2130,7 +2204,7 @@ pub async fn create_duckdb_file(path: &str) -> Result<(), DbError> {
 /// (`sqlite::open` has no `SQLITE_OPEN_CREATE`), so this is the one way to
 /// start a database from the form, staged for the same reason.
 pub async fn create_sqlite_file(path: &str) -> Result<(), DbError> {
-    staged_backup(&RealFs, path, sqlite::create_file).await
+    staged_backup(&RealFs, path, None, sqlite::create_file).await
 }
 
 impl Db {
@@ -2141,10 +2215,16 @@ impl Db {
     pub async fn backup_to_file(&self, target: &str) -> Result<(), DbError> {
         match self.engine {
             Engine::Sqlite => {
-                staged_backup(&RealFs, target, |part| sqlite::backup_to(self, part)).await
+                staged_backup(&RealFs, target, Some(&self.file), |part| {
+                    sqlite::backup_to(self, part)
+                })
+                .await
             }
             Engine::DuckDb => {
-                staged_backup(&RealFs, target, |part| duckdb::backup_to(self, part)).await
+                staged_backup(&RealFs, target, Some(&self.file), |part| {
+                    duckdb::backup_to(self, part)
+                })
+                .await
             }
             Engine::MySql | Engine::Postgres | Engine::MsSql => {
                 Err(DbError::Refused(DbRefusal::BackupInTerminal))
@@ -3997,9 +4077,29 @@ mod tests {
     struct FakeFs {
         calls: std::sync::Mutex<Vec<String>>,
         publish_fails: bool,
+        /// Paths that exist, each with its canonical form.
+        files: Vec<(&'static str, &'static str)>,
+        /// Canonical paths an instance in this process holds.
+        held: Vec<&'static str>,
+        /// Sidecars standing beside the target.
+        sidecars: Vec<&'static str>,
     }
 
     impl StagingFs for FakeFs {
+        fn existing(&self, path: &std::path::Path) -> Option<std::path::PathBuf> {
+            self.files
+                .iter()
+                .find(|(p, _)| std::path::Path::new(p) == path)
+                .map(|(_, c)| std::path::PathBuf::from(c))
+        }
+        fn held(&self, canonical: &std::path::Path) -> bool {
+            self.held
+                .iter()
+                .any(|h| std::path::Path::new(h) == canonical)
+        }
+        fn sidecars(&self, _target: &std::path::Path) -> Vec<std::path::PathBuf> {
+            self.sidecars.iter().map(std::path::PathBuf::from).collect()
+        }
         fn clear(&self, part: &std::path::Path) -> std::io::Result<()> {
             self.calls
                 .lock()
@@ -4038,7 +4138,7 @@ mod tests {
         let wrote = std::sync::Mutex::new(None);
         // A bare name, so the expected paths carry no separator to differ by
         // platform.
-        staged_backup(&fs, "shop.duckdb", |part| {
+        staged_backup(&fs, "shop.duckdb", None, |part| {
             *wrote.lock().unwrap() = Some(part.clone());
             async { Ok(()) }
         })
@@ -4054,7 +4154,7 @@ mod tests {
         );
 
         let fs = FakeFs::default();
-        let r = staged_backup(&fs, "shop.duckdb", |_| async {
+        let r = staged_backup(&fs, "shop.duckdb", None, |_| async {
             Err(DbError::Query("disk full".into()))
         })
         .await;
@@ -4074,7 +4174,7 @@ mod tests {
             publish_fails: true,
             ..Default::default()
         };
-        let r = staged_backup(&fs, "shop.duckdb", |_| async { Ok(()) }).await;
+        let r = staged_backup(&fs, "shop.duckdb", None, |_| async { Ok(()) }).await;
         let Err(DbError::Query(m)) = r else {
             panic!("{r:?}")
         };
@@ -4088,6 +4188,76 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|c| c.starts_with("discard"))
+        );
+    }
+
+    /// Staged with `fs`, for a target the copy must never reach: the refusal
+    /// comes first, so nothing is cleared, copied or published.
+    async fn refused(fs: &FakeFs, target: &str, source: Option<&str>) -> String {
+        let copied = std::sync::atomic::AtomicBool::new(false);
+        let r = staged_backup(fs, target, source, |_| {
+            copied.store(true, std::sync::atomic::Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await;
+        assert!(!copied.load(std::sync::atomic::Ordering::SeqCst), "copied");
+        assert!(fs.calls.lock().unwrap().is_empty(), "{:?}", fs.calls);
+        match r {
+            Err(DbError::Query(m)) => m,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **A backup never replaces the database it copies**, however the two
+    /// paths are spelled: on Unix the rename succeeds under the open file,
+    /// and the source's later writes go into a file no path names.
+    #[tokio::test]
+    async fn a_backup_onto_its_own_source_is_refused() {
+        let fs = FakeFs {
+            files: vec![
+                ("shop.duckdb", "/d/shop.duckdb"),
+                ("./shop.duckdb", "/d/shop.duckdb"),
+            ],
+            ..Default::default()
+        };
+        let m = refused(&fs, "./shop.duckdb", Some("shop.duckdb")).await;
+        assert!(m.contains("./shop.duckdb"), "{m}");
+    }
+
+    /// **Nor a file an instance in this process holds** — a Manual tab's
+    /// pinned DuckDB connection, or another connection's operation: *New
+    /// file* and a backup alike.
+    #[tokio::test]
+    async fn a_target_this_process_holds_open_is_refused() {
+        let fs = FakeFs {
+            files: vec![("app.duckdb", "/d/app.duckdb")],
+            held: vec!["/d/app.duckdb"],
+            ..Default::default()
+        };
+        let m = refused(&fs, "app.duckdb", None).await;
+        assert!(m.contains("app.duckdb"), "{m}");
+    }
+
+    /// **Nor a file with a sidecar beside it**: the replaced file's `-wal`
+    /// would be replayed into the new one. Named, and never deleted — a live
+    /// one can hold another program's committed data.
+    #[tokio::test]
+    async fn a_target_with_a_sidecar_is_refused_and_the_sidecar_named() {
+        let fs = FakeFs {
+            files: vec![("old.db", "/d/old.db")],
+            sidecars: vec!["old.db-wal"],
+            ..Default::default()
+        };
+        let m = refused(&fs, "old.db", None).await;
+        assert!(m.contains("old.db-wal"), "{m}");
+    }
+
+    #[test]
+    fn the_sidecars_are_each_engines_own() {
+        let p = sidecar_paths(std::path::Path::new("a.db"));
+        assert_eq!(
+            p,
+            ["a.db-wal", "a.db-journal", "a.db.wal"].map(std::path::PathBuf::from)
         );
     }
 
