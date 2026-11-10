@@ -37,7 +37,13 @@ modal. `over_backdrop` is one draggable strip across the
 bar, raised only while `modal_backdrop_up` says a backdrop is on screen, carrying the scrim
 colour itself (the modal layer no longer reaches the header) and stopping short of the caption
 buttons at `controls_width` so the *header's own* buttons stay the live ones — one set of
-close handlers, and the strip it leaves clear is exactly the strip that still works. It is
+close handlers, and the strip it leaves clear is exactly the strip that still works. **Its
+leading edge is not stopped short, though: the band starts at `inset_left(0.0)`, not at
+`leading_inset()`.** Starting at the inset left a lit 72px block around macOS's traffic lights on
+an otherwise dimmed window, which read as a hole in the scrim rather than as a title bar. The inset
+exists only to clear controls the *OS* draws, and AppKit draws the lights in a view above our
+content, so dimming under them leaves them lit and pressable, as they are over a native sheet; only
+controls of our own, which our own pointer walk reaches, need the band to stop before them. It is
 deliberately not a copy of the header: a press anywhere along it moves the window, because
 nothing else up there does anything while a modal is up and a real title bar drags from
 anywhere. It stays **under** the resize zones, which are the layer outside the root, so the top

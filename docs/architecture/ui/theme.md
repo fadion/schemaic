@@ -1,7 +1,9 @@
 # `ui/theme.rs`, `themes.rs`, `icons.rs`, `fonts.rs`, `sql_highlight.rs`
 
 `theme.rs`/`themes.rs`/`icons.rs`/`fonts.rs`/`sql_highlight.rs`. `theme.rs` is the call-site
-surface (named colour fns, the type scale, `header_h`/`footer_h`, `scaled`/`scaled_font`);
+surface (named colour fns, the type scale, `header_h`/`footer_h`, `scaled`/`scaled_font`, and `header_h_at` — `header_h` at a
+given `UiScale`, for window creation, before the registry exists, to centre macOS's traffic
+lights; see `core/window_chrome.rs`);
 `themes.rs` holds the data and the three runtime axes, including `UiScale` and the pure
 `scale_at`/`scale_font_at` rounding; `icons.rs` sizes every glyph, scaling the **base** size its
 callers pass.

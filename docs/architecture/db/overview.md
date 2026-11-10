@@ -208,6 +208,25 @@ in `lib.rs`, so the bound belongs to the public method, while `ping` and `fetch_
 bounded per engine — `pg::ping` takes the deadline as a parameter, and SQLite's wraps an `open` that can block on a
 dead network share. Writing the file down per method is what stops the gate reading a file its
 subject has left, which is how a source gate stops testing anything without failing.
+**Every one of these bounds times the server, never the password read.** `open` is where a
+`PasswordSource` is read, and each deadline was drawn around `open` — so on macOS, where that read
+waits on a keychain dialog until the user answers it, an unanswered dialog spent the server's five
+seconds: at every launch of a rebuilt, and so re-signed, binary the schema load logged
+`schema load failed: … timed out` five seconds after start, the tree was cleared, and the health
+check said *Disconnected* about a server that was up. `Db::with_password_read` is the fix — a
+clone with the source already read (`pass` filled, `pass_source` cleared; a handle with no source
+comes back unchanged) — and the ten public methods that draw a deadline, the seven above with
+`list_databases` and the two `WORKLOAD_TIMEOUT` reads `fetch_top_statements` and
+`fetch_missing_indexes`, call it first and dispatch on the handle it returns. That is what puts
+the engine modules' own bounds — `mysql`/`pg`/`mssql::ping`, their `fetch_databases`, SQL Server's
+`listing_within` — on a handle whose password is already in hand; reading it inside one of them
+instead would put the dialog back on the clock. This crate puts no bound on the read itself. What
+it does not move is a cloud-IAM token: `sign_in_secret` still fetches that inside the bound, as
+before. The source gate's second half asserts `.with_password_read().await?` comes before
+`match this.engine` in each of the ten, and the live tier shows the effect —
+`a_slow_password_read_is_not_charged_to_the_servers_deadline`, a source sleeping `PING_TIMEOUT`
+plus a second under which `fetch_databases` and `ping` must still succeed, was observed red
+against MariaDB before the fix with exactly *connection failed: timed out*.
 **`fetch_table` is the app's second forever-timer, and this gate's own doc used to say in so many
 words that `fetch_sessions` was the only one.** The Live
 Monitor re-arms `fetch_table` every two seconds for as long as its modal is open, and the premise
@@ -422,6 +441,8 @@ the handle is minted on the UI thread — and `sign_in_secret` (MySQL and Postgr
 `mssql::auth_method`'s `Password` arm both go through it. A source's `Err` is the connect's error
 (`a_password_source_is_read_at_sign_in_and_only_when_needed`,
 `an_unreadable_password_source_fails_the_sign_in`). `Debug` prints only whether a source is set.
+A method that draws a deadline reads the source before it starts the clock, through
+`Db::with_password_read` — why, under the deadlines above.
 `parts()` still hands out `pass`, which is empty for such a handle — the MCP endpoint handoff,
 its one production reader, ignores it, the subprocess reading the password itself.
 Schema introspection fills the **full** column model (see `core::schema`): MySQL from

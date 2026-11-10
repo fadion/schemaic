@@ -25,7 +25,7 @@ exclude = ["vendor"]
 private_intra_doc_links = "allow"
 
 [workspace.package]
-version = "0.38.0"
+version = "0.39.0"
 edition = "2024"
 license = "MIT"
 authors = ["Schemaic contributors"]
@@ -361,6 +361,29 @@ debug = "line-tables-only"
 [profile.dev.package.schemaic-app]
 opt-level = 0
 debug = "line-tables-only"
+
+# **A debug build panicked at launch on macOS 26 (Tahoe)**, before any window
+# opened. `objc2` 0.4 — reached through `floem-winit` 0.29's `icrate` 0.0.4 —
+# checks every Objective-C message's declared return type against the runtime's
+# under `debug_assertions`, and panics on a mismatch. Tahoe backs
+# `NSScreen.screens` with a Swift array whose
+# `countByEnumeratingWithState:objects:count:` reports `Q` (unsigned 64-bit) where
+# `icrate` declares `q` (signed): the same width in the same register, so the call
+# is sound and only the check fails. The window-placement restore in `main` is the
+# first caller, through `MonitorHandle::position`. A release build never runs the
+# check, which is why the shipped app was unaffected and CI — which builds and
+# tests on macOS but never launches the app — could not see it. The check is
+# turned off for this one crate rather than worked around at the call site:
+# Floem's own monitor queries reach the same enumeration. Remove this once Floem
+# moves to an `objc2` whose bindings carry the right encoding.
+#
+# **Keyed on `0.4`, not `0.4.1`, and not on the bare name.** A spec naming one
+# patch release stops matching at the next `cargo update`, and cargo says so
+# only as a warning, so the panic would come back looking like a new bug. The
+# bare name would also switch the check off in the `objc2` 0.5 and 0.6 that
+# other crates bring in, whose bindings it has no complaint about.
+[profile.dev.package."objc2@0.4"]
+debug-assertions = false
 
 # **Floem 0.2.0, vendored and patched** — see `vendor/floem/PATCHES.md` for
 # every change against the published crate and why. The crate is upstream's,

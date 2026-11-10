@@ -3995,6 +3995,43 @@ mod schema_tests {
                  otherwise costs the OS connect timeout, and this one repeats"
             );
         }
+        // **And the bound times the server, not the password read.** Every
+        // public method that draws a deadline reads its `PasswordSource` first
+        // (`Db::with_password_read`), before it dispatches to an engine: the
+        // bound sits around `open`, `open` is where the password is read, and
+        // on macOS that read waits on a keychain dialog — five seconds of it
+        // failed every launch's schema load with "timed out". The engine
+        // modules' own bounds are then drawn on a handle whose password is
+        // already in hand. The live tier shows the effect
+        // (`a_slow_password_read_is_not_charged_to_the_servers_deadline`);
+        // this keeps a new bounded method from forgetting it.
+        let lib = read("lib.rs");
+        for name in [
+            "ping",
+            "fetch_databases",
+            "list_databases",
+            "fetch_sessions",
+            "fetch_locks",
+            "fetch_server_vars",
+            "kill_session",
+            "fetch_table",
+            "fetch_top_statements",
+            "fetch_missing_indexes",
+        ] {
+            let body = body_of(&lib, &sig_of("lib.rs", name), name);
+            let read_at = body
+                .find(".with_password_read().await?")
+                .unwrap_or_else(|| {
+                    panic!("`{name}` draws a deadline without reading the password first")
+                });
+            let dispatch_at = body
+                .find("match this.engine")
+                .unwrap_or_else(|| panic!("`{name}` no longer dispatches on the read handle"));
+            assert!(
+                read_at < dispatch_at,
+                "`{name}` reads the password after it starts dispatching"
+            );
+        }
     }
 
     /// **Every exit out of `import_on` says what the rollback achieved.**

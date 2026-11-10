@@ -78,7 +78,10 @@ it as a number**: "39 names covered by `KEYWORDS`, and the five left over are
 *two*-way split of a **three**-way set: the names `SQL_FUNCTIONS` misses are those with their own
 grammar rule (MariaDB's reserved words, so in `KEYWORDS`), MySQL 8's (`MYSQL_ONLY`), and the
 natively-registered ones neither view reports, which only the parser can vouch for. The test sums
-all three against what `SQL_FUNCTIONS` leaves out and asserts none of them is empty, so a
+all three — with a fourth part beside them, the names this endpoint is too old or too new for
+(`is_version_bound`, below), which is empty on a server that matches every version the catalog
+carries and so is counted rather than assumed — against what `SQL_FUNCTIONS` leaves out, and
+asserts none of the three is empty, so a
 release that moves the split fails there rather than leaving a sentence that reads plausibly and
 is false. **The `KEYWORDS` excuse is put to the parser as well**, because reserved-word-ness does
 not imply callability and this half was using it as if it did: 696 keywords, 681 of them not in
@@ -96,7 +99,34 @@ server with five functions it has not got. `1064` is the third answer and separa
 a *type* or a reserved word: `mysql.help_topic` indexes `DATETIME`, `BEGIN` and `CALL` beside the
 functions, and MySQL 8.4 answers 1064 for `SRID` and `CONTAINS`, which it keeps as reserved words
 after removing the functions. A name that cannot be typed as a call cannot be squiggled as one
-either — and must not be offered.
+either — and must not be offered. Where a test must not read `1064` as absence it asks the
+narrower `names_the_server_has_never_heard_of` (`1305`/`1630` only) — the `KEYWORDS` excuse
+above, and both version lists below.
+**The catalog spans MariaDB versions, and two lists say so: `NEWER_THAN_BASELINE` and its other
+direction, `REMOVED_SINCE_BASELINE`.** The tier's MariaDB legs are not one version — CI pins the
+floating `mariadb:11` tag, which rolled from 11.4 to 11.8, and the newest names were found on a
+local Homebrew 13.0.2 — so without them the oracles contradicted each other: a newer server's
+names were squiggles under correct SQL until the catalog carried them, and once it did, an older
+server read them as invented. `NEWER_THAN_BASELINE` carries `intel`'s MariaDB 11 block and its
+MariaDB 13 one (`MONTHS_BETWEEN`, `ST_COLLECT`, `TO_NUMBER`, `TRUNC`, absent from the 11.x CI
+leg); `REMOVED_SINCE_BASELINE` carries `DES_ENCRYPT`/`DES_DECRYPT`, which 13.0.2's parser has
+dropped and 11.x still calls. **Each excuses a name only where this endpoint lacks it**, and one
+predicate, `is_version_bound`, is what `over_listing`, its partition sum and
+`each_server_is_only_credited_with_the_builtins_it_really_has` all ask, so the two lists cannot
+be honoured in one test and forgotten in the next. Neither list can be confirmed from one
+endpoint — each is about the difference between two versions, and the tier sees one at a time —
+so each has a test of what one endpoint *can* check:
+`the_newer_names_are_a_version_boundary_and_not_a_dumping_ground`, that every name is in
+`FUNCTIONS` and that one this server reports is one its parser has heard of, and
+`the_removed_names_are_a_version_boundary_and_not_a_dumping_ground`, that every name is in
+`FUNCTIONS` and that one this server does *not* report is "no such function" (`1305`/`1630`)
+rather than a `1064` or an arity error, either of which would mean the name is still there in
+some form. **The newer-names test asks the narrower question on purpose**: it used
+`is_not_callable`, which counts `1064`, and `ST_COLLECT` — an aggregate, so `(1,2)` is not its
+syntax while `ST_COLLECT(g)` runs — answers exactly that, so the test condemned a name 13.0.2
+reports and executes. The trade both lists accept is the one `core/intel.md` records: a tab is
+offered a name its version cannot call, against a squiggle under correct SQL on the other
+version, because narrowing it would need a version in `ServerFlavour`.
 **"MySQL is unguarded here" stood in this paragraph as a stated limitation and was a live defect.**
 It is true that MySQL ships no `SQL_FUNCTIONS` (`mysql.func` holds loadable UDFs, not builtins), so
 there is no *catalogue* oracle to write — and that is not the only kind.
@@ -882,6 +912,23 @@ the paragraph below covers. A wrong password is asserted to be
 carries `'`, `\` and `*` on purpose — the first two are `ddl_string`'s job (and MySQL's
 `NO_BACKSLASH_ESCAPES` is where that went wrong) and the third is the character the account
 editor's mask is written in.
+**A refused login says why when the reason is the server's account set rather than the code.**
+The three password-login tests — `a_created_account_can_log_in_with_the_password_it_was_given`,
+`a_reset_password_replaces_the_one_the_account_had` and
+`a_salted_password_logs_in_on_create_and_on_reset` — log in through
+`ScratchAccount::log_in_or_say_why`. On an engine whose accounts have hosts
+(`users::accounts_have_hosts`) an **anonymous account** — `''@'localhost'`, which Homebrew's
+MariaDB and `mariadb-install-db` without `--skip-test-db` both create — outranks `'name'@'%'` for
+a client the server sees as `localhost`, because MySQL matches the most specific host before the
+user; so a scratch account at the default `%` is refused with the password it was given, and
+"Access denied" reads exactly like the mangled credential these tests exist to catch. Measured on
+Homebrew's MariaDB 13.0.2: all three failed that way. So on a refusal of an account at `%`, the
+failure names the server's anonymous accounts at the **loopback** hosts (`localhost`, `127.0.0.1`,
+`::1`) and the `DROP USER` that removes them, and only *counts* any others — those are the
+machine's own host names, which do not belong in test output or CI logs. **It is a failure, not a skip, and it never drops them itself**: a
+skip would quietly remove the only tests that write a credential to a server from every machine
+that has those accounts, and dropping them is a change to somebody's server this tier has no
+business making.
 **`a_reset_password_replaces_the_one_the_account_had` is the repair, and it is here because which
 engine spells it which way is a claim only a server settles.** `ALTER USER … IDENTIFIED BY` and
 `ALTER ROLE … PASSWORD` are two statements for one act, and MySQL's `ALTER ROLE` is about roles
@@ -1007,11 +1054,11 @@ at that than a pass/fail test would be. Also uncovered, for ordinary reasons of 
 needed it yet: streaming a genuinely large export, and multi-schema PostgreSQL.
 **It is gated as a *target*, not at runtime.** The manifest declares the target
 `required-features = ["live-tests"]`, so `cargo test --workspace` does not build it and the pure
-tier stays pure by construction. It is **669 tests on Windows, 668 elsewhere,** as this is
-written (re-derived with `--list`) — 159 suite functions expanded across the three legs by
-`main.rs`'s macro (477), SQL Server's own 169 in `mssql.rs` (168 off Windows: one,
-`a_windows_sign_in_is_this_processs_own_identity`, is `cfg(windows)`), the seventeen in the two
-catalog oracles outside the macro (`pg_catalog`'s ten and `mariadb_catalog`'s seven), and the
+tier stays pure by construction. It is **712 tests on Windows, 711 elsewhere,** as this is
+written (re-derived with `--list`) — 173 suite functions expanded across the three legs by
+`main.rs`'s macro (519), SQL Server's own 169 in `mssql.rs` (168 off Windows: one,
+`a_windows_sign_in_is_this_processs_own_identity`, is `cfg(windows)`), the eighteen in the two
+catalog oracles outside the macro (`pg_catalog`'s ten and `mariadb_catalog`'s eight), and the
 six that need no server (the four name-guard cases, `endpoint.rs`'s declared-case count, and the
 skip-notice source gate). The figure this sentence
 carried for a while was 306, a count that had never included the oracles, and then 388, which had

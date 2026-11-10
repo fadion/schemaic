@@ -52,6 +52,30 @@ pub async fn a_ping_reaches_the_server(target: &'static Target) {
         });
 }
 
+/// **A password read that takes its time is not charged to the server.** The
+/// app reads a saved password from the OS keyring when a connection is first
+/// used, and on macOS that read waits on a keychain dialog for as long as the
+/// user takes to answer it. Listing the databases and the health ping are each
+/// bounded by `PING_TIMEOUT`, and the bound used to be drawn around `open` —
+/// which is where the password is read — so a dialog left open five seconds
+/// failed the schema load with "timed out" and showed "Disconnected" for a
+/// server that was up. Seen at every launch of a rebuilt binary on macOS,
+/// whose keychain asks again for each new build.
+pub async fn a_slow_password_read_is_not_charged_to_the_servers_deadline(target: &'static Target) {
+    let password = target.password();
+    let slow = schemaic_db::PasswordSource::new(move || {
+        std::thread::sleep(schemaic_db::PING_TIMEOUT + Duration::from_secs(1));
+        Ok(password.clone())
+    });
+    let db = target.db_as(&target.user(), "").with_password_source(slow);
+    db.fetch_databases()
+        .await
+        .unwrap_or_else(|e| panic!("the listing spent its deadline on the password: {e}"));
+    db.ping(schemaic_db::PING_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("the ping spent its deadline on the password: {e}"));
+}
+
 /// The server's settings read back, with a setting all three servers share by
 /// name; and where the engine publishes a status list
 /// ([`supports_status`](schemaic_core::server_vars::supports_status) — asked,

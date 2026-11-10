@@ -198,6 +198,15 @@ pub fn modal_backdrop() -> Color {
     Color::rgb8(0, 0, 0).multiply_alpha(0.5)
 }
 
+/// The veil over the schema tree while its connection is **Disconnected**: the
+/// side panel's own colour at half strength, so every row fades toward the
+/// panel rather than toward black — the tree reads as the schema as last
+/// loaded, not as a live one, in either theme. A veil because Floem 0.2 has no
+/// opacity to dim a subtree with.
+pub fn stale_veil() -> Color {
+    bg_panel().multiply_alpha(0.5)
+}
+
 /// Soft drop shadow under floating tooltips (translucent black — theme-independent,
 /// reads as a shadow on both light and dark chrome).
 pub fn tooltip_shadow() -> Color {
@@ -729,8 +738,16 @@ pub fn scrollbar_hover() -> Color {
 
 /// Height of the window's header bar.
 pub fn header_h() -> f64 {
-    scaled(40.0)
+    scaled(HEADER_H)
 }
+/// [`header_h`] at a given scale, for the one reader that needs it before the
+/// theme registry exists: the window's creation, which places macOS's traffic
+/// lights against the bar once and for good (`Chrome::traffic_lights_offset`).
+pub fn header_h_at(scale: UiScale) -> f64 {
+    scale_at(HEADER_H, scale.factor())
+}
+/// The header's unscaled height — the one value both faces of it scale.
+const HEADER_H: f64 = 40.0;
 /// The rule under the header, and part of its [`header_h`] (border-box), so it
 /// occupies the bar's last logical pixel. Named because a second view has to
 /// find it: the band `window_chrome::over_backdrop` lays over a modal stops

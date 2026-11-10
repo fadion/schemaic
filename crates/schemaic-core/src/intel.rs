@@ -1087,6 +1087,8 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "DES_ENCRYPT(str [, key])",
         "Triple-DES encrypt (deprecated)",
     ),
+    // `DES_ENCRYPT`/`DES_DECRYPT` are gone from MariaDB 13.0.2 (`ERROR 1305`)
+    // and still callable on 11.x, so they stay — see [`MARIADB_ONLY`].
     f(
         "DES_DECRYPT",
         "DES_DECRYPT(crypt [, key])",
@@ -2166,6 +2168,42 @@ pub const FUNCTIONS: &[SqlFunction] = &[
         "A vector from its JSON-array text form",
     ),
     f("VEC_TOTEXT", "VEC_TOTEXT(vec)", "A vector as a JSON array"),
+    // ── MariaDB 13 ───────────────────────────────────────────────────────────
+    //
+    // The same version axis as the block above, one step further: these four
+    // are in 13.0.2's `SQL_FUNCTIONS` and not in the 11.x CI runs, and
+    // `live::mariadb_catalog`'s `NEWER_THAN_BASELINE` carries them for that
+    // reason. None has a `mysql.help_topic` entry on 13.0.2, so the signatures
+    // were **measured**: arity by `SELECT <name>(…)` at 0–3 arguments, keeping
+    // what is not `ERROR 1582`, and behaviour by executing them —
+    // `MONTHS_BETWEEN('2024-03-15','2024-01-31')` is `1.4838…`,
+    // `TRUNC('2024-03-15','MM')` is `2024-03-01 00:00:00`,
+    // `TO_NUMBER('1,234.5','9,999.9')` is `1234.5`, and `ST_COLLECT` over two
+    // points is a `MULTIPOINT`. **`TRUNC` is the date one only**: `TRUNC(12.345,
+    // 1)` answers `NULL` there, so the summary does not promise Oracle's numeric
+    // form. `ST_COLLECT` is an aggregate (`(1,2)` is a syntax error,
+    // `ST_COLLECT(DISTINCT g)` parses), and MySQL 8.0.24 has it too, so it is
+    // not [`MARIADB_ONLY`]; the other three are.
+    f(
+        "MONTHS_BETWEEN",
+        "MONTHS_BETWEEN(date1, date2)",
+        "Months from date2 to date1, fractional",
+    ),
+    f(
+        "ST_COLLECT",
+        "ST_COLLECT([DISTINCT] g)",
+        "Aggregate geometries into a collection",
+    ),
+    f(
+        "TO_NUMBER",
+        "TO_NUMBER(str [, format])",
+        "A number from its text form",
+    ),
+    f(
+        "TRUNC",
+        "TRUNC(date [, format])",
+        "A date truncated to the unit format names",
+    ),
 ];
 
 /// The authoritative catalog of **SQLite** built-in functions, trusted by the
@@ -2721,7 +2759,10 @@ pub const SQLITE_FUNCTIONS: &[SqlFunction] = &[
 /// mode. A handful — `DES_ENCRYPT`, `DES_DECRYPT`, `ENCODE`, `ENCRYPT`,
 /// `OLD_PASSWORD` — are functions MySQL *removed* in 8.0 and MariaDB kept. The
 /// question this list answers is "can the server in front of me call it", and
-/// for MySQL 8.4 the answer is no either way.
+/// for MySQL 8.4 the answer is no either way. MariaDB has since removed
+/// `DES_ENCRYPT`/`DES_DECRYPT` as well (gone from 13.0.2's parser), so they
+/// stay here for the older MariaDB that can still call them; the live tier's
+/// `REMOVED_SINCE_BASELINE` is what excuses them on a server that cannot.
 ///
 /// Sorted, for the binary search and so a duplicate is visible;
 /// `every_flavoured_name_is_in_the_catalog` holds both.
@@ -2810,6 +2851,7 @@ pub const MARIADB_ONLY: &[&str] = &[
     "MEDIAN",
     "MLINEFROMTEXT",
     "MLINEFROMWKB",
+    "MONTHS_BETWEEN",
     "MPOINTFROMTEXT",
     "MPOINTFROMWKB",
     "MPOLYFROMTEXT",
@@ -2852,7 +2894,9 @@ pub const MARIADB_ONLY: &[&str] = &[
     "SYS_GUID",
     "TOUCHES",
     "TO_CHAR",
+    "TO_NUMBER",
     "TRIM_ORACLE",
+    "TRUNC",
     "UUID_V4",
     "UUID_V7",
     "VEC_DISTANCE",

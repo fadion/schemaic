@@ -93,6 +93,12 @@ impl WindowChrome {
         self.chrome.leading_inset()
     }
 
+    /// Does the header lead with the app's mark? Not on macOS, where the
+    /// traffic lights stand there — `Chrome::header_shows_mark`.
+    pub fn shows_mark(self) -> bool {
+        self.chrome.header_shows_mark()
+    }
+
     fn toggle_maximized(self) {
         let next = !self.window.is_maximized();
         self.window.maximized(next);
@@ -242,6 +248,15 @@ impl WindowChrome {
     /// dim over the bar is this view's, and the strip it leaves clear is exactly
     /// the strip that still works.
     ///
+    /// **The leading edge is dimmed, though, all the way to the window's edge.**
+    /// The band used to start at [`Self::leading_inset`] — the header's padding
+    /// for macOS's traffic lights — and so left a lit block at the corner of
+    /// a dimmed window, reading as a hole in the scrim rather than a title bar.
+    /// The inset clears controls the *OS* draws, and AppKit draws them in a view
+    /// above ours: the dim goes under the lights, which stay lit and keep every
+    /// press, exactly as they do over a native sheet. Only controls of our own,
+    /// which our own pointer walk reaches, need the band to stop short of them.
+    ///
     /// **`up` must be every modal, not this or that one** — it is the same
     /// predicate the modal layer is positioned by, so the band is on screen
     /// exactly when a backdrop is.
@@ -281,7 +296,7 @@ impl WindowChrome {
             if up() {
                 s.absolute()
                     .inset_top(0.0)
-                    .inset_left(this.leading_inset())
+                    .inset_left(0.0)
                     .inset_right(this.controls_width())
                     .height(theme::header_h())
             } else {

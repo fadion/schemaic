@@ -53,20 +53,43 @@ removing nothing from it yields `{}`, that differs from what was read, and Schem
 into a directory it creates inside Google's config tree. An app that has never run that CLI has
 no business leaving a file where it keeps its settings.
 `withdrawing_rules_from_a_file_that_is_not_there_writes_nothing` drives the composition rather
-than the predicate, because the composition is what bit.
+than the predicate, because the composition is what bit — and it bit a second time one layer up.
+`settings_to_edit`'s `None` for that case was right, but `edit_settings` read it as a withdraw
+that did not take, so every launch on a machine without Antigravity — the sweep plans `RulesOnly`
+even with no claim on disk — logged the `ERROR` below saying Schemaic's rules were still granted
+in a file that does not exist. It was found on a first macOS launch, and is not macOS-specific.
 **The settings write is atomic, and its answer is used.** `edit_settings` writes through
 `persist::write_file_atomic`, whose own doc opens by naming the failure it exists for:
 `fs::write` truncates before it writes, so a full disk, a dropped network share or a crash
 between the two leaves the file empty — and this is another vendor's configuration, in a
 directory Schemaic does not own and cannot regenerate. It returns whether the file now says what
 it was asked to say, which includes the `harness::SettingsEdit::Unchanged` case where it already
-did and nothing is written at all. All three callers used to discard that answer, so
+did and nothing is written at all. That decision is the pure `settings_plan(create, existing,
+edit) -> SettingsPlan` now, `edit_settings` being the IO shell around it: `Holds` (the file
+already says it — `Unchanged`, or a withdraw from a file that is not there, since no file grants
+nothing), `Declined` (the edit was refused and the caller must hear it) or `Write(String)`.
+Granting is untouched by the missing-file arm, `settings_to_edit` always yielding a document when
+`create` is true (`withdrawing_from_a_missing_settings_file_holds_rather_than_fails`, which also
+pins that an unparseable document is still `Declined`).
+**"Not there" means `NotFound` and nothing wider, and the arm above is why that matters.** The
+read was `std::fs::read_to_string(&path).ok()`, which folded every read error into "no file" —
+harmless while a missing file was a failed withdraw, and a silent hole once it `Holds`: a file
+that is there and cannot be read (permission denied, bytes that are not UTF-8, a directory at the
+path) was "withdrawn from" with no log line while it might still auto-approve `run_query`, and a
+grant over one wrote a fresh document over the user's. The read is an `Existing` now — `Text`,
+`Missing`, `Unreadable`, through `From<io::Result<String>>`, where only `ErrorKind::NotFound` is
+`Missing` — `settings_to_edit` takes it, and `settings_plan` answers `Declined` for `Unreadable`
+before anything else, in both directions
+(`an_unreadable_settings_file_is_declined_rather_than_read_as_missing`, which goes through the
+conversion itself, since that is where the errors were folded together). All three callers used to discard that answer, so
 `is_installed()` could report `true` with no rules granted, and a withdraw that failed or was
 declined — an unwritable file, an unparseable one — left a standing `run_query` auto-approval in
 the user's configuration permanently and silently. A failed withdraw is a `tracing::error!` now,
 at `Drop` and in `sweep` both, because the state it leaves is the one this module calls the bad
 one — rules standing with no registration — and it is permanent: the next launch's sweep fails
-on the same file the same way.
+on the same file the same way. It is reached only for a file that is there and could not be
+read, parsed or written (or a settings path that cannot be resolved at all), which the comment at the
+sweep's site claimed before it was true.
 **The sweep now asks whether the leftovers are leftovers, and what it used to be was a live bug
 rather than a stated limit.** It ran at every launch and removed the registration and the
 allow-rules unconditionally, so launching a second Schemaic pulled the database tools out from

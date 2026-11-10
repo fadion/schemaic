@@ -53,6 +53,23 @@ impl Host {
     }
 }
 
+/// The traffic lights' leading offset, in points: floem's own default, which
+/// [`Chrome::leading_inset`] is sized around and nothing has had cause to move.
+pub const TRAFFIC_LIGHTS_X: f64 = 11.0;
+
+/// How far above the y handed to winit as the traffic lights' offset their
+/// centre lands, in points from the window's top edge: an offset of `y` puts
+/// the centre at `y - 2.25`.
+///
+/// **Measured, not documented.** winit 0.29 sizes the title-bar container to
+/// `button height + y` and never sets a button's y, so where the button ends
+/// up is AppKit's layout. On macOS 26.7 (Apple Silicon, 2× captures of the
+/// window at y = 16, 21 and 26) the red light's 14pt circle was centred at
+/// 13.75, 18.75 and 23.75pt — one point per point of y, 2.25 short of it. A
+/// macOS release that lays the container out differently moves this, and the
+/// symptom is lights off-centre by the difference, nothing worse.
+pub const LIGHT_CENTRE_ABOVE_OFFSET: f64 = 2.25;
+
 /// What this host leaves to us once the title bar is off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Chrome {
@@ -129,14 +146,55 @@ impl Chrome {
     /// Free space to leave at the header's leading edge, in logical pixels, for
     /// window controls the *OS* draws over our content.
     ///
-    /// macOS only: the three lights sit at floem's hardcoded (11, 16) offset and
-    /// run about 52px wide, so 72 clears them with room to breathe. Everywhere
-    /// else our own controls are laid out in the header like any other child and
-    /// need no reserved gap.
+    /// macOS only: the three lights start [`TRAFFIC_LIGHTS_X`] in, 14pt circles
+    /// 23pt apart, so the green one ends near 71 (measured on macOS 26.7). 72
+    /// cleared them but sat the header's first object — the logo, then; the
+    /// connection switcher now, see [`Self::header_shows_mark`] — hard against
+    /// the green light; 82 leaves about 11pt after it, the same margin the
+    /// lights keep from the window's edge.
+    /// Everywhere else our own controls are laid out in the header like any
+    /// other child and need no reserved gap.
     pub const fn leading_inset(self) -> f64 {
         match self.host {
-            Host::MacOs => 72.0,
+            Host::MacOs => 82.0,
             Host::Windows | Host::Linux => 0.0,
+        }
+    }
+
+    /// Does the header lead with the app's mark?
+    ///
+    /// Not on macOS: there the traffic lights already mark the window's corner
+    /// and the menu bar and the Dock name the app, so the mark was a fourth
+    /// object crowding the lights rather than an identity nothing else gave.
+    /// The connection switcher leads the row instead, at [`Self::leading_inset`].
+    /// Where the controls are ours they sit at the trailing edge, and the mark
+    /// is the only thing at the leading one that says whose window it is.
+    pub const fn header_shows_mark(self) -> bool {
+        match self.host {
+            Host::MacOs => false,
+            Host::Windows | Host::Linux => true,
+        }
+    }
+
+    /// Where winit should put the traffic lights (`MacOSWindowConfig::
+    /// traffic_lights_offset`) so that they sit vertically centred in a header
+    /// whose visible bar — above its bottom rule — is `bar_h` points tall.
+    /// `None` off macOS, where there are no OS-drawn controls to place.
+    ///
+    /// **Floem's own default, (11, 16), centred them in nothing.** It is a
+    /// constant chosen for a standard-height title bar; Schemaic's header is
+    /// taller, and the lights sat about 6pt above its middle. The y of the
+    /// offset is not the lights' top or centre either — winit resizes the
+    /// title-bar container to it and leaves AppKit to place the buttons — so the
+    /// relation is [`LIGHT_CENTRE_ABOVE_OFFSET`], measured rather than derived.
+    ///
+    /// Taken once, at window creation: winit has no setter for it afterwards, so
+    /// the caller passes the bar height at the interface scale the app launches
+    /// with, and a scale changed mid-session re-centres them at the next launch.
+    pub fn traffic_lights_offset(self, bar_h: f64) -> Option<(f64, f64)> {
+        match self.host {
+            Host::MacOs => Some((TRAFFIC_LIGHTS_X, bar_h / 2.0 + LIGHT_CENTRE_ABOVE_OFFSET)),
+            Host::Windows | Host::Linux => None,
         }
     }
 
@@ -226,6 +284,64 @@ mod tests {
                 "{host:?} draws one half of the frame but not the other"
             );
         }
+    }
+
+    /// The lights' centre — the offset's y less what AppKit's layout takes off
+    /// it — lands on the bar's middle, at every interface scale's bar height.
+    #[test]
+    fn the_traffic_lights_are_centred_in_the_bar_they_are_placed_for() {
+        let c = Chrome::of(Host::MacOs);
+        // The header's visible bar at 80%, 100%, 130% and 160%: 40 scaled, less
+        // its 1pt bottom rule.
+        for bar_h in [31.0, 39.0, 51.0, 63.0] {
+            let (x, y) = c.traffic_lights_offset(bar_h).expect("macOS places them");
+            assert_eq!(x, TRAFFIC_LIGHTS_X);
+            assert_eq!(y - LIGHT_CENTRE_ABOVE_OFFSET, bar_h / 2.0, "bar {bar_h}");
+        }
+        // The case the measurement came from: a 39pt bar wants 21.75, where
+        // floem's 16 put the centre at 13.75 — 5.75pt high.
+        assert_eq!(c.traffic_lights_offset(39.0), Some((11.0, 21.75)));
+    }
+
+    /// The mark leads the header where nothing else stands at its leading edge,
+    /// and gives way to the traffic lights where they do.
+    #[test]
+    fn the_header_leads_with_the_mark_only_where_the_os_draws_no_controls_there() {
+        assert!(Chrome::of(Host::Windows).header_shows_mark());
+        assert!(Chrome::of(Host::Linux).header_shows_mark());
+        assert!(!Chrome::of(Host::MacOs).header_shows_mark());
+        for host in ALL {
+            let c = Chrome::of(host);
+            assert_eq!(
+                c.header_shows_mark(),
+                c.leading_inset() == 0.0,
+                "{host:?}: the mark and a leading inset for OS controls are one or the other"
+            );
+        }
+    }
+
+    /// Only the host whose lights the OS draws is given an offset for them.
+    #[test]
+    fn only_os_drawn_controls_get_a_traffic_lights_offset() {
+        for host in ALL {
+            let c = Chrome::of(host);
+            assert_eq!(
+                c.traffic_lights_offset(39.0).is_some(),
+                !c.draws_own_controls(),
+                "{host:?}"
+            );
+        }
+    }
+
+    /// The lights still clear the leading inset at their offset: three buttons
+    /// 14pt wide, 23pt apart (measured on macOS 26.7), starting at the offset's x.
+    #[test]
+    fn the_leading_inset_clears_the_lights_at_their_offset() {
+        let c = Chrome::of(Host::MacOs);
+        let (x, _) = c.traffic_lights_offset(39.0).unwrap();
+        // …with at least the lights' own margin from the window's edge to spare
+        // before the connection switcher.
+        assert!(x + 2.0 * 23.0 + 14.0 + TRAFFIC_LIGHTS_X <= c.leading_inset());
     }
 
     /// The leading inset exists only to clear controls *someone else* draws, so

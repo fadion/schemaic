@@ -59,6 +59,15 @@ pub struct TickCtx {
     /// …and that tunnel isn't established yet. Nothing to ping *through* — the
     /// existing status stands until the tunnel comes up.
     pub tunnel_pending: bool,
+    /// The active connection's last schema load **failed on reaching the
+    /// server** and cleared its tree — a connect failure, not a refusal of the
+    /// app's own (a keychain read the user declined, init SQL the guard
+    /// refused), which nothing changes on its own and a retry would only ask
+    /// about again.
+    pub tree_failed: bool,
+    /// Consecutive automatic reloads ([`Tick::reload`]) that failed in turn —
+    /// their own backoff, apart from [`Self::failures`], which counts checks.
+    pub reload_failures: u32,
 }
 
 /// Why a tick decided not to ping. Purely descriptive (logging / tests) — the
@@ -78,6 +87,11 @@ pub enum SkipReason {
 pub struct Tick {
     /// `None` = ping now.
     pub skip: Option<SkipReason>,
+    /// Load the schema again instead — the one way a tunnelled connection whose
+    /// load failed before its tunnel opened can recover. Its tunnel is opened by
+    /// the load and by nothing else, so with none to ping through no check can
+    /// ever pass and [`reloads_failed_tree`] never fires.
+    pub reload: bool,
     /// Delay before the next tick. Always set — the timer must re-arm on every
     /// path, including skips, or one quiet moment ends polling for the session.
     pub next: Duration,
@@ -103,14 +117,28 @@ pub fn tick(cfg: HealthCfg, ctx: TickCtx) -> Tick {
     let base = interval(cfg, ctx.tunnelled);
     let skip = |why| Tick {
         skip: Some(why),
+        reload: false,
         next: base,
     };
     if ctx.tunnel_pending {
+        // **Unless the load that opens the tunnel is what failed.** Nothing
+        // else opens one, so waiting for it to come up waits for ever over an
+        // empty tree. Reload instead, behind the gates a ping has, backed off
+        // at the tunnelled interval on the reloads that failed — each is an SSH
+        // handshake against a host that may be down for hours.
+        if ctx.tree_failed && ctx.focused && !ctx.busy {
+            return Tick {
+                skip: Some(SkipReason::TunnelPending),
+                reload: true,
+                next: backoff(base, ctx.reload_failures, cfg.max_backoff),
+            };
+        }
         // Re-arm on the *base* interval, not the tunnelled one: this costs
         // nothing (no network at all) and is how the app notices the tunnel came
         // up, so it shouldn't be the slowest path.
         return Tick {
             skip: Some(SkipReason::TunnelPending),
+            reload: false,
             next: cfg.base,
         };
     }
@@ -122,6 +150,7 @@ pub fn tick(cfg: HealthCfg, ctx: TickCtx) -> Tick {
     }
     Tick {
         skip: None,
+        reload: false,
         next: backoff(base, ctx.failures, cfg.max_backoff),
     }
 }
@@ -234,9 +263,80 @@ pub fn fold(h: Health, e: Evidence) -> Health {
     }
 }
 
+/// Should the evidence that has just landed reload a schema tree whose last load
+/// **failed**? `before` is the verdict the evidence is folded over.
+///
+/// The case it exists for: a load that fails at launch — the server not up yet,
+/// a tunnel still coming up, a keychain dialog nobody had answered — clears the
+/// tree, and nothing loaded it again. The health poll recovered on its own and
+/// the header cleared "Disconnected", over a tree that stayed empty until the
+/// user found Refresh.
+///
+/// **Only a check, and only one that changes the verdict to Connected.** A
+/// listing *is* the load, and an edit starts its own. A check that finds the
+/// connection already Connected says nothing new — and reloading on it would
+/// loop against a load that fails on something the ping does not need (a
+/// privilege, a catalogue the account cannot read): fail, check, reload, fail,
+/// every poll. A real recovery is a change of verdict, so that is the trigger.
+pub fn reloads_failed_tree(before: ConnStatus, e: Evidence, tree_failed: bool) -> bool {
+    tree_failed && e == Evidence::Checked(true) && before != ConnStatus::Connected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The recovery the poll found reloads the tree it left empty, from either
+    /// verdict short of Connected.
+    #[test]
+    fn a_check_that_recovers_the_connection_reloads_a_failed_tree() {
+        for before in [ConnStatus::Disconnected, ConnStatus::Unknown] {
+            assert!(
+                reloads_failed_tree(before, Evidence::Checked(true), true),
+                "{before:?} → Connected left the failed tree empty"
+            );
+        }
+    }
+
+    /// No failed load, nothing to reload: the tree a recovery finds is fine.
+    #[test]
+    fn a_recovery_leaves_a_tree_that_loaded_alone() {
+        assert!(!reloads_failed_tree(
+            ConnStatus::Disconnected,
+            Evidence::Checked(true),
+            false
+        ));
+    }
+
+    /// A check that finds the connection already Connected is not a recovery —
+    /// reloading on it would retry a load that fails on a privilege the ping
+    /// does not need, at every poll.
+    #[test]
+    fn a_check_that_changes_nothing_does_not_retry_a_failed_load() {
+        assert!(!reloads_failed_tree(
+            ConnStatus::Connected,
+            Evidence::Checked(true),
+            true
+        ));
+    }
+
+    /// A failed check, a listing and an edit are never the trigger: the first
+    /// is no recovery, the second is the load itself, the third starts its own.
+    #[test]
+    fn only_a_passing_check_reloads() {
+        for e in [Evidence::Checked(false), Evidence::Listed, Evidence::Edited] {
+            for before in [
+                ConnStatus::Disconnected,
+                ConnStatus::Unknown,
+                ConnStatus::Connected,
+            ] {
+                assert!(
+                    !reloads_failed_tree(before, e, true),
+                    "{e:?} from {before:?}"
+                );
+            }
+        }
+    }
 
     /// A ctx that pings: focused, idle, direct, healthy.
     fn ready() -> TickCtx {
@@ -353,6 +453,94 @@ mod tests {
             ..ready()
         };
         assert_eq!(tick(HealthCfg::default(), ctx).next, secs(30));
+    }
+
+    /// A tunnelled connection whose load failed before its tunnel opened.
+    fn tunnel_never_opened() -> TickCtx {
+        TickCtx {
+            status: ConnStatus::Unknown,
+            tunnelled: true,
+            tunnel_pending: true,
+            tree_failed: true,
+            reload_failures: 1,
+            ..ready()
+        }
+    }
+
+    /// **A load that failed before its tunnel opened is retried by the poll.**
+    /// The load is the only thing that opens a tunnel, and a check with no
+    /// tunnel to ping through returns without pinging — so before this the
+    /// tree stayed empty for good, and the reload a recovering check triggers
+    /// (`reloads_failed_tree`) could never fire for it.
+    #[test]
+    fn a_tunnel_that_never_opened_is_reopened_by_reloading() {
+        let t = tick(HealthCfg::default(), tunnel_never_opened());
+        assert!(
+            t.reload,
+            "the poll must retry the load that opens the tunnel"
+        );
+        assert!(!t.ping(), "there is still nothing to ping through");
+    }
+
+    /// The retries back off on their own count, at the tunnelled interval: each
+    /// is an SSH handshake against a host that may be down for hours.
+    #[test]
+    fn reopening_a_tunnel_backs_off_on_the_reloads_that_failed() {
+        let next = |reload_failures| {
+            tick(
+                HealthCfg::default(),
+                TickCtx {
+                    reload_failures,
+                    ..tunnel_never_opened()
+                },
+            )
+            .next
+        };
+        assert_eq!(next(0), secs(30));
+        assert_eq!(next(1), secs(60));
+        assert_eq!(next(2), secs(120));
+        assert_eq!(next(9), secs(120));
+    }
+
+    /// Not in the background and not over a running query — the same two
+    /// gates a ping has — and not where nothing failed.
+    #[test]
+    fn a_tunnel_is_only_reopened_for_a_failed_tree_in_a_focused_idle_window() {
+        let cases = [
+            TickCtx {
+                focused: false,
+                ..tunnel_never_opened()
+            },
+            TickCtx {
+                busy: true,
+                ..tunnel_never_opened()
+            },
+            TickCtx {
+                tree_failed: false,
+                ..tunnel_never_opened()
+            },
+        ];
+        for ctx in cases {
+            let t = tick(HealthCfg::default(), ctx);
+            assert!(!t.reload, "{ctx:?}");
+            assert_eq!(t.skip, Some(SkipReason::TunnelPending), "{ctx:?}");
+            assert_eq!(t.next, secs(10), "{ctx:?}");
+        }
+    }
+
+    /// With the tunnel up the ping can reach the server, and a passing one
+    /// reloads through `reloads_failed_tree` — the tick has no reload to add.
+    #[test]
+    fn a_failed_tree_over_an_open_tunnel_is_left_to_the_check() {
+        let t = tick(
+            HealthCfg::default(),
+            TickCtx {
+                tunnel_pending: false,
+                ..tunnel_never_opened()
+            },
+        );
+        assert!(t.ping());
+        assert!(!t.reload);
     }
 
     #[test]

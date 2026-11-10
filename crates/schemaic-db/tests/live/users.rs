@@ -413,6 +413,86 @@ impl ScratchAccount {
             .statements
     }
 
+    /// Log in as this account with `password`, and on a refusal fail with
+    /// `what` — **and with the server's own reason when it is not the code's**.
+    ///
+    /// On an engine whose accounts have hosts (`users::accounts_have_hosts`) an
+    /// **anonymous account** — `''@'localhost'`, which Homebrew's MariaDB and
+    /// `mariadb-install-db` without `--skip-test-db` both create — sorts ahead
+    /// of `'name'@'%'` for a client that server sees as `localhost`, because
+    /// MySQL matches the most specific *host* first and only then the user. So a
+    /// scratch account created at the default `%` host is refused with the
+    /// password it was given, and "Access denied" reads exactly like the
+    /// mangled-credential bug these tests exist to catch. Measured on Homebrew's
+    /// MariaDB 13.0.2: all three password tests failed that way.
+    ///
+    /// **Said, not skipped, and not repaired.** A skip would quietly remove the
+    /// only tests that write a credential to a server from every machine that
+    /// has the accounts; dropping them is a change to somebody's server that the
+    /// tier has no business making. So the failure names the accounts and the
+    /// statement that removes them, and the decision stays with whoever owns the
+    /// server.
+    async fn log_in_or_say_why(&self, target: &'static Target, password: &str, what: &str) {
+        let Err(e) = target
+            .db_as(&self.principal.name, password)
+            .ping(std::time::Duration::from_secs(10))
+            .await
+        else {
+            return;
+        };
+        let mut why = String::new();
+        if users::accounts_have_hosts(self.dialect) && self.principal.host.as_deref() == Some("%") {
+            // **Only the loopback hosts are named.** They are the ones that
+            // outrank `'name'@'%'` for a local client, and the others are the
+            // machine's own host names — `mariadb-install-db` makes
+            // `''@'<hostname>'` too — which have no business in test output or
+            // CI logs. Those are counted, never printed.
+            const LOOPBACK: &[&str] = &["localhost", "127.0.0.1", "::1"];
+            let hosts: Vec<String> = target
+                .base_db()
+                .fetch_principals(None)
+                .await
+                .map(|l| {
+                    l.list
+                        .into_iter()
+                        .filter(|p| p.name.is_empty())
+                        .map(|p| p.host.unwrap_or_default())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let named: Vec<String> = hosts
+                .iter()
+                .filter(|h| LOOPBACK.contains(&h.as_str()))
+                .map(|h| format!("''@'{h}'"))
+                .collect();
+            let others = hosts.len() - named.len();
+            if !named.is_empty() {
+                let list = named.join(", ");
+                let more = if others > 0 {
+                    format!(" (and {others} more at non-loopback hosts, not named here)")
+                } else {
+                    String::new()
+                };
+                why = format!(
+                    "\n\nThe server has the anonymous account(s) {list}{more}, which \
+                     outrank '{}'@'%' for a local client, so this refusal is the \
+                     server's account set and not the password the code wrote. \
+                     Drop them on that server (`DROP USER {list};`) or point the \
+                     tier at one without them.",
+                    self.principal.name
+                );
+            } else if others > 0 {
+                why = format!(
+                    "\n\nThe server has {others} anonymous account(s) at \
+                     non-loopback hosts (not named here); one may outrank \
+                     '{}'@'%' for this client.",
+                    self.principal.name
+                );
+            }
+        }
+        panic!("{}: {what}: {e}{why}", target.endpoint());
+    }
+
     async fn teardown(mut self) {
         let mine = self.principal.clone();
         self.drop_named(&mine).await;
@@ -678,17 +758,13 @@ pub async fn a_created_account_can_log_in_with_the_password_it_was_given(target:
     )
     .await;
 
-    let as_them = target.db_as(&account.principal.name, password);
-    as_them
-        .ping(std::time::Duration::from_secs(10))
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "{}: the account was created but will not accept the password it \
-                 was given: {e}",
-                target.endpoint()
-            )
-        });
+    account
+        .log_in_or_say_why(
+            target,
+            password,
+            "the account was created but will not accept the password it was given",
+        )
+        .await;
 
     // And the negative, so the login above cannot be passing because the server
     // accepts anything: a *different* password must be refused.
@@ -735,17 +811,14 @@ pub async fn a_reset_password_replaces_the_one_the_account_had(target: &'static 
 
     // The premise: it really did have the old password, so the refusal at the
     // end is the reset's doing and not a login that never worked.
-    target
-        .db_as(&account.principal.name, was)
-        .ping(std::time::Duration::from_secs(10))
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "{}: the account will not take the password it was created with, \
-                 so this test cannot tell a reset from a broken create: {e}",
-                target.endpoint()
-            )
-        });
+    account
+        .log_in_or_say_why(
+            target,
+            was,
+            "the account will not take the password it was created with, so this \
+             test cannot tell a reset from a broken create",
+        )
+        .await;
 
     // **The account as the *server* lists it**, not as this test drafted it —
     // the distinction `a_created_role_is_one_the_server_accepts` was written
@@ -761,17 +834,13 @@ pub async fn a_reset_password_replaces_the_one_the_account_had(target: &'static 
         })))
         .await;
 
-    target
-        .db_as(&account.principal.name, now)
-        .ping(std::time::Duration::from_secs(10))
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "{}: the reset was accepted but the account will not take the new \
-                 password: {e}",
-                target.endpoint()
-            )
-        });
+    account
+        .log_in_or_say_why(
+            target,
+            now,
+            "the reset was accepted but the account will not take the new password",
+        )
+        .await;
 
     assert!(
         target
@@ -821,12 +890,13 @@ pub async fn a_salted_password_logs_in_on_create_and_on_reset(target: &'static T
         let db = target.db_as(&account.principal.name, pw);
         async move { db.ping(std::time::Duration::from_secs(10)).await }
     };
-    login(first).await.unwrap_or_else(|e| {
-        panic!(
-            "{}: a salted create will not take the password it was given: {e}",
-            target.endpoint()
+    account
+        .log_in_or_say_why(
+            target,
+            first,
+            "a salted create will not take the password it was given",
         )
-    });
+        .await;
     assert!(
         login("not-the-password").await.is_err(),
         "{}: the server accepted a password this account was never given",
@@ -842,13 +912,13 @@ pub async fn a_salted_password_logs_in_on_create_and_on_reset(target: &'static T
             password_policy: None,
         })))
         .await;
-    login(second).await.unwrap_or_else(|e| {
-        panic!(
-            "{}: a salted reset was accepted but the account will not take the \
-             new password: {e}",
-            target.endpoint()
+    account
+        .log_in_or_say_why(
+            target,
+            second,
+            "a salted reset was accepted but the account will not take the new password",
         )
-    });
+        .await;
     assert!(
         login(first).await.is_err(),
         "{}: the old password still works, so the salted reset changed nothing",

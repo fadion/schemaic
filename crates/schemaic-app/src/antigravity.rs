@@ -155,15 +155,41 @@ fn settings_path_from(
 /// vendor's config tree. An app that has never run that CLI has no business
 /// leaving a file where it keeps its settings.
 ///
-/// `existing` is `None` when the file could not be read, which for this CLI
-/// means it is not there.
-fn settings_to_edit(create: bool, existing: Option<String>) -> Option<String> {
+/// An [`Existing::Unreadable`] file is declined either way: it is there, so
+/// granting must not overwrite it with a fresh document, and what it grants
+/// cannot be read to withdraw from.
+fn settings_to_edit(create: bool, existing: Existing) -> Option<String> {
     match (existing, create) {
-        (Some(cur), _) => Some(cur),
+        (Existing::Text(cur), _) => Some(cur),
         // A fresh install: the pure layer treats empty as an empty document.
-        (None, true) => Some(String::new()),
+        (Existing::Missing, true) => Some(String::new()),
         // Nothing to withdraw from, so nothing to write.
-        (None, false) => None,
+        (Existing::Missing, false) => None,
+        // There and unread: nothing to hand `edit` either way.
+        (Existing::Unreadable, _) => None,
+    }
+}
+
+/// The settings file as [`edit_settings`] found it — the read's three answers,
+/// kept apart because they decide different things.
+#[derive(Debug, PartialEq, Eq)]
+enum Existing {
+    /// Read: this text.
+    Text(String),
+    /// **Not there** (`NotFound`) — the one failure that means "no file".
+    Missing,
+    /// There, and not readable — permission denied, bytes that are not UTF-8,
+    /// a directory at the path. It may grant anything.
+    Unreadable,
+}
+
+impl From<std::io::Result<String>> for Existing {
+    fn from(read: std::io::Result<String>) -> Self {
+        match read {
+            Ok(text) => Existing::Text(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Existing::Missing,
+            Err(_) => Existing::Unreadable,
+        }
     }
 }
 
@@ -190,20 +216,57 @@ fn edit_settings(create: bool, edit: impl Fn(&str) -> Option<SettingsEdit>) -> b
     let Some(path) = settings_path() else {
         return false;
     };
-    let Some(current) = settings_to_edit(create, std::fs::read_to_string(&path).ok()) else {
-        return false;
-    };
-    match edit(&current) {
-        // Declined: the document is not a JSON object, and losing the user's
-        // file is worse than losing this session's database tools.
-        None => false,
-        Some(SettingsEdit::Unchanged) => true,
-        Some(SettingsEdit::Write(next)) => {
+    match settings_plan(create, std::fs::read_to_string(&path).into(), edit) {
+        SettingsPlan::Holds => true,
+        SettingsPlan::Declined => false,
+        SettingsPlan::Write(next) => {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
             persist::write_file_atomic(&path, next.as_bytes()).is_ok()
         }
+    }
+}
+
+/// What [`edit_settings`] does with the file, decided without touching it.
+#[derive(Debug, PartialEq, Eq)]
+enum SettingsPlan {
+    /// The file already says what it was asked to say; nothing is written.
+    Holds,
+    /// The edit was refused, and the caller must hear that it did not take.
+    Declined,
+    /// Write this document.
+    Write(String),
+}
+
+/// The decision behind [`edit_settings`], with the file's contents as an
+/// argument, so the composition of [`settings_to_edit`] with the edit is what a
+/// test reaches, rather than each half alone.
+fn settings_plan(
+    create: bool,
+    existing: Existing,
+    edit: impl Fn(&str) -> Option<SettingsEdit>,
+) -> SettingsPlan {
+    // A file that is there and cannot be read is declined before anything else:
+    // granting over it would replace the user's document, and withdrawing from
+    // it cannot see what it grants. The read used to be `.ok()`, which handed
+    // both to the "not there" arm below as a success.
+    if existing == Existing::Unreadable {
+        return SettingsPlan::Declined;
+    }
+    let Some(current) = settings_to_edit(create, existing) else {
+        // Only a withdraw from a file that is not there: no file grants
+        // nothing, which is what a withdraw asks the file to say. Reading this
+        // as a failure logged a "still granted" error at every launch for
+        // everyone without Antigravity.
+        return SettingsPlan::Holds;
+    };
+    match edit(&current) {
+        // Declined: the document is not a JSON object, and losing the user's
+        // file is worse than losing this session's database tools.
+        None => SettingsPlan::Declined,
+        Some(SettingsEdit::Unchanged) => SettingsPlan::Holds,
+        Some(SettingsEdit::Write(next)) => SettingsPlan::Write(next),
     }
 }
 
@@ -783,7 +846,7 @@ mod tests {
     fn withdrawing_rules_from_a_file_that_is_not_there_writes_nothing() {
         let rules = antigravity_allow_rules(&["list_schema"]);
         // The sweep's arguments: no file, and no permission to create one.
-        assert_eq!(settings_to_edit(false, None), None);
+        assert_eq!(settings_to_edit(false, Existing::Missing), None);
         // …and had it been allowed to proceed, this is what would have landed —
         // the write this test exists to prevent. (It is `Unchanged` now, which
         // is a second guard on the same hazard: nothing was there to remove.)
@@ -794,7 +857,7 @@ mod tests {
 
         // Granting is the other half and still creates: a fresh install has no
         // file, and its tools are refused without the rules.
-        let fresh = settings_to_edit(true, None).expect("a document to edit");
+        let fresh = settings_to_edit(true, Existing::Missing).expect("a document to edit");
         // Through the surgery `install` actually calls — see
         // `antigravity_settings_with_only_rules`, which is what makes the grant
         // describe the connection's level rather than the union of every level
@@ -810,10 +873,83 @@ mod tests {
         // An existing document is handed over verbatim either way.
         let doc = r#"{"permissions":{"allow":["mcp(other/thing)"]}}"#.to_string();
         assert_eq!(
-            settings_to_edit(false, Some(doc.clone())),
+            settings_to_edit(false, Existing::Text(doc.clone())),
             Some(doc.clone())
         );
-        assert_eq!(settings_to_edit(true, Some(doc.clone())), Some(doc));
+        assert_eq!(
+            settings_to_edit(true, Existing::Text(doc.clone())),
+            Some(doc)
+        );
+    }
+
+    /// **A file that is there but cannot be read is neither granted over nor
+    /// withdrawn from.** The read used to be `.ok()`, so permission denied,
+    /// bytes that are not UTF-8 or a directory at the path all arrived as "no
+    /// file": a withdraw answered `Holds` — no log, while the unread file may
+    /// still auto-approve `run_query` — and a grant wrote a fresh document over
+    /// the user's. Driven through the read's own conversion, which is where the
+    /// errors were folded together.
+    #[test]
+    fn an_unreadable_settings_file_is_declined_rather_than_read_as_missing() {
+        use std::io::{Error, ErrorKind};
+        let rules = antigravity_allow_rules(&crate::ai::ai_allowed_tools(true, true));
+        let unreadable = || -> Existing { Err(Error::from(ErrorKind::PermissionDenied)).into() };
+        assert_eq!(
+            settings_plan(false, unreadable(), |cur| {
+                antigravity_settings_without_rules(cur, &rules)
+            }),
+            SettingsPlan::Declined,
+            "a withdraw from a file it could not read must reach the log"
+        );
+        assert_eq!(
+            settings_plan(true, unreadable(), |cur| {
+                antigravity_settings_with_only_rules(cur, &rules, &rules)
+            }),
+            SettingsPlan::Declined,
+            "a grant must not write over a file it could not read"
+        );
+        // Not UTF-8 is the same answer: `read_to_string` reports `InvalidData`.
+        let bad: Existing = Err(Error::from(ErrorKind::InvalidData)).into();
+        assert_eq!(bad, Existing::Unreadable);
+        // …and only `NotFound` is a missing file.
+        let gone: Existing = Err(Error::from(ErrorKind::NotFound)).into();
+        assert_eq!(gone, Existing::Missing);
+    }
+
+    /// **A withdraw from a file that is not there has succeeded, not failed.**
+    /// The startup sweep withdraws at every launch whether or not a session
+    /// crashed, and for everyone without Antigravity the file is absent:
+    /// [`settings_to_edit`] rightly declines to make a document, and
+    /// `edit_settings` read that refusal as a withdraw that did not take — so
+    /// every such launch logged an `ERROR` saying Schemaic's tool rules were
+    /// "still granted" in a file that does not exist. Asked through the same
+    /// composition the caller runs, which is where the bug was.
+    #[test]
+    fn withdrawing_from_a_missing_settings_file_holds_rather_than_fails() {
+        let all = crate::ai::ai_allowed_tools(true, true);
+        let rules = antigravity_allow_rules(&all);
+        // The sweep's call: withdraw, no file.
+        assert_eq!(
+            settings_plan(false, Existing::Missing, |cur| {
+                antigravity_settings_without_rules(cur, &rules)
+            }),
+            SettingsPlan::Holds
+        );
+        // A withdraw the surgery refuses still fails — the one the log is for.
+        assert_eq!(
+            settings_plan(false, Existing::Text("[1, 2]".into()), |cur| {
+                antigravity_settings_without_rules(cur, &rules)
+            }),
+            SettingsPlan::Declined
+        );
+        // And a withdraw from a file holding our rules writes them out.
+        let granted = format!(r#"{{"permissions":{{"allow":["{}"]}}}}"#, rules[0]);
+        let SettingsPlan::Write(left) = settings_plan(false, Existing::Text(granted), |cur| {
+            antigravity_settings_without_rules(cur, &rules)
+        }) else {
+            panic!("our rule must be withdrawn from a file that has it");
+        };
+        assert!(!left.contains(&rules[0]), "{left}");
     }
 
     #[test]

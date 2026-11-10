@@ -1651,6 +1651,32 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
     // through the signal for that reason.
     nav.tree_id.set(Some(tree.id()));
 
+    // **Dimmed while the connection is Disconnected, never hidden.** The tree
+    // is the schema as last loaded: names to browse and write against, and the
+    // expansion and scroll a blip should not cost. Hiding it flashed it away on
+    // every dropped packet; left as it was, it read as live under a header that
+    // said otherwise. The veil passes every pointer event through — scrolling,
+    // expanding, the context menus all keep working (absolute overlays
+    // intercept clicks otherwise; see floem-gotchas.md) — and lifts on the
+    // check that finds the server again. `Unknown` is not dimmed, for the
+    // reason `ConnStatus::is_down` gives: it is also every startup.
+    let conn_status = ui.conn.conn_status;
+    let veil = empty().pointer_events(|| false).style(move |s| {
+        let s = s.absolute().inset(0.0);
+        if conn_status.get().is_down() {
+            s.background(theme::stale_veil())
+        } else {
+            s
+        }
+    });
+    let tree = stack((tree, veil)).style(|s| {
+        s.flex_col()
+            .flex_grow(1.0_f32)
+            .width_full()
+            .min_height(0.0)
+            .min_width(0.0)
+    });
+
     // Title row: "SCHEMA" left; the visibility (eye) and settings (gear) menus
     // right. The gear is rightmost; the eye sits 10px to its left. Each icon
     // closes the OTHER menu and toggles its own — so clicking one while the
