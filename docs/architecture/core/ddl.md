@@ -2642,8 +2642,7 @@ rather than `TABLE`. **The recreate's risk sentences were written for the other 
 and had to learn this**: they told the user the comment "does not survive … re-apply any
 COMMENT" over a plan that sets it again, and named the new name as the one dropped. The comment
 half now asks `recreate_restates_routine_comment` (MySQL's `CREATE` carries a `COMMENT` clause,
-SQL Server's plan sets it after, and so does DuckDB's, below; PostgreSQL's `COMMENT ON` is not
-repeated), the sentence names
+SQL Server's plan sets it after, and so do DuckDB's and PostgreSQL's, below), the sentence names
 the name the server holds, and `RoutineDraft::clash` (behind `name_clash`) asks `ddl_is_transactional` for its
 consequence — on MySQL the `DROP` commits before the `CREATE` is refused, so the rename destroys
 the original; SQL Server's `run_ddl` is one transaction, so the refused `CREATE` takes the
@@ -2669,6 +2668,28 @@ option the routine's shape cannot carry (`TsqlShape::allows`), because the serve
 names neither the option nor why, and `INLINE = ON` beside `EXECUTE AS`, which a scalar function
 cannot be inlined with (Msg 16203, measured on SQL Server 2022)
 (`a_sql_server_routine_option_its_shape_refuses_is_refused`).
+**PostgreSQL's routine comment is a `COMMENT ON` by signature, on SQL Server's rule.** Its reader
+left `RoutineInfo::comment` empty until `routines_where` read `obj_description(p.oid, 'pg_proc')`
+(under `schemaic-db`), and once it did, `routine_follow_ups` needed a PostgreSQL arm: `COMMENT ON
+FUNCTION|PROCEDURE <signature> IS …`, or `IS NULL` to clear it — after a create or a re-create
+any comment, since the `DROP` took it, and after a `CREATE OR REPLACE`, which keeps it, only a
+changed one. Without the arm, Schema Compare of two functions whose comments differed planned a
+`CREATE OR REPLACE` that changed nothing and reported them different again after every Apply
+(`a_postgres_routines_comment_is_set_after_its_create`). So `recreate_restates_routine_comment`
+is true on PostgreSQL now, and the re-create's sentence names only the privileges as lost
+(`re_creating_a_routine_says_the_grants_do_not_survive`).
+**A scripted copy restates a view's and a routine's comment** wherever
+`script_restates_object_comments` says the engine's is a statement of its own — DuckDB, PostgreSQL
+and SQL Server. *Copy DDL* and the dump dropped both on the last two while keeping a table's.
+MySQL answers no because its routine `CREATE` carries the `COMMENT` clause and its views have no
+comment — `information_schema` reports every view's as `VIEW` — and SQLite has none at all.
+`view_comment_sql` writes `COMMENT ON [MATERIALIZED] VIEW` (`is_materialized_view` picks the word)
+or, on SQL Server, the `MS_Description` added at level-1 type `VIEW` — **not `TABLE`**, which
+`sp_addextendedproperty` refuses for a view (Msg 15135, verified on SQL Server 2022; `TsqlComment`'s
+`object_type` doc said a view was filed under `TABLE` until then). `routine_comment_sql` is
+`routine_follow_ups` with no `before`, so a copy writes exactly the statement a create is followed
+by (`a_scripted_copy_restates_view_and_routine_comments`). Where each lands in the script is
+`schema.rs`'s (`ObjectItem::routine_script`, `TableInfo::tsql_create_ddl`).
 **DuckDB's routines are its macros, and the routine editor came on for them the way the view
 editor did** — every engine fact here measured on the bundled 2.0.0. `duckdb_supports` admits
 `CreateRoutine` and `ReplaceRoutine` when the draft is a `RoutineKind::Function` — a macro is a

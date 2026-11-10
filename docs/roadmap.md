@@ -39,16 +39,6 @@ have landed.
 
 ## Desktop app
 
-### Small gaps
-
-Each of these is a one-session change.
-
-- **A view's and a routine's comment in *Copy DDL* and the dump, on PostgreSQL and SQL Server.**
-  Their scripts drop both today — `COMMENT ON VIEW` / `COMMENT ON FUNCTION`, and the
-  `MS_Description` property — while a table's is kept. DuckDB's are restated
-  (`ddl::script_restates_object_comments`); turn the predicate on per engine with the statement
-  its edits already write, and check each engine's dump tests.
-
 ### DuckDB as a fifth engine
 
 Phase 1 has landed: the engine reads, runs scripts and DDL plans, introspects, exports, plans,

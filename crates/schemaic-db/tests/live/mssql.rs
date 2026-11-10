@@ -1683,6 +1683,65 @@ async fn a_dumps_comments_stay_out_of_the_modules_it_restores() {
     }
 }
 
+/// **A dump restores a view's and a routine's comment**, the `MS_Description`
+/// property each carries, as it did a table's — in a batch of its own after
+/// the `CREATE`, since inside the module's batch it would be stored as part of
+/// it. The dump dropped both.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dump_restores_a_views_and_a_routines_comment() {
+    use schemaic_core::dump::DumpOptions;
+    if !enabled() || azure_cannot("restores into a second database, which it has not got") {
+        return;
+    }
+    let src = Scratch::create("objcmtsrc").await;
+    src.exec("CREATE TABLE dbo.c (id int PRIMARY KEY)").await;
+    src.exec("CREATE VIEW dbo.v_c AS SELECT id FROM dbo.c")
+        .await;
+    src.exec("CREATE PROCEDURE dbo.p_c AS SELECT COUNT(*) FROM dbo.c;")
+        .await;
+    src.exec("CREATE FUNCTION dbo.f_c (@x int) RETURNS int AS BEGIN RETURN @x; END")
+        .await;
+    for (kind, name, text) in [
+        ("VIEW", "v_c", "the view's"),
+        ("PROCEDURE", "p_c", "the procedure's"),
+        ("FUNCTION", "f_c", "the function's"),
+    ] {
+        src.exec(&format!(
+            "EXEC sp_addextendedproperty @name = N'MS_Description', @value = N'{}', \
+             @level0type = N'SCHEMA', @level0name = N'dbo', \
+             @level1type = N'{kind}', @level1name = N'{name}'",
+            text.replace('\'', "''")
+        ))
+        .await;
+    }
+    let file = Box::pin(dump_file(&src, DumpOptions::default())).await;
+    let dst = Scratch::create("objcmtdst").await;
+    let end = Box::pin(restore_batches(&dst, &file)).await;
+    assert!(
+        matches!(end, schemaic_core::script::ExecEnd::Done),
+        "{end:?}\n{file}"
+    );
+    for (name, text) in [
+        ("dbo.v_c", "the view's"),
+        ("dbo.p_c", "the procedure's"),
+        ("dbo.f_c", "the function's"),
+    ] {
+        let got = dst
+            .scalar(&format!(
+                "SELECT CAST(value AS nvarchar(4000)) FROM sys.extended_properties \
+                 WHERE class = 1 AND major_id = OBJECT_ID(N'{name}') AND minor_id = 0 \
+                 AND name = N'MS_Description'"
+            ))
+            .await;
+        assert_eq!(got, text, "{name}'s comment\n---\n{file}");
+        // And the module is the module alone, the comment not inside it.
+        let def = dst
+            .scalar(&format!("SELECT OBJECT_DEFINITION(OBJECT_ID(N'{name}'))"))
+            .await;
+        assert!(!def.contains("MS_Description"), "{name}: {def}");
+    }
+}
+
 /// **A replay stops before it drops anything where a graph table is there.**
 /// The file cannot put one back as it is — an edge's rows are not in it, and
 /// a node's would come back under new node ids — and it dropped them: replayed

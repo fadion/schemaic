@@ -155,6 +155,7 @@ live_suite!(
     ],
     routines: [
         a_pg_redefinition_keeps_a_functions_planner_attributes,
+        a_pg_scripted_copy_keeps_a_functions_and_views_comment,
         a_mariadb_sequence_is_not_read_as_a_base_table,
     ],
     ddl: [

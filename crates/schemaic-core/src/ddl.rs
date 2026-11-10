@@ -11577,8 +11577,8 @@ struct TsqlComment<'a> {
     schema: &'a str,
     /// The object's name — a table's, or a routine's.
     table: &'a str,
-    /// Its level-1 type: `TABLE` (a view is filed under it too), `PROCEDURE`
-    /// or `FUNCTION`.
+    /// Its level-1 type: `TABLE`, `VIEW` (which `sp_addextendedproperty`
+    /// will not take as a `TABLE`, Msg 15135), `PROCEDURE` or `FUNCTION`.
     object_type: &'a str,
     column: Option<&'a str>,
 }
@@ -13359,17 +13359,25 @@ fn fks_equal(a: &ForeignKeyInfo, b: &ForeignKeyInfo) -> bool {
 /// place — then only a changed comment is written — and `None` when it was
 /// created, fresh or again, and any comment is. Set whether or not one is
 /// there (`TsqlComment::set`). On DuckDB a macro's comment, `COMMENT ON MACRO
-/// [TABLE]`, after every create and replace — the replace clears it. Nothing
-/// on the other engines, whose comment is part of the `CREATE` (MySQL) or its
-/// own change (PostgreSQL).
+/// [TABLE]`, after every create and replace — the replace clears it. On
+/// PostgreSQL its `COMMENT ON FUNCTION|PROCEDURE`, by signature, on the same
+/// rule as SQL Server's: a `CREATE OR REPLACE` keeps the comment, so only a
+/// changed one is written, and a re-create's `DROP` took it, so any is.
+/// Nothing on MySQL, whose comment is part of the `CREATE`, or SQLite.
 fn routine_follow_ups(f: &RoutineInfo, before: Option<&RoutineInfo>, d: SqlDialect) -> Vec<String> {
+    let comment = blank_as_none(f.comment.as_deref());
+    let changed = match before {
+        Some(server) => comment != blank_as_none(server.comment.as_deref()),
+        None => comment.is_some(),
+    };
     match d {
+        SqlDialect::Postgres if changed => vec![format!(
+            "COMMENT ON {} {} IS {};",
+            f.object_keyword(d),
+            f.signature_sql(d),
+            comment_literal(comment, d)
+        )],
         SqlDialect::MsSql => {
-            let comment = blank_as_none(f.comment.as_deref());
-            let changed = match before {
-                Some(server) => comment != blank_as_none(server.comment.as_deref()),
-                None => comment.is_some(),
-            };
             if !changed {
                 return Vec::new();
             }
@@ -15016,39 +15024,64 @@ pub fn view_comments_restated(
 /// Does a **scripted copy** of a view or a routine — *Copy DDL*, the `.sql`
 /// dump — restate its comment after its `CREATE`?
 ///
-/// DuckDB's does: a view's and a macro's comment is a `COMMENT ON` of its
-/// own, which no `CREATE` has a clause for, and the dump dropped both until
-/// it was written after them ([`view_comment_sql`], `routine_follow_ups`).
-/// **Not yet on PostgreSQL** (`COMMENT ON VIEW`, `COMMENT ON FUNCTION`) **or
-/// SQL Server** (`MS_Description`): their scripts drop a view's and a
-/// routine's comment today — a gap of theirs, on the roadmap, not an answer
-/// about them. MySQL's routine `CREATE` carries its `COMMENT` clause and its
-/// views have none; SQLite has no comments.
+/// DuckDB's, PostgreSQL's and SQL Server's do: there a view's and a routine's
+/// comment is a statement of its own — `COMMENT ON` on the first two, the
+/// `MS_Description` extended property on SQL Server — which no `CREATE` has a
+/// clause for, and their dumps dropped both until it was written after them
+/// ([`view_comment_sql`], `routine_follow_ups`). MySQL's routine `CREATE`
+/// carries its `COMMENT` clause, and its views have none — `information_schema`
+/// reports every view's comment as `VIEW`, which is not one. SQLite has no
+/// comments.
 ///
 /// An exhaustive `match`, for the reason [`supports_owners`] gives.
 pub fn script_restates_object_comments(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::DuckDb => true,
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+        SqlDialect::DuckDb | SqlDialect::Postgres | SqlDialect::MsSql => true,
+        SqlDialect::MySql | SqlDialect::Sqlite => false,
     }
 }
 
-/// The `COMMENT ON VIEW` a scripted copy of view `t` ends with, where
-/// [`script_restates_object_comments`] and it has a comment.
+/// The statement a scripted copy of view `t` ends with to restate its
+/// comment, where [`script_restates_object_comments`] and it has one: a
+/// `COMMENT ON [MATERIALIZED] VIEW`, or on SQL Server the `MS_Description`
+/// property added on it at level-1 type `VIEW`, which goes in a batch of its
+/// own after the `CREATE VIEW`.
 pub fn view_comment_sql(t: &TableInfo, dialect: SqlDialect) -> Option<String> {
     let c = t.comment.as_deref().filter(|c| !c.trim().is_empty())?;
-    (t.is_view && script_restates_object_comments(dialect)).then(|| {
-        format!(
-            "COMMENT ON VIEW {} IS {};",
+    if !(t.is_view && script_restates_object_comments(dialect)) {
+        return None;
+    }
+    Some(match dialect {
+        // Filed under `VIEW`: `sp_addextendedproperty` refuses a view named
+        // as a `TABLE` (Msg 15135), though `sys.extended_properties` keeps
+        // both by the same object id.
+        SqlDialect::MsSql => TsqlComment {
+            schema: t
+                .schema
+                .as_deref()
+                .unwrap_or(crate::schema::MSSQL_DEFAULT_SCHEMA),
+            table: &t.name,
+            object_type: "VIEW",
+            column: None,
+        }
+        .add(c),
+        _ => format!(
+            "COMMENT ON {} {} IS {};",
+            if is_materialized_view(t) {
+                "MATERIALIZED VIEW"
+            } else {
+                "VIEW"
+            },
             qualified(&t.name, t.schema.as_deref(), dialect),
             ddl_string(c, dialect)
-        )
+        ),
     })
 }
 
 /// The statements a scripted copy of routine `f` ends with to restate its
-/// comment, where [`script_restates_object_comments`]: on DuckDB a macro's
-/// `COMMENT ON MACRO [TABLE]`, the same statement an edit writes.
+/// comment, where [`script_restates_object_comments`] — the statement an edit
+/// writes after a create: DuckDB's `COMMENT ON MACRO [TABLE]`, PostgreSQL's
+/// `COMMENT ON FUNCTION|PROCEDURE` by signature, SQL Server's `MS_Description`.
 pub fn routine_comment_sql(f: &RoutineInfo, dialect: SqlDialect) -> Vec<String> {
     if script_restates_object_comments(dialect) {
         routine_follow_ups(f, None, dialect)
@@ -15058,17 +15091,16 @@ pub fn routine_comment_sql(f: &RoutineInfo, dialect: SqlDialect) -> Vec<String> 
 }
 
 /// Does a routine's drop-and-create on `dialect` **put its comment back**?
-/// MySQL's `CREATE` carries a `COMMENT` clause, and SQL Server's plan sets the
-/// `MS_Description` again after it (`routine_follow_ups`); PostgreSQL's
-/// `COMMENT ON` is a statement the recreate does not repeat, and SQLite has
-/// no routines. DuckDB's plan sets the comment again after every create
-/// (`routine_follow_ups`), its replace clearing it anyway
-/// ([`replace_clears_comment`]). What the recreate's risk sentence may say is
-/// lost.
+/// MySQL's `CREATE` carries a `COMMENT` clause, and SQL Server's and
+/// PostgreSQL's plans set the `MS_Description` or the `COMMENT ON` again after
+/// it (`routine_follow_ups`); SQLite has no routines. DuckDB's plan sets the
+/// comment again after every create (`routine_follow_ups`), its replace
+/// clearing it anyway ([`replace_clears_comment`]). What the recreate's risk
+/// sentence may say is lost.
 fn recreate_restates_routine_comment(dialect: SqlDialect) -> bool {
     match dialect {
-        SqlDialect::MySql | SqlDialect::MsSql | SqlDialect::DuckDb => true,
-        SqlDialect::Postgres | SqlDialect::Sqlite => false,
+        SqlDialect::MySql | SqlDialect::MsSql | SqlDialect::DuckDb | SqlDialect::Postgres => true,
+        SqlDialect::Sqlite => false,
     }
 }
 
@@ -29837,9 +29869,11 @@ mod tests {
     }
 
     /// A scripted copy restates a DuckDB view's and macro's comment after
-    /// its `CREATE` — and, until their own gap is closed, no other engine's.
+    /// its `CREATE`, as PostgreSQL's and SQL Server's do — and not MySQL's,
+    /// whose routine `CREATE` carries it and whose views have none, or
+    /// SQLite's, which has no comments.
     #[test]
-    fn a_duckdb_scripted_copy_restates_view_and_macro_comments() {
+    fn a_scripted_copy_restates_view_and_routine_comments() {
         let v = TableInfo {
             name: "v".into(),
             schema: Some("main".into()),
@@ -29859,10 +29893,36 @@ mod tests {
             routine_comment_sql(&m, DuckDb),
             ["COMMENT ON MACRO \"main\".\"m\" IS 'doubles';"]
         );
-        for d in [MySql, Postgres, Sqlite, MsSql] {
+        // MySQL's information_schema calls every view's comment `VIEW`; it
+        // is not one, and is never written.
+        for d in [MySql, Sqlite] {
             assert_eq!(view_comment_sql(&v, d), None, "{d:?}");
             assert!(routine_comment_sql(&m, d).is_empty(), "{d:?}");
         }
+        assert_eq!(
+            view_comment_sql(&v, Postgres).as_deref(),
+            Some("COMMENT ON VIEW \"main\".\"v\" IS 'it''s a view';")
+        );
+        let on_server = view_comment_sql(&v, MsSql).expect("a SQL Server view's");
+        assert!(
+            on_server.starts_with("EXEC sp_addextendedproperty @name = N'MS_Description'"),
+            "{on_server}"
+        );
+        assert!(on_server.contains("@level1type = N'VIEW', @level1name = N'v'"));
+        let p = RoutineInfo {
+            name: "p".into(),
+            schema: Some("dbo".into()),
+            kind: crate::schema::RoutineKind::Procedure,
+            comment: Some("does".into()),
+            ..Default::default()
+        };
+        let on_server = routine_comment_sql(&p, MsSql);
+        assert_eq!(on_server.len(), 1);
+        assert!(
+            on_server[0].contains("@level1type = N'PROCEDURE'"),
+            "{on_server:?}"
+        );
+        assert!(on_server[0].contains("N'does'"), "{on_server:?}");
         // No comment, or not a view: nothing.
         let bare = TableInfo {
             comment: None,
@@ -31458,22 +31518,25 @@ mod tests {
             );
         }
 
-        /// **A re-create loses the routine's grants and its comment, and the
-        /// risk block is the only place that can appear.** The plan is a `DROP`
-        /// and a `CREATE`; what is missing from it is invisible by construction,
-        /// and the model carries neither an ACL nor a comment to restate. Live
-        /// on PostgreSQL 16.15, `proacl` and `obj_description` were both NULL
-        /// after a plan the user consented to as "Re-create function tally".
+        /// **A re-create loses the routine's grants, and the risk block is
+        /// the only place that can appear.** The plan is a `DROP` and a
+        /// `CREATE`; what is missing from it is invisible by construction, and
+        /// the model carries no ACL to restate. Live on PostgreSQL 16.15,
+        /// `proacl` and `obj_description` were both NULL after a plan the user
+        /// consented to as "Re-create function tally". The comment the model
+        /// now does carry, and the plan sets it again after the create
+        /// (`routine_follow_ups`), so the sentence no longer says it is lost.
         ///
-        /// A *replace* keeps both, so it must not carry the sentence — a warning
-        /// that fires on every edit is a warning nobody reads.
+        /// A *replace* keeps the grants, so it must not carry the sentence — a
+        /// warning that fires on every edit is a warning nobody reads.
         #[test]
-        fn re_creating_a_routine_says_the_grants_and_the_comment_do_not_survive() {
+        fn re_creating_a_routine_says_the_grants_do_not_survive() {
             let mut f = fnc();
             f.name = "tally".into();
             f.arguments = "a integer".into();
             f.identity_arguments = "a integer".into();
             f.returns = "integer".into();
+            f.comment = Some("counts".into());
 
             let mut changed = RoutineDraft::from_info(&f);
             changed.info.arguments = "a integer, b integer".into();
@@ -31481,7 +31544,7 @@ mod tests {
             assert!(
                 risks
                     .iter()
-                    .any(|r| r.contains("Privileges") && r.contains("comment")),
+                    .any(|r| r.contains("Privileges") && !r.contains("comment")),
                 "{risks:?}"
             );
 
@@ -31498,6 +31561,52 @@ mod tests {
             // and MySQL grants on a routine do not survive one either.
             let risks = diff_routine(&f, &body_only, MySql).destructive();
             assert!(risks.iter().any(|r| r.contains("Privileges")), "{risks:?}");
+        }
+
+        /// **A PostgreSQL routine's comment is written as `COMMENT ON`, by
+        /// signature**: after a re-create, whose `DROP` took it, and in place
+        /// only when it changed. Without it a Compare of two functions whose
+        /// comments differ planned a `CREATE OR REPLACE` that changed nothing,
+        /// and called them different again after every Apply.
+        #[test]
+        fn a_postgres_routines_comment_is_set_after_its_create() {
+            let mut f = fnc();
+            f.name = "tally".into();
+            f.arguments = "a integer".into();
+            f.identity_arguments = "a integer".into();
+            f.returns = "integer".into();
+            f.comment = Some("counts".into());
+            let set = "COMMENT ON FUNCTION \"public\".\"tally\"(a integer) IS 'counts';";
+
+            // In place, a comment that changed.
+            let mut server = f.clone();
+            server.comment = Some("old".into());
+            let sql = diff_routine(&server, &RoutineDraft::from_info(&f), Postgres).emit();
+            assert_eq!(sql.last().map(String::as_str), Some(set), "{sql:?}");
+            // Cleared.
+            let mut cleared = RoutineDraft::from_info(&server);
+            cleared.info.comment = None;
+            let sql = diff_routine(&server, &cleared, Postgres).emit();
+            assert_eq!(
+                sql.last().map(String::as_str),
+                Some("COMMENT ON FUNCTION \"public\".\"tally\"(a integer) IS NULL;"),
+                "{sql:?}"
+            );
+            // A body-only edit leaves an unchanged comment alone.
+            let mut body = RoutineDraft::from_info(&f);
+            body.info.body = "SELECT 2".into();
+            let sql = diff_routine(&f, &body, Postgres).emit();
+            assert!(!sql.iter().any(|s| s.starts_with("COMMENT ON")), "{sql:?}");
+            // A re-create sets it again, under the new signature.
+            let mut changed = RoutineDraft::from_info(&f);
+            changed.info.arguments = "a integer, b integer".into();
+            changed.info.identity_arguments = "a integer, b integer".into();
+            let sql = diff_routine(&f, &changed, Postgres).emit();
+            assert_eq!(
+                sql.last().map(String::as_str),
+                Some("COMMENT ON FUNCTION \"public\".\"tally\"(a integer, b integer) IS 'counts';"),
+                "{sql:?}"
+            );
         }
 
         /// The line the normalisation must not cross: a `DEFAULT` *inside* a

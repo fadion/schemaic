@@ -136,6 +136,93 @@ pub async fn a_pg_redefinition_keeps_a_functions_planner_attributes(target: &'st
     scratch.teardown().await;
 }
 
+/// **A PostgreSQL function's and view's comment survive their scripted
+/// copy.** Both are read off the catalogue, both objects are dropped, and
+/// Schemaic's own statements — the create, then the comment a scripted copy
+/// ends with (`ddl::routine_comment_sql`, `ddl::view_comment_sql`) — put them
+/// back; the comments are read again. *Copy DDL* and the dump dropped both,
+/// and the routine reader never read a function's at all.
+pub async fn a_pg_scripted_copy_keeps_a_functions_and_views_comment(target: &'static Target) {
+    if target.engine.dialect() != SqlDialect::Postgres {
+        crate::endpoint::note_no_op(target, "is not the engine this restates for");
+        return;
+    }
+    let pg = SqlDialect::Postgres;
+    let scratch = Scratch::create(target, "object_comments").await;
+    scratch
+        .exec("CREATE FUNCTION f(x integer) RETURNS integer LANGUAGE sql AS 'SELECT x'")
+        .await;
+    scratch
+        .exec("COMMENT ON FUNCTION f(integer) IS 'it''s f'")
+        .await;
+    scratch.exec("CREATE VIEW v AS SELECT 1 AS a").await;
+    scratch.exec("COMMENT ON VIEW v IS 'vee'").await;
+
+    let read = |what: &'static str| {
+        let scratch = &scratch;
+        async move {
+            let s = scratch
+                .db
+                .fetch_schema(&scratch.database, CancellationToken::new())
+                .await
+                .unwrap_or_else(|e| panic!("introspecting {}: {e}", scratch.database));
+            let f = s
+                .routines
+                .iter()
+                .find(|r| r.name == "f")
+                .map(|r| (**r).clone())
+                .unwrap_or_else(|| panic!("{what}: no function f"));
+            let v = s
+                .tables
+                .iter()
+                .find(|t| t.name == "v")
+                .cloned()
+                .unwrap_or_else(|| panic!("{what}: no view v"));
+            (f, v)
+        }
+    };
+    let (f, v) = read("before").await;
+    assert_eq!(
+        f.comment.as_deref(),
+        Some("it's f"),
+        "{}: the function's comment",
+        target.name
+    );
+    assert_eq!(
+        v.comment.as_deref(),
+        Some("vee"),
+        "{}: the view's comment",
+        target.name
+    );
+
+    let mut script = vec![f.create_sql(pg, false)];
+    script.extend(schemaic_core::ddl::routine_comment_sql(&f, pg));
+    script.extend(schemaic_core::ddl::view_ddl(&v, pg));
+    script.extend(schemaic_core::ddl::view_comment_sql(&v, pg));
+    scratch.exec("DROP VIEW v").await;
+    scratch.exec("DROP FUNCTION f(integer)").await;
+    scratch
+        .db
+        .run_ddl(&scratch.database, &script, CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("{}: the script was refused: {e}\n{script:#?}", target.name));
+
+    let (f, v) = read("after").await;
+    assert_eq!(
+        f.comment.as_deref(),
+        Some("it's f"),
+        "{}: {script:#?}",
+        target.name
+    );
+    assert_eq!(
+        v.comment.as_deref(),
+        Some("vee"),
+        "{}: {script:#?}",
+        target.name
+    );
+    scratch.teardown().await;
+}
+
 async fn routine_of(scratch: &Scratch) -> RoutineInfo {
     let schema = scratch
         .db

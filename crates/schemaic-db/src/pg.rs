@@ -4015,7 +4015,8 @@ async fn routines_where(client: &Client, filter: &str) -> Result<Vec<RoutineInfo
                     p.oid::text, p.prokind, \
                     pg_catalog.pg_get_function_identity_arguments(p.oid), \
                     p.proparallel, p.proleakproof::int, p.procost::text, \
-                    CASE WHEN p.proretset THEN p.prorows::text END \
+                    CASE WHEN p.proretset THEN p.prorows::text END, \
+                    pg_catalog.obj_description(p.oid, 'pg_proc') \
              FROM pg_proc p \
              JOIN pg_namespace n ON n.oid = p.pronamespace \
              JOIN pg_language l ON l.oid = p.prolang \
@@ -4053,6 +4054,9 @@ async fn routines_where(client: &Client, filter: &str) -> Result<Vec<RoutineInfo
             leakproof: cell(r, 13) == "1",
             cost: Some(cell(r, 14)).filter(|s| !s.is_empty()),
             rows: Some(cell(r, 15)).filter(|s| !s.is_empty()),
+            // Its `COMMENT ON`, which a scripted copy restates and a re-create
+            // sets again (`ddl::routine_follow_ups`); NULL for none.
+            comment: Some(cell(r, 16)).filter(|s| !s.trim().is_empty()),
             // MySQL's alone; PostgreSQL has no clause for any of them and the
             // emitter writes nothing for a `None`.
             ..Default::default()

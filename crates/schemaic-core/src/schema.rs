@@ -4048,7 +4048,10 @@ pub struct RoutineInfo {
     /// whose rights the body runs with, and a recreate that dropped it would
     /// silently hand the routine to whoever applied the edit.
     pub definer: Option<String>,
-    /// **MySQL.** The `COMMENT` clause. A recreate that omits it loses it.
+    /// The routine's comment: MySQL's `COMMENT` clause, which a recreate that
+    /// omits it loses; PostgreSQL's and DuckDB's `COMMENT ON`, and SQL
+    /// Server's `MS_Description`, each a statement of its own that a plan and a
+    /// scripted copy write after the create (`ddl::routine_follow_ups`).
     pub comment: Option<String>,
     /// **MySQL.** The session state the routine was created under, from
     /// `SHOW CREATE`. `None` means "not known" — an unfetched routine and every
@@ -5835,14 +5838,7 @@ impl ObjectItem {
             // `CREATE`'s batch would be stored as part of the module.
             // Its comment after it, where the engine's is a statement of its
             // own (`ddl::script_restates_object_comments`).
-            ObjectItem::Routine(r) => {
-                let mut sql = Self::routine_script(r, dialect, false, None);
-                for c in crate::ddl::routine_comment_sql(r, dialect) {
-                    sql.push('\n');
-                    sql.push_str(&c);
-                }
-                sql
-            }
+            ObjectItem::Routine(r) => Self::routine_script(r, dialect, false, None),
             // Through `client_script` for the same reason a routine is: this
             // `CREATE` carries no terminator of its own (the apply path sends it
             // whole) and its body may be a `BEGIN … END` full of `;`.
@@ -5916,6 +5912,11 @@ impl ObjectItem {
 
     /// A routine's script — see [`Self::create_sql`] — replacing one of its
     /// name in place, or after `drop`.
+    ///
+    /// Its comment after it, where the engine's is a statement of its own
+    /// (`ddl::routine_comment_sql`), as one more statement of the script — so
+    /// on SQL Server it is a batch of its own, never part of the module — and
+    /// after a `drop` as well as a create, since the drop took it.
     fn routine_script(
         r: &RoutineInfo,
         dialect: crate::intel::SqlDialect,
@@ -5938,6 +5939,7 @@ impl ObjectItem {
         stmts.extend(crate::ddl::routine_create_statements(
             r, dialect, true, replace,
         ));
+        stmts.extend(crate::ddl::routine_comment_sql(r, dialect));
         crate::ddl::client_script(&stmts, dialect)
     }
 }
@@ -6560,17 +6562,22 @@ impl TableInfo {
                 ),
             };
             let Some(draft) = crate::ddl::ViewDraft::from_table(self) else {
-                return create;
+                return match crate::ddl::view_comment_sql(self, d) {
+                    Some(comment) => format!("{create}\nGO\n{comment}"),
+                    None => create,
+                };
             };
             // Under the settings it was created with, both stated and each
             // `SET` a batch of its own (`ddl::tsql_settings_scripted`); then
             // an indexed view's indexes, each in a batch of its own too —
             // `CREATE VIEW` must be alone in one — and one the model cannot
             // restate named, as a table's is.
+            // Its comment last, a batch of its own like the rest.
             let mut out =
                 crate::ddl::tsql_settings_scripted(create, &draft.options.tsql.module, false)
                     .into_iter()
                     .chain(crate::ddl::view_index_statements(&draft, &self.name, d))
+                    .chain(crate::ddl::view_comment_sql(self, d))
                     .collect::<Vec<_>>()
                     .join("\nGO\n");
             for ix in draft.options.tsql.indexes.iter().filter(|ix| ix.lossy) {
@@ -12609,6 +12616,101 @@ mod tests {
             .expect(&sql);
         assert!(head < member, "{sql}");
         assert!(sql[head..member].contains("\nGO\n"), "{sql}");
+    }
+
+    /// **A SQL Server view's and routine's comment is in its script**, as the
+    /// `MS_Description` property, in a batch after the `CREATE` — inside the
+    /// `CREATE`'s batch it would be stored as part of the module. *Copy DDL*
+    /// and the dump dropped both while a table's was kept.
+    #[test]
+    fn a_sql_server_view_and_routine_script_restate_their_comment() {
+        let ms = crate::intel::SqlDialect::MsSql;
+        let v = TableInfo {
+            schema: Some("sales".into()),
+            name: "v".into(),
+            is_view: true,
+            comment: Some("it's a view".into()),
+            create_sql: Some("CREATE VIEW v AS SELECT 1 AS a".into()),
+            ..Default::default()
+        };
+        let sql = v.create_ddl(ms);
+        let create = sql.find("CREATE VIEW [sales].[v]").expect(&sql);
+        let comment = sql
+            .find("EXEC sp_addextendedproperty @name = N'MS_Description', @value = N'it''s a view'")
+            .expect(&sql);
+        assert!(create < comment, "{sql}");
+        assert!(sql[create..comment].contains("\nGO\n"), "{sql}");
+        assert!(
+            sql.contains("@level1type = N'VIEW', @level1name = N'v'"),
+            "{sql}"
+        );
+
+        let r = RoutineInfo {
+            name: "p".into(),
+            schema: Some("dbo".into()),
+            kind: RoutineKind::Procedure,
+            body: "SELECT 1".into(),
+            comment: Some("does a thing".into()),
+            ..Default::default()
+        };
+        let sql = ObjectItem::Routine(std::sync::Arc::new(r)).create_sql(ms);
+        let create = sql.find("CREATE PROCEDURE [dbo].[p]").expect(&sql);
+        let comment = sql.find("N'does a thing'").expect(&sql);
+        assert!(create < comment, "{sql}");
+        assert!(sql[create..comment].contains("\nGO\n"), "{sql}");
+        assert!(sql.contains("@level1type = N'PROCEDURE'"), "{sql}");
+    }
+
+    /// **A PostgreSQL view's and routine's comment is in its script**, as the
+    /// `COMMENT ON` an edit writes — a materialized view's naming it so, and a
+    /// function's by its signature, since an overloaded name is several.
+    #[test]
+    fn a_postgres_view_and_routine_script_restate_their_comment() {
+        let pg = crate::intel::SqlDialect::Postgres;
+        let v = TableInfo {
+            schema: Some("public".into()),
+            name: "v".into(),
+            is_view: true,
+            comment: Some("it's a view".into()),
+            view_definition: Some("SELECT 1 AS a".into()),
+            ..Default::default()
+        };
+        let sql = v.create_ddl(pg);
+        assert!(
+            sql.ends_with("\nCOMMENT ON VIEW \"public\".\"v\" IS 'it''s a view';"),
+            "{sql}"
+        );
+        let m = TableInfo {
+            view_options: Some(ViewOptions {
+                materialized: true,
+                ..ViewOptions::default()
+            }),
+            ..v
+        };
+        let sql = m.create_ddl(pg);
+        assert!(
+            sql.ends_with("\nCOMMENT ON MATERIALIZED VIEW \"public\".\"v\" IS 'it''s a view';"),
+            "{sql}"
+        );
+
+        let f = RoutineInfo {
+            name: "tally".into(),
+            schema: Some("public".into()),
+            kind: RoutineKind::Function,
+            arguments: "a integer".into(),
+            identity_arguments: "a integer".into(),
+            returns: "integer".into(),
+            language: "sql".into(),
+            body: "SELECT a".into(),
+            comment: Some("counts".into()),
+            ..Default::default()
+        };
+        let sql = ObjectItem::Routine(std::sync::Arc::new(f)).create_sql(pg);
+        assert!(
+            sql.trim_end()
+                .ends_with("COMMENT ON FUNCTION \"public\".\"tally\"(a integer) IS 'counts';"),
+            "{sql}"
+        );
     }
 
     /// **A numbered group's members are created under the group's settings

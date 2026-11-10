@@ -168,6 +168,18 @@ trigger**: its script is `TriggerInfo::create_set_sql`, not `ObjectItem::create_
 note there is a statement of its own ahead of the trigger's settings, which `client_script`
 gives a batch apart (`a_signed_triggers_script_says_the_signature_is_not_in_it`; live, the same
 leg).
+**They restate a view's and a routine's comment too**, where the engine's is a statement of its
+own (`ddl::script_restates_object_comments` — DuckDB, PostgreSQL, SQL Server); on the last two
+both were dropped while a table's was kept. A routine's goes through `ObjectItem::routine_script`,
+the one builder behind `create_sql` and `replacing_sql`: `ddl::routine_comment_sql` is one more
+statement of its `client_script`, so on SQL Server it is a batch of its own and never part of the
+module, and it follows the replay's `DROP … IF EXISTS` and create as well, since the drop took
+it. A view's follows `create_ddl`'s statement, and in `tsql_create_ddl`'s view branch is a `GO`
+batch of its own after the `CREATE VIEW` and its indexes — on the path where the view's draft
+cannot be built as well (`a_sql_server_view_and_routine_script_restate_their_comment`,
+`a_postgres_view_and_routine_script_restate_their_comment`; live,
+`a_pg_scripted_copy_keeps_a_functions_and_views_comment` and
+`a_dump_restores_a_views_and_a_routines_comment`).
 `TableInfo::create_ddl` — `CREATE TABLE`/`VIEW`, built on the
 above; its **view** branch delegates to `ddl::view_ddl` so Copy DDL, the MCP table-info tool
 and the apply path all emit through one view emitter (it used to have its own, which restated

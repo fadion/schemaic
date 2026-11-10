@@ -1927,6 +1927,11 @@ that list is a function no trigger can be pointed at. It narrows on `prorettype`
 a call the trigger editor makes every time the routine editor closes back to it. Both queries
 inside `routines_where` take the same filter string, because the settings fold is keyed on oid
 and a filter that disagreed would attach one routine's `SET` clauses to nothing.
+The main query's last column is `obj_description(p.oid, 'pg_proc')`, the routine's comment — left
+`None` on PostgreSQL until a scripted copy had to restate it — and a comment read is one the plan
+must write: `ddl::routine_follow_ups` gained its `COMMENT ON FUNCTION|PROCEDURE` arm in the same
+change, since without it Compare reported two functions whose comments differed as different
+after every Apply (under `core/ddl.rs`).
 MySQL reads `information_schema.ROUTINES` plus `PARAMETERS` — that server publishes no rendered
 signature, so `mysql_routines` rebuilds the `IN a INT, OUT b TEXT` form from one row per
 parameter, keyed by name **and kind** because a function and a procedure may share a name, and

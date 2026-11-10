@@ -768,6 +768,11 @@ looked up as the plan runs, as `tsql_drop_default` looks up its constraint, so a
 by Apply cannot make it fail, and one statement with no `;` inside for that one's reason. The
 procedures take their names as literal strings, so the level path is unbracketed `N'…'`s
 (`sql_server_sets_and_clears_comments_by_the_names_the_plan_leaves`).
+**A view's is filed under `VIEW`, not `TABLE`**: `sp_addextendedproperty` refuses a view named
+as a `TABLE` (Msg 15135, verified on SQL Server 2022), though `sys.extended_properties` keeps both
+by the same object id. It matters to the scripted copy, which now restates a view's comment as a
+`GO` batch after its `CREATE VIEW` (`ddl::view_comment_sql`; live,
+`a_dump_restores_a_views_and_a_routines_comment`).
 `tsql_alter_column` restates **both** type and nullability, with the collation, whenever any of
 them changed, since T-SQL resets what `ALTER COLUMN` isn't told — a retype that left `NOT NULL`
 off would make the column nullable — and an identity is always altered `NOT NULL`. **What it
