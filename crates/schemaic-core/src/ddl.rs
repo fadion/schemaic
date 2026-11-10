@@ -13371,12 +13371,23 @@ fn routine_follow_ups(f: &RoutineInfo, before: Option<&RoutineInfo>, d: SqlDiale
         None => comment.is_some(),
     };
     match d {
-        SqlDialect::Postgres if changed => vec![format!(
-            "COMMENT ON {} {} IS {};",
-            f.object_keyword(d),
-            f.signature_sql(d),
-            comment_literal(comment, d)
-        )],
+        // **By the signature the create just wrote**, read from `arguments`:
+        // a draft's `identity_arguments` is the server's copy, which the
+        // routine form never touches, so after a parameter-list edit it named
+        // the signature the plan had just dropped, and the whole edit failed
+        // at Apply (*function … does not exist*).
+        SqlDialect::Postgres if changed => {
+            let signed = RoutineInfo {
+                identity_arguments: routine_identity_args(&f.arguments, d),
+                ..f.clone()
+            };
+            vec![format!(
+                "COMMENT ON {} {} IS {};",
+                f.object_keyword(d),
+                signed.signature_sql(d),
+                comment_literal(comment, d)
+            )]
+        }
         SqlDialect::MsSql => {
             if !changed {
                 return Vec::new();
@@ -31615,10 +31626,12 @@ mod tests {
             body.info.body = "SELECT 2".into();
             let sql = diff_routine(&f, &body, Postgres).emit();
             assert!(!sql.iter().any(|s| s.starts_with("COMMENT ON")), "{sql:?}");
-            // A re-create sets it again, under the new signature.
+            // A re-create sets it again, under the new signature — read from
+            // the arguments the form edits, since `identity_arguments` stays
+            // the server's copy (the editor never touches it). It named the
+            // dropped signature, and the edit failed at Apply.
             let mut changed = RoutineDraft::from_info(&f);
-            changed.info.arguments = "a integer, b integer".into();
-            changed.info.identity_arguments = "a integer, b integer".into();
+            changed.info.arguments = "a integer, b integer DEFAULT 2".into();
             let sql = diff_routine(&f, &changed, Postgres).emit();
             assert_eq!(
                 sql.last().map(String::as_str),

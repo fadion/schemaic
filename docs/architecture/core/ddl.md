@@ -2684,7 +2684,12 @@ FUNCTION|PROCEDURE <signature> IS …`, or `IS NULL` to clear it — after a cre
 any comment, since the `DROP` took it, and after a `CREATE OR REPLACE`, which keeps it, only a
 changed one. Without the arm, Schema Compare of two functions whose comments differed planned a
 `CREATE OR REPLACE` that changed nothing and reported them different again after every Apply
-(`a_postgres_routines_comment_is_set_after_its_create`). So `recreate_restates_routine_comment`
+(`a_postgres_routines_comment_is_set_after_its_create`). **The signature is the one the create
+just wrote**, `routine_identity_args` over the draft's `arguments`: a draft's
+`identity_arguments` is the server's copy, which the routine form never touches, so after a
+parameter-list edit the `COMMENT ON` named the signature the plan had just dropped and the whole
+edit failed at Apply (*function … does not exist*, run on PostgreSQL 16) — the test had set
+`identity_arguments` by hand, which the editor never does. So `recreate_restates_routine_comment`
 is true on PostgreSQL now, and the re-create's sentence names only the privileges as lost
 (`re_creating_a_routine_says_the_grants_do_not_survive`).
 **A scripted copy restates a view's and a routine's comment** wherever
