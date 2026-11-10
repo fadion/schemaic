@@ -1048,8 +1048,14 @@ it is a catalogue index, and the table it sits on then refuses every later `ALTE
 (`Withheld::DuckDbReferenced { table, by }`, read off `TableInfo::referenced_by`, under
 `schema.rs`): `DROP TABLE` refuses such a table (*Could not drop the table because this table is
 main key table of the table …*), and with no `ADD FOREIGN KEY` the key cannot be dropped and put
-back around the copy as SQL Server's rebuild does it; a self-reference goes down with the table
-and comes back with it, so it is not counted. And `rebuild_strands_a_generated_column`, which
+back around the copy as SQL Server's rebuild does it. **A self-reference is refused too**, named
+as the table's own (`by` is the table, read off its own keys, since `referenced_by` leaves
+self-references out): the working table's key on the original made it a dependent the `DROP`
+refused, so every edit of such a table failed at Apply with a plan Preview had shown as runnable,
+and a key pointed at the working table fails the copy instead — DuckDB checks a self-reference
+within one `INSERT` against the rows already there, so a child copied beside its parent is
+refused (2.0, measured; `a_self_referencing_table_is_withheld_not_failed`). This said a
+self-reference "goes down with the table and comes back with it". And `rebuild_strands_a_generated_column`, which
 takes the dialect now, refuses renaming or dropping a column a generated column reads, whose
 `CREATE` fails as SQLite's does (*Column "qty" referenced by generated column does not exist*).
 The risk line is the non-T-SQL one (`Risk::RebuildTable { tsql: false }`). The unit pins are

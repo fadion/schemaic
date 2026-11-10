@@ -5843,6 +5843,38 @@ mod tests {
         assert_eq!(cells(&db, "SELECT b FROM g"), vec![vec!["8"]]);
     }
 
+    /// **A table whose foreign key references itself is not rebuilt, and the
+    /// plan says so**: the working table's key pointed at the original, so
+    /// `DROP TABLE` refused (*main key table of the table …*) and every
+    /// structural edit failed at Apply with a plan Preview had shown as
+    /// runnable. Pointing the key at the working table instead fails the
+    /// copy, DuckDB checking a self-reference within one `INSERT` against the
+    /// rows already there.
+    #[test]
+    fn a_self_referencing_table_is_withheld_not_failed() {
+        let db = mem("designer_self_ref");
+        seed(
+            &db,
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id), v VARCHAR);
+             INSERT INTO t VALUES (1, NULL, 'root');
+             INSERT INTO t VALUES (2, 1, 'leaf');",
+        );
+        let before = table_of(&db, "t");
+        let mut draft = schemaic_core::ddl::TableDraft::from_table(&before);
+        draft.rename_column(2, "v2");
+        let cs = schemaic_core::ddl::diff(&before, &draft, SqlDialect::DuckDb);
+        assert!(
+            cs.withheld_lines().iter().any(|w| matches!(
+                w,
+                schemaic_core::ddl::Withheld::DuckDbReferenced { table, by }
+                    if table == "t" && by == "t"
+            )),
+            "{:?} — plan {:#?}",
+            cs.unsupported(),
+            cs.emit()
+        );
+    }
+
     /// **A generated column made plain keeps its values**: the rebuild reads
     /// the computed ones as the source — reading a generated column is fine,
     /// only writing one is refused. The copy left it out, and every row's

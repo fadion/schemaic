@@ -19482,14 +19482,29 @@ fn duckdb_supports(change: &Change) -> bool {
 /// table that references it. `DROP TABLE` refuses a table another one's key
 /// points at (*Could not drop the table because this table is main key table
 /// of the table …*), and with no `ALTER TABLE … ADD FOREIGN KEY` the key could
-/// not be dropped and put back around it as SQL Server's rebuild does. A key of
-/// its own, a self-reference among them, goes down with the table and comes
-/// back with it, so it is not counted ([`crate::schema::link_inbound_foreign_keys`]).
+/// not be dropped and put back around it as SQL Server's rebuild does.
+///
+/// **A key onto the table itself refuses it too**, named as the table's own
+/// (`by` is the table). Left on the original, the working table's key made it
+/// a dependent the `DROP TABLE` refused; pointed at the working table, the
+/// copy fails instead, DuckDB checking a self-reference within one `INSERT`
+/// against the rows already there (2.0: *key "id: 1" does not exist in the
+/// referenced table* for a child copied beside its parent), and nothing short
+/// of one statement per tree level can order them. A self-reference is not
+/// in `referenced_by` ([`crate::schema::link_inbound_foreign_keys`]), so it
+/// is read off the table's own keys.
 fn duckdb_rebuild_refusals(current: &TableInfo) -> Vec<Withheld> {
-    let mut by: Vec<&str> = current
-        .referenced_by
-        .iter()
-        .map(|r| r.table.as_str())
+    let own = current.foreign_keys.iter().any(|fk| {
+        fk.ref_table == current.name
+            && fk
+                .ref_schema
+                .as_deref()
+                .is_none_or(|s| Some(s) == current.schema.as_deref())
+    });
+    let mut by: Vec<&str> = own
+        .then_some(current.name.as_str())
+        .into_iter()
+        .chain(current.referenced_by.iter().map(|r| r.table.as_str()))
         .collect();
     by.dedup();
     by.into_iter()
