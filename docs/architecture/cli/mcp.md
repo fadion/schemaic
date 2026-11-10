@@ -601,7 +601,12 @@ over `fetch_table_stats`, and rather than printing an empty second table says wh
 the engine reports index sizes per table, or the database has none — by
 `workload::index_sizes_per_table_only`, the question the app's view asks too. `index_health {database?}` reads the database's schema (`with_deadline`)
 and its stats and prints `workload::index_health`'s findings and `perf::usage_note`, and its
-description tells the model to say "unused since …", never "never used". **On SQL Server
+description tells the model to say "unused since …", never "never used". **The findings are held
+to `MCP_ROW_CAP`** (`format_findings`), as `run_query`'s rows and a plan are, in
+`index_health`'s own order, with "(200 of N findings, capped; `schemaic indexes` lists them all)"
+under a cut table: a database partitioned by day or a schema per tenant gave one table of every
+finding, riding along on every later turn
+(`index_health_stops_at_the_cap_and_says_how_many_it_left_out`). **On SQL Server
 (`supports_missing_index_hints`) it then appends `Db::fetch_missing_indexes`' top `PERF_ROWS` as a
 numbered table, and below it each suggestion's DDL whole, headed "to propose — never to run"** —
 `ddl::diff`'s own `CREATE INDEX`, through `workload::suggestion_ddl`, and a closing line to check

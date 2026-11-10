@@ -1839,11 +1839,7 @@ async fn index_health(db: &Db, database: Option<&str>) -> (String, bool) {
         Err(e) => return e,
     };
     let findings = wl::index_health(&schema.tables, &stats);
-    let mut out = if findings.is_empty() {
-        format!("No duplicate, redundant or unused indexes found in {database}.")
-    } else {
-        format_table(&crate::perf::index_health_result(&findings))
-    };
+    let mut out = format_findings(&findings, database);
     out.push_str("\n\n");
     out.push_str(crate::perf::usage_note(&stats));
     let dialect = dialect_of(db);
@@ -1871,6 +1867,26 @@ async fn index_health(db: &Db, database: Option<&str>) -> (String, bool) {
         }
     }
     (out, false)
+}
+
+/// `index_health`'s findings as a table, **held to [`MCP_ROW_CAP`]** as
+/// `run_query`'s rows and a plan are, since a tool result rides along on every
+/// later turn: a table partitioned by day, or a schema per tenant, ran to
+/// hundreds of rows. The cut keeps `index_health`'s own order (each kind
+/// largest first) and says how many were left out.
+fn format_findings(findings: &[schemaic_core::workload::IndexFinding], database: &str) -> String {
+    if findings.is_empty() {
+        return format!("No duplicate, redundant or unused indexes found in {database}.");
+    }
+    let shown = findings.len().min(MCP_ROW_CAP);
+    let mut out = format_table(&crate::perf::index_health_result(&findings[..shown]));
+    if shown < findings.len() {
+        out.push_str(&format!(
+            "\n({shown} of {} findings, capped; `schemaic indexes` lists them all)",
+            findings.len()
+        ));
+    }
+    out
 }
 
 /// `table_sizes`: the largest tables and indexes of one database.
@@ -4469,6 +4485,33 @@ mod tests {
         assert!(out.contains("| detail |"), "{out}");
         assert!(out.contains("SCAN t"), "{out}");
         assert!(out.ends_with("(1 plan row)"), "{out}");
+    }
+
+    /// **Index health is held to the row cap too**, and says how many it left
+    /// out: a table partitioned by day, or a schema per tenant, gave one pipe
+    /// table of every finding, riding along on every later turn.
+    #[test]
+    fn index_health_stops_at_the_cap_and_says_how_many_it_left_out() {
+        use schemaic_core::workload::{IndexFinding, IndexProblem};
+        let findings: Vec<IndexFinding> = (0..MCP_ROW_CAP + 5)
+            .map(|i| IndexFinding {
+                schema: None,
+                table: format!("p_{i}"),
+                index: format!("ix_{i}"),
+                problem: IndexProblem::Unused,
+                bytes: None,
+            })
+            .collect();
+        let out = super::format_findings(&findings, "shop");
+        assert_eq!(out.matches("| ix_").count(), MCP_ROW_CAP, "{out}");
+        assert!(
+            out.contains(&format!("({MCP_ROW_CAP} of {} findings", MCP_ROW_CAP + 5)),
+            "{out}"
+        );
+        let few = super::format_findings(&findings[..2], "shop");
+        assert_eq!(few.matches("| ix_").count(), 2, "{few}");
+        assert!(!few.contains("findings,"), "{few}");
+        assert!(super::format_findings(&[], "shop").starts_with("No duplicate"));
     }
 
     /// **A plan is held to the row cap a query is**, and says when it was cut:
