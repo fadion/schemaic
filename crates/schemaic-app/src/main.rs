@@ -4270,8 +4270,8 @@ fn app_view(
             // **Analyze executes the statement, so a write is refused here**,
             // on the action, and not only by the modal hiding its toggle: the
             // transaction it is rolled back in undoes neither a MyISAM write
-            // nor a sequence.
-            if analyze && schemaic_core::sql::contains_write(&sql, db.engine().dialect()) {
+            // nor a sequence (`sql::analyze_refused` reads `setval` too).
+            if analyze && schemaic_core::sql::analyze_refused(&sql, db.engine().dialect()) {
                 plan_state.set(PlanState::Failed(tr!("plan-analyze-unavailable")));
                 return;
             }
@@ -17600,7 +17600,7 @@ mod app_tests {
         let end = at + body[at..].find("\n    };").expect("the end of `run_plan`");
         let region = &body[at..end];
         let asks = region
-            .find("analyze && schemaic_core::sql::contains_write(")
+            .find("analyze && schemaic_core::sql::analyze_refused(")
             .expect("`run_plan` no longer refuses to Analyze a write");
         let runs = region
             .find(".explain(")

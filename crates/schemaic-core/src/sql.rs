@@ -6605,6 +6605,33 @@ pub fn contains_write(sql: &str, dialect: SqlDialect) -> bool {
     false
 }
 
+/// Is `sql` one **EXPLAIN ANALYZE must not run**: a write ([`contains_write`]),
+/// or a call that moves a sequence — which the rolled-back transaction Analyze
+/// runs in does not undo. `contains_write` reads no calls, so DuckDB's
+/// `SELECT setval('s', 100)` was offered to Analyze on a writable connection
+/// and moved the sequence for real (measured on 2.0.0: `ROLLBACK` leaves it).
+/// Narrower than [`read_only_reason`]'s deny list on purpose: a file read is
+/// no write, and Analyze on `read_csv` stays offered.
+pub fn analyze_refused(sql: &str, dialect: SqlDialect) -> bool {
+    contains_write(sql, dialect)
+        || statement_ranges(sql, dialect).into_iter().any(|(lo, hi)| {
+            let (marked, _) = called_word_tokens(&sql[lo..hi], dialect);
+            marked
+                .iter()
+                .any(|(w, called)| *called && sequence_movers(dialect).contains(&w.as_str()))
+        })
+}
+
+/// The builtins on `dialect` that move a sequence when called, upper-cased.
+/// MySQL and SQL Server spell it `NEXT VALUE FOR`, which [`contains_write`]
+/// already reads; SQLite has no sequences.
+fn sequence_movers(dialect: SqlDialect) -> &'static [&'static str] {
+    match dialect {
+        SqlDialect::Postgres | SqlDialect::DuckDb => &["NEXTVAL", "SETVAL"],
+        SqlDialect::MySql | SqlDialect::Sqlite | SqlDialect::MsSql => &[],
+    }
+}
+
 /// The words that make a statement a write **anywhere** in it on an engine
 /// whose statements need no `;` between them — SQL Server's.
 ///
@@ -10930,6 +10957,36 @@ mod tests {
                 assert!(!super::contains_write(&sql, d), "{d:?}: {sql}");
             }
         }
+    }
+
+    /// **Analyze refuses a statement that moves a sequence**, which the
+    /// rolled-back transaction it runs in does not undo — DuckDB's `setval`
+    /// (measured on 2.0.0) and `nextval`, PostgreSQL's alike. `contains_write`
+    /// reads no calls, so on a writable DuckDB connection Analyze offered to
+    /// run `SELECT setval('s', 100)` for real. A file read is no write: Analyze
+    /// on `read_csv` stays offered.
+    #[test]
+    fn analyze_is_refused_on_a_statement_that_moves_a_sequence() {
+        use super::analyze_refused;
+        for d in [SqlDialect::DuckDb, SqlDialect::Postgres] {
+            for sql in [
+                "SELECT setval('s', 100)",
+                "SELECT nextval('s')",
+                "SELECT id, NEXTVAL('s') FROM t",
+            ] {
+                assert!(analyze_refused(sql, d), "{d:?}: {sql}");
+            }
+            assert!(
+                !analyze_refused("SELECT * FROM t WHERE nextval > 1", d),
+                "{d:?}"
+            );
+        }
+        assert!(analyze_refused("DELETE FROM t", SqlDialect::DuckDb));
+        assert!(!analyze_refused(
+            "SELECT * FROM read_csv('/d/x.csv')",
+            SqlDialect::DuckDb
+        ));
+        assert!(!analyze_refused("SELECT * FROM t", SqlDialect::MySql));
     }
 
     /// **DuckDB's writers in its own catalogue are refused, and logged.**

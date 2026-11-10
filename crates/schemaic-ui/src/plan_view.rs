@@ -105,7 +105,7 @@ pub(crate) fn plan_overlay(
             // Statements that write can't be safely ANALYZE'd (it would execute
             // them), so the toggle is offered only for read-only statements.
             let is_write =
-                schemaic_core::sql::contains_write(&plan_sql.get_untracked(), plan_dialect());
+                schemaic_core::sql::analyze_refused(&plan_sql.get_untracked(), plan_dialect());
 
             let analyze_control = if is_write {
                 text(tr!("plan-analyze-unavailable"))

@@ -105,10 +105,13 @@ Re-introducing the anti-patterns these guard against is a regression:
   missing-`WHERE` net, `confirm_writes`, and the read-only-connection block that by design has no
   "Run anyway". **Don't add a run path that takes the raw action, and don't re-implement the
   verdict** — a new protection is an arm of `run_verdict`, and a `RunVerdict::Block` must stay
-  un-overridable. (`plan_view`'s `contains_write` is not a second guard: it decides whether
-  `EXPLAIN ANALYZE` may run a statement for its timings. **That decision is made on the action
+  un-overridable. (`plan_view`'s `sql::analyze_refused` is not a second guard: it decides whether
+  `EXPLAIN ANALYZE` may run a statement for its timings — `contains_write`, or a call that moves
+  a sequence (`nextval`/`setval` on PostgreSQL and DuckDB), since `contains_write` reads no calls
+  and DuckDB's `setval` ran under Analyze on a writable connection, which no rollback undoes.
+  **That decision is made on the action
   too**, not only by the modal hiding its toggle: `run_plan` refuses `analyze` of a statement
-  `contains_write` calls a write, with `plan-analyze-unavailable`, before it reaches `.explain(` —
+  `analyze_refused` answers for, with `plan-analyze-unavailable`, before it reaches `.explain(` —
   security review S9 found the hidden toggle the only thing between a write and Analyze, which
   *executes* it, and the transaction it is rolled back in undoes neither a MyISAM write nor a
   sequence. That transaction stays, as the backstop rather than the guard
