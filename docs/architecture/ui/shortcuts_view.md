@@ -28,7 +28,12 @@ height** whatever it holds: the prompt and *Not set* stand beside a zero-width k
 (`key_slot_text`), so a row does not shrink and pull the rows under it up.
 **Assign makes the row the capture.** It sets `Edit::Capturing` and focuses the row, whose own
 `KeyDown` listener reads the next press through `shortcuts::chord_of` and asks `Keymap::check`.
-`Free` assigns and saves at once; `Unchanged` ends quietly; `Taken` puts *Replace* / *Cancel*
+The verdict's step is `step_for`'s, pure and tested. `Free` and **`Unchanged`** both assign and
+save at once — choosing the key a command already runs on is an answer, and `Keymap::assign` is
+what drops a kept entry the file could not apply; ending quietly on `Unchanged` left a kept
+`Ctrl+Banana` in the file and its startup notice coming back
+(`assigning_a_kept_commands_own_key_clears_the_kept_entry`), and *Reset to default* is offered
+while `Keymap::keeps` the command's entry, not only off the default (`reset_offered`). `Taken` puts *Replace* / *Cancel*
 under the row — text buttons in the manual transaction's Commit and Rollback colours
 (`theme::tx_commit`, `tx_rollback`), outside the ring, since Enter and Escape on the row answer
 them too — so nothing is taken from another command

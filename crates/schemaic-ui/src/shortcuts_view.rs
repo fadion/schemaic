@@ -73,21 +73,50 @@ struct RowCtx {
     pressed: Rc<std::cell::Cell<Option<Command>>>,
 }
 
+/// What the capturing row does with a [`Verdict`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// Give the command the chord, and save.
+    Assign,
+    /// Ask before taking the chord from `holder`.
+    Confirm(Command),
+    /// Refused in place: a fixed key (its index in the fixed list).
+    Fixed(usize),
+    /// Refused in place: no command may have it.
+    Refused(schemaic_core::keymap::Refusal),
+}
+
+/// The step a verdict asks for. **`Unchanged` assigns too**: choosing the key
+/// a command already runs on is an answer, and `Keymap::assign` is what drops
+/// a kept entry the file could not apply. Going idle there left a kept
+/// `Ctrl+Banana` in the file, and its startup notice with it.
+fn step_for(verdict: Verdict) -> Step {
+    match verdict {
+        Verdict::Free | Verdict::Unchanged => Step::Assign,
+        Verdict::Taken(holder) => Step::Confirm(holder),
+        Verdict::Fixed(i) => Step::Fixed(i),
+        Verdict::Refused(r) => Step::Refused(r),
+    }
+}
+
+/// Is *Reset to default* offered for `command`: off its default, or running
+/// on it only because the file's entry for it could not be applied.
+fn reset_offered(map: &schemaic_core::keymap::Keymap, command: Command) -> bool {
+    !map.is_default(command) || map.keeps(command)
+}
+
 impl RowCtx {
     /// Act on a chord the capturing row heard.
     fn captured(&self, command: Command, chord: Chord) {
         let keys: Vec<_> = self.fixed.iter().map(|r| r.key).collect();
-        match keymap().with_untracked(|m| m.check(command, chord, &keys)) {
-            Verdict::Free => {
-                self.assign(command, chord);
-            }
-            Verdict::Unchanged => self.edit.set(Edit::Idle),
-            Verdict::Taken(holder) => self.edit.set(Edit::Confirm {
+        match step_for(keymap().with_untracked(|m| m.check(command, chord, &keys))) {
+            Step::Assign => self.assign(command, chord),
+            Step::Confirm(holder) => self.edit.set(Edit::Confirm {
                 command,
                 chord,
                 holder,
             }),
-            Verdict::Fixed(i) => self.edit.set(Edit::Capturing {
+            Step::Fixed(i) => self.edit.set(Edit::Capturing {
                 command,
                 refused: Some(tr!(
                     "keymap-fixed",
@@ -99,7 +128,7 @@ impl RowCtx {
                         .unwrap_or_default()
                 )),
             }),
-            Verdict::Refused(r) => self.edit.set(Edit::Capturing {
+            Step::Refused(r) => self.edit.set(Edit::Capturing {
                 command,
                 refused: Some(tr!(
                     "keymap-refused",
@@ -284,7 +313,7 @@ fn command_row(command: Command, ctx: RowCtx, tabindex: u32) -> impl IntoView {
                 MenuEntry::action(tr!("keymap-clear"), move || c1.clear(command))
                     .disabled(map.chord(command).is_none()),
                 MenuEntry::action(tr!("keymap-reset"), move || c2.reset(command))
-                    .disabled(map.is_default(command)),
+                    .disabled(!reset_offered(&map, command)),
             ];
             ch.menus.close_except(Some(crate::widgets::MenuId::Popup));
             ch.anchor.set(None);
@@ -660,5 +689,66 @@ mod tests {
             "Ctrl+Shift+P"
         ));
         assert!(!row_matches("ctrlp", "New query tab", "Ctrl+T"));
+    }
+
+    /// **Assigning a command the key it already shows saves.** The modal's
+    /// `Unchanged` arm went back to idle without calling `assign`, so a
+    /// kept `Ctrl+Banana` for Open SQL file stayed in the file, and its
+    /// startup notice came back every time, through the very gesture that
+    /// looks like it fixes it. Driven through the modal's own decision and
+    /// then the keymap, as the row does.
+    #[test]
+    fn assigning_a_kept_commands_own_key_clears_the_kept_entry() {
+        use schemaic_core::keymap::{Chord, Command, Keymap, KeymapFile};
+        let file = KeymapFile {
+            bindings: [("open-file".to_string(), Some("Ctrl+Banana".to_string()))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let (mut map, _) = Keymap::load(&file, &[]);
+        let ctrl_o = Chord::parse("Ctrl+O").unwrap();
+        let verdict = map.check(Command::OpenFile, ctrl_o, &[]);
+        assert_eq!(super::step_for(verdict), super::Step::Assign);
+        assert!(map.assign(Command::OpenFile, ctrl_o, &[]));
+        assert_eq!(map.to_file(), KeymapFile::default());
+    }
+
+    /// The other verdicts keep their steps: a free key assigns, a taken one
+    /// asks, a fixed or refused one is refused in place.
+    #[test]
+    fn each_verdict_takes_its_own_step() {
+        use super::{Step, step_for};
+        use schemaic_core::keymap::{Command, Refusal, Verdict};
+        assert_eq!(step_for(Verdict::Free), Step::Assign);
+        assert_eq!(step_for(Verdict::Unchanged), Step::Assign);
+        assert_eq!(
+            step_for(Verdict::Taken(Command::NewTab)),
+            Step::Confirm(Command::NewTab)
+        );
+        assert_eq!(step_for(Verdict::Fixed(3)), Step::Fixed(3));
+        assert_eq!(
+            step_for(Verdict::Refused(Refusal::Editing)),
+            Step::Refused(Refusal::Editing)
+        );
+    }
+
+    /// *Reset to default* is offered on a command whose kept entry runs it on
+    /// its default: resetting is the other obvious way to quiet the notice.
+    #[test]
+    fn reset_is_offered_while_a_kept_entry_stands() {
+        use schemaic_core::keymap::{Command, Keymap, KeymapFile};
+        let file = KeymapFile {
+            bindings: [("open-file".to_string(), Some("Ctrl+Banana".to_string()))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let (map, _) = Keymap::load(&file, &[]);
+        assert!(super::reset_offered(&map, Command::OpenFile));
+        assert!(!super::reset_offered(
+            &Keymap::defaults(),
+            Command::OpenFile
+        ));
     }
 }

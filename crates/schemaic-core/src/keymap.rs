@@ -736,6 +736,15 @@ impl Keymap {
         self.chord(command) == Some(command.default_chord())
     }
 
+    /// Does the file hold an entry for `command` that could not be applied —
+    /// one the next [`assign`](Keymap::assign), [`clear`](Keymap::clear) or
+    /// [`reset`](Keymap::reset) removes? Such a command runs on its default,
+    /// so [`is_default`](Keymap::is_default) alone cannot offer the reset that
+    /// would quiet its startup notice.
+    pub fn keeps(&self, command: Command) -> bool {
+        self.kept.contains_key(command.id())
+    }
+
     /// The command a press of `chord` runs in `context`. A handler asks for
     /// its own context; the editor, which consumes every key, asks for
     /// [`Context::Global`] first and then for its own.
