@@ -389,8 +389,14 @@ event whose `phase` is `turn_end` (`reason.error.message`, and its `code`), is h
 `DshTurn::failure` and said when `final` closes a failed turn; `error` says its own `message`.
 `dsh_failure_text` reads both as "message (code)", and `DshTurn::say` sets either apart from prose
 already printed (`a_failure_after_prose_is_its_own_paragraph`). **`final`'s text is not printed**, since it restates the answer the `text` events
-already gave (`the_answer_is_printed_once_and_the_thinking_not_at_all` — otherwise "9595"), and
-`thinking` is dropped as every dialect's reasoning is. **Usage is per step**, on `status` events
+already gave (`the_answer_is_printed_once_and_the_thinking_not_at_all` — otherwise "9595") —
+**except to finish a cut one**: `--json` caps every string but `final`'s at 8 KiB, a strict byte
+prefix flagged `truncated` (dsh 0.2.1-rc.2's `boundJsonEvent`, read from its bundle), and an event
+past the 32 KiB line cap loses its `text` altogether. `DshTurn::cut` holds the last step's printed
+prefix when it was cut (cleared by a tool call or result, so a cut step before more work stays
+cut), and a `completed` `final` prints what is past it, or the whole answer when nothing was
+printed (`a_truncated_answer_is_finished_from_final`); a long answer was shown and saved cut off
+mid-statement. And `thinking` is dropped as every dialect's reasoning is. **Usage is per step**, on `status` events
 whose `phase` is `step_end`, each step being a request of its own, so the turn's figures are their
 sum — input as `inputTokens` plus `cacheReadTokens`, Cursor's reading, and output as
 `outputTokens`; no duration is read, so `duration_ms` stays `None`

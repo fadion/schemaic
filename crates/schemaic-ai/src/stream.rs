@@ -217,6 +217,10 @@ struct DshTurn {
     /// Why the turn failed, from `status`/`turn_end` — said when `final`
     /// closes it, since a failed turn writes no prose of its own.
     failure: Option<String>,
+    /// The last step's prose as printed, when `--json` cut it (`truncated`):
+    /// a byte prefix of the answer `final` carries whole, so `final` prints
+    /// what is past it. Empty when the line cap dropped the text altogether.
+    cut: Option<String>,
 }
 
 impl DshTurn {
@@ -1099,8 +1103,11 @@ impl StreamParser {
     /// **Whole steps, not tokens.** `text` is projected from a committed
     /// assistant message, so each one is a step's prose entire and is printed
     /// as it comes; `final` restates the answer and is *not* printed, or every
-    /// reply would appear twice. `thinking` is dropped, as every dialect's
-    /// reasoning is here.
+    /// reply would appear twice — **unless the last step's `text` was cut**:
+    /// `--json` caps every string but `final`'s at 8 KiB, a byte prefix flagged
+    /// `truncated`, so `final` then prints what is past the prefix
+    /// ([`DshTurn::cut`]). `thinking` is dropped, as every dialect's reasoning
+    /// is here.
     ///
     /// **Two ways to end.** A turn ends on `final`, whose `reason.kind` is
     /// `completed` for a success — an in-turn failure (measured: an account
@@ -1124,10 +1131,15 @@ impl StreamParser {
             }
             "text" => {
                 let t = s("text");
+                let truncated = v.get("truncated").and_then(|x| x.as_bool()) == Some(true);
                 if t.trim().is_empty() {
+                    self.dsh.cut = truncated.then(String::new);
                     return Vec::new();
                 }
-                vec![self.dsh.say(t)]
+                let said = self.dsh.say(t);
+                // `say` trims the start; the prefix is matched as printed.
+                self.dsh.cut = truncated.then(|| t.trim_start().to_string());
+                vec![said]
             }
             // An in-turn failure's reason travels here and nowhere else: the
             // `final` after it is empty (measured, the 402 balance error).
@@ -1139,6 +1151,7 @@ impl StreamParser {
             }
             "tool_call" => {
                 self.dsh.spoke = false;
+                self.dsh.cut = None;
                 let id = s("callId").to_string();
                 if !self.first_sight(&id) {
                     return Vec::new();
@@ -1157,6 +1170,7 @@ impl StreamParser {
             }
             "tool_result" => {
                 self.dsh.spoke = false;
+                self.dsh.cut = None;
                 let id = s("callId").to_string();
                 let mut out = Vec::new();
                 // A result nothing announced opens its own chip, rather than
@@ -1206,6 +1220,24 @@ impl StreamParser {
                     && let Some(why) = self.dsh.failure.take()
                 {
                     out.push(self.dsh.say(&why));
+                }
+                // **Unless the last step's prose was cut**: then `final`, the
+                // one string `--json` does not cap, finishes it — the part
+                // past the printed prefix, or the whole answer when the line
+                // cap dropped the text.
+                if kind == Some("completed")
+                    && let Some(printed) = self.dsh.cut.take()
+                {
+                    let whole = s("text").trim_start();
+                    if printed.is_empty() {
+                        if !whole.trim().is_empty() {
+                            out.push(self.dsh.say(whole));
+                        }
+                    } else if let Some(rest) = whole.strip_prefix(printed.as_str())
+                        && !rest.is_empty()
+                    {
+                        out.push(StreamEvent::TextDelta(rest.to_string()));
+                    }
                 }
                 out.push(StreamEvent::TurnDone {
                     // An absent reason is a failure here, unlike Copilot's
@@ -4003,6 +4035,56 @@ mod deepseek_tests {
             r#"{"type":"text","text":"Second."}"#,
         ]);
         assert_eq!(text_of(&evs), "First.\n\nSecond.");
+    }
+
+    /// **A `text` cut at 8 KiB is finished from `final`.** `--json` caps every
+    /// string but `final`'s at 8,192 bytes — a strict byte prefix, flagged
+    /// `truncated` (dsh 0.2.1-rc.2's `boundJsonEvent`, read from its bundle) —
+    /// and an event past the 32 KiB line cap loses its `text` altogether. The
+    /// long answer was shown, and saved, cut off mid-statement.
+    #[test]
+    fn a_truncated_answer_is_finished_from_final() {
+        let full: String = "INSERT INTO t VALUES (1);\n".repeat(400); // 10,400 bytes
+        let cut = &full[..8192];
+        let line = |ty: &str, text: &str, extra: &str| {
+            format!(
+                r#"{{"type":"{ty}","text":{}{extra}}}"#,
+                serde_json::Value::String(text.to_string())
+            )
+        };
+        let text = line("text", cut, r#","truncated":true"#);
+        let fin = line("final", &full, r#","reason":{"kind":"completed"}"#);
+        let evs = drive(&[
+            r#"{"type":"session","sessionId":"s","cwd":"C:\\cfg"}"#,
+            &text,
+            &fin,
+        ]);
+        assert_eq!(text_of(&evs), full);
+        // Dropped whole by the line cap: `final` is the whole answer.
+        let gone = r#"{"type":"text","truncated":true}"#;
+        let evs = drive(&[
+            r#"{"type":"session","sessionId":"s","cwd":"C:\\cfg"}"#,
+            gone,
+            &fin,
+        ]);
+        assert_eq!(text_of(&evs), full);
+        // A cut step that spoke after an earlier one keeps its paragraph.
+        let first = r#"{"type":"text","text":"Here it is."}"#;
+        let evs = drive(&[
+            r#"{"type":"session","sessionId":"s","cwd":"C:\\cfg"}"#,
+            first,
+            &text,
+            &fin,
+        ]);
+        assert_eq!(text_of(&evs), format!("Here it is.\n\n{full}"));
+        // Not cut: `final` restates the answer and is not printed again.
+        let whole = line("text", &full, "");
+        let evs = drive(&[
+            r#"{"type":"session","sessionId":"s","cwd":"C:\\cfg"}"#,
+            &whole,
+            &fin,
+        ]);
+        assert_eq!(text_of(&evs), full);
     }
 
     /// A result whose status is not `completed` is a failed call, red on the
