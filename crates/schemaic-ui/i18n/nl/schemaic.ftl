@@ -2952,6 +2952,11 @@ perf-problem-unused = Niet gelezen sinds de tellers voor het laatst zijn gereset
 perf-problem-duplicate = Dubbel van { $of }
 perf-problem-redundant = Gedekt door { $by }, waarvan de sleutel met deze begint
 perf-usage-note = Gebruikstellingen beginnen opnieuw wanneer de server herstart of de statistieken worden gereset, dus een index die alleen door een maandelijkse taak wordt gebruikt kan ongebruikt lijken. Controleer dit voordat je er een verwijdert.
+perf-usage-note-since = Gebruikstellingen lopen sinds { $since }, de laatste herstart van de server of reset van de statistieken, dus een index die alleen door een maandelijkse taak wordt gebruikt kan ongebruikt lijken. Controleer dit voordat je er een verwijdert.
+perf-usage-standbys = { $count ->
+    [one] Deze server heeft { $count } standby die van hem repliceert, wiens leesacties hij niet telt: een index die alleen query's daar gebruiken lijkt hier ongebruikt, en hem verwijderen verwijdert hem daar ook.
+   *[other] Deze server heeft { $count } standby's die van hem repliceren, wier leesacties hij niet telt: een index die alleen query's daar gebruiken lijkt hier ongebruikt, en hem verwijderen verwijdert hem daar ook.
+}
 perf-usage-uncounted = Deze server rapporteert geen indexgebruikstellingen, dus geen enkele index kan ongebruikt worden genoemd — alleen dubbele indexen en prefixen worden getoond.
 perf-create-index = Index maken
 perf-missing-title = Ontbrekende indexen die de optimizer sinds de laatste herstart heeft vastgelegd

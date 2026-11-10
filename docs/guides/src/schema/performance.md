@@ -42,8 +42,10 @@ Three kinds of index are listed, each with its size:
 - indexes whose key is the start of another's, so the longer one already covers them.
 
 Usage counts start again when the server restarts or its statistics are reset, so an index used
-only by a monthly job can look unused. Check before dropping one. If the server keeps no usage
-counts, the view says so and lists only duplicates and prefixes.
+only by a monthly job can look unused. Check before dropping one. Where the server says when its
+counts began, the view gives that date; on a PostgreSQL primary with standbys it also says their
+reads are not counted, and that dropping an index drops it on them too. If the server keeps no
+usage counts, the view says so and lists only duplicates and prefixes.
 
 Where two indexes overlap, the one listed is the one you could drop:
 

@@ -2955,6 +2955,11 @@ perf-problem-unused = Non letto dall'ultimo azzeramento dei contatori
 perf-problem-duplicate = Duplica { $of }
 perf-problem-redundant = Coperto da { $by }, la cui chiave inizia come questa
 perf-usage-note = I conteggi di utilizzo ripartono quando il server si riavvia o le sue statistiche vengono azzerate, quindi un indice usato solo da un job mensile può sembrare inutilizzato. Verifica prima di eliminarne uno.
+perf-usage-note-since = I conteggi di utilizzo partono da { $since }, l'ultimo riavvio del server o azzeramento delle sue statistiche, quindi un indice usato solo da un job mensile può sembrare inutilizzato. Verifica prima di eliminarne uno.
+perf-usage-standbys = { $count ->
+    [one] Questo server ha { $count } standby che replica da esso, le cui letture non conta: un indice usato solo dalle query lì sembra inutilizzato qui, ed eliminarlo lo elimina anche lì.
+   *[other] Questo server ha { $count } standby che replicano da esso, le cui letture non conta: un indice usato solo dalle query lì sembra inutilizzato qui, ed eliminarlo lo elimina anche lì.
+}
 perf-usage-uncounted = Questo server non riporta conteggi di utilizzo degli indici, quindi nessun indice può essere definito inutilizzato: vengono mostrati solo duplicati e prefissi.
 perf-create-index = Crea indice
 perf-missing-title = Indici mancanti registrati dall'ottimizzatore dall'ultimo riavvio

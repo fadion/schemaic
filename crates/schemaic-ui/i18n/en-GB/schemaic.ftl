@@ -3451,6 +3451,11 @@ perf-problem-unused = Not read since the counters were last reset
 perf-problem-duplicate = Duplicates { $of }
 perf-problem-redundant = Covered by { $by }, whose key begins with this one's
 perf-usage-note = Usage counts start again when the server restarts or its statistics are reset, so an index used only by a monthly job can look unused. Check before dropping one.
+perf-usage-note-since = Usage counts run since { $since }, the server's last restart or statistics reset, so an index used only by a monthly job can look unused. Check before dropping one.
+perf-usage-standbys = { $count ->
+    [one] This server has { $count } standby streaming from it, whose reads it does not count: an index only queries there use looks unused here, and dropping it drops it there too.
+   *[other] This server has { $count } standbys streaming from it, whose reads it does not count: an index only queries there use looks unused here, and dropping it drops it there too.
+}
 perf-usage-uncounted = This server reports no index usage counts, so no index can be called unused — only duplicates and prefixes are shown.
 perf-create-index = Create index
 perf-missing-title = Missing indexes the optimiser recorded since the last restart

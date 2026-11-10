@@ -11359,6 +11359,7 @@ fn app_view(
                                         Ok(PerfData::Indexes {
                                             findings: wl::index_health(&schema.tables, &stats),
                                             counted: wl::usage_counted(&stats),
+                                            usage: stats.usage().clone(),
                                             missing,
                                             missing_error,
                                         })

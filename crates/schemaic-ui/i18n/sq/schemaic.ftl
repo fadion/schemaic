@@ -2952,6 +2952,11 @@ perf-problem-unused = Nuk është lexuar që nga rivendosja e fundit e numërues
 perf-problem-duplicate = Dyfishon { $of }
 perf-problem-redundant = Mbuluar nga { $by }, çelësi i të cilit fillon si ky
 perf-usage-note = Numërimet e përdorimit fillojnë nga e para kur serveri rinis ose statistikat e tij rivendosen, ndaj një indeks që përdoret vetëm nga një punë mujore mund të duket i papërdorur. Kontrolloni para se të fshini një të tillë.
+perf-usage-note-since = Numërimet e përdorimit nisin nga { $since }, rinisja e fundit e serverit ose rivendosja e statistikave të tij, ndaj një indeks që përdoret vetëm nga një punë mujore mund të duket i papërdorur. Kontrolloni para se të fshini një të tillë.
+perf-usage-standbys = { $count ->
+    [one] Ky server ka { $count } server rezervë që riprodhohet prej tij, leximet e të cilit nuk i numëron: një indeks që e përdorin vetëm pyetjet atje duket i papërdorur këtu, dhe fshirja e tij e fshin edhe atje.
+   *[other] Ky server ka { $count } serverë rezervë që riprodhohen prej tij, leximet e të cilëve nuk i numëron: një indeks që e përdorin vetëm pyetjet atje duket i papërdorur këtu, dhe fshirja e tij e fshin edhe atje.
+}
 perf-usage-uncounted = Ky server nuk raporton numërime përdorimi të indeksëve, ndaj asnjë indeks nuk mund të quhet i papërdorur — shfaqen vetëm të dyfishtat dhe prefiksët.
 perf-create-index = Krijo indeks
 perf-missing-title = Indeksët që mungojnë, të regjistruar nga optimizuesi që nga rinisja e fundit

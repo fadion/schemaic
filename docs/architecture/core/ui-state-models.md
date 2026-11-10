@@ -765,8 +765,9 @@ tested (they share `history.rs`'s shape; a new one belongs here, not in the UI):
   usage_note` dates its caveat by it and names the standbys, so an "unused" finding ten minutes
   after a restart, or on a primary whose reports run on a standby, says how little it saw
   (S6.1-L1-05; measured on PostgreSQL 16, MariaDB 10.11, MySQL 8 and SQL Server 2022/2025). The
-  *Performance* view does not show it yet: its `PerfData::Indexes` is built in the app and carries
-  only `counted`. `RowCount::{Exact,Estimate}` stops an estimate
+  *Performance* view says the same: `PerfData::Indexes` carries the `UsageScope`, and
+  `perf_view::usage_note` words it (`perf-usage-note-since`, `perf-usage-standbys`).
+  `RowCount::{Exact,Estimate}` stops an estimate
   from printing as a fact, `Freshness` says *why* a figure may be stale (MySQL caches
   `information_schema` stats for `information_schema_stats_expiry`, a day by default;
   PostgreSQL's `reltuples` is only as fresh as the last `ANALYZE`), and `IndexStats::is_unused`

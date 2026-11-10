@@ -377,13 +377,14 @@ fn body(ctx: &PerfCtx, t: &PerfTarget, st: PerfState, slow: RwSignal<bool>) -> A
             PerfData::Indexes {
                 findings,
                 counted,
+                usage,
                 missing,
                 missing_error,
             } => indexes_list(
                 ctx,
                 t,
                 findings,
-                *counted,
+                usage_note(*counted, usage),
                 missing,
                 missing_error.as_deref(),
             ),
@@ -632,11 +633,31 @@ fn drop_offered(loaded: Option<&schemaic_core::schema::TableInfo>, index: &str) 
     loaded.is_some_and(|t| t.indexes.iter().any(|ix| ix.name == index))
 }
 
+/// The line under the index findings: why none may be unused where usage is
+/// not counted, and otherwise since when it was counted and — on a primary
+/// with standbys — that their reads are not, as `schemaic indexes` says
+/// (`cli::perf::usage_note`). Undated, ten minutes after a restart every
+/// untouched index read as "drop it".
+fn usage_note(counted: bool, usage: &schemaic_core::stats::UsageScope) -> String {
+    if !counted {
+        return tr!("perf-usage-uncounted");
+    }
+    let mut note = match &usage.since {
+        Some(since) => tr!("perf-usage-note-since", since = since.clone()),
+        None => tr!("perf-usage-note"),
+    };
+    if let Some(n) = usage.standbys.filter(|n| *n > 0) {
+        note.push(' ');
+        note.push_str(&tr!("perf-usage-standbys", count = n));
+    }
+    note
+}
+
 fn indexes_list(
     ctx: &PerfCtx,
     t: &PerfTarget,
     findings: &[IndexFinding],
-    counted: bool,
+    usage_line: String,
     missing: &[MissingIndex],
     missing_error: Option<&str>,
 ) -> AnyView {
@@ -653,11 +674,7 @@ fn indexes_list(
     rows.push(message(
         icons::CIRCLE_QUESTION,
         theme::text_faint,
-        if counted {
-            tr!("perf-usage-note")
-        } else {
-            tr!("perf-usage-uncounted")
-        },
+        usage_line,
     ));
     if schemaic_core::workload::supports_missing_index_hints(t.dialect) {
         rows.push(section(tr!("perf-missing-title")));
@@ -969,6 +986,34 @@ fn footer(
 #[cfg(test)]
 mod tests {
     use crate::i18n::tr;
+
+    /// **The view dates its usage line, as the CLI does**, and names a
+    /// primary's standbys; without a date it keeps the old sentence, and an
+    /// uncounted server says so whatever the scope.
+    #[test]
+    fn the_usage_line_dates_the_counts_and_names_the_standbys() {
+        use schemaic_core::stats::UsageScope;
+        let scope = |since: Option<&str>, standbys| UsageScope {
+            since: since.map(str::to_string),
+            standbys,
+        };
+        let dated = super::usage_note(true, &scope(Some("2026-11-10 16:27:20"), Some(0)));
+        assert!(dated.contains("2026-11-10 16:27:20"), "{dated}");
+        assert!(!dated.contains("standby"), "{dated}");
+        assert_eq!(
+            super::usage_note(true, &scope(None, None)),
+            tr!("perf-usage-note")
+        );
+        let two = super::usage_note(true, &scope(None, Some(2)));
+        assert!(two.starts_with(&tr!("perf-usage-note")), "{two}");
+        assert!(two.contains("2 standbys"), "{two}");
+        let one = super::usage_note(true, &scope(None, Some(1)));
+        assert!(one.contains("1 standby "), "{one}");
+        assert_eq!(
+            super::usage_note(false, &scope(Some("x"), Some(3))),
+            tr!("perf-usage-uncounted")
+        );
+    }
 
     /// **A Drop is offered only where it would act.** The tree's copy of a
     /// table that lacks the index (made since it loaded) gave an empty diff,

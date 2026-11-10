@@ -62,7 +62,10 @@ before the round trip and compared on landing alongside the target, the list and
 last may write. Statements are `Db::fetch_top_statements(database, order,
 DEFAULT_STATEMENT_LIMIT)`; Sizes are `fetch_table_stats` ranked by `workload::largest(&stats,
 PERF_VIEW_ROWS)` (50, a `main.rs` constant); Indexes are `fetch_schema` and then
-`fetch_table_stats`, swept by `workload::index_health` and `usage_counted`, and — where
+`fetch_table_stats`, swept by `workload::index_health` and `usage_counted`, with the stats'
+`UsageScope` carried to the line under the findings — `usage_note`, which dates the counts and
+names a primary's standbys as `schemaic indexes` does, or keeps the undated sentence where the
+server says nothing (`the_usage_line_dates_the_counts_and_names_the_standbys`) — and — where
 `supports_missing_index_hints` — `fetch_missing_indexes(Some(db), PERF_VIEW_ROWS)`, **whose
 failure costs only that section** (`PerfData::Indexes::missing_error`), as a refused
 usage view costs only the usage figures. It adds no deadline of its own, and the `fetch_schema`

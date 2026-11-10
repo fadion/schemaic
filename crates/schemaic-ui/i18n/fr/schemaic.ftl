@@ -2955,6 +2955,11 @@ perf-problem-unused = Non lu depuis la dernière réinitialisation des compteurs
 perf-problem-duplicate = Double { $of }
 perf-problem-redundant = Couvert par { $by }, dont la clé commence comme celle-ci
 perf-usage-note = Les compteurs d'utilisation repartent de zéro quand le serveur redémarre ou que ses statistiques sont réinitialisées : un index utilisé uniquement par une tâche mensuelle peut donc sembler inutilisé. Vérifiez avant d'en supprimer un.
+perf-usage-note-since = Les compteurs d'utilisation courent depuis { $since }, le dernier redémarrage du serveur ou la dernière réinitialisation de ses statistiques : un index utilisé uniquement par une tâche mensuelle peut donc sembler inutilisé. Vérifiez avant d'en supprimer un.
+perf-usage-standbys = { $count ->
+    [one] Ce serveur a { $count } serveur secondaire qui se réplique depuis lui, dont il ne compte pas les lectures : un index que seules les requêtes là-bas utilisent semble inutilisé ici, et le supprimer le supprime aussi là-bas.
+   *[other] Ce serveur a { $count } serveurs secondaires qui se répliquent depuis lui, dont il ne compte pas les lectures : un index que seules les requêtes là-bas utilisent semble inutilisé ici, et le supprimer le supprime aussi là-bas.
+}
 perf-usage-uncounted = Ce serveur ne fournit aucun compteur d'utilisation des index, donc aucun index ne peut être déclaré inutilisé — seuls les doublons et les préfixes sont affichés.
 perf-create-index = Créer un index
 perf-missing-title = Index manquants enregistrés par l'optimiseur depuis le dernier redémarrage

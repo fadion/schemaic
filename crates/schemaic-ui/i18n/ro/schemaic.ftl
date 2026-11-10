@@ -3051,6 +3051,12 @@ perf-problem-unused = Necitit de la ultima resetare a contoarelor
 perf-problem-duplicate = Duplică { $of }
 perf-problem-redundant = Acoperit de { $by }, a cărui cheie începe ca a acestuia
 perf-usage-note = Contoarele de utilizare reîncep când serverul repornește sau statisticile lui sunt resetate, deci un index folosit doar de o sarcină lunară poate părea neutilizat. Verifică înainte de a elimina unul.
+perf-usage-note-since = Contoarele de utilizare curg din { $since }, ultima repornire a serverului sau resetare a statisticilor lui, deci un index folosit doar de o sarcină lunară poate părea neutilizat. Verifică înainte de a elimina unul.
+perf-usage-standbys = { $count ->
+    [one] Acest server are { $count } server de rezervă care se replică din el, ale cărui citiri nu le numără: un index folosit doar de interogările de acolo pare neutilizat aici, iar eliminarea lui îl elimină și acolo.
+    [few] Acest server are { $count } servere de rezervă care se replică din el, ale căror citiri nu le numără: un index folosit doar de interogările de acolo pare neutilizat aici, iar eliminarea lui îl elimină și acolo.
+   *[other] Acest server are { $count } de servere de rezervă care se replică din el, ale căror citiri nu le numără: un index folosit doar de interogările de acolo pare neutilizat aici, iar eliminarea lui îl elimină și acolo.
+}
 perf-usage-uncounted = Acest server nu raportează contoare de utilizare a indexurilor, deci niciun index nu poate fi numit neutilizat — sunt afișate doar duplicatele și prefixele.
 perf-create-index = Creează index
 perf-missing-title = Indexuri lipsă înregistrate de optimizator de la ultima repornire

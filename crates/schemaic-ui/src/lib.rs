@@ -5733,12 +5733,13 @@ pub enum PerfData {
     /// The ranked statements, or which source is missing.
     Statements(schemaic_core::workload::StatementReport),
     /// [`schemaic_core::workload::index_health`]'s findings, whether usage was
-    /// counted at all, and — where the engine records them — the missing
-    /// indexes (`missing_error` when that one read failed and the rest did
-    /// not).
+    /// counted at all and since when ([`schemaic_core::stats::UsageScope`]),
+    /// and — where the engine records them — the missing indexes
+    /// (`missing_error` when that one read failed and the rest did not).
     Indexes {
         findings: Vec<schemaic_core::workload::IndexFinding>,
         counted: bool,
+        usage: schemaic_core::stats::UsageScope,
         missing: Vec<schemaic_core::workload::MissingIndex>,
         missing_error: Option<String>,
     },
