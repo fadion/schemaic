@@ -1105,8 +1105,84 @@ fn decode_cell(
         Ok(r) => r.map_err(query_err)?,
         Err(_) => return Ok((Value::Str(lost(&type_name())), false)),
     };
+    // A `BIT` and a `BIGNUM` arrive as their storage bytes; they are values
+    // with a text of their own, not binary.
+    match (&v, kind.id) {
+        (DValue::Blob(b), LogicalTypeId::Bit) => {
+            return Ok((
+                bit_text(b).map_or(Value::Str(lost("BIT")), Value::Str),
+                false,
+            ));
+        }
+        (DValue::Blob(b), LogicalTypeId::Bignum) => {
+            return Ok((
+                bignum_text(b).map_or(Value::Str(lost("BIGNUM")), Value::Str),
+                false,
+            ));
+        }
+        _ => {}
+    }
     let bytes = matches!(v, DValue::Blob(_) | DValue::Geometry(_));
     Ok((cell_of(v, kind), bytes))
+}
+
+/// A `BIT` from DuckDB's storage: a byte saying how many leading bits of the
+/// first data byte are padding, then the bits, most significant first.
+fn bit_text(b: &[u8]) -> Option<String> {
+    let (&pad, data) = b.split_first()?;
+    if pad > 7 || data.is_empty() {
+        return None;
+    }
+    let bits: String = data
+        .iter()
+        .flat_map(|byte| {
+            (0..8)
+                .rev()
+                .map(move |i| if byte >> i & 1 == 1 { '1' } else { '0' })
+        })
+        .skip(usize::from(pad))
+        .collect();
+    Some(bits)
+}
+
+/// A `BIGNUM` from DuckDB's storage: a three-byte header — its top bit set
+/// for a value that is not negative, the rest the byte count — then the
+/// magnitude's bytes, most significant first; a negative value has the header
+/// and the bytes inverted. Written in decimal, as DuckDB writes it.
+fn bignum_text(b: &[u8]) -> Option<String> {
+    if b.len() < 4 {
+        return None;
+    }
+    let negative = b[0] & 0x80 == 0;
+    let mut magnitude: Vec<u8> = b[3..]
+        .iter()
+        .map(|&x| if negative { !x } else { x })
+        .collect();
+    // Repeated division by 10^9 over the base-256 digits.
+    let mut groups: Vec<u32> = Vec::new();
+    while magnitude.iter().any(|&x| x != 0) {
+        let mut rem: u64 = 0;
+        for d in &mut magnitude {
+            let cur = (rem << 8) | u64::from(*d);
+            *d = (cur / 1_000_000_000) as u8;
+            rem = cur % 1_000_000_000;
+        }
+        groups.push(rem as u32);
+    }
+    let mut out = String::new();
+    if negative && !groups.is_empty() {
+        out.push('-');
+    }
+    match groups.split_last() {
+        None => out.push('0'),
+        Some((top, rest)) => {
+            out.push_str(&top.to_string());
+            for g in rest.iter().rev() {
+                out.push_str(&format!("{g:09}"));
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Column `i`'s type name, for a cell the driver could not decode.
@@ -1242,6 +1318,12 @@ fn text_of(v: &DValue, kind: &Shape, nested: bool) -> String {
         }
         DValue::Text(s) | DValue::Enum(s) if nested => nested_string(s),
         DValue::Text(s) | DValue::Enum(s) => s.clone(),
+        DValue::Blob(b) if kind.id == LogicalTypeId::Bit => {
+            bit_text(b).unwrap_or_else(|| lost("BIT"))
+        }
+        DValue::Blob(b) if kind.id == LogicalTypeId::Bignum => {
+            bignum_text(b).unwrap_or_else(|| lost("BIGNUM"))
+        }
         DValue::Blob(b) | DValue::Geometry(b) => binary_display(b.len()),
         DValue::Date32(days) => date_text(*days),
         // Inside a list or struct, where `decode_cell` cannot step in first.
@@ -4966,6 +5048,39 @@ mod tests {
             Value::Null,
             "a NULL union"
         );
+    }
+
+    /// **A `BIT` and a `BIGNUM` read as DuckDB writes them**, not as bytes:
+    /// the driver hands both over as blobs, so the grid showed `<n bytes>`,
+    /// marked the column binary, and a dump withheld them as NULL under a
+    /// note calling them binary. Checked against DuckDB's own text.
+    #[test]
+    fn a_bit_and_a_bignum_read_as_their_text() {
+        let db = mem("bit-bignum");
+        let rt = rt();
+        for (expr, ty) in [
+            ("'1011'", "BIT"),
+            ("'0'", "BIT"),
+            ("'101010101010101010101'", "BIT"),
+            ("'0'", "BIGNUM"),
+            ("'1'", "BIGNUM"),
+            ("'-1'", "BIGNUM"),
+            ("'255'", "BIGNUM"),
+            ("'-256'", "BIGNUM"),
+            ("'123456789012345678901234567890123456789012'", "BIGNUM"),
+            ("'-98765432109876543210987654321098765432109876'", "BIGNUM"),
+        ] {
+            let rs = rt
+                .block_on(q(
+                    &db,
+                    &format!("SELECT {expr}::{ty} AS v, CAST({expr}::{ty} AS VARCHAR) AS t"),
+                ))
+                .unwrap();
+            let shown = rs.cell(0, 0).unwrap().display().to_string();
+            let duck = rs.cell(0, 1).unwrap().display().to_string();
+            assert_eq!(shown, duck, "{expr}::{ty}");
+            assert!(rs.binary_columns.is_empty(), "{expr}::{ty} marked binary");
+        }
     }
 
     /// **A value the driver panics on does not run the process's panic

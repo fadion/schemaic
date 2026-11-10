@@ -65,7 +65,12 @@ unreachable rather than downloaded behind a query (`no_extension_is_fetched_behi
 `FLOAT` through its own shortest text so `0.1::FLOAT` reads `0.1`, a `DECIMAL` exact as text, a
 timestamp in ISO form with `TIMESTAMP WITH TIME ZONE` in UTC (`+00`, this build linking no ICU),
 an interval as `1 year 2 months 3 days 04:05:06`, a list `[1, 2]`, a struct `{'a': 1}`, a blob
-as its size and its column marked binary. A column's type name keeps a declared alias (`JSON`).
+as its size and its column marked binary. **A `BIT` and a `BIGNUM` are not blobs**, though the
+driver hands both over as their storage bytes: `bit_text` reads the padding byte and the bits,
+`bignum_text` the three-byte header (sign and length) and the magnitude, inverted for a negative,
+and each is written as DuckDB writes it, the column not marked binary
+(`a_bit_and_a_bignum_read_as_their_text`, checked against DuckDB's own cast) — they showed
+`<n bytes>` and a dump withheld them as NULL under a note calling them binary. A column's type name keeps a declared alias (`JSON`).
 **A string inside a list, struct or map, and a struct's field name, is escaped with backslashes**
 (`nested_string`: `['it\'s', 'a\\b']`), not by SQL's doubling of the quote, because that text is
 what a grid edit of the cell sends back for DuckDB to cast, and the cast does not read doubling —
