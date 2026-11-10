@@ -4592,15 +4592,17 @@ fn deny_keywords_for(dialect: SqlDialect) -> &'static [&'static str] {
             "SERIALIZABLE",
             "REPEATABLEREAD",
         ],
-        // DuckDB's own. Its file readers open any path on *this* machine —
-        // the unattended paths' session also runs with external access off
-        // (`db::duckdb`), and this names them first so the refusal says
-        // what it is. `COPY`/`EXPORT` write files, `ATTACH` opens another
-        // database by path, `INSTALL`/`FORCE` fetch extensions, `PRAGMA` and
-        // `CHECKPOINT` act on the file, `QUERY`/`QUERY_TABLE` run SQL from a
-        // string this gate cannot read, `GETENV` reads the process's
-        // environment, and `NEXTVAL` advances a sequence. `BEGIN` and
-        // `ABORT` are its transaction words beyond the standard ones.
+        // DuckDB's own statement words. `COPY`/`EXPORT` write files,
+        // `ATTACH` opens another database by path, `INSTALL`/`FORCE` fetch
+        // extensions, `PRAGMA` and `CHECKPOINT` act on the file, `GETENV`
+        // (outside the generated catalogue) reads the process's
+        // environment. `BEGIN` and `ABORT` are its transaction words beyond
+        // the standard ones. **Its builtins that act are a list of their
+        // own**, [`DUCKDB_ACTING_FUNCTIONS`] — the file readers, which open
+        // any path on *this* machine (the unattended paths' session also
+        // runs with external access off, `db::duckdb`), `query`, `setval`,
+        // the logging switches — reviewed against the generated catalogue,
+        // so a version bump cannot add a writer unseen.
         SqlDialect::DuckDb => &[
             "COPY",
             "EXPORT",
@@ -4613,32 +4615,7 @@ fn deny_keywords_for(dialect: SqlDialect) -> &'static [&'static str] {
             "VACUUM",
             "BEGIN",
             "ABORT",
-            "QUERY",
-            "QUERY_TABLE",
             "GETENV",
-            "NEXTVAL",
-            "SETSEED",
-            "READ_CSV",
-            "READ_CSV_AUTO",
-            "SNIFF_CSV",
-            "READ_PARQUET",
-            "PARQUET_SCAN",
-            "PARQUET_METADATA",
-            "PARQUET_SCHEMA",
-            "PARQUET_FILE_METADATA",
-            "PARQUET_KV_METADATA",
-            "READ_JSON",
-            "READ_JSON_AUTO",
-            "READ_JSON_OBJECTS",
-            "READ_JSON_OBJECTS_AUTO",
-            "READ_NDJSON",
-            "READ_NDJSON_AUTO",
-            "READ_NDJSON_OBJECTS",
-            "READ_TEXT",
-            "READ_BLOB",
-            "GLOB",
-            "DUCKDB_SECRETS",
-            "WHICH_SECRET",
         ],
     }
 }
@@ -4648,8 +4625,101 @@ fn deny_keywords_for(dialect: SqlDialect) -> &'static [&'static str] {
 /// The composition of the two halves, in one place, so no caller can check one
 /// and miss the other.
 fn is_denied(word: &str, dialect: SqlDialect) -> bool {
-    DENY_ANY_ENGINE.contains(&word) || deny_keywords_for(dialect).contains(&word)
+    DENY_ANY_ENGINE.contains(&word)
+        || deny_keywords_for(dialect).contains(&word)
+        || acting_functions(dialect).contains(&word)
 }
+
+/// The builtins on `dialect` that act, where the engine's calls are answered
+/// by its deny list rather than an allowlist and its function set is closed
+/// and generated — DuckDB's alone ([`read_call_policy`]). Kept apart from
+/// [`deny_keywords_for`] so the review of each new engine version has one
+/// list to extend (`every_duckdb_builtin_has_been_reviewed_for_whether_it_acts`).
+fn acting_functions(dialect: SqlDialect) -> &'static [&'static str] {
+    match dialect {
+        SqlDialect::DuckDb => DUCKDB_ACTING_FUNCTIONS,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => &[],
+    }
+}
+
+/// DuckDB's builtins that act — reviewed, name by name, against
+/// [`crate::duckdb_builtins::DUCKDB_FUNCTIONS`] (755 on 2.0.0). What acts:
+///
+/// - **opens a file by path** — every reader, `glob`, `read_duckdb` (another
+///   database), the Parquet metadata readers, `sniff_csv`;
+/// - **runs SQL from a string** this gate cannot read — `query`,
+///   `query_table`, `json_execute_serialized_sql`, and `json_serialize_plan`,
+///   which binds its text and so opens what it reads;
+/// - **changes the instance or the file** — `checkpoint`, `force_checkpoint`,
+///   logging and profiling switched on or off (`enable_logging(storage='file')`
+///   writes files, from inside a `READ ONLY` transaction), `write_log`,
+///   `truncate_duckdb_logs`, the external-resource registry;
+/// - **moves a sequence or the random seed** — `nextval`, `setval` (which
+///   `ROLLBACK` does not undo, measured), `setseed`;
+/// - **reads memory or secrets** — `arrow_scan` takes a pointer;
+///   `duckdb_secrets`, `which_secret`;
+/// - **sleeps** — `pg_sleep`, `sleep_ms`, as MySQL's `SLEEP` is denied.
+///
+/// Everything else in the catalogue was read as a pure function or a
+/// catalogue read. Upper-case, as the gate's tokens are.
+const DUCKDB_ACTING_FUNCTIONS: &[&str] = &[
+    "ARROW_SCAN",
+    "ARROW_SCAN_DUMB",
+    "CHECKPOINT",
+    "CREATE_EXTERNAL_RESOURCE",
+    "DEREGISTER_EXTERNAL_RESOURCE",
+    "DESTROY_EXTERNAL_RESOURCE",
+    "DISABLE_LOGGING",
+    "DISABLE_PROFILING",
+    "DUCKDB_SECRETS",
+    "ENABLE_LOGGING",
+    "ENABLE_PROFILING",
+    "FORCE_CHECKPOINT",
+    "GLOB",
+    "JSON_EXECUTE_SERIALIZED_SQL",
+    "JSON_SERIALIZE_PLAN",
+    "NEXTVAL",
+    "PARQUET_BLOOM_PROBE",
+    "PARQUET_FILE_METADATA",
+    "PARQUET_FULL_METADATA",
+    "PARQUET_KV_METADATA",
+    "PARQUET_METADATA",
+    "PARQUET_SCAN",
+    "PARQUET_SCHEMA",
+    "PG_SLEEP",
+    "QUERY",
+    "QUERY_TABLE",
+    "READ_BLOB",
+    "READ_CSV",
+    "READ_CSV_AUTO",
+    "READ_DUCKDB",
+    "READ_JSON",
+    "READ_JSON_AUTO",
+    "READ_JSON_OBJECTS",
+    "READ_JSON_OBJECTS_AUTO",
+    "READ_NDJSON",
+    "READ_NDJSON_AUTO",
+    "READ_NDJSON_OBJECTS",
+    "READ_PARQUET",
+    "READ_SINGLE_CSV_FILE",
+    "READ_SINGLE_JSON_FILE",
+    "READ_SINGLE_PARQUET_FILE",
+    "READ_TEXT",
+    "REGISTER_EXTERNAL_RESOURCE",
+    "REGISTER_EXTERNAL_RESOURCE_TYPE",
+    "SETSEED",
+    "SETVAL",
+    "SLEEP_MS",
+    "SNIFF_CSV",
+    "TRUNCATE_DUCKDB_LOGS",
+    "WHICH_SECRET",
+    "WRITE_LOG",
+];
+
+/// How many builtins the review of [`DUCKDB_ACTING_FUNCTIONS`] covered, and
+/// their names' fingerprint (FNV-1a over the comma-joined names).
+#[cfg(test)]
+const DUCKDB_FUNCTIONS_REVIEWED: (usize, u64) = (755, 0x0bbe_ec0f_ace6_7d77);
 
 /// Is `word`, as an unquoted name followed by an argument list, the builtin
 /// function of that name on `dialect` rather than the write it spells
@@ -10806,6 +10876,87 @@ mod tests {
         // A column that merely shares a reader's name is still refused — the
         // gate over-blocks a name rather than under-block a call.
         assert!(gate("SELECT read_csv FROM t", d).is_err());
+    }
+
+    /// **DuckDB's writers in its own catalogue are refused, and logged.**
+    /// Each measured on 2.0.0: `setval` moves a sequence and `ROLLBACK` does
+    /// not undo it; `enable_logging(storage='file', …)` wrote CSV files from
+    /// inside a `READ ONLY` transaction and turned query logging on for every
+    /// tab sharing the instance; the profiling and log functions act on the
+    /// instance the same way.
+    #[test]
+    fn duckdb_refuses_the_functions_that_act_on_the_instance() {
+        let d = SqlDialect::DuckDb;
+        for sql in [
+            "SELECT setval('s', 100)",
+            "SELECT * FROM enable_logging(storage='file', storage_path='logdir')",
+            "SELECT * FROM disable_logging()",
+            "SELECT * FROM truncate_duckdb_logs()",
+            "SELECT write_log('x')",
+            "SELECT * FROM enable_profiling()",
+            "SELECT * FROM disable_profiling()",
+            "SELECT * FROM force_checkpoint()",
+            "SELECT * FROM checkpoint()",
+            "SELECT * FROM read_duckdb('other.duckdb')",
+            "SELECT json_execute_serialized_sql('{}')",
+            "SELECT pg_sleep(10)",
+        ] {
+            assert!(super::read_only_reason(sql, d).is_err(), "{sql} passed");
+            assert!(crate::write_log::is_logged(sql, d), "{sql} not logged");
+            let policy = GuardPolicy {
+                dialect: d,
+                read_only: true,
+                confirm_writes: false,
+                no_database: false,
+            };
+            assert!(
+                matches!(
+                    run_verdict(&[sql.to_string()], policy),
+                    RunVerdict::Block(_)
+                ),
+                "{sql} ran on a read-only connection"
+            );
+        }
+    }
+
+    /// **Every DuckDB builtin has been looked at for whether it acts.** The
+    /// catalogue is the linked engine's (`db::duckdb`'s
+    /// `the_builtin_catalogue_is_the_linked_engines`), so a version bump
+    /// changes it — and DuckDB's calls are answered by its deny list, not an
+    /// allowlist, so a new writer there would pass the read-only gate unseen.
+    /// The fingerprint makes the bump stop here: review the new names, add
+    /// every one that writes, opens a file, runs SQL from a string, sleeps or
+    /// changes the instance to [`DUCKDB_ACTING_FUNCTIONS`], then take the new
+    /// fingerprint from the failure.
+    #[test]
+    fn every_duckdb_builtin_has_been_reviewed_for_whether_it_acts() {
+        let names: Vec<&str> = crate::duckdb_builtins::DUCKDB_FUNCTIONS
+            .iter()
+            .map(|f| f.name)
+            .collect();
+        // FNV-1a over the names in catalogue order, comma-joined.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in names.join(",").bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        assert_eq!(
+            (names.len(), h),
+            DUCKDB_FUNCTIONS_REVIEWED,
+            "DuckDB's builtin catalogue changed: review the new functions for writers \
+             (DUCKDB_ACTING_FUNCTIONS), then set DUCKDB_FUNCTIONS_REVIEWED to ({}, {h:#x})",
+            names.len()
+        );
+        for acting in DUCKDB_ACTING_FUNCTIONS {
+            assert!(
+                names.iter().any(|n| n.eq_ignore_ascii_case(acting)),
+                "{acting} is not a builtin of the linked engine"
+            );
+            assert!(
+                is_denied(acting, SqlDialect::DuckDb),
+                "{acting} is not denied"
+            );
+        }
     }
 
     /// DuckDB lexes like PostgreSQL in the ways the boundary scanner cares

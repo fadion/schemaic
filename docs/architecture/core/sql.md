@@ -167,14 +167,27 @@ every word finds it there. `OPENROWSET`/`OPENQUERY`/`OPENDATASOURCE` are on it b
 a server file or send text to another server this gate cannot read. `WHILE` and `GOTO` are on it
 as T-SQL's `BENCHMARK`: a loop writes nothing for the rolled-back session to undo, and runs until
 it is stopped — on the unattended paths, by nobody (`a_sql_server_loop_is_not_a_read`).
-**DuckDB's deny list is mostly its file readers**, because a DuckDB read can open any path on
-this machine: `READ_CSV`/`READ_CSV_AUTO`/`SNIFF_CSV`, the `READ_PARQUET`/`PARQUET_*` and
-`READ_JSON*`/`READ_NDJSON*` families, `READ_TEXT`, `READ_BLOB` and `GLOB` — and beside them
-`COPY` and `EXPORT` (they write files), `ATTACH`/`DETACH` (another database by path),
-`INSTALL`/`FORCE` (fetch an extension), `PRAGMA`, `CHECKPOINT` and `VACUUM` (they act on the
-file), `QUERY`/`QUERY_TABLE` (they run SQL from a string this gate cannot read), `GETENV` (the
-process's environment), `NEXTVAL` and `SETSEED`, `DUCKDB_SECRETS`/`WHICH_SECRET`, and `BEGIN` and
-`ABORT`, its transaction words beyond the standard ones. **The list is not what stops a file
+**DuckDB's deny list is two lists.** Its statement words, in `deny_keywords_for`: `COPY` and
+`EXPORT` (they write files), `ATTACH`/`DETACH` (another database by path), `INSTALL`/`FORCE`
+(fetch an extension), `PRAGMA`, `CHECKPOINT` and `VACUUM` (they act on the file), `GETENV` (the
+process's environment, outside the generated catalogue), and `BEGIN` and `ABORT`, its transaction
+words beyond the standard ones. And **its builtins that act, `DUCKDB_ACTING_FUNCTIONS`, reviewed
+name by name against the generated `DUCKDB_FUNCTIONS`** (755 on 2.0.0), which `is_denied` asks
+through `acting_functions`: every file reader, since a DuckDB read can open any path on this
+machine (`READ_CSV`/`SNIFF_CSV`, the `READ_PARQUET`/`PARQUET_*`, `READ_JSON*`/`READ_NDJSON*` and
+`READ_SINGLE_*` families, `READ_TEXT`, `READ_BLOB`, `READ_DUCKDB`, `GLOB`); what runs SQL from a
+string the gate cannot read (`QUERY`, `QUERY_TABLE`, `JSON_EXECUTE_SERIALIZED_SQL`, and
+`JSON_SERIALIZE_PLAN`, which binds its text); what changes the instance (`CHECKPOINT`,
+`FORCE_CHECKPOINT`, `ENABLE_`/`DISABLE_LOGGING` and `_PROFILING`, `WRITE_LOG`,
+`TRUNCATE_DUCKDB_LOGS`, the external-resource registry); `NEXTVAL`, `SETVAL` and `SETSEED`;
+`ARROW_SCAN` (a pointer), `DUCKDB_SECRETS`/`WHICH_SECRET`; and `PG_SLEEP`/`SLEEP_MS`. It was one
+hand-kept list that missed `setval` — measured not undone by `ROLLBACK`, and run by Analyze — and
+`enable_logging(storage='file', …)`, which wrote CSV files from inside a `READ ONLY` transaction
+on a GUI connection marked read-only and turned query logging on for every tab sharing the
+instance (`duckdb_refuses_the_functions_that_act_on_the_instance`). Since DuckDB's calls have no
+allowlist, **`every_duckdb_builtin_has_been_reviewed_for_whether_it_acts` pins the catalogue's
+count and an FNV-1a fingerprint of its names**: an engine bump that regenerates the catalogue
+stops there until the new names are reviewed and any writer added. **The list is not what stops a file
 read**: `FROM 'secrets.csv'` names a file as a string in table position, which no word scan can
 refuse, and a column that merely shares a reader's name is refused with the call
 (`duckdb_reads_its_own_way_and_not_through_a_file`). The unattended paths run on a *sealed*
@@ -295,7 +308,7 @@ PostgreSQL and SQL Server, `None` for MySQL and SQLite, whose builtin sets are s
 and keep their deny lists, and `None` for DuckDB, whose set is large but closed *in this build*
 — an extension is linked in or unreachable, auto-install and auto-load being off and `INSTALL`
 and `LOAD` denied — and whose user functions are macros, an expression or a query, which cannot
-write; what acts is on its deny list, and the unattended session is sealed besides. SQL Server's builtins are closed too, but a user-defined function may
+write; what acts is on its deny list (`DUCKDB_ACTING_FUNCTIONS`, above), and the unattended session is sealed besides. SQL Server's builtins are closed too, but a user-defined function may
 call an extended stored procedure and a CLR one does whatever its assembly may, so a name the
 gate cannot vouch for is refused there as well. What differs between the two is a `CallPolicy`
 rather than a second scanner: the lists (`MSSQL_READ_FUNCTIONS` unqualified, and
