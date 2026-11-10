@@ -370,7 +370,7 @@ sentence, which would send the reader to check a privilege that is fine. **The t
 that emits and must not run.** `CompareEntry::held_back` is the reason no plan may carry an
 entry's changes — a `HeldBack`, one variant per reason (`PartitionOfHeld { parent, sub }`,
 `PartitioningDiffers`, `SequenceUnwritten`, `PartitionedUnrestated`, `SequenceRangeLeft { at,
-min, max }`, `DefaultsUnread`), whose `message()` is the sentence — set where the server would refuse the
+min, max }`, `DefaultsUnread`, `NamesMissingType { name }`), whose `message()` is the sentence — set where the server would refuse the
 statements and the only change it would take does damage the comparison may not choose for the
 user, or where the difference needs a statement the comparison does not write at all;
 `unplannable` is true whenever it is set, and `omission` reads it ahead of its other three
@@ -620,6 +620,17 @@ two sides' texts (two encrypted modules are the same, flagged `uncertain`), and 
 entry is a `Differing` one `unplannable` discloses. The target's being unreadable is not this
 case — a readable source replaces it (`a_module_the_source_could_not_read_is_disclosed_not_planned`;
 live, `a_comparison_discloses_the_modules_the_source_would_not_show`, 2022 and 2025).
+**A view or routine that names a user type the target lacks is held back too**
+(`HeldBack::NamesMissingType { name }`, set in a pass of its own before the order): the
+comparison carries no user types — DuckDB's `DbSchema::user_types` are read for the dump alone —
+so a source view `SELECT CAST('a' AS mood)` was planned alone, Apply failed on *Type with name
+mood does not exist*, nothing in the plan said why, and the next compare offered it again. A
+right-side type absent from the left, by qualified name, holds every created or altered view
+whose definition, and routine whose body, arguments or return type, `mentions` it, with the
+sentence naming the type and the way on (create it by hand, compare again). A table needs no
+hold: DuckDB restates a column typed by one with the type spelled out
+(`a_view_naming_a_type_the_target_lacks_is_held_back`). Carrying user types as a compare kind of
+their own was left to the user, who chose the note.
 **A DuckDB source macro whose parameter defaults are unread is held back the same way**
 (`RoutineInfo::defaults_unread`, under `schema.rs` and `db/duckdb.rs`: the catalogue lists
 `b := 2` as `b`). The reader now reads such defaults from an export of the schema, so a macro

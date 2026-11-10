@@ -970,6 +970,9 @@ pub(crate) fn omission_text(o: &schemaic_core::compare::PlanOmission) -> String 
                 OmissionWhy::HeldBack(HeldBack::DefaultsUnread) => {
                     tr!("compare-held-defaults-unread")
                 }
+                OmissionWhy::HeldBack(HeldBack::NamesMissingType { name }) => {
+                    tr!("compare-held-names-missing-type", name = name.as_str())
+                }
                 OmissionWhy::NeedsSource => tr!("compare-omitted-needs-source"),
                 OmissionWhy::Unread => tr!("compare-omitted-unread"),
                 OmissionWhy::NoStatement => tr!("compare-omitted-no-statement"),
@@ -1556,6 +1559,9 @@ mod tests {
                 max: "1000".into(),
             }),
             OmissionWhy::HeldBack(HeldBack::DefaultsUnread),
+            OmissionWhy::HeldBack(HeldBack::NamesMissingType {
+                name: "main.mood".into(),
+            }),
         ] {
             for kind in [
                 CompareKind::Table,

@@ -54,6 +54,9 @@ On DuckDB, the whole migration runs in one transaction, and a few things stop it
   server's `compare_schemas`. DuckDB's catalogue doesn't hold the defaults, and Schemaic reads them
   from DuckDB's own export, which needs file access the MCP server turns off. **Compare with**
   plans such a macro like any other.
+- *A view or macro that names a type you made with `CREATE TYPE`*, when the other database
+  doesn't have that type, is held back with a note naming it: the comparison doesn't create types.
+  Create the type there by hand, then compare again.
 - *A table another table's foreign key points at can't be rebuilt.* The preview lists it under
   **This engine can't express part of this plan**, and **Apply** stays off until you leave that
   table unticked.

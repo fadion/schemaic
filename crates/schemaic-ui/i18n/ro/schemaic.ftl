@@ -1290,6 +1290,7 @@ compare-held-sequence-unwritten = această comparație nu scrie nicio instrucți
 compare-held-partitioned-unrestated = este partiționat și niciun CREATE TABLE de aici nu îi reformulează schema de partiționare — creează manual funcția și schema de partiționare, apoi tabelul
 compare-held-sequence-range = contorul țintei a ajuns la { $at }, în afara noului interval { $min }–{ $max }, iar serverul refuză să restrângă o secvență dincolo de o valoare pe care a distribuit-o. Repornește-o pe țintă (ALTER SEQUENCE … RESTART WITH) la o valoare pe care nu o conține niciun tabel, apoi compară din nou
 compare-held-defaults-unread = DuckDB nu raportează valorile implicite ale parametrilor săi, așa că o instrucțiune scrisă din el le-ar pierde — copiaz-o manual din sursă
+compare-held-names-missing-type = numește tipul { $name }, pe care ținta nu îl are și pe care această comparație nu îl creează — creează tipul manual pe țintă, apoi compară din nou
 compare-note-set-aside = { $aside } — { $side ->
         [target] ținta
        *[source] sursa

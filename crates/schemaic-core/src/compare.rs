@@ -478,6 +478,10 @@ pub enum HeldBack {
     /// ([`RoutineInfo::defaults_unread`]): written from its reading, it would
     /// lose them.
     DefaultsUnread,
+    /// A view or routine whose text names the user type `name` (qualified),
+    /// which the source has and the target does not: the comparison carries
+    /// no user types, so its `CREATE` would fail on the missing type.
+    NamesMissingType { name: String },
 }
 
 impl HeldBack {
@@ -511,6 +515,10 @@ impl HeldBack {
             HeldBack::DefaultsUnread => "DuckDB does not report its parameter defaults, so a \
                  statement written from it would drop them — copy it from the source by hand"
                 .to_string(),
+            HeldBack::NamesMissingType { name } => format!(
+                "it names the type {name}, which the target does not have and this comparison \
+                 does not create — create the type on the target by hand, then compare again"
+            ),
         }
     }
 }
@@ -1110,6 +1118,55 @@ impl SchemaComparison {
                 &mut notes,
             ) {
                 entries.push(tsql_entry(ck, ok, l, r, names, own));
+            }
+        }
+
+        // ── what names a user type the target lacks ─────────────────────────
+        //
+        // The comparison carries no user types (DuckDB's are read for the
+        // dump alone), so a view or routine whose text names one the target
+        // lacks was planned alone and failed at Apply on the missing type,
+        // with nothing to say why (release review S5-L1-04). Held back, the
+        // plan names the type instead. A table needs no such hold: DuckDB
+        // restates a column typed by one with the type spelled out.
+        let missing: Vec<&crate::schema::UserType> = right
+            .user_types
+            .iter()
+            .filter(|u| {
+                !left.user_types.iter().any(|l| {
+                    names.key(&display_name(l.schema.as_deref(), &l.name))
+                        == names.key(&display_name(u.schema.as_deref(), &u.name))
+                })
+            })
+            .collect();
+        if !missing.is_empty() {
+            for e in entries.iter_mut().filter(|e| {
+                e.held_back.is_none()
+                    && matches!(e.status, ObjectStatus::OnlyRight | ObjectStatus::Differing)
+            }) {
+                let texts: Vec<&str> = match e.kind {
+                    CompareKind::View => right
+                        .tables
+                        .iter()
+                        .filter(|t| t.is_view && t.name == e.name && t.schema == e.schema)
+                        .filter_map(|t| t.view_definition.as_deref())
+                        .collect(),
+                    CompareKind::Function | CompareKind::Procedure => right
+                        .routines
+                        .iter()
+                        .filter(|r| r.name == e.name && r.schema == e.schema)
+                        .flat_map(|r| [r.body.as_str(), r.arguments.as_str(), r.returns.as_str()])
+                        .collect(),
+                    _ => continue,
+                };
+                if let Some(u) = missing
+                    .iter()
+                    .find(|u| texts.iter().any(|t| mentions(t, &u.name)))
+                {
+                    e.held_back = Some(HeldBack::NamesMissingType {
+                        name: display_name(u.schema.as_deref(), &u.name),
+                    });
+                }
             }
         }
 
@@ -3730,6 +3787,65 @@ mod tests {
 
     fn mysql(left: DbSchema, right: DbSchema) -> SchemaComparison {
         SchemaComparison::of(&left, &right, SqlDialect::MySql)
+    }
+
+    /// **A view or routine that names a user type the target lacks is held
+    /// back, and says so.** The comparison does not carry DuckDB's user
+    /// types, so the plan created the view alone, Apply failed (*Type with
+    /// name mood does not exist*), and nothing in the plan said why; a second
+    /// compare offered the same plan.
+    #[test]
+    fn a_view_naming_a_type_the_target_lacks_is_held_back() {
+        use crate::schema::UserType;
+        let mood = UserType {
+            name: "mood".into(),
+            schema: Some("main".into()),
+            definition: "ENUM('a', 'b')".into(),
+            comment: None,
+        };
+        let main = |mut t: TableInfo| {
+            t.schema = Some("main".into());
+            t
+        };
+        let left = schema_of(vec![main(table("keep", &[("a", "INTEGER")]))]);
+        let mut right = schema_of(vec![
+            main(table("keep", &[("a", "INTEGER")])),
+            main(view("tv", "SELECT CAST('a' AS mood) AS m")),
+            main(view("plain", "SELECT 1 AS moody")),
+        ]);
+        right.user_types = vec![mood.clone()];
+        let c = SchemaComparison::of(&left, &right, SqlDialect::DuckDb);
+        let held = |name: &str| {
+            c.entries
+                .iter()
+                .find(|e| e.kind == CompareKind::View && e.name == name)
+                .unwrap()
+                .held_back
+                .clone()
+        };
+        assert_eq!(
+            held("tv"),
+            Some(HeldBack::NamesMissingType {
+                name: "main.mood".into()
+            })
+        );
+        assert_eq!(held("plain"), None, "a word that only starts with the name");
+        let plan = c.plan(|_| true);
+        assert!(
+            !plan.emit().iter().any(|s| s.contains("\"tv\"")),
+            "{:?}",
+            plan.emit()
+        );
+        assert!(
+            plan.omitted().iter().any(|o| o.contains("mood")),
+            "{:?}",
+            plan.omitted()
+        );
+        // Where the target has the type, nothing is held.
+        let mut left = left;
+        left.user_types = vec![mood];
+        let c = SchemaComparison::of(&left, &right, SqlDialect::DuckDb);
+        assert!(c.entries.iter().all(|e| e.held_back.is_none()));
     }
 
     /// **A created function a created view calls is planned before the

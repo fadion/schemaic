@@ -1255,6 +1255,7 @@ compare-held-sequence-unwritten = questo confronto non scrive alcuna istruzione 
 compare-held-partitioned-unrestated = è partizionata, e nessun CREATE TABLE qui riformula il suo schema di partizione — crea a mano la funzione e lo schema di partizione, poi la tabella
 compare-held-sequence-range = il contatore della destinazione ha raggiunto { $at }, fuori dal nuovo intervallo da { $min } a { $max }, e il server rifiuta di restringere una sequenza oltre un valore che ha già distribuito. Riavviala sulla destinazione (ALTER SEQUENCE … RESTART WITH) a un valore che nessuna tabella contiene, poi confronta di nuovo
 compare-held-defaults-unread = DuckDB non riporta i valori predefiniti dei suoi parametri, quindi un'istruzione scritta da esso li perderebbe — copiala a mano dall'origine
+compare-held-names-missing-type = nomina il tipo { $name }, che la destinazione non ha e che questo confronto non crea — crea il tipo a mano sulla destinazione, poi confronta di nuovo
 compare-note-set-aside = { $aside } — { $side ->
         [target] anche la destinazione
        *[source] anche l'origine

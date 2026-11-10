@@ -1255,6 +1255,7 @@ compare-held-sequence-unwritten = ky krahasim nuk shkruan urdhër për një seku
 compare-held-partitioned-unrestated = është e ndarë, dhe asnjë CREATE TABLE këtu nuk e riformulon skemën e saj të ndarjes — krijoni funksionin dhe skemën e ndarjes, pastaj tabelën, me dorë
 compare-held-sequence-range = numëruesi i objektivit ka arritur { $at }, jashtë intervalit të ri { $min } deri { $max }, dhe serveri refuzon ta ngushtojë një sekuencë përtej një vlere që e ka dhënë. Riniseni në objektiv (ALTER SEQUENCE … RESTART WITH) në një vlerë që nuk e mban asnjë tabelë, pastaj krahasoni sërish
 compare-held-defaults-unread = DuckDB nuk i raporton vlerat e paracaktuara të parametrave të tij, kështu një urdhër i shkruar prej tij do t’i humbiste — kopjojeni me dorë nga burimi
+compare-held-names-missing-type = përmend llojin { $name }, që objektivi nuk e ka dhe ky krahasim nuk e krijon — krijojeni llojin me dorë në objektiv, pastaj krahasoni sërish
 compare-note-set-aside = { $aside } — { $side ->
         [target] objektivi
        *[source] burimi

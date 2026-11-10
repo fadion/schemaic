@@ -1431,6 +1431,8 @@ compare-held-partitioned-unrestated = it is partitioned, and no CREATE TABLE her
 # $at is where the target's counter is; $min and $max the new range.
 compare-held-sequence-range = the target's counter has reached { $at }, outside the new range { $min } to { $max }, and the server refuses to narrow a sequence past a value it has handed out. Restart it on the target (ALTER SEQUENCE … RESTART WITH) at a value no table holds, then compare again
 compare-held-defaults-unread = DuckDB does not report its parameter defaults, so a statement written from it would drop them — copy it from the source by hand
+# $name is the user type, schema-qualified (an identifier: never translated).
+compare-held-names-missing-type = it names the type { $name }, which the target does not have and this comparison does not create — create the type on the target by hand, then compare again
 # Two objects on one side whose names fold to one on a case-insensitive target;
 # $side is target or source.
 compare-note-set-aside = { $aside } — the { $side ->
