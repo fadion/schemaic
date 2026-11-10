@@ -310,6 +310,11 @@ pub struct IndexInfo {
     /// gets it again from its parent when it is created, and a second
     /// `CREATE INDEX` of the name fails the restore. `false` everywhere else.
     pub inherited: bool,
+    /// **DuckDB's index comment** (`COMMENT ON INDEX`, `duckdb_indexes().comment`),
+    /// which a rebuild has to set again after it creates the index anew: the
+    /// `DROP TABLE` took it, and nothing said so. `None` on every other engine,
+    /// which this does not read.
+    pub comment: Option<String>,
 }
 
 /// What a [`TableInfo`] actually **is** — the three answers

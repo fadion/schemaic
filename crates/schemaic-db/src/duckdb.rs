@@ -2349,7 +2349,7 @@ fn read_schema(conn: &DuckConn) -> Result<DbSchema, DbError> {
     // Indexes made by `CREATE INDEX`, each with its statement.
     let mut stmt = conn
         .prepare(
-            "SELECT schema_name, table_name, index_name, is_unique, expressions, sql \
+            "SELECT schema_name, table_name, index_name, is_unique, expressions, sql, comment \
                FROM duckdb_indexes() WHERE database_name = current_database() \
               ORDER BY schema_name, table_name, index_name",
         )
@@ -2370,6 +2370,10 @@ fn read_schema(conn: &DuckConn) -> Result<DbSchema, DbError> {
             columns: exprs.iter().map(|e| index_column(e)).collect(),
             unique: r.get(3).map_err(query_err)?,
             create_sql: r.get(5).map_err(query_err)?,
+            comment: r
+                .get::<_, Option<String>>(6)
+                .map_err(query_err)?
+                .filter(|c| !c.is_empty()),
             ..Default::default()
         });
     }
@@ -6114,6 +6118,31 @@ mod tests {
         );
         designed(&db, "g", |d| d.rename_column(3, "n2"));
         assert_eq!(cells(&db, "SELECT b FROM g"), vec![vec!["8"]]);
+    }
+
+    /// **A rebuild keeps an index's comment.** The `DROP TABLE` takes the
+    /// index and its comment with it, and the index came back bare, with
+    /// nothing in the plan to say so.
+    #[test]
+    fn a_rebuild_keeps_an_index_comment() {
+        let db = mem("designer_index_comment");
+        seed(
+            &db,
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, v VARCHAR);
+             CREATE INDEX i ON t(a);
+             COMMENT ON INDEX i IS 'hello';
+             INSERT INTO t VALUES (1, 2, 'x');",
+        );
+        let plan = designed(&db, "t", |d| d.rename_column(2, "v2"));
+        assert!(
+            plan.iter().any(|s| s.starts_with("CREATE TABLE")),
+            "rebuilt: {plan:#?}"
+        );
+        assert_eq!(
+            cells(&db, "SELECT comment FROM duckdb_indexes() WHERE index_name = 'i'"),
+            vec![vec!["hello"]],
+            "{plan:#?}"
+        );
     }
 
     /// **A table whose foreign key references itself is not rebuilt, and the

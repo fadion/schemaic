@@ -3535,6 +3535,7 @@ fn table_indexes(conn: &SqliteConn, db: &str, table: &str) -> Result<Vec<IndexIn
             using: None,
             order: Vec::new(),
             inherited: false,
+            comment: None,
             unique,
             foreign: false,
             method: None,

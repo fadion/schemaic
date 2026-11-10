@@ -1036,7 +1036,9 @@ while a generated *source* column is read like any other, so one the draft makes
 values it computed (it was skipped as a source too, and every row's value was NULL after the
 commit — `a_generated_column_made_stored_keeps_its_values`); `DROP TABLE`
 of the original; `ALTER TABLE … RENAME TO` the **draft's** name, so a table rename is inside the
-rebuild as on SQL Server; then the indexes and the table's and columns' `COMMENT ON` — the
+rebuild as on SQL Server; then the indexes, each with its `COMMENT ON INDEX` where it had one
+(`IndexInfo::comment`, read from `duckdb_indexes().comment` — the `DROP` took it, and the index
+came back bare: `a_rebuild_keeps_an_index_comment`), and the table's and columns' `COMMENT ON` — the
 indexes **after** the rename, an index's name living in the schema, where the old table's are
 gone only once it is. A view over the table survives, DuckDB binding a view's query when it is
 read rather than when it is made. **A unique constraint goes in the table body, never as a

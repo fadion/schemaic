@@ -19621,6 +19621,14 @@ pub fn duckdb_rebuild_sql(current: &TableInfo, draft: &TableDraft) -> Vec<String
     for ix in &draft.indexes {
         if !unique_constraint_is_inline(d, &ix.info) && !ix.info.inherited {
             out.push(create_index_sql(&ix.info, &fin, d));
+            // The `DROP TABLE` took the index's comment with it.
+            if let Some(c) = ix.info.comment.as_deref().filter(|c| !c.is_empty()) {
+                out.push(format!(
+                    "COMMENT ON INDEX {} IS {};",
+                    qualified(&ix.info.name, schema, d),
+                    ddl_string(c, d)
+                ));
+            }
         }
     }
     if let Some(c) = draft.comment.as_deref().filter(|c| !c.is_empty()) {
