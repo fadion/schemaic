@@ -529,6 +529,9 @@ pub fn render_rows<W: std::io::Write>(
 /// withheld blob's `NULL` — which a `NOT NULL` alias refuses on restore
 /// (Msg 515) — and one over `sql_variant` came back an `nvarchar` variant.
 ///
+/// **DuckDB's values the driver cannot carry** ([`duckdb_literal_select`]):
+/// read as DuckDB's own text, or a union as its tag and its text.
+///
 /// Every other engine reads its columns as they are: a blob there stays
 /// withheld and noted, as the export's own rule has it.
 pub fn literal_select(
@@ -538,7 +541,8 @@ pub fn literal_select(
 ) -> Option<(String, crate::export::ServerLiteral)> {
     match dialect {
         SqlDialect::MsSql => {}
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
+        SqlDialect::DuckDb => return duckdb_literal_select(c),
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
             return None;
         }
     }
@@ -621,6 +625,81 @@ pub fn literal_select(
         }
         _ => None,
     }
+}
+
+/// The DuckDB types whose values the app's decoder carries exactly, read as
+/// they are; every other column is read as DuckDB's own text
+/// ([`duckdb_literal_select`]). Upper-cased, a `DECIMAL`'s parameters aside.
+const DUCKDB_EXACT_TYPES: &[&str] = &[
+    "BOOLEAN",
+    "TINYINT",
+    "SMALLINT",
+    "INTEGER",
+    "BIGINT",
+    "HUGEINT",
+    "UTINYINT",
+    "USMALLINT",
+    "UINTEGER",
+    "UBIGINT",
+    "UHUGEINT",
+    "FLOAT",
+    "DOUBLE",
+    "DECIMAL",
+    "VARCHAR",
+    "JSON",
+    "UUID",
+    "DATE",
+    "TIME",
+    "TIMESTAMP",
+    "TIMESTAMP_S",
+    "TIMESTAMP_MS",
+    "TIMESTAMP WITH TIME ZONE",
+    "INTERVAL",
+    // Withheld and noted, as a blob is on every engine.
+    "BLOB",
+];
+
+/// [`literal_select`]'s DuckDB arm. **A column whose values the driver hands
+/// over without what makes them themselves is read as DuckDB's text**,
+/// `CAST(c AS VARCHAR)`, written as a string DuckDB casts back on insert:
+/// a `TIMETZ` lost its offset, a `TIMESTAMP_NS` its nanoseconds, a `TIME_NS`
+/// panicked the driver (the file held `'<TIME_NS>'`), a `BIT` or `BIGNUM`
+/// came over as bytes and was withheld as NULL, and a list or struct holding
+/// any of them, or an unsigned `HUGEINT`, was written in the grid's words. So
+/// is every type not on [`DUCKDB_EXACT_TYPES`] — an enum, a user type, a list,
+/// a struct, a map, a type a later DuckDB adds — since the text is the one
+/// form DuckDB reads back for all of them.
+///
+/// **A `UNION` is read as its tag and its text** (`ServerLiteral::DuckUnion`),
+/// written `union_value(tag := '…')`: a string alone was cast back into
+/// whichever member takes a string — `42` came back under a `VARCHAR` member
+/// — and a NULL union was written as the string `'NULL'`.
+fn duckdb_literal_select(
+    c: &crate::schema::ColumnInfo,
+) -> Option<(String, crate::export::ServerLiteral)> {
+    let col = ident_sql(&c.name, SqlDialect::DuckDb);
+    let ty = c.type_name.trim().to_ascii_uppercase();
+    if ty.starts_with("UNION(") || ty.starts_with("UNION (") {
+        return Some((
+            format!(
+                "CASE WHEN {col} IS NULL THEN NULL ELSE \
+                 strlen(union_tag({col})::VARCHAR)::VARCHAR || ':' || \
+                 union_tag({col})::VARCHAR || CAST({col} AS VARCHAR) END AS {col}"
+            ),
+            crate::export::ServerLiteral::DuckUnion,
+        ));
+    }
+    let head = match ty.split_once('(') {
+        Some((h, _)) if h.trim() == "DECIMAL" || h.trim() == "NUMERIC" => "DECIMAL",
+        _ => ty.as_str(),
+    };
+    if DUCKDB_EXACT_TYPES.contains(&head) {
+        return None;
+    }
+    Some((
+        format!("CAST({col} AS VARCHAR) AS {col}"),
+        crate::export::ServerLiteral::Text,
+    ))
 }
 
 /// The read of `c` that keeps a **MySQL-family `FLOAT`** exact —
@@ -7337,6 +7416,76 @@ mod tests {
             panic!("{:?}", p.steps[0])
         };
         assert!(h.contains("sqlcmd -x"), "{h}");
+    }
+
+    /// **DuckDB reads what its driver cannot carry as DuckDB's own text**,
+    /// and a union as its tag and text; a type the decoder carries exactly is
+    /// read as it is, and a blob stays withheld.
+    #[test]
+    fn duckdb_reads_what_its_driver_bends_as_text() {
+        use crate::export::ServerLiteral::{DuckUnion, Text};
+        let read = |ty: &str| {
+            let c = ColumnInfo {
+                name: "v".into(),
+                type_name: ty.into(),
+                ..Default::default()
+            };
+            literal_select(&c, &[], SqlDialect::DuckDb)
+        };
+        for ty in [
+            "INTEGER",
+            "DECIMAL(10,2)",
+            "VARCHAR",
+            "TIMESTAMP",
+            "TIMESTAMP WITH TIME ZONE",
+            "BLOB",
+        ] {
+            assert_eq!(read(ty), None, "{ty}");
+        }
+        for ty in [
+            "TIME WITH TIME ZONE",
+            "TIMESTAMP_NS",
+            "TIME_NS",
+            "BIT",
+            "BIGNUM",
+            "UHUGEINT[]",
+            "STRUCT(a TIME_NS)",
+            "mood",
+        ] {
+            assert_eq!(
+                read(ty),
+                Some(("CAST(\"v\" AS VARCHAR) AS \"v\"".to_string(), Text)),
+                "{ty}"
+            );
+        }
+        let (sql, form) = read("UNION(n INTEGER, t VARCHAR)").unwrap();
+        assert_eq!(form, DuckUnion);
+        assert!(
+            sql.contains("union_tag(\"v\")") && sql.ends_with("AS \"v\""),
+            "{sql}"
+        );
+    }
+
+    /// A union's tag is read by its length, so one holding the separator is
+    /// read whole; text that is not the shape is withheld rather than written.
+    #[test]
+    fn a_duckdb_union_is_written_under_its_own_member() {
+        use crate::export::{ServerLiteral::DuckUnion, server_literal};
+        assert_eq!(
+            server_literal(DuckUnion, "1:n42").as_deref(),
+            Some("union_value(\"n\" := '42')")
+        );
+        assert_eq!(
+            server_literal(DuckUnion, "3:a:bit's").as_deref(),
+            Some("union_value(\"a:b\" := 'it''s')")
+        );
+        for bad in ["n42", "x:n42", "9:n42", "0:42"] {
+            assert_eq!(server_literal(DuckUnion, bad), None, "{bad}");
+        }
+        assert_eq!(
+            server_literal(crate::export::ServerLiteral::Text, "03:04:05+02").as_deref(),
+            Some("'03:04:05+02'")
+        );
     }
 
     /// **A column typed by an alias is read as its base type.** Its

@@ -674,7 +674,7 @@ fn run_query(
     let start = Instant::now();
     let mut stmt = prepare_one(conn, sql)?;
     let mut rows = stmt.query([]).map_err(query_err)?;
-    let (columns, kinds): (Vec<Column>, Vec<LogicalTypeId>) = {
+    let (columns, kinds): (Vec<Column>, Vec<Shape>) = {
         let st = rows
             .as_ref()
             .ok_or_else(|| DbError::Query("the statement returned no result".into()))?;
@@ -687,7 +687,7 @@ fn run_query(
                         type_name: type_name(&lt),
                         origin: None,
                     },
-                    lt.id(),
+                    Shape::of(&lt),
                 )
             })
             .unzip()
@@ -739,7 +739,7 @@ fn run_query(
         }
         cells.clear();
         for (i, kind) in kinds.iter().enumerate() {
-            let (v, bytes) = decode_cell(row, i, *kind, || columns_type(&builder, i))?;
+            let (v, bytes) = decode_cell(row, i, kind, || columns_type(&builder, i))?;
             if bytes {
                 builder.mark_binary(i);
             }
@@ -998,26 +998,81 @@ fn table_facts(conn: &DuckConn, schema: &str, table: &str) -> duckdb::Result<Vec
     Ok(facts)
 }
 
+/// A column's logical type as the decoder needs it: its id and, for a list,
+/// array, map, struct or union, its children's — what tells an unsigned
+/// `HUGEINT` inside a list from a signed one, which the driver's value alone
+/// does not (it carries both as `HugeInt`).
+#[derive(Clone, Debug)]
+struct Shape {
+    id: LogicalTypeId,
+    children: Vec<Shape>,
+}
+
+/// The shape of a value whose type is not known — a union's member, whose
+/// tag the driver does not hand over.
+static UNKNOWN: Shape = Shape {
+    id: LogicalTypeId::Invalid,
+    children: Vec::new(),
+};
+
+impl Shape {
+    fn of(lt: &LogicalTypeHandle) -> Shape {
+        use LogicalTypeId as T;
+        let id = lt.id();
+        let children = match id {
+            T::List | T::Array => vec![Shape::of(&lt.child(0))],
+            T::Map => vec![Shape::of(&lt.child(0)), Shape::of(&lt.child(1))],
+            T::Struct | T::Union => (0..lt.num_children())
+                .map(|i| Shape::of(&lt.child(i)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        Shape { id, children }
+    }
+
+    fn child(&self, i: usize) -> &Shape {
+        self.children.get(i).unwrap_or(&UNKNOWN)
+    }
+}
+
+/// What a cell shows when the driver has already lost its value: the type,
+/// as for a value it cannot decode at all. A `TIME WITH TIME ZONE` reaches
+/// it as the time without its offset (duckdb 1.20000.1), which read as another
+/// instant; the dump reads such a column as DuckDB's own text instead
+/// (`dump::literal_select`).
+fn lost(type_name: &str) -> String {
+    format!("<{type_name}>")
+}
+
 /// Cell `i` of `row` as [`cell_of`] renders it, and whether it held bytes —
 /// the one decoder, so a re-fetched row reads as the result it replaces.
 ///
 /// A `NULL`-typed column (`SELECT NULL`) is asked nothing, since the driver
 /// panics decoding one (duckdb 1.20000.1, `row.rs`), and any other value it
 /// cannot decode costs that cell — a `<TYPE>` placeholder from `type_name` —
-/// rather than the worker and with it the whole result.
+/// rather than the worker and with it the whole result. A `TIME WITH TIME
+/// ZONE` is that placeholder without being asked ([`lost`]).
 fn decode_cell(
     row: &duckdb::Row<'_>,
     i: usize,
-    kind: LogicalTypeId,
+    kind: &Shape,
     type_name: impl FnOnce() -> String,
 ) -> Result<(Value, bool), DbError> {
-    if kind == LogicalTypeId::SqlNull {
-        return Ok((Value::Null, false));
+    match kind.id {
+        LogicalTypeId::SqlNull => return Ok((Value::Null, false)),
+        LogicalTypeId::TimeTZ => {
+            // NULL is still NULL; only a value has lost its offset.
+            return Ok(match row.get_ref(i).map_err(query_err)? {
+                duckdb::types::ValueRef::Null => (Value::Null, false),
+                _ => (Value::Str(lost(&type_name())), false),
+            });
+        }
+        _ => {}
     }
     let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| row.get::<_, DValue>(i)));
     let v: DValue = match got {
         Ok(r) => r.map_err(query_err)?,
-        Err(_) => return Ok((Value::Str(format!("<{}>", type_name())), false)),
+        Err(_) => return Ok((Value::Str(lost(&type_name())), false)),
     };
     let bytes = matches!(v, DValue::Blob(_) | DValue::Geometry(_));
     Ok((cell_of(v, kind), bytes))
@@ -1099,10 +1154,12 @@ fn type_name(lt: &LogicalTypeHandle) -> String {
 /// is widened through its own shortest text, so `0.1::FLOAT` reads `0.1` rather
 /// than `0.10000000149011612`; a `DECIMAL` keeps every digit as text. A
 /// **blob has no lossless text form** and is rendered as its size, as on every
-/// engine (`model::binary_display`); the caller marks the column binary.
-fn cell_of(v: DValue, kind: LogicalTypeId) -> Value {
+/// engine (`model::binary_display`); the caller marks the column binary. A
+/// NULL union is NULL, not the text `NULL`.
+fn cell_of(v: DValue, kind: &Shape) -> Value {
     match v {
         DValue::Null => Value::Null,
+        DValue::Union(inner) if matches!(*inner, DValue::Null) => Value::Null,
         DValue::Boolean(b) => Value::Str(if b { "true" } else { "false" }.to_string()),
         DValue::TinyInt(i) => Value::Int(i.into()),
         DValue::SmallInt(i) => Value::Int(i.into()),
@@ -1126,8 +1183,11 @@ fn cell_of(v: DValue, kind: LogicalTypeId) -> Value {
 }
 
 /// `v` as DuckDB's text, `nested` inside a list, struct or map — where a
-/// string is quoted, as DuckDB writes `['a', 'b']`.
-fn text_of(v: &DValue, kind: LogicalTypeId, nested: bool) -> String {
+/// string is quoted, as DuckDB writes `['a', 'b']`. `kind` is `v`'s own
+/// type: inside a list, struct or map the driver carries an unsigned
+/// `HUGEINT` as a signed one, so past `i128::MAX` it read negative — and this
+/// text is what a grid edit of the struct sends back.
+fn text_of(v: &DValue, kind: &Shape, nested: bool) -> String {
     match v {
         DValue::Null => "NULL".to_string(),
         DValue::Boolean(b) => b.to_string(),
@@ -1135,6 +1195,8 @@ fn text_of(v: &DValue, kind: LogicalTypeId, nested: bool) -> String {
         DValue::SmallInt(i) => i.to_string(),
         DValue::Int(i) => i.to_string(),
         DValue::BigInt(i) => i.to_string(),
+        // The bits are the unsigned value's; the carrier is what is signed.
+        DValue::HugeInt(i) if kind.id == LogicalTypeId::UHugeint => (*i as u128).to_string(),
         DValue::HugeInt(i) => i.to_string(),
         DValue::UHugeInt(u) => u.to_string(),
         DValue::UTinyInt(u) => u.to_string(),
@@ -1144,12 +1206,16 @@ fn text_of(v: &DValue, kind: LogicalTypeId, nested: bool) -> String {
         DValue::Float(f) => f.to_string(),
         DValue::Double(f) => f.to_string(),
         DValue::Decimal(d) => d.to_string(),
-        DValue::Timestamp(unit, t) => timestamp_text(*unit, *t, kind == LogicalTypeId::TimestampTZ),
+        DValue::Timestamp(unit, t) => {
+            timestamp_text(*unit, *t, kind.id == LogicalTypeId::TimestampTZ)
+        }
         DValue::Text(s) | DValue::Enum(s) if nested => nested_string(s),
         DValue::Text(s) | DValue::Enum(s) => s.clone(),
         DValue::Blob(b) | DValue::Geometry(b) => binary_display(b.len()),
         DValue::Date32(days) => date_text(*days),
-        DValue::Time64(unit, t) => time_text(micros(*unit, *t)),
+        // Inside a list or struct, where `decode_cell` cannot step in first.
+        DValue::Time64(..) if kind.id == LogicalTypeId::TimeTZ => lost("TIME WITH TIME ZONE"),
+        DValue::Time64(unit, t) => time_text(*unit, *t),
         DValue::Interval {
             months,
             days,
@@ -1158,19 +1224,16 @@ fn text_of(v: &DValue, kind: LogicalTypeId, nested: bool) -> String {
         DValue::List(items) | DValue::Array(items) => {
             let inner: Vec<String> = items
                 .iter()
-                .map(|x| text_of(x, LogicalTypeId::Invalid, true))
+                .map(|x| text_of(x, kind.child(0), true))
                 .collect();
             format!("[{}]", inner.join(", "))
         }
         DValue::Struct(fields) => {
             let inner: Vec<String> = fields
                 .iter()
-                .map(|(k, x)| {
-                    format!(
-                        "{}: {}",
-                        nested_string(k),
-                        text_of(x, LogicalTypeId::Invalid, true)
-                    )
+                .enumerate()
+                .map(|(i, (k, x))| {
+                    format!("{}: {}", nested_string(k), text_of(x, kind.child(i), true))
                 })
                 .collect();
             format!("{{{}}}", inner.join(", "))
@@ -1181,14 +1244,16 @@ fn text_of(v: &DValue, kind: LogicalTypeId, nested: bool) -> String {
                 .map(|(k, x)| {
                     format!(
                         "{}={}",
-                        text_of(k, LogicalTypeId::Invalid, true),
-                        text_of(x, LogicalTypeId::Invalid, true)
+                        text_of(k, kind.child(0), true),
+                        text_of(x, kind.child(1), true)
                     )
                 })
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
-        DValue::Union(inner) => text_of(inner, LogicalTypeId::Invalid, nested),
+        // The driver does not say which member is set, so its type is not
+        // known here.
+        DValue::Union(inner) => text_of(inner, &UNKNOWN, nested),
         // A kind a newer driver adds: its debug form says what it is rather
         // than the row failing.
         other => format!("{other:?}"),
@@ -1204,54 +1269,84 @@ fn nested_string(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
-/// `t` in `unit`, in microseconds — the finest the text below writes.
-fn micros(unit: TimeUnit, t: i64) -> i64 {
-    match unit {
-        TimeUnit::Second => t.saturating_mul(1_000_000),
-        TimeUnit::Millisecond => t.saturating_mul(1_000),
-        TimeUnit::Microsecond => t,
-        TimeUnit::Nanosecond => t / 1_000,
-    }
+/// `t` in `unit` as whole seconds and the nanoseconds past them — **floored**,
+/// so a moment before 1970 lands in its own second (`-1` ns is the last
+/// nanosecond of `1969-12-31 23:59:59`, which truncation put at `1970`).
+fn seconds_and_nanos(unit: TimeUnit, t: i64) -> (i64, u32) {
+    let per = match unit {
+        TimeUnit::Second => 1,
+        TimeUnit::Millisecond => 1_000,
+        TimeUnit::Microsecond => 1_000_000,
+        TimeUnit::Nanosecond => 1_000_000_000,
+    };
+    let nanos = t.rem_euclid(per) * (1_000_000_000 / per);
+    (t.div_euclid(per), nanos as u32)
 }
 
-/// `.ffffff` with its trailing zeros dropped, or nothing for a whole second.
-fn fraction(us: u32) -> String {
-    if us == 0 {
+/// `.fffffffff` with its trailing zeros dropped, or nothing for a whole
+/// second — nanoseconds kept, as DuckDB writes a `TIMESTAMP_NS`.
+fn fraction_ns(ns: u32) -> String {
+    if ns == 0 {
         return String::new();
     }
-    let s = format!(".{us:06}");
+    let s = format!(".{ns:09}");
     s.trim_end_matches('0').to_string()
 }
 
+/// `.ffffff` for a count of microseconds — an interval's.
+fn fraction(us: u32) -> String {
+    fraction_ns(us * 1_000)
+}
+
+/// DuckDB's ±infinity for a date: `i32::MAX` and its negation.
 fn date_text(days: i32) -> String {
+    match days {
+        i32::MAX => return "infinity".to_string(),
+        d if d == -i32::MAX => return "-infinity".to_string(),
+        _ => {}
+    }
     chrono::DateTime::from_timestamp(i64::from(days) * 86_400, 0)
         .map(|d| d.format("%Y-%m-%d").to_string())
         .unwrap_or_else(|| days.to_string())
 }
 
-fn time_text(us: i64) -> String {
-    let us = us.rem_euclid(86_400_000_000);
-    let secs = us / 1_000_000;
+/// A time of day, nanoseconds kept, and `24:00:00` — a `TIME` DuckDB holds
+/// as one whole day — written as itself rather than wrapped to midnight.
+fn time_text(unit: TimeUnit, t: i64) -> String {
+    let (secs, ns) = seconds_and_nanos(unit, t);
+    if secs == 86_400 && ns == 0 {
+        return "24:00:00".to_string();
+    }
+    let secs = secs.rem_euclid(86_400);
     format!(
         "{:02}:{:02}:{:02}{}",
         secs / 3600,
         (secs / 60) % 60,
         secs % 60,
-        fraction((us % 1_000_000) as u32)
+        fraction_ns(ns)
     )
 }
 
 /// A timestamp as DuckDB writes one: `2020-01-02 03:04:05.123456`, with `+00`
 /// after it for a `TIMESTAMP WITH TIME ZONE`, which this build (no ICU) holds
-/// and shows in UTC.
+/// and shows in UTC; a `TIMESTAMP_NS` to the nanosecond, and DuckDB's
+/// ±infinity (`i64::MAX` and its negation) as `infinity`/`-infinity`.
 fn timestamp_text(unit: TimeUnit, t: i64, zoned: bool) -> String {
-    let us = micros(unit, t);
-    let Some(dt) = chrono::DateTime::from_timestamp_micros(us) else {
+    match t {
+        i64::MAX => return "infinity".to_string(),
+        t if t == -i64::MAX => return "-infinity".to_string(),
+        _ => {}
+    }
+    let (secs, ns) = seconds_and_nanos(unit, t);
+    let Some(dt) = chrono::DateTime::from_timestamp(secs, 0) else {
         return t.to_string();
     };
-    let frac = fraction(us.rem_euclid(1_000_000) as u32);
     let zone = if zoned { "+00" } else { "" };
-    format!("{}{frac}{zone}", dt.format("%Y-%m-%d %H:%M:%S"))
+    format!(
+        "{}{}{zone}",
+        dt.format("%Y-%m-%d %H:%M:%S"),
+        fraction_ns(ns)
+    )
 }
 
 /// An interval as DuckDB writes one: `1 year 2 months 3 days 04:05:06`, the
@@ -2857,11 +2952,11 @@ fn refetch_on(
         let mut got = stmt
             .query(duckdb::params_from_iter(params))
             .map_err(query_err)?;
-        let kinds: Vec<(LogicalTypeId, String)> = match got.as_ref() {
+        let kinds: Vec<(Shape, String)> = match got.as_ref() {
             Some(st) => (0..st.column_count())
                 .map(|i| {
                     let lt = st.column_logical_type(i);
-                    (lt.id(), type_name(&lt))
+                    (Shape::of(&lt), type_name(&lt))
                 })
                 .collect(),
             None => continue,
@@ -2870,7 +2965,7 @@ fn refetch_on(
             let cells = kinds
                 .iter()
                 .enumerate()
-                .map(|(i, (kind, name))| decode_cell(r, i, *kind, || name.clone()).map(|(v, _)| v))
+                .map(|(i, (kind, name))| decode_cell(r, i, kind, || name.clone()).map(|(v, _)| v))
                 .collect::<Result<Vec<_>, _>>()?;
             out.push((row.data_row, cells));
         }
@@ -4757,6 +4852,89 @@ mod tests {
         assert_eq!(twice, 42);
         c.execute_batch("INSERT INTO parent(name) VALUES ('c')")
             .expect("a default key clears the restored rows");
+    }
+
+    /// The values the driver hands over without what makes them themselves:
+    /// a `TIMETZ`'s offset, a `TIMESTAMP_NS`'s nanoseconds, `24:00:00`,
+    /// ±infinity, a `TIME_NS` (a panic in the driver), `BIT` and `BIGNUM`
+    /// (bytes to it), a `UNION`'s member and a NULL union, an unsigned
+    /// `HUGEINT` inside a list.
+    const LOSSY_FIXTURE: &str = "
+        CREATE TABLE lossy(id INTEGER PRIMARY KEY, tz TIMETZ, ns TIMESTAMP_NS, tm TIME,
+            ts TIMESTAMP, d DATE, tn TIME_NS, b BIT, bn BIGNUM,
+            u UNION(n INTEGER, t VARCHAR), lu UHUGEINT[]);
+        INSERT INTO lossy VALUES (1, '03:04:05+02', '2026-01-02 03:04:05.123456789',
+            '24:00:00', 'infinity', '-infinity', '01:02:03.123456789', '1011',
+            '123456789012345678901234567890123456789012', 42::INTEGER,
+            [340282366920938463463374607431768211455]);
+        INSERT INTO lossy VALUES (2, NULL, '1969-12-31 23:59:59.999999999', '00:00:00',
+            '-infinity', 'infinity', NULL, NULL, NULL, NULL, NULL);
+        INSERT INTO lossy (id, u) VALUES (3, 'x');
+    ";
+
+    /// **A dump restores each of them as it was** — the file is a backup.
+    /// They were written as the grid's text: the offset, the nanoseconds and
+    /// 24:00 lost, a union re-tagged, a NULL union the string `'NULL'`, `BIT`
+    /// and `BIGNUM` withheld as NULL, and ±infinity or a `TIME_NS` making the
+    /// file unrestorable.
+    #[test]
+    fn a_dump_restores_values_the_driver_cannot_carry() {
+        use schemaic_core::script::ExecEnd;
+        let src = mem("dump-lossy-src");
+        seed(&src, LOSSY_FIXTURE);
+        let file = dump_file(&src, schemaic_core::dump::DumpOptions::default());
+        let dst = mem("dump-lossy-dst");
+        assert_eq!(restore_file(&dst, &file), ExecEnd::Done, "{file}");
+        assert_eq!(fingerprint(&dst), fingerprint(&src), "{file}");
+        let tags = |db: &Db| {
+            cells(
+                db,
+                "SELECT coalesce(union_tag(u)::VARCHAR, '-') FROM lossy ORDER BY id",
+            )
+        };
+        assert_eq!(tags(&dst), tags(&src), "{file}");
+        assert_eq!(tags(&dst), vec![vec!["n"], vec!["-"], vec!["t"]]);
+    }
+
+    /// **The grid shows them as DuckDB writes them**, or, where the driver
+    /// has already lost the value, says so rather than showing another one.
+    #[test]
+    fn values_the_driver_bends_read_as_duckdb_writes_them() {
+        let db = mem("lossy-values");
+        seed(&db, LOSSY_FIXTURE);
+        let rows = cells(
+            &db,
+            "SELECT tz, ns, tm, ts, d, lu, u FROM lossy ORDER BY id",
+        );
+        assert_eq!(
+            rows[0],
+            [
+                "<TIME WITH TIME ZONE>",
+                "2026-01-02 03:04:05.123456789",
+                "24:00:00",
+                "infinity",
+                "-infinity",
+                "[340282366920938463463374607431768211455]",
+                "42",
+            ]
+        );
+        assert_eq!(
+            rows[1][1..5],
+            [
+                "1969-12-31 23:59:59.999999999",
+                "00:00:00",
+                "-infinity",
+                "infinity"
+            ]
+        );
+        let rs = rt()
+            .block_on(q(&db, "SELECT u FROM lossy WHERE id = 2"))
+            .unwrap();
+        assert_eq!(
+            rs.cell(0, 0).unwrap().to_value(),
+            Value::Null,
+            "a NULL union"
+        );
     }
 
     /// **A replay onto the database the dump came from** puts back exactly

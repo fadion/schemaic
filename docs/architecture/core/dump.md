@@ -87,6 +87,21 @@ computed column, which the server recomputes, and telling the person replaying i
 rows were renumbered would be false (`a_sql_server_identity_is_carried_inside_identity_insert`,
 which asserts the switch brackets the rows, the identity is absent from the header and the word
 is too).
+**On DuckDB the dump reads what the driver bends as DuckDB's own text**
+(`duckdb_literal_select`): every column whose type is not on `DUCKDB_EXACT_TYPES` — the scalars
+the decoder carries exactly, a blob withheld as everywhere — is read `CAST(c AS VARCHAR) AS c`
+and written through `ServerLiteral::Text` as a string DuckDB casts back on insert. The cells had
+been the grid's text: a `TIMETZ` written without its offset, a `TIMESTAMP_NS` cut to
+microseconds, a `BIT` or `BIGNUM` withheld as NULL as if binary, a `TIME_NS` as the `<TIME_NS>`
+placeholder (an unrestorable file), and a list or struct holding any of them in the grid's words
+— so is an enum, a user type, a nested type and anything a later DuckDB adds, the text being the
+one form DuckDB reads back for all of them. **A `UNION` is read as its tag and its text**,
+`<len>:<tag><text>` (`ServerLiteral::DuckUnion`, the tag's byte length first so a tag holding
+the separator is read whole), and written `union_value("tag" := '…')`: the text alone was cast
+back into whichever member takes a string, so `42` came back under the `VARCHAR` member, and a
+NULL union was the string `'NULL'` (`duckdb_reads_what_its_driver_bends_as_text`,
+`a_duckdb_union_is_written_under_its_own_member`; end to end in `db::duckdb`,
+`a_dump_restores_values_the_driver_cannot_carry`).
 **On SQL Server the dump carries what a text cell cannot, by asking the server for SQL.** A
 `varbinary`, `binary` or `image` cell is the `<n bytes>` placeholder, and so are the CLR types
 `hierarchyid`, `geography` and `geometry`; a `sql_variant` arrives as its value's text, so a

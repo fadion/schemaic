@@ -3236,6 +3236,14 @@ pub enum ServerLiteral {
     /// made of it, and it is written
     /// `CAST(CAST(<text> COLLATE <name> AS <base type>) AS sql_variant)`.
     Variant,
+    /// DuckDB's own text of a value, written as a string literal DuckDB casts
+    /// back to the column's type on insert — a `TIMETZ` with its offset, a
+    /// `TIMESTAMP_NS` to the nanosecond, a `BIT`, a list or struct.
+    Text,
+    /// `<n>:<tag><text>` — a DuckDB `UNION`, `n` the tag's length in bytes,
+    /// written `union_value("<tag>" := '<text>')` so it comes back under the
+    /// member it was in.
+    DuckUnion,
 }
 
 /// The literal a server-rendered cell becomes, or `None` when the text is not
@@ -3248,6 +3256,25 @@ pub fn server_literal(form: ServerLiteral, text: &str) -> Option<String> {
     };
     match form {
         ServerLiteral::Hex => hex(text).then(|| text.to_string()),
+        ServerLiteral::Text => Some(script_literal(
+            &Value::Str(text.to_string()),
+            "",
+            SqlDialect::DuckDb,
+        )),
+        ServerLiteral::DuckUnion => {
+            let (len, rest) = text.split_once(':')?;
+            let len: usize = len.parse().ok()?;
+            let tag = rest.get(..len)?;
+            let value = rest.get(len..)?;
+            if tag.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "union_value({} := {})",
+                ident_sql(tag, SqlDialect::DuckDb),
+                script_literal(&Value::Str(value.to_string()), "", SqlDialect::DuckDb)
+            ))
+        }
         ServerLiteral::Variant => {
             let (ty, value) = text.split_once('|')?;
             let (base, collation) = match ty.split_once(" COLLATE ") {

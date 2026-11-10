@@ -77,7 +77,20 @@ column (`SELECT NULL`) is never asked of it, since decoding one panics, and ever
 read under `catch_unwind`, so a value it cannot decode costs that cell — a `<TYPE>` placeholder —
 rather than the worker and the whole result (`values_read_as_duckdb_writes_them`). Both walls
 are in `decode_cell`, the one cell decoder, which `run_query` and `refetch_rows` share so that a
-re-fetched row reads exactly as the result it is spliced into. **A write's
+re-fetched row reads exactly as the result it is spliced into.
+**What the driver bends is put back where it can be, and said where it cannot**
+(`values_the_driver_bends_read_as_duckdb_writes_them`): a timestamp is split into seconds and
+nanoseconds by flooring (`seconds_and_nanos` — truncation put a pre-1970 `TIMESTAMP_NS` in the
+wrong second) and a `TIMESTAMP_NS`/`TIME_NS` keeps its nanoseconds; `TIME '24:00:00'` is written
+as itself rather than wrapped to midnight; DuckDB's ±infinity (`i64::MAX` and its negation for a
+timestamp, `i32::MAX` and its negation for a date) is `infinity`/`-infinity` rather than the raw
+integer; a NULL union is NULL rather than the text `NULL`; and each column's type travels down
+into a list, struct or map as a `Shape`, because nested the driver carries an unsigned `HUGEINT`
+as a signed one and `[UHUGEINT max]` read `[-1]` — the text a grid edit of the struct would send
+back. **A `TIME WITH TIME ZONE` reaches the decoder without its offset** (duckdb 1.20000.1 hands
+it over as a plain `Time64`), so it shows the `<TIME WITH TIME ZONE>` placeholder rather than
+another instant; a union's member type is not known either, the driver not saying which member
+is set. The dump does not read either from the decoder (`dump::literal_select`, below). **A write's
 row count arrives as a result**: DuckDB answers `INSERT`/`UPDATE`/`DELETE` without `RETURNING`,
 and `CREATE TABLE … AS`, with a one-row `Count` column, which `counts_rows` recognises and turns
 into `ResultSet::affected` so the grid does not show it as data
