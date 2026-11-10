@@ -16,6 +16,12 @@ the gate enforces, and names the engine with `SqlDialect::engine_label()`. A har
 `SHOW TABLES`, so a model reasoning from the tool's own text spent turns on statements that could
 only come back as parser errors; `run_query_advertises_exactly_the_heads_its_gate_allows` walks
 every advertised head back through the gate.
+**Stdio and tools are the whole surface, on purpose.** There is no HTTP or SSE transport: over
+stdio the server is a child of whatever spawned it, so who may talk to it is settled at the process
+boundary, where a socket would need an authentication scheme of its own and would be one more
+thing on the machine listening for connections. `initialize` declares `tools` as its only
+capability, and there are no MCP resources or prompts — few clients use either, and the tools
+already answer what they would carry; a `resources/list` or `prompts/list` is `-32601` (below).
 **Who started it is a type, `Host`, and it decides one tool.** `Host::Panel` is `schemaic
 --mcp-serve`, spawned by whichever agent CLI the AI panel launched, over the endpoint blob the
 app wrote — already tunnelled, and never on a command line (`ai.rs`'s entry has the plumbing).

@@ -1,8 +1,7 @@
 # `db/duckdb.rs`
 
 **`duckdb.rs` is the fifth engine** (the `duckdb` crate, the engine compiled in — `bundled`,
-with the `parquet` and `json` extensions linked statically), phases 1 and 2
-of the roadmap's *DuckDB as a fifth engine*: it connects, reads, introspects, validates, runs
+with the `parquet` and `json` extensions linked statically): it connects, reads, introspects, validates, runs
 batches, scripts and DDL plans, plans a query, lists its settings, backs a file up, writes grid
 edits back, imports a file into a table, dumps to a `.sql` file, holds a Manual tab's
 transaction, designs tables and edits views and macros, creates and drops schemas, compares two
@@ -341,7 +340,7 @@ line above its `CREATE`. A macro is dropped up front as what it is, `DROP MACRO 
 the init SQL runs on it — held with its interrupt handle, the file's own catalog read at open
 (`home`, for provenance as above) and the `Arc<Instance>` it came off, so the instance does not
 close between the tab's statements and **no other program can open the file until the tab goes
-back to Auto**. That is the one thing the roadmap said this mode had to tell the user, and the
+back to Auto**. That is the one thing this mode has to tell the user, and the
 connection form's hint says it (`connections-duckdb-hint`). The driver is blocking, so `on_pinned`
 runs each call on the blocking pool with the connection behind a `std::sync::Mutex` of its own —
 the session's `tokio` mutex above it is what orders the tab's operations — and a watcher task
@@ -369,7 +368,7 @@ so on **any** failure — those two, or a Stop — it issues `ROLLBACK` and fail
 `Rollback::Transaction`, whose note says every statement the tab ran since its transaction began
 is undone, not only the edits. `Session::commit_writes`' DuckDB arm then clears `in_tx` and reports
 `StmtOutcome::FailedAndRolledBack`, folding the pill to `Idle`, never an isolated outcome. That is
-the roadmap's decision: the grid commit is not refused inside a transaction, and its failure is
+a decision, not a gap: the grid commit is not refused inside a transaction, and its failure is
 reported as the transaction's loss rather than claimed as a batch undone alone
 (`a_failed_grid_commit_rolls_the_manual_transaction_back_and_says_so` — a one-row miss after an
 edit that landed, the tab's earlier `INSERT` gone too, the next statement opening a fresh

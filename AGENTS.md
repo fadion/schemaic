@@ -10,7 +10,7 @@ siblings, and the MCP server both `schemaic mcp` and the AI panel run; no Floem)
 `--mcp-serve` branch, the CLI's argv branch).
 
 **Five engines, and they are not equal.** MySQL/MariaDB, PostgreSQL and SQL Server are full;
-**DuckDB** (`db::duckdb`, embedded like SQLite) is partway through its roadmap entry — it reads,
+**DuckDB** (`db::duckdb`, embedded like SQLite) has landed in full — it reads,
 runs scripts and DDL plans, introspects, exports, plans, backs up, imports, dumps to `.sql`, writes
 grid edits back (on provenance read from the statement, never keyed on `rowid`) and holds a Manual
 tab's transaction — pinning the file's instance, and its lock, while it does — and edits

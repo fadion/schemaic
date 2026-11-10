@@ -1582,7 +1582,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   commit nests in a savepoint so its failure undoes the batch alone, and DuckDB has none (2.0: a
   parser error), so there a refused statement has aborted the user's transaction and a one-row
   miss has written into it. `duckdb::pinned_write` rolls the whole transaction back — the
-  roadmap's decision, rather than refusing the grid commit inside a transaction — and the note says
+  decision, rather than refusing the grid commit inside a transaction — and the note says
   every statement the tab ran since its transaction began is undone, where `Complete`'s *rolled
   back all changes* would read as the batch alone and leave the user believing in earlier work
   that is gone (`a_failed_grid_commit_rolls_the_manual_transaction_back_and_says_so`, red with that

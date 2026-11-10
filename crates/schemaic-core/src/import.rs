@@ -3169,8 +3169,8 @@ pub fn non_finite_literal(f: f64, dialect: SqlDialect) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Every engine imports now — DuckDB's `import_rows` landed with the
-    /// roadmap's phase 2 — so the table menu offers *Import* on each.
+    /// Every engine imports now — DuckDB's `import_rows` was the last to
+    /// land — so the table menu offers *Import* on each.
     #[test]
     fn every_engine_imports() {
         for d in [

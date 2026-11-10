@@ -2889,8 +2889,8 @@ pub(crate) async fn pinned_exec(p: &Pinned, sql: &'static str) -> Result<(), DbE
 /// **DuckDB has no `SAVEPOINT`** (2.0: a parser error), so a batch that
 /// fails cannot be undone alone: a statement the server refuses aborts the
 /// transaction, and a statement that touched the wrong number of rows has
-/// written into it. Either way the whole transaction is rolled back here —
-/// the roadmap's decision — and the failure says so
+/// written into it. Either way the whole transaction is rolled back here,
+/// by decision rather than refusal, and the failure says so
 /// ([`Rollback::Transaction`](schemaic_core::model::Rollback::Transaction)),
 /// never that only these edits were undone: the tab's earlier statements
 /// went with them. A Stop is the same loss.
@@ -4188,8 +4188,7 @@ mod tests {
         assert_eq!(n, 2);
     }
 
-    /// **Why `rowid` is never an edit key here** — the roadmap's measurement,
-    /// kept. A checkpoint after a delete that empties most of a row group
+    /// **Why `rowid` is never an edit key here**, measured and kept. A checkpoint after a delete that empties most of a row group
     /// compacts it and renumbers what is left: the row holding 63 had rowid 63
     /// and comes back as 3, a rowid another row held before. A grid that read
     /// rowid 3 and then committed would write that other row. (Measured the

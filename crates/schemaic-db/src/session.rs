@@ -1234,8 +1234,8 @@ impl Session {
             }
             // **No savepoint, so a failure is the transaction's**: the batch
             // runs bare inside it, and `pinned_write` rolls the whole
-            // transaction back when any part of it fails or is stopped — the
-            // roadmap's decision, since DuckDB cannot undo the batch alone.
+            // transaction back when any part of it fails or is stopped, since
+            // DuckDB cannot undo the batch alone.
             // Reported as gone and undone, never as isolated.
             Backend::DuckDb { pinned } => {
                 let r = crate::duckdb::pinned_write(pinned, write, &cancel).await;
