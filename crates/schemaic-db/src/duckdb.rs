@@ -4165,6 +4165,13 @@ mod tests {
             .block_on(q(&db, "SELECT true AS \"Success\" WHERE false"))
             .unwrap();
         assert_eq!(rs.columns.len(), 1, "a query keeps its column");
+        // A `CREATE TABLE … AS` answers a one-row `Count` under a `CREATE`
+        // head too, and keeps its real count: `counts_rows` is asked first.
+        let rs = rt
+            .block_on(q(&db, "CREATE TABLE u AS SELECT * FROM range(3)"))
+            .unwrap();
+        assert!(rs.columns.is_empty());
+        assert_eq!(rs.affected, Some(3));
     }
 
     #[test]
