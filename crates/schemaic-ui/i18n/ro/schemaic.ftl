@@ -1928,6 +1928,7 @@ connections-database-file-dialog = Selectează baza de date SQLite
 connections-duckdb-file-dialog = Selectează baza de date DuckDB
 connections-new-file = Fișier nou
 connections-duckdb-new-file-dialog = Bază de date DuckDB nouă
+connections-sqlite-new-file-dialog = Bază de date SQLite nouă
 connections-new-file-failed = Nu s-a putut crea { $path }: { $why }
 connections-duckdb-hint = O bază de date DuckDB este un singur fișier, așa că nu există server de accesat — nici gazdă, utilizator, parolă sau tunel. Schemaic deschide fișierul doar cât rulează o instrucțiune, așa că alt program îl poate deschide între timp — cu excepția perioadei în care o filă este în modul de tranzacție Manual, care ține fișierul deschis, și celelalte programe în afara lui, până când fila revine la Auto. Rezultatele dintr-un tabel cu cheie primară pot fi editate, iar fișierele pot fi importate.
 connections-sqlite-hint = O bază de date SQLite este un singur fișier, așa că nu există server de accesat — nici gazdă, utilizator, parolă sau tunel. Tranzacțiile manuale nu sunt încă disponibile pe ea: instrucțiunile se confirmă pe măsură ce sunt trimise.

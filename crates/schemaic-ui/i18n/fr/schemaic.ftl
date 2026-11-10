@@ -1887,6 +1887,7 @@ connections-database-file-dialog = Sélectionner une base de données SQLite
 connections-duckdb-file-dialog = Sélectionner une base de données DuckDB
 connections-new-file = Nouveau fichier
 connections-duckdb-new-file-dialog = Nouvelle base de données DuckDB
+connections-sqlite-new-file-dialog = Nouvelle base de données SQLite
 connections-new-file-failed = Impossible de créer { $path } : { $why }
 connections-duckdb-hint = Une base de données DuckDB est un simple fichier : il n'y a donc aucun serveur à joindre — ni hôte, ni utilisateur, ni mot de passe, ni tunnel. Schemaic n'ouvre le fichier que pendant l'exécution d'une instruction, si bien qu'un autre programme peut l'ouvrir entre-temps — sauf lorsqu'un onglet est en mode de transaction Manuel, qui garde le fichier ouvert, et les autres programmes à l'écart, jusqu'à ce que l'onglet repasse en Validation auto. Les résultats d'une table dotée d'une clé primaire sont modifiables, et des fichiers peuvent être importés.
 connections-sqlite-hint = Une base de données SQLite est un simple fichier : il n'y a donc aucun serveur à joindre — ni hôte, ni utilisateur, ni mot de passe, ni tunnel. Les transactions manuelles n'y sont pas encore disponibles : les instructions sont validées dès leur envoi.

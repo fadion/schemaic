@@ -1887,6 +1887,7 @@ connections-database-file-dialog = SQLite-database selecteren
 connections-duckdb-file-dialog = DuckDB-database selecteren
 connections-new-file = Nieuw bestand
 connections-duckdb-new-file-dialog = Nieuwe DuckDB-database
+connections-sqlite-new-file-dialog = Nieuwe SQLite-database
 connections-new-file-failed = Kon { $path } niet maken: { $why }
 connections-duckdb-hint = Een DuckDB-database is één bestand, dus er is geen server om te bereiken — geen host, gebruiker, wachtwoord of tunnel. Schemaic opent het bestand alleen terwijl een instructie draait, zodat een ander programma het tussendoor kan openen — behalve zolang een tabblad in de transactiemodus Handmatig staat, die het bestand open houdt, en andere programma's erbuiten, tot het tabblad teruggaat naar Auto. Resultaten uit een tabel met een primaire sleutel kunnen worden bewerkt, en bestanden kunnen worden geïmporteerd.
 connections-sqlite-hint = Een SQLite-database is één bestand, dus er is geen server om te bereiken — geen host, gebruiker, wachtwoord of tunnel. Handmatige transacties zijn er nog niet beschikbaar: instructies worden doorgevoerd zodra ze worden verstuurd.

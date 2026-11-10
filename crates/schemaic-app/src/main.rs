@@ -12533,14 +12533,26 @@ fn app_view(
         })
     };
 
-    // The DuckDB form's *New file*: the file is made off the UI thread, and the
-    // answer comes back to the form that asked.
+    // The SQLite and DuckDB forms' *New file*: the file is made off the UI
+    // thread, and the answer comes back to the form that asked.
     let create_duckdb_file: schemaic_ui::CreateFile = {
         let handle = handle.clone();
         Rc::new(move |path: String, done: Rc<dyn Fn(Result<(), String>)>| {
             let send = create_ext_action(cx, move |res: Result<(), String>| done(res));
             handle.spawn(async move {
                 let res = schemaic_db::create_duckdb_file(&path)
+                    .await
+                    .map_err(|e| db_error_shown(&e));
+                send(res);
+            });
+        })
+    };
+    let create_sqlite_file: schemaic_ui::CreateFile = {
+        let handle = handle.clone();
+        Rc::new(move |path: String, done: Rc<dyn Fn(Result<(), String>)>| {
+            let send = create_ext_action(cx, move |res: Result<(), String>| done(res));
+            handle.spawn(async move {
+                let res = schemaic_db::create_sqlite_file(&path)
                     .await
                     .map_err(|e| db_error_shown(&e));
                 send(res);
@@ -16113,6 +16125,7 @@ fn app_view(
             delete_conn,
             test_conn,
             create_duckdb_file,
+            create_sqlite_file,
             recheck_conn: check_conn.clone(),
             open_import,
             export_connections,

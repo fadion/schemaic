@@ -39,7 +39,8 @@ The **Database** section changes with **Type**:
   supplies the port, so **Port** is ignored.
 - *SQLite* — just a **Database file**. There's no server, so no host, password, tunnel or TLS, and
   the **Network** section goes away. SQLite statements commit as they're sent: there's no manual
-  transaction mode.
+  transaction mode. Connecting never creates a missing file; to start a new database, press
+  **New file** inside the field, as for [DuckDB files](#duckdb-files).
 - *DuckDB* — the same: just a **Database file**, with no **Network** section. See
   [DuckDB files](#duckdb-files) below.
 
@@ -50,7 +51,8 @@ See [Signing in and TLS](sign-in.md).
 
 Type the path in **Database file**, or press **Browse…** inside the field to pick it. To start a
 new database, press **New file** inside the field instead: choose where to save it, and Schemaic
-creates an empty DuckDB database there and fills in the path. If you choose a file that already
+creates an empty database there and fills in the path. SQLite's **New file** works the same way.
+If you choose a file that already
 exists and agree to replace it, it becomes a new, empty database — though if creating it fails,
 the old file is left as it was, and the reason shows under the field.
 

@@ -263,19 +263,27 @@ alike — a file and nothing else — with the dialog title and the hint passed 
 own words (`connections-duckdb-file-dialog`, `connections-duckdb-hint`), and a `names_a_file`
 check: DuckDB's is `connection::duckdb_names_a_file`, and while it says no the hint is replaced
 by `db-refused-duckdb-not-a-file` in the error colour, as the init SQL's refusal is shown;
-SQLite's answers yes to anything. **DuckDB's block also has *New file***, because a connection
-never creates the file it names (`db::duckdb::open_target`) and so the form had no way to start a
-database: `file_fields` takes `create: Option<…>` — `ConnActions::create_duckdb_file`, threaded
-through `conn_form`, for DuckDB and `None` for SQLite — and builds the field with
-`path_field_with`, whose `ExtraButton` sits after Browse inside the field (`FieldCfg::button`
-returning the two in an `h_stack`), at the stop after it: path 60, Browse 61, New file 62. It
-opens a save dialog (`connections-duckdb-new-file-dialog`, `database.duckdb`, a `.duckdb` filter
-named by `backup-kind-duckdb`), and the app's closure runs `schemaic_db::create_duckdb_file` on
-the runtime and answers through `create_ext_action`. On success the path becomes the draft's
-file; on failure `connections-new-file-failed` takes the hint's place in the error colour until
-the path changes — below the not-a-file refusal, which wins while both hold. The dialog's
-"Replace?" is the only confirmation a file being made over gets, which is why the create is
-staged (*db/overview.md*).
+SQLite's answers yes to anything. **Both file blocks also have *New file***, because a connection
+never creates the file it names on either engine (`db::duckdb::open_target`, and `db::sqlite`'s
+`open` without `SQLITE_OPEN_CREATE`) and so the form had no way to start a database. It was
+DuckDB's alone at first, `file_fields` taking `create: Option<…>` with `None` for SQLite; it now
+takes a `NewFile` — the `CreateFile` that makes the database and the save dialog that names it
+(title, suggested name, the one file type offered) — because each engine's dialog is its own:
+DuckDB's `connections-duckdb-new-file-dialog`, `database.duckdb`, a `.duckdb` filter named by
+`backup-kind-duckdb`; SQLite's `connections-sqlite-new-file-dialog`, `database.db`, and
+`db`/`sqlite`/`sqlite3` named by `backup-kind-sqlite`, `.db` first as *Back up* names one.
+`ConnActions::create_duckdb_file` and `create_sqlite_file` are threaded through `conn_form`, and
+the field is built with `path_field_with`, whose `ExtraButton` sits after Browse inside the field
+(`FieldCfg::button` returning the two in an `h_stack`), at the stop after it: path 60, Browse 61,
+New file 62. That `h_stack` **stretches its children rather than centring them**: the field
+stretches the row to its own height and a lone Browse fills it, but centring the pair left both
+at their label's height, short of the box. The app's closures run `schemaic_db::create_duckdb_file`
+or `create_sqlite_file` on the runtime and answer through `create_ext_action`. On success the
+path becomes the draft's file; on failure `connections-new-file-failed` takes the hint's place in
+the error colour until the path changes — below the not-a-file refusal, which wins while both
+hold. The hint sits 6px under the field, as the TLS rows' do, not at the group's 20px, where it
+read as a stray paragraph. The dialog's "Replace?" is the only confirmation a file being made over
+gets, which is why the create is staged (*db/overview.md*).
 **An *Authentication* picker appears only on an engine offering more than one mode** — SQL
 Server, PostgreSQL and the MySQL family, through `AuthMode::offered`; SQLite and DuckDB have none — between Database and the credentials, at tabindex 68 in
 the gap the surrounding indices were spaced to leave. `DraftSignals::auth` is threaded through
@@ -313,7 +321,7 @@ a line and the column's gap.
 `modal_title_owned`), the list's New/Import/Export rows and its right-click Duplicate/Delete,
 the footer's Delete/Test/Save, the four section headings, every field label, toggle and hint,
 the file pickers' window titles (`connections-*-dialog`, *New file*'s among them), the *Browse…*
-inside a path field (`connections-browse`), and DuckDB's *New file* with its failure
+inside a path field (`connections-browse`), and the file engines' *New file* with its failure
 (`connections-new-file`, `connections-new-file-failed`); the failed Test's tooltip falls back to `connections-test-failed`.
 `field` and `masked_field` take their label as `impl Into<String>`, `host_port_row` and
 `path_field` as `String` — `path_field` clones the dialog title into its Browse closure — and

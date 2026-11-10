@@ -2125,6 +2125,14 @@ pub async fn create_duckdb_file(path: &str) -> Result<(), DbError> {
     staged_backup(&RealFs, path, duckdb::create_file).await
 }
 
+/// [`create_duckdb_file`] for SQLite — an **empty SQLite database** at `path`,
+/// the SQLite form's *New file*. A connection never creates the file it names
+/// (`sqlite::open` has no `SQLITE_OPEN_CREATE`), so this is the one way to
+/// start a database from the form, staged for the same reason.
+pub async fn create_sqlite_file(path: &str) -> Result<(), DbError> {
+    staged_backup(&RealFs, path, sqlite::create_file).await
+}
+
 impl Db {
     /// Copy a SQLite or DuckDB database whole to the file `target`, replacing
     /// one already there only once the copy is whole ([`staged_backup`]). The

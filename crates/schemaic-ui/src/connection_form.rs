@@ -246,8 +246,19 @@ struct ExtraButton {
     action: Rc<dyn Fn()>,
 }
 
+/// A file engine's *New file*: what makes the database, and the save dialog
+/// that names it — its title, the name it suggests and the one file type it
+/// offers.
+struct NewFile {
+    create: crate::CreateFile,
+    title: String,
+    default_name: &'static str,
+    kind: &'static str,
+    extensions: &'static [&'static str],
+}
+
 /// [`path_field`] with an optional second button after Browse, at `tabindex +
-/// 2` — the DuckDB file's *New file*.
+/// 2` — a SQLite or DuckDB file's *New file*.
 fn path_field_with(
     label_text: String,
     sig: RwSignal<String>,
@@ -879,6 +890,7 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
     let delete_conn = actions.delete_conn.clone();
     let test_conn = actions.test_conn.clone();
     let create_duckdb_file = actions.create_duckdb_file.clone();
+    let create_sqlite_file = actions.create_sqlite_file.clone();
     // The list's right-click menu goes through the app-wide popup channel, like
     // every other menu — it is rendered at the workspace root, which is the only
     // surface painted above this modal's panel.
@@ -1257,6 +1269,7 @@ pub(crate) fn manage_modal(conn: ConnUi, o: OverlayUi, actions: Rc<ConnActions>)
                 delete_conn.clone(),
                 test_conn.clone(),
                 create_duckdb_file.clone(),
+                create_sqlite_file.clone(),
                 conn_test,
                 save_flash,
                 test_flash,
@@ -1921,9 +1934,9 @@ fn file_fields(
     dialog: String,
     hint: String,
     names_a_file: fn(&str) -> bool,
-    // DuckDB's *New file*: a connection never creates the file it names, so
-    // this is the one way to start a database from the form. `None` on SQLite.
-    create: Option<crate::CreateFile>,
+    // *New file*: a connection never creates the file it names, on either
+    // engine, so this is the one way to start a database from the form.
+    new_file: NewFile,
 ) -> impl IntoView {
     // Why the last *New file* failed, until the path changes again.
     let create_failed: RwSignal<Option<String>> = RwSignal::new(None);
@@ -1933,16 +1946,23 @@ fn file_fields(
     });
     let refused = move || draft.file.with(|f| !names_a_file(f));
     let bad = move || refused() || create_failed.with(Option::is_some);
-    let extra = create.map(|create| ExtraButton {
+    let NewFile {
+        create,
+        title,
+        default_name,
+        kind,
+        extensions,
+    } = new_file;
+    let extra = Some(ExtraButton {
         label: tr!("connections-new-file"),
         action: Rc::new(move || {
             use floem::file::{FileDialogOptions, FileSpec};
             let opts = FileDialogOptions::new()
-                .title(tr!("connections-duckdb-new-file-dialog"))
-                .default_name("database.duckdb")
+                .title(&title)
+                .default_name(default_name)
                 .allowed_types(vec![FileSpec {
-                    name: crate::i18n::tr_static!("backup-kind-duckdb"),
-                    extensions: &["duckdb"],
+                    name: kind,
+                    extensions,
                 }]);
             let create = create.clone();
             floem::action::save_as(opts, move |file| {
@@ -1952,7 +1972,8 @@ fn file_fields(
                 let path = path.to_string_lossy().to_string();
                 let shown = path.clone();
                 // The dialog has asked before replacing a file, so a path that
-                // exists is made over (`create_duckdb_file` stages it).
+                // exists is made over (`create_duckdb_file` and
+                // `create_sqlite_file` stage it).
                 create(
                     path.clone(),
                     Rc::new(move |res: Result<(), String>| match res {
@@ -1969,7 +1990,7 @@ fn file_fields(
     });
     // The database file: a path editable by hand — the control the SSH key and
     // TLS certificates share — with Browse inside it as its own stop right after
-    // the path (61), and DuckDB's New file after it (62). It was a second copy
+    // the path (61), and New file after it (62). It was a second copy
     // of `path_field` until GitHub #19 moved the button in.
     v_stack((
         path_field_with(
@@ -2009,8 +2030,10 @@ fn conn_form(
     save_conn: Rc<dyn Fn()>,
     delete_conn: Rc<dyn Fn(u64)>,
     test_conn: Rc<dyn Fn()>,
-    // The DuckDB file block's *New file* (`ConnActions::create_duckdb_file`).
+    // The file blocks' *New file* (`ConnActions::create_duckdb_file`,
+    // `create_sqlite_file`).
     create_duckdb_file: crate::CreateFile,
+    create_sqlite_file: crate::CreateFile,
     conn_test: RwSignal<crate::TestState>,
     save_flash: RwSignal<bool>,
     test_flash: RwSignal<bool>,
@@ -2135,7 +2158,15 @@ fn conn_form(
                 tr!("connections-database-file-dialog"),
                 tr!("connections-sqlite-hint"),
                 |_| true,
-                None,
+                NewFile {
+                    create: create_sqlite_file.clone(),
+                    title: tr!("connections-sqlite-new-file-dialog"),
+                    default_name: "database.db",
+                    kind: crate::i18n::tr_static!("backup-kind-sqlite"),
+                    // `.db` first, as Back up names one; the other two are
+                    // the spellings a SQLite file is as often given.
+                    extensions: &["db", "sqlite", "sqlite3"],
+                },
             )
             .into_any(),
             DbKind::DuckDb => file_fields(
@@ -2144,7 +2175,13 @@ fn conn_form(
                 tr!("connections-duckdb-file-dialog"),
                 tr!("connections-duckdb-hint"),
                 schemaic_core::connection::duckdb_names_a_file,
-                Some(create_duckdb_file.clone()),
+                NewFile {
+                    create: create_duckdb_file.clone(),
+                    title: tr!("connections-duckdb-new-file-dialog"),
+                    default_name: "database.duckdb",
+                    kind: crate::i18n::tr_static!("backup-kind-duckdb"),
+                    extensions: &["duckdb"],
+                },
             )
             .into_any(),
             _ => server_fields(draft, ring_engine.clone()).into_any(),

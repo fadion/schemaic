@@ -818,10 +818,11 @@ rename — so nothing under the target's name is ever wider than the file it rep
 half it cannot keep: the engine creates the sibling itself (DuckDB's `ATTACH` refuses a file that
 exists, even an empty one), so there is no `create_new` and the copy has the default mode while it
 is being written, as a backup always had.
-**`create_duckdb_file` is its third caller** — a free function, not a `Db` method, since there is
-no connection yet: the connection form's *New file* makes an empty DuckDB database
-(`duckdb::create_file`, *db/duckdb.md*) through the same staging, because its save dialog has
-asked "Replace?" too, and a yes is honoured only once the new database is whole — a failed create
+**`create_duckdb_file` and `create_sqlite_file` are its third and fourth callers** — free
+functions, not `Db` methods, since there is no connection yet: the connection form's *New file*
+makes an empty DuckDB or SQLite database (`duckdb::create_file`, `sqlite::create_file`,
+*db/duckdb.md*, *db/sqlite.md*) through the same staging, because its save dialog has asked
+"Replace?" too, and a yes is honoured only once the new database is whole — a failed create
 leaves the old file as it was.
 **`Db::fetch_blob` is the binary-cell panel's whole backend** — one connection, one `SELECT`, one
 row, like everything else here. `Ok(None)` means the cell is SQL `NULL` **or** the row is gone,

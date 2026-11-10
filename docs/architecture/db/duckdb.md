@@ -470,7 +470,7 @@ editor, DuckDB having no triggers, through `ddl::duckdb_supports`.
 open creates one, which for a database *client* is the wrong default by some distance: a mistyped
 path would open an empty database that looked like it worked. **Making one is a separate,
 deliberate act** — the connection form's *New file*, `schemaic_db::create_duckdb_file` over
-`create_file` — and until it existed Schemaic could not start a DuckDB database at all: an empty
+`create_file`, as SQLite's is `create_sqlite_file` (*db/sqlite.md*) — and until it existed Schemaic could not start a DuckDB database at all: an empty
 file is no way round the refusal, DuckDB calling it "not a valid DuckDB database file".
 `create_file` refuses a path that exists (it only ever sees the `.part` sibling `staged_backup` has
 cleared, *db/overview.md*), opens it with the app's own `config(false, false)`, so no extension

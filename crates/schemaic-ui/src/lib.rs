@@ -5898,6 +5898,9 @@ pub struct ConnActions {
     /// file* (`schemaic_db::create_duckdb_file`) — answering on the UI thread
     /// with `Ok` or the reason it could not be made.
     pub create_duckdb_file: CreateFile,
+    /// The same for SQLite — the SQLite form's *New file*
+    /// (`schemaic_db::create_sqlite_file`).
+    pub create_sqlite_file: CreateFile,
     /// Re-run the active connection's health check. Nothing re-checks on a
     /// timer, so this is how a recovered server gets noticed without switching
     /// connections — it's what the header's "Not connected" retry calls.

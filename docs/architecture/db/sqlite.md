@@ -416,6 +416,21 @@ that, picking an existing file in the save dialog, which had already asked "Repl
 database, opened first as an empty one, which `VACUUM INTO` accepts as a target
 (`a_backup_copies_the_database_whole`), so the suite touches no file — and so it calls
 `backup_to` directly, a memory URI having no `.part` to rename.
+**A missing file is refused, never created — and *New file* is how one is made** (`create_file`,
+behind `schemaic_db::create_sqlite_file` and the connection form's *New file*). `open` leaves out
+`SQLITE_OPEN_CREATE` on purpose: rusqlite's `open` creates a missing file, and a mistyped path
+would then open as an empty database and present itself as a connection that worked. That left
+the form no way to start a SQLite database at all. `create_file` does not bring the flag back on
+any connection: it opens an empty **in-memory** database and runs the backup's own `VACUUM INTO
+?1` with the path, which writes a whole database file, header page included — so it reads as
+SQLite to any tool rather than as an empty file — and refuses a path that exists, which is why it
+only ever sees the `.part` sibling `staged_backup` has cleared (*db/overview.md*). **It refuses
+what `open_target(&path, false)` refuses first** — empty, `:memory:`, a `file:` name, the URI
+refusal on even in a test build — because `VACUUM INTO` takes a name the way `open` does, URI
+handling included: `file:x?mode=memory` would "create" a database that keeps nothing, report it
+made, and leave the form holding a path no connection can open
+(`new_file_refuses_a_name_that_keeps_nothing`, neither of whose names reaches the disk). No
+committed test makes a real file, since that needs one.
 **The live check never compiles a `PRAGMA`** (`prepare_check`, security review S11). Live
 validation prepares whatever the user is typing, and a prepare is not inert here: SQLite runs some
 pragmas while *preparing* them rather than when stepping, and a few of those set process-wide state

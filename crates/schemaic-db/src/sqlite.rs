@@ -2197,6 +2197,26 @@ pub(crate) async fn backup_to(db: &Db, target: String) -> Result<(), DbError> {
     .await
 }
 
+/// Make an empty SQLite database at `path`, which must not exist — the
+/// staging sibling `create_sqlite_file` clears. `VACUUM INTO` from an empty
+/// in-memory database: it writes a whole database file (the header page, so
+/// the file reads as SQLite to any tool, not as an empty one), refuses a path
+/// that already exists, and needs no `SQLITE_OPEN_CREATE` on any connection
+/// this module opens — `open` keeps refusing a missing file.
+pub(crate) async fn create_file(path: String) -> Result<(), DbError> {
+    // `open`'s boundary, URI refusal included even in a test build: a name
+    // that keeps nothing must not be "created" and reported made.
+    open_target(&path, false)?;
+    tokio::task::spawn_blocking(move || {
+        let conn = SqliteConn::open_in_memory().map_err(query_err)?;
+        conn.execute("VACUUM INTO ?1", [path.as_str()])
+            .map(|_| ())
+            .map_err(query_err)
+    })
+    .await
+    .map_err(|e| DbError::Refused(crate::DbRefusal::SqliteWorker(e.to_string())))?
+}
+
 /// Validate `sql` without running it.
 ///
 /// `prepare` compiles the statement and reports a syntax error or an unknown
@@ -5738,6 +5758,20 @@ mod tests {
 
         // …and what it hands back is the name to open, untouched.
         assert_eq!(open_target("C:/db.sqlite", false).unwrap(), "C:/db.sqlite");
+    }
+
+    /// **New file refuses the names `open` refuses, before it writes.** Its
+    /// `VACUUM INTO` takes a name the way `open` does, URI handling included,
+    /// so `file:x?mode=memory` or `:memory:` would "create" a database that
+    /// keeps nothing and report it made — and the form would then fill in a
+    /// path no connection can open. Neither name reaches the disk, so this
+    /// runs without a file.
+    #[tokio::test]
+    async fn new_file_refuses_a_name_that_keeps_nothing() {
+        for name in ["", ":memory:", "file:new_file_probe?mode=memory"] {
+            let e = create_file(name.to_string()).await.expect_err(name);
+            assert!(matches!(e, DbError::Refused(_)), "{name}: {e}");
+        }
     }
 
     /// **A block is bounded in bytes, not only in rows.** The row count was a

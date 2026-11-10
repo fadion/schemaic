@@ -1887,6 +1887,7 @@ connections-database-file-dialog = Zgjidhni bazën e të dhënave SQLite
 connections-duckdb-file-dialog = Zgjidhni bazën e të dhënave DuckDB
 connections-new-file = Skedar i ri
 connections-duckdb-new-file-dialog = Bazë e re të dhënash DuckDB
+connections-sqlite-new-file-dialog = Bazë e re të dhënash SQLite
 connections-new-file-failed = { $path } nuk u krijua dot: { $why }
 connections-duckdb-hint = Një bazë të dhënash DuckDB është një skedar i vetëm, kështu nuk ka server për t’u arritur — as host, përdorues, fjalëkalim apo tunel. Schemaic e hap skedarin vetëm ndërsa ekzekutohet një urdhër, kështu një program tjetër mund ta hapë ndërkohë — përveç kur një skedë është në mënyrën e transaksionit Manual, e cila e mban skedarin të hapur, dhe programet e tjera jashtë tij, derisa skeda të kthehet në Auto. Rezultatet nga një tabelë me çelës primar mund të redaktohen, dhe skedarët mund të importohen.
 connections-sqlite-hint = Një bazë të dhënash SQLite është një skedar i vetëm, kështu nuk ka server për t’u arritur — as host, përdorues, fjalëkalim apo tunel. Transaksionet manuale ende nuk ofrohen për të: urdhrat konfirmohen sapo dërgohen.

@@ -2181,6 +2181,7 @@ connections-database-file-dialog = Select SQLite database
 connections-duckdb-file-dialog = Select DuckDB database
 connections-new-file = New file
 connections-duckdb-new-file-dialog = New DuckDB database
+connections-sqlite-new-file-dialog = New SQLite database
 # $path is the file picked; $why is the engine's or the filesystem's reason.
 connections-new-file-failed = Couldn't create { $path }: { $why }
 connections-duckdb-hint = A DuckDB database is a single file, so there is no server to reach — no host, user, password or tunnel. Schemaic opens the file only while a statement runs, so another program can open it in between — except while a tab is in Manual transaction mode, which keeps the file open, and other programs out of it, until the tab goes back to Auto. Results from a table with a primary key can be edited, and files imported.
