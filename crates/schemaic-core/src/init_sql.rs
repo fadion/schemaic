@@ -72,26 +72,22 @@ pub const SQLITE_PRAGMAS: &[&str] = &[
     "MMAP_SIZE",
 ];
 
-/// The DuckDB settings an init may make: resources, name resolution and
-/// ordering. Not here, on purpose: everything the unattended paths' seal rests
-/// on (`enable_external_access`, `allow_*`, the extension `autoinstall_*`/
-/// `autoload_*` switches, `custom_extension_repository`, `lock_configuration`),
-/// `access_mode`, where files land (`temp_directory`), and anything else nobody
-/// has weighed yet.
-const DUCKDB_SETTINGS: &[&str] = &[
-    "THREADS",
-    "WORKER_THREADS",
-    "MEMORY_LIMIT",
-    "MAX_MEMORY",
-    "SEARCH_PATH",
-    "SCHEMA",
-    "DEFAULT_ORDER",
-    "DEFAULT_NULL_ORDER",
-    "NULL_ORDER",
-    "PRESERVE_INSERTION_ORDER",
-    "DEFAULT_COLLATION",
-    "MAX_EXPRESSION_DEPTH",
-];
+/// The DuckDB settings an init may make: name resolution, and nothing else.
+///
+/// **The two a sealed handle accepts.** A sealed instance locks its
+/// configuration, and DuckDB's `DBConfig::CheckLock` then refuses every
+/// setting but `schema` and `search_path` — so `threads`, `memory_limit`,
+/// the orderings and the rest, which this list held, failed every unattended
+/// read of the connection at connect (the MCP tools, `schemaic query`), the
+/// form's own placeholder among them. Most of them are instance-wide besides
+/// (`threads` and `memory_limit` have only a global scope, `default_order` a
+/// global default), so an unsealed one changed the **shared instance** for
+/// every operation on the file, another saved connection's included — the
+/// effect refusing `GLOBAL` was meant to rule out. Not here either, on
+/// purpose: everything the seal rests on (`enable_external_access`,
+/// `allow_*`, the extension switches, `lock_configuration`), `access_mode`
+/// and `temp_directory`.
+const DUCKDB_SETTINGS: &[&str] = &["SEARCH_PATH", "SCHEMA"];
 
 /// The MySQL/MariaDB session variables an init may set: time zone, locale,
 /// timeouts, buffer sizes, optimiser knobs, an isolation level (which cannot
@@ -386,7 +382,7 @@ pub fn example(dialect: SqlDialect) -> &'static str {
         SqlDialect::MySql => "SET time_zone = '+00:00'",
         SqlDialect::MsSql => "SET LANGUAGE british",
         SqlDialect::Sqlite => "PRAGMA foreign_keys = ON",
-        SqlDialect::DuckDb => "SET threads = 4",
+        SqlDialect::DuckDb => "SET schema = 'main'",
     }
 }
 
@@ -799,22 +795,27 @@ mod tests {
         }
     }
 
-    /// DuckDB's init takes its resource and resolution settings, and never one
-    /// the unattended paths' seal rests on, nor a `GLOBAL` one — the instance
-    /// is shared by every operation open on the file.
+    /// DuckDB's init takes name resolution — the two settings a sealed
+    /// handle's locked configuration accepts — and never one the unattended
+    /// paths' seal rests on, nor an instance-wide one: the instance is shared
+    /// by every operation open on the file, and a sealed one refuses it.
     #[test]
     fn duckdb_takes_its_listed_settings_and_nothing_that_lifts_a_seal() {
         let d = SqlDialect::DuckDb;
         assert_eq!(
             check(
-                "SET threads = 4; SET SESSION memory_limit = '2GB'; SET schema TO 'app'",
+                "SET schema TO 'app'; SET SESSION search_path = 'app,main'",
                 d
             )
             .unwrap()
             .len(),
-            3
+            2
         );
         for refused in [
+            "SET threads = 4",
+            "SET SESSION memory_limit = '2GB'",
+            "SET default_order = 'DESC'",
+            "SET preserve_insertion_order = false",
             "SET enable_external_access = true",
             "SET autoinstall_known_extensions = true",
             "SET autoload_known_extensions = true",

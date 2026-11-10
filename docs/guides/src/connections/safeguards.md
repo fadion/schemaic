@@ -66,10 +66,12 @@ Each engine has its own settings, so what the box takes depends on the engine:
 | MySQL/MariaDB | `SET time_zone = '+00:00'`   |
 | SQL Server    | `SET LANGUAGE british`       |
 | SQLite        | `PRAGMA foreign_keys = ON`   |
-| DuckDB        | `SET threads = 4`            |
+| DuckDB        | `SET schema = 'main'`        |
 
 It only accepts session settings Schemaic knows are safe. It refuses anything that isn't a `SET`
 (or a `PRAGMA` on SQLite), anything that changes the server rather than the session, and the few
 settings Schemaic's own guards rely on: transaction and read-only settings, `autocommit`, MySQL's
-`sql_mode`, a character set other than UTF-8, and the like. The line under the box says what's
+`sql_mode`, a character set other than UTF-8, and the like. On DuckDB it takes only `schema` and
+`search_path`: anything else applies to the whole database file rather than to one session, and
+the read-only paths (the AI assistant's tools, `schemaic query`) couldn't connect with it. The line under the box says what's
 wrong as you type, and a connection whose init SQL would be refused doesn't connect.

@@ -3781,6 +3781,26 @@ mod tests {
         assert!(rt.block_on(q(&db, "INSERT INTO t VALUES (2)")).is_ok());
     }
 
+    /// **An init SQL the form accepts is one a sealed handle runs.** A sealed
+    /// instance locks its configuration, and a locked configuration takes
+    /// only `schema` and `search_path` (DuckDB's `DBConfig::CheckLock`), so
+    /// the form's own placeholder, `SET threads = 4`, broke every unattended
+    /// read of the connection at connect — the MCP tools, `schemaic query`.
+    #[test]
+    fn a_sealed_handle_runs_the_init_the_form_offers() {
+        let example = schemaic_core::init_sql::example(SqlDialect::DuckDb);
+        let db = mem("init-sealed-example");
+        seed(&db, "CREATE TABLE t(x INT)");
+        let rt = rt();
+        // The suites' own `memory:` instances are unsealed; a fresh name for
+        // the sealed one, since an instance is sealed or not for its life.
+        let sealed = mem("init-sealed").with_init_sql(example).sealed();
+        let r = rt.block_on(q(&sealed, "SELECT 1"));
+        assert!(r.is_ok(), "{example}: {r:?}");
+        let unsealed = db.with_init_sql(example);
+        assert!(rt.block_on(q(&unsealed, "SELECT * FROM t")).is_ok());
+    }
+
     /// **Live validation executes nothing, whatever DuckDB reads the text
     /// as.** The driver's `prepare` *runs* every statement but the last, and
     /// core's lexer and DuckDB's disagree on where a `--` comment ends (a lone

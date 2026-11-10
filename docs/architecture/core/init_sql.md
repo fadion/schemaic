@@ -21,7 +21,7 @@ database it asked for — the tab's, the tree node's — and an `INSERT` would b
 ping.
 `example(dialect)` is the form's placeholder for the field: one setting `check` accepts on that
 engine — `SET time_zone = '+00:00'` on MySQL, `SET LANGUAGE british` on SQL Server, `PRAGMA
-foreign_keys = ON` on SQLite, `SET threads = 4` on DuckDB, PostgreSQL's search path on its own.
+foreign_keys = ON` on SQLite, `SET schema = 'main'` on DuckDB, PostgreSQL's search path on its own.
 That search path was the placeholder on all five, so the example the field offered was refused as
 typed on MySQL, SQL Server and SQLite; `each_engines_example_passes_its_own_check` runs each
 through `check`.
@@ -54,11 +54,16 @@ TIME ZONE`. SQL Server's is three: `MSSQL_VALUE_SETTINGS` (`LANGUAGE`, `DATEFORM
 pass only `ON`. A T-SQL `@x` is refused: a variable ends with its batch and sets nothing.
 `SQLITE_PRAGMAS` lists the per-connection pragmas, unqualified and with an `=` value or none,
 and leaves out what writes the file (`journal_mode`, `user_version`, `auto_vacuum`) or lifts
-the read-only guard (`query_only`, `writable_schema`). `DUCKDB_SETTINGS` is resources, name
-resolution and ordering — `threads`, `memory_limit`, `search_path`, `schema`, the default orders
-and collation — taking a `SESSION` or `LOCAL` scope and **refusing `GLOBAL`**, which on DuckDB is
-the whole instance's setting, and the instance is shared by every operation open on the file at
-that moment (`db::duckdb`). It leaves out everything the unattended paths' seal rests on —
+the read-only guard (`query_only`, `writable_schema`). `DUCKDB_SETTINGS` is name resolution
+alone — `search_path` and `schema` — taking a `SESSION` or `LOCAL` scope and **refusing
+`GLOBAL`**, which on DuckDB is the whole instance's setting, and the instance is shared by every
+operation open on the file at that moment (`db::duckdb`). **Those two are the settings a sealed
+handle accepts**: its locked configuration refuses every other (DuckDB's `DBConfig::CheckLock`),
+and the list once held `threads`, `memory_limit`, the default orders and collation, so the
+placeholder `SET threads = 4` passed `check` and then failed every unattended read at connect —
+and most of them are instance-wide however they are spelled, so an unsealed one moved the shared
+instance under every other operation on the file (`a_sealed_handle_runs_the_init_the_form_offers`
+in `db::duckdb`). It leaves out everything the unattended paths' seal rests on —
 `enable_external_access`, the `allow_*` and extension `autoinstall_*`/`autoload_*` switches,
 `custom_extension_repository`, `lock_configuration` — and `access_mode` and `temp_directory`
 (`duckdb_takes_its_listed_settings_and_nothing_that_lifts_a_seal`). **Left off on purpose**, each list's doc

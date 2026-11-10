@@ -29,8 +29,13 @@ overlap (`overlapping_operations_share_one_instance`). A Manual tab's pinned con
 not this exception but the invariant's existing `TxMode::Manual` one, and it holds the instance —
 and the file's lock — for as long as the tab stays in Manual mode. **It is why the init SQL refuses `SET
 GLOBAL` here** (`init_sql`'s `DUCKDB_SETTINGS` and its `duckdb` arm): a `GLOBAL` setting is the
-instance's, and the instance belongs to whatever else is open on the file at that moment. The init
-SQL itself runs on each operation's cloned connection, in `connect`.
+instance's, and the instance belongs to whatever else is open on the file at that moment — and why
+the list is only `schema` and `search_path`. Most other settings are instance-wide however they
+are spelled (`threads` and `memory_limit` have only a global scope), and a sealed instance's
+locked configuration refuses everything but those two (`DBConfig::CheckLock`), so the form's
+own former placeholder, `SET threads = 4`, failed every unattended read of the connection at
+connect (`a_sealed_handle_runs_the_init_the_form_offers`). The init SQL itself runs on each
+operation's cloned connection, in `connect`.
 **Sealed instances, for the paths nobody watches.** A DuckDB query can read any file on this
 machine — `read_csv`, `read_parquet`, and `FROM 'secrets.csv'`, a string in table position that
 no text gate can name. `Db::sealed()` sets `Db::sealed`, and a sealed handle's instance opens
