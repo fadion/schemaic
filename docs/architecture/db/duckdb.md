@@ -75,7 +75,13 @@ it with the value it came from.
 **Two decode hazards are walled off, both in the driver** (duckdb 1.20000.1): a `NULL`-typed
 column (`SELECT NULL`) is never asked of it, since decoding one panics, and every other cell is
 read under `catch_unwind`, so a value it cannot decode costs that cell — a `<TYPE>` placeholder —
-rather than the worker and the whole result (`values_read_as_duckdb_writes_them`). Both walls
+rather than the worker and the whole result (`values_read_as_duckdb_writes_them`). **The
+caught panic does not run the process's panic hook** (`quietly`): every `TIME_NS` value panics
+in the driver, and the app's hook forces a backtrace and logs about 5 KB a time — a gigabyte of
+log and a minute for a 200k-row result. The first decode wraps whatever hook is installed (the
+app's, set at start-up) in one that skips a panic raised while a thread-local flag is set, and
+`quietly` sets it around the driver's call alone, so every other panic still reaches the hook
+(`an_undecodable_cell_does_not_run_the_panic_hook`). Both walls
 are in `decode_cell`, the one cell decoder, which `run_query` and `refetch_rows` share so that a
 re-fetched row reads exactly as the result it is spliced into.
 **What the driver bends is put back where it can be, and said where it cannot**

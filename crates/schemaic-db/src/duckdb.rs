@@ -1044,6 +1044,37 @@ fn lost(type_name: &str) -> String {
     format!("<{type_name}>")
 }
 
+thread_local! {
+    /// Set while [`quietly`] asks the driver for a cell on this thread.
+    static QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Wrap the process's panic hook so a panic raised while [`QUIET`] is set on
+/// its thread skips it. Done once, the first time a cell is decoded — after
+/// the app's start-up hook, which it then wraps.
+fn install_quiet_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if !QUIET.with(std::cell::Cell::get) {
+            previous(info);
+        }
+    }));
+}
+
+/// Run `f` under `catch_unwind` **without the panic hook**: the driver
+/// panics on every `TIME_NS` value (duckdb 1.20000.1, `row.rs`), a panic the
+/// decoder expects and turns into the cell's placeholder, while the app's hook
+/// forces a backtrace and logs about 5 KB for each — a gigabyte of log, and a
+/// minute, for a 200k-row result. Any other thread's panic still reaches it.
+fn quietly<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(install_quiet_hook);
+    QUIET.with(|q| q.set(true));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    QUIET.with(|q| q.set(false));
+    r
+}
+
 /// Cell `i` of `row` as [`cell_of`] renders it, and whether it held bytes —
 /// the one decoder, so a re-fetched row reads as the result it replaces.
 ///
@@ -1069,7 +1100,7 @@ fn decode_cell(
         }
         _ => {}
     }
-    let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| row.get::<_, DValue>(i)));
+    let got = quietly(|| row.get::<_, DValue>(i));
     let v: DValue = match got {
         Ok(r) => r.map_err(query_err)?,
         Err(_) => return Ok((Value::Str(lost(&type_name())), false)),
@@ -4935,6 +4966,42 @@ mod tests {
             Value::Null,
             "a NULL union"
         );
+    }
+
+    /// **A value the driver panics on does not run the process's panic
+    /// hook.** Every `TIME_NS` cell panics in duckdb 1.20000.1, and the app's
+    /// hook forces a backtrace and logs it — about 5 KB a cell, a gigabyte
+    /// for a 200k-row result. The cell is still its placeholder, and a NULL
+    /// is still NULL.
+    #[test]
+    fn an_undecodable_cell_does_not_run_the_panic_hook() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static HOOKED: AtomicUsize = AtomicUsize::new(0);
+        let before = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if info.to_string().contains("Time64(ns)") {
+                HOOKED.fetch_add(1, Ordering::SeqCst);
+            }
+            before(info);
+        }));
+        // Over whatever hook is now in place, as the app's start-up hook is.
+        install_quiet_hook();
+        let db = mem("time-ns-quiet");
+        let rows = cells(
+            &db,
+            "SELECT CASE WHEN i < 3 THEN TIME_NS '01:02:03.123456789' END \
+             FROM range(4) r(i) ORDER BY i",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec!["<TIME_NS>"],
+                vec!["<TIME_NS>"],
+                vec!["<TIME_NS>"],
+                vec!["NULL"]
+            ]
+        );
+        assert_eq!(HOOKED.load(Ordering::SeqCst), 0, "the hook ran");
     }
 
     /// **A replay onto the database the dump came from** puts back exactly
