@@ -3166,6 +3166,30 @@ fn select_alias_in_where(dialect: SqlDialect) -> bool {
     }
 }
 
+/// May a select item read an alias **an earlier item of the same list**
+/// defines — DuckDB's lateral column alias, `SELECT qty AS t, t + 1`, and an
+/// aggregate's `FILTER (WHERE t > 1)` in that list? DuckDB 2.0.0 reads it
+/// behind the columns (measured: `qty AS total, total + 1` adds to
+/// `orders.total`), and refuses a forward one (*cannot be referenced before it
+/// is defined*). MySQL, PostgreSQL, SQLite and SQL Server read input columns
+/// alone there.
+fn select_list_sees_earlier_aliases(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::DuckDb => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
+/// Is a select-list alias in scope in `QUALIFY`? DuckDB 2.0.0 reads one there
+/// behind the columns (measured: `-qty AS total … QUALIFY total > 150` tests
+/// `orders.total`). No other engine here has the clause.
+fn select_alias_in_qualify(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::DuckDb => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
+}
+
 /// Is a select-list alias in scope in a join's `ON` on this engine? SQLite
 /// resolves one there, behind a column of the same name, as in its `WHERE` —
 /// `SELECT a.id * 2 AS k FROM a JOIN b ON b.id = k` runs on 3.53, a subquery
@@ -15735,6 +15759,20 @@ mod output_alias {
                 }
                 for e in &ons_exprs {
                     behind(e, super::select_alias_in_join_on(self.dialect));
+                }
+                // DuckDB's lateral column alias and an aggregate's `FILTER`
+                // read it in the list itself; an item reading its own alias
+                // or a later one is refused by the engine, so every item is
+                // asked rather than only those after the definition.
+                for item in &sel.projection {
+                    if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } =
+                        item
+                    {
+                        behind(e, super::select_list_sees_earlier_aliases(self.dialect));
+                    }
+                }
+                if let Some(q) = &sel.qualify {
+                    behind(q, super::select_alias_in_qualify(self.dialect));
                 }
             }
             let (using, natural) = colres::coalesced_cols(sel);
@@ -39455,6 +39493,56 @@ mod output_alias_tests {
                 DUCK
             ),
             Err(AliasRenameRefusal::Conflict)
+        );
+    }
+
+    /// **DuckDB reads an alias in a later select item, in an aggregate's
+    /// `FILTER (WHERE …)` and in `QUALIFY`, each behind the columns** (2.0.0,
+    /// measured): `qty AS t, t + 1` binds the alias, `qty AS total, total + 1`
+    /// adds to `orders.total`, and so do `FILTER (WHERE total > 150)` and
+    /// `QUALIFY total > 150`. A rename that left those reads behind gave a
+    /// query that no longer binds.
+    #[test]
+    fn a_duckdb_alias_is_renamed_where_the_select_list_filter_and_qualify_read_it() {
+        for (sql, want) in [
+            (
+                "SELECT qty AS t|, t + 1 AS u FROM orders",
+                "SELECT qty AS z, z + 1 AS u FROM orders",
+            ),
+            (
+                "SELECT qty AS t|, sum(qty) FILTER (WHERE t > 1) OVER () FROM orders",
+                "SELECT qty AS z, sum(qty) FILTER (WHERE z > 1) OVER () FROM orders",
+            ),
+            (
+                "SELECT qty AS t|, count(*) FILTER (WHERE t > 1) FROM orders GROUP BY qty",
+                "SELECT qty AS z, count(*) FILTER (WHERE z > 1) FROM orders GROUP BY qty",
+            ),
+            (
+                "SELECT qty AS t| FROM orders QUALIFY row_number() OVER (ORDER BY t) = 1",
+                "SELECT qty AS z FROM orders QUALIFY row_number() OVER (ORDER BY z) = 1",
+            ),
+            (
+                "SELECT qty AS t|, row_number() OVER () AS r FROM orders QUALIFY t > 5",
+                "SELECT qty AS z, row_number() OVER () AS r FROM orders QUALIFY z > 5",
+            ),
+            // Behind the columns: `total` there is `orders.total`.
+            (
+                "SELECT qty AS total|, total + 1 AS u FROM orders QUALIFY total > 1",
+                "SELECT qty AS z, total + 1 AS u FROM orders QUALIFY total > 1",
+            ),
+        ] {
+            assert_eq!(renamed(sql, "z", DUCK), Ok(want.to_string()), "{sql}");
+        }
+        // A rename to a column's name would hand those reads to the column.
+        assert_eq!(
+            renamed("SELECT qty * 2 AS t|, t + 1 AS u FROM orders", "id", DUCK),
+            Err(AliasRenameRefusal::Conflict)
+        );
+        // Elsewhere a select item does not read an alias: PostgreSQL's `t`
+        // there is a column, and the rename leaves it.
+        assert_eq!(
+            renamed("SELECT qty AS t|, total + 1 AS u FROM orders", "z", PG),
+            Ok("SELECT qty AS z, total + 1 AS u FROM orders".to_string())
         );
     }
 

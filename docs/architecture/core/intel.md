@@ -2149,7 +2149,14 @@ DuckDB, where `OVER (ORDER BY total)` sorts by `orders.total` beside an alias `t
 `window_sees_output_aliases` answers a `WindowAlias` (`Ahead`, `BehindColumns`, `Never`), asking
 `Catalog::flavour` on MySQL, and a MySQL-family server it cannot name leaves the rename `Unsure`
 (`a_windows_order_by_reads_the_alias_on_mariadb_alone`,
-`a_duckdb_window_reads_the_alias_behind_the_columns`).
+`a_duckdb_window_reads_the_alias_behind_the_columns`). **DuckDB also reads the alias in the
+select list itself** — its lateral column alias, `qty AS t, t + 1`, an aggregate's `FILTER (WHERE
+t > 1)` included — **and in `QUALIFY`**, both behind the columns (measured on 2.0.0: `qty AS
+total, total + 1` adds to `orders.total`, as `FILTER (WHERE total > 150)` and `QUALIFY total >
+150` test it), so `select_list_sees_earlier_aliases` and `select_alias_in_qualify` add every
+select item's and the `QUALIFY`'s bare names as `Clause::BehindColumns` candidates; a rename
+that left them gave a query that no longer bound
+(`a_duckdb_alias_is_renamed_where_the_select_list_filter_and_qualify_read_it`).
 **`output_alias::find` builds a `Tree` of every `SELECT` in the statement** — a sqlparser
 `Visitor` over `pre_visit_query`, `pre_visit_select` and `pre_visit_table_factor`, keyed by node
 address, since the borrow each callback is handed cannot be stored — holding each block's
