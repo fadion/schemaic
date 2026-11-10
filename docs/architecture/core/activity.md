@@ -239,7 +239,10 @@ the cursor could never step past the pair — `step_cursor` finds a key at its f
 Down from the pair's first row produced the same key again and the cursor stayed put. So the
 keys are built for a whole list at once, `RowKey::of_locks` over the rows drawn, in order, each
 row counting the earlier ones that show what it does; there is no per-row constructor, because a
-lock alone cannot know its `nth`. The count is ordinal, so across a poll the cursor stays on the
+lock alone cannot know its `nth`. `drawn_lock_rows(list, q, waits)` is the one place they are
+built for the panel — the rows the search matches, cut at `RENDER_CAP`, each paired with its key —
+and `drawn_lock_at` finds the lock a key names among them, so the list, the arrows and the menu
+key cannot key one row two ways. The count is ordinal, so across a poll the cursor stays on the
 *n*th such row rather than on one particular task
 (`the_cursor_steps_past_two_lock_rows_that_show_the_same_thing`). `step_cursor` moves it by a
 `CursorStep` (`Down`/`Up`/`First`/`Last`) over the keys of the rows drawn now, stopping at

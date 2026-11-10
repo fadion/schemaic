@@ -34,15 +34,18 @@ schema tree: this container is rebuilt on every poll, so a focused row would be 
 the keyboard two to thirty seconds after it was reached. For the same reason the cursor is a
 `core::activity::RowKey` — an identity, never an index, since after a re-sort an index names
 whoever sorted into that slot and the action the cursor exists for is a kill. The steps and the
-menu key both read the rows through `drawn_sessions`/`drawn_locks`, the one definition the
-builders draw from too, so the cursor cannot land on a row the search or `RENDER_CAP` left off
-screen; and the menu key asks `live_cursor` first, so a cursor whose session has gone opens
-nothing rather than the menu of the row now in its place. A lock row's key comes from
-`RowKey::of_locks` over the drawn rows, in `locks_list` and `ListKeys::rows` alike, and
-`ListKeys::menu` finds the lock by **zipping the drawn rows with those keys**, not by searching
-the list for a lock with the key's content: two rows can show the same lock (`core/activity.md`),
-and a content search answers the first of them for either, so the three must build the keys the
-same way from the same rows. The menu is the same
+menu key both read the rows through `drawn_sessions`/`core::activity::drawn_lock_rows`, the one
+definition the builders draw from too, so the cursor cannot land on a row the search or
+`RENDER_CAP` left off screen; and the menu key asks `live_cursor` first, so a cursor whose session
+has gone opens nothing rather than the menu of the row now in its place. **A lock row and its key
+come together from `drawn_lock_rows`** (the drawn rows, each paired with `RowKey::of_locks`' key),
+in `locks_list` and `ListKeys::rows` alike, and `ListKeys::menu` finds the lock through
+`drawn_lock_at`, **by the key each row was drawn with**, not by searching the list for a lock
+with the key's content: two rows can show the same lock (`core/activity.md`), and a content
+search answers the first of them for either. The three sites rebuilt rows and keys themselves,
+and one keying with a different search would have compiled and opened one row's menu for another;
+now they share the core pair, whose test asks every drawn key to find its own lock back,
+duplicates and a search included (`every_drawn_lock_rows_key_finds_its_own_lock`). The menu is the same
 `row_menu`/`lock_menu` the right-click builds (`ListKeys::menu`), so the two routes cannot offer
 different entries for one row, opened **at the row** — `PopupAnchor::BelowBox` on the window box
 the cursor row publishes from `on_move`/`on_resize` in `with_cursor` — because the pointer may be

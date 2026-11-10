@@ -153,21 +153,6 @@ fn drawn_sessions<'a>(
     (rows.to_vec(), undrawn)
 }
 
-/// [`drawn_sessions`] for the *Locks* list.
-fn drawn_locks<'a>(
-    list: &'a activity::LockList,
-    q: &str,
-    waits: &str,
-) -> (Vec<&'a activity::LockInfo>, usize) {
-    let matched: Vec<&activity::LockInfo> = list
-        .locks
-        .iter()
-        .filter(|l| activity::lock_matches_with(l, q, waits))
-        .collect();
-    let (rows, undrawn) = activity::render_slice(&matched);
-    (rows.to_vec(), undrawn)
-}
-
 /// Attach the cursor to a built row: its highlight, a primary click moving the
 /// cursor here, the box it publishes while it is the cursor, and the one-shot
 /// scroll into view.
@@ -238,15 +223,16 @@ struct ListKeys {
 }
 
 impl ListKeys {
-    /// The rows drawn now, in order — [`drawn_sessions`] or [`drawn_locks`].
+    /// The rows drawn now, in order — [`drawn_sessions`] or
+    /// [`activity::drawn_lock_rows`].
     fn rows(&self) -> Vec<RowKey> {
         let q = self.search.get_untracked();
         if self.view.get_untracked() == crate::ActivityView::Locks {
             return self.locks.with_untracked(|lk| match lk {
                 crate::LocksState::Loaded(list) => {
                     let waits = tr!("activity-lock-waits-for");
-                    let (rows, _) = drawn_locks(list, &q, &waits);
-                    RowKey::of_locks(rows)
+                    let (rows, _) = activity::drawn_lock_rows(list, &q, &waits);
+                    rows.into_iter().map(|(_, key)| key).collect()
                 }
                 _ => Vec::new(),
             });
@@ -279,12 +265,9 @@ impl ListKeys {
             RowKey::Lock { .. } => self.locks.with_untracked(|lk| match lk {
                 crate::LocksState::Loaded(list) => {
                     let waits = tr!("activity-lock-waits-for");
-                    let (rows, _) = drawn_locks(list, &self.search.get_untracked(), &waits);
-                    let keys = RowKey::of_locks(rows.iter().copied());
-                    rows.iter()
-                        .zip(&keys)
-                        .find(|(_, k)| *k == key)
-                        .map(|(l, _)| lock_menu(l, self.kill.clone(), read_only, dialect))
+                    let q = self.search.get_untracked();
+                    activity::drawn_lock_at(list, &q, &waits, key)
+                        .map(|l| lock_menu(l, self.kill.clone(), read_only, dialect))
                 }
                 _ => None,
             }),
@@ -1368,7 +1351,7 @@ fn locks_list(
 ) -> floem::AnyView {
     // Matched against the verb the rows draw, in the interface's language.
     let waits = tr!("activity-lock-waits-for");
-    let (rows, undrawn) = drawn_locks(list, q, &waits);
+    let (rows, undrawn) = activity::drawn_lock_rows(list, q, &waits);
     if rows.is_empty() {
         return list_message(
             if !q.trim().is_empty() {
@@ -1381,10 +1364,8 @@ fn locks_list(
             theme::text_muted,
         );
     }
-    let keys = RowKey::of_locks(rows.iter().copied());
     let mut items: Vec<floem::AnyView> = rows
-        .iter()
-        .zip(keys)
+        .into_iter()
         .map(|(l, key)| {
             with_cursor(
                 lock_row(l, kill.clone(), overlay, menus, read_only, dialect),

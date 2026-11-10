@@ -552,6 +552,47 @@ pub fn live_cursor<'a>(rows: &[RowKey], cur: Option<&'a RowKey>) -> Option<&'a R
     cur.filter(|c| rows.contains(c))
 }
 
+/// The *Locks* rows the panel draws now, in order, **each with the key it is
+/// drawn with** — those `q` matches ([`lock_matches_with`], against the
+/// interface's `waits` verb), then the first [`RENDER_CAP`] — and how many
+/// matched rows were left undrawn.
+///
+/// **One function for the three sites that must agree**: the list drawing
+/// each row with its key, the arrows stepping over the keys, and the menu key
+/// finding the lock its key names ([`drawn_lock_at`]). Each rebuilt the rows
+/// and keys itself, and a site keying with a different search would have
+/// compiled, passed every test and opened one row's menu for another.
+pub fn drawn_lock_rows<'a>(
+    list: &'a LockList,
+    q: &str,
+    waits: &str,
+) -> (Vec<(&'a LockInfo, RowKey)>, usize) {
+    let matched: Vec<&LockInfo> = list
+        .locks
+        .iter()
+        .filter(|l| lock_matches_with(l, q, waits))
+        .collect();
+    let (rows, undrawn) = render_slice(&matched);
+    let keys = RowKey::of_locks(rows.iter().copied());
+    (rows.iter().copied().zip(keys).collect(), undrawn)
+}
+
+/// The drawn lock whose row `key` names — what the menu key opens the menu
+/// of, found among [`drawn_lock_rows`]' rows by the key each was drawn with,
+/// since two rows can show the same lock (`RowKey`'s `nth`).
+pub fn drawn_lock_at<'a>(
+    list: &'a LockList,
+    q: &str,
+    waits: &str,
+    key: &RowKey,
+) -> Option<&'a LockInfo> {
+    drawn_lock_rows(list, q, waits)
+        .0
+        .into_iter()
+        .find(|(_, k)| k == key)
+        .map(|(l, _)| l)
+}
+
 #[cfg(test)]
 mod cursor_tests {
     use super::*;
@@ -694,6 +735,46 @@ mod cursor_tests {
             step_cursor(&rows, Some(&rows[2]), CursorStep::Up).as_ref(),
             Some(&rows[1])
         );
+    }
+
+    /// **The menu key opens the menu of the row the cursor is on**, for every
+    /// row drawn, duplicates and a search included: each key
+    /// [`drawn_lock_rows`] draws a row with finds that very lock back.
+    #[test]
+    fn every_drawn_lock_rows_key_finds_its_own_lock() {
+        let lock = |session: i64, object: &str, granted: bool, blocked_by: Vec<i64>| LockInfo {
+            session,
+            object: object.into(),
+            kind: "RECORD".into(),
+            mode: "X".into(),
+            granted,
+            blocked_by,
+            killable: true,
+        };
+        let list = LockList {
+            locks: vec![
+                lock(5, "a", true, vec![]),
+                lock(5, "supremum", true, vec![7]),
+                lock(5, "supremum", true, vec![8]),
+                lock(9, "orders", false, vec![5]),
+                lock(9, "supremum", false, vec![5]),
+            ],
+            ..Default::default()
+        };
+        for q in ["", "supremum", "waits for", "nothing matches this"] {
+            let (rows, undrawn) = drawn_lock_rows(&list, q, "waits for");
+            assert_eq!(undrawn, 0);
+            for (l, key) in &rows {
+                let found = drawn_lock_at(&list, q, "waits for", key);
+                assert!(
+                    found.is_some_and(|f| std::ptr::eq(f, *l)),
+                    "{q:?}: {key:?} found {found:?}"
+                );
+            }
+        }
+        let (rows, _) = drawn_lock_rows(&list, "supremum", "waits for");
+        assert_eq!(rows.len(), 3);
+        assert_ne!(rows[0].1, rows[1].1);
     }
 }
 
