@@ -9321,6 +9321,11 @@ fn dotted_name_start(toks: &[Token], end: usize) -> Option<usize> {
 /// - spellings: `< =`, `0X00`, `FROM ::fn_x(…)`, ODBC's `{fn …}`, a
 ///   procedure's group number `p;2`.
 ///
+/// DuckDB's ([`duckdb_gap_masks`]), each measured `OK` on 2.0.0 and each an
+/// error from sqlparser 0.62's `DuckDbDialect`: `ASOF` before a join (its
+/// grammar has Snowflake's `MATCH_CONDITION` instead of `ON`), a `USING
+/// SAMPLE …` clause, and a `#n` positional column's `#`.
+///
 /// `toks` are the statement's, which runs from byte `lo` to `hi`.
 fn grammar_gap_masks(
     sql: &str,
@@ -9330,11 +9335,116 @@ fn grammar_gap_masks(
     dialect: SqlDialect,
 ) -> Vec<Mask> {
     match dialect {
-        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::DuckDb => {
-            Vec::new()
-        }
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => Vec::new(),
+        SqlDialect::DuckDb => duckdb_gap_masks(sql, lo, hi, toks),
         SqlDialect::MsSql => tsql_gap_masks(sql, lo, hi, toks),
     }
+}
+
+/// [`grammar_gap_masks`]' DuckDB arm.
+///
+/// - `ASOF` right before a join keyword is blanked: `ASOF [LEFT] JOIN t ON …`
+///   reads as the ordinary join, so its `ON` is still checked.
+/// - `USING SAMPLE …` is blanked to the next clause at its own depth (`ORDER`,
+///   `LIMIT`, `OFFSET`, a set operator, a closing `)`) or the statement's end
+///   — the sample's own words (`reservoir(50 ROWS) REPEATABLE (100)`) are no
+///   column.
+/// - the `#` of a positional column `#1` is blanked, leaving the number.
+fn duckdb_gap_masks(sql: &str, lo: usize, hi: usize, toks: &[Token]) -> Vec<Mask> {
+    let b = sql.as_bytes();
+    let word = |j: usize| match toks.get(j) {
+        Some(Token {
+            kind: TkKind::Word(w),
+            quoted: false,
+            ..
+        }) => Some(w.to_ascii_uppercase()),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    for (j, t) in toks.iter().enumerate() {
+        match t.kind {
+            TkKind::LParen => depth += 1,
+            TkKind::RParen => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        let Some(w) = word(j) else { continue };
+        if w == "ASOF"
+            && word(j + 1).is_some_and(|n| {
+                matches!(
+                    n.as_str(),
+                    "JOIN" | "LEFT" | "RIGHT" | "INNER" | "FULL" | "OUTER"
+                )
+            })
+        {
+            out.push(Mask {
+                from: t.at,
+                to: t.end,
+                fill: "",
+            });
+        } else if w == "USING" && word(j + 1).as_deref() == Some("SAMPLE") {
+            // The clause ends where a token at its own depth opens the next
+            // one; with none, at the statement's end, short of its `;`.
+            let mut d = depth;
+            let mut to = None;
+            for (k, n) in toks.iter().enumerate().skip(j + 2) {
+                match n.kind {
+                    TkKind::LParen => d += 1,
+                    TkKind::RParen if d == depth => {
+                        to = Some(n.at);
+                        break;
+                    }
+                    TkKind::RParen => d -= 1,
+                    _ if d == depth
+                        && word(k).is_some_and(|x| {
+                            matches!(
+                                x.as_str(),
+                                "ORDER" | "LIMIT" | "OFFSET" | "UNION" | "EXCEPT" | "INTERSECT"
+                            )
+                        }) =>
+                    {
+                        to = Some(n.at);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let to = to.unwrap_or_else(|| {
+                let tail = sql[..hi].trim_end();
+                if tail.len() > lo && tail.ends_with(';') {
+                    tail.len() - 1
+                } else {
+                    hi
+                }
+            });
+            out.push(Mask {
+                from: t.at,
+                to,
+                fill: "",
+            });
+        }
+    }
+    // A number is no token, so `#n` is found in the code bytes, walked over
+    // the one boundary lexer: a `#` inside a string or a comment is not one.
+    let mut i = lo;
+    while i < hi {
+        if let Some(j) = crate::sql::skip_noncode(&b[..hi], i, SqlDialect::DuckDb) {
+            i = j;
+            continue;
+        }
+        if b[i] == b'#'
+            && b.get(i + 1).is_some_and(u8::is_ascii_digit)
+            && (i == lo || !crate::sql::is_word_byte(b[i - 1]))
+        {
+            out.push(Mask {
+                from: i,
+                to: i + 1,
+                fill: "",
+            });
+        }
+        i += 1;
+    }
+    out
 }
 
 /// [`grammar_gap_masks`]' T-SQL arm.
@@ -10052,6 +10162,16 @@ fn compound_assignment_at(toks: &[Token], clauses: &[Option<&'static str>], p: u
 fn is_query_body_keyword(word: &str) -> bool {
     let up = word.to_ascii_uppercase();
     matches!(up.as_str(), "SELECT" | "WITH" | "VALUES")
+}
+
+/// Can a query **open with `FROM`** — DuckDB's `FROM t` and `CREATE TABLE x AS
+/// FROM t`, measured on 2.0.0? Then a CTAS's `AS FROM` is its body, not
+/// `FROM` used as an alias.
+fn query_may_open_with_from(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::DuckDb => true,
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => false,
+    }
 }
 
 /// MySQL/MariaDB **reserved** words — those that can't be used as a bare (unquoted)
@@ -10991,6 +11111,11 @@ fn is_table_ref_continuation(word: &str) -> bool {
             | "IGNORE"
             | "PARTITION"
             | "WINDOW"
+            // DuckDB's (and Snowflake's) clause after `WINDOW`, and its
+            // `ASOF JOIN`: `FROM t QUALIFY …` read `QUALIFY` as an alias and
+            // squiggled valid DuckDB (S4-L1-04).
+            | "QUALIFY"
+            | "ASOF"
             | "AS"
             // Ends the table reference of a data-modifying statement —
             // `DELETE FROM zap RETURNING *`. Without it the alias check read
@@ -11901,6 +12026,7 @@ fn alias_checks(
         // nor a table type's `CREATE TYPE t AS TABLE (…)`.
         if is_create
             && (is_query_body_keyword(b)
+                || (query_may_open_with_from(dialect) && b.eq_ignore_ascii_case("FROM"))
                 || ((creates_type || creates_macro) && b.eq_ignore_ascii_case("TABLE")))
         {
             continue;
@@ -12555,6 +12681,17 @@ mod colres {
                         col: col.value.to_ascii_lowercase(),
                         range: self.range(col.span),
                     });
+                }
+                // A field read off a value — DuckDB's `{'a': 1}.a`, a
+                // subscript's `(x)[1].f` — names a field of that value, not a
+                // column: recorded before the visitor reaches it.
+                Expr::CompoundFieldAccess { access_chain, .. } => {
+                    for a in access_chain {
+                        if let sqlparser::ast::AccessExpr::Dot(field) = a {
+                            let at = self.range(field.span());
+                            self.not_columns.push(at);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -33571,6 +33708,52 @@ mod tests {
                 "{sql}: {d:?}"
             );
         }
+    }
+
+    /// **DuckDB clauses sqlparser's grammar lacks are no error** — each
+    /// measured `OK` on DuckDB 2.0.0, and each squiggled as an error: a
+    /// `QUALIFY` read as an implicit alias, `ASOF JOIN … ON` (sqlparser has
+    /// Snowflake's `MATCH_CONDITION`), `USING SAMPLE`, a `#1` positional
+    /// column, a `FROM`-first CTAS body, and a field read off a struct
+    /// literal. Unlike [`duckdb_statements_the_parser_lacks`]' heads, these
+    /// are read past where they stand, so the rest of the statement stays
+    /// checked.
+    #[test]
+    fn duckdb_clauses_the_parser_lacks_are_no_error() {
+        let mut wrong = Vec::new();
+        for sql in [
+            "SELECT salary AS t FROM employees QUALIFY row_number() OVER (ORDER BY t) = 1;",
+            "SELECT * FROM employees e QUALIFY row_number() OVER (ORDER BY e.id) = 1;",
+            "SELECT * FROM employees ASOF JOIN departments d ON employees.id >= d.id;",
+            "SELECT * FROM employees ASOF LEFT JOIN departments d ON employees.id >= d.id;",
+            "SELECT salary FROM employees USING SAMPLE 10%;",
+            "SELECT salary FROM employees USING SAMPLE reservoir(50 ROWS) REPEATABLE (100) ORDER BY salary;",
+            "SELECT #1 FROM employees;",
+            "SELECT salary, id FROM employees ORDER BY #2;",
+            "CREATE TABLE x AS FROM employees;",
+            "SELECT {'a': 1}.a;",
+        ] {
+            let d = diag_d(sql, SqlDialect::DuckDb);
+            if d.iter().any(|x| x.severity == Severity::Error) {
+                wrong.push(format!("{sql}: {d:?}"));
+            }
+        }
+        // Read past, not withheld: an error elsewhere in the statement, or a
+        // column the catalogue lacks, still shows.
+        for sql in [
+            "SELECT nope FROM employees USING SAMPLE 10%;",
+            "SELECT * FROM employees QUALIFY nope = 1;",
+            "SELECT * FROM employees ASOF JOIN departments d ON employees.nope >= d.id;",
+            "SELECT #1 FROM employees WHERE;",
+            "CREATE TABLE x AS FROM employees WHERE;",
+            "CREATE TABLE x AS FROM nope;",
+        ] {
+            let d = diag_d(sql, SqlDialect::DuckDb);
+            if !d.iter().any(|x| x.severity == Severity::Error) {
+                wrong.push(format!("no error for {sql}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     /// **Only a T-SQL write's target may name an alias its own `FROM`

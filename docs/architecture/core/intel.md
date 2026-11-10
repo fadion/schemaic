@@ -566,7 +566,17 @@ pins both halves: the overload forms draw no syntax error, while `CREATE MACRO m
 `CREATE MACRO t(a) AS TABLE SELECT a, (a) AS x FROM;` still do (the second red against the
 shape-only version). Its overload forms end in `;` on purpose: an unterminated last statement is
 the one being typed, whose parse error is withheld anyway, and written without one the test
-passed before the fix.
+passed before the fix. **DuckDB's clause-level gaps are read past, not withheld by head**
+(`duckdb_gap_masks`, measured `OK` on 2.0.0 and each squiggled before): `ASOF` before a join is
+blanked so `ASOF [LEFT] JOIN t ON …` reads as the ordinary join (sqlparser has Snowflake's
+`MATCH_CONDITION` instead), `USING SAMPLE …` is blanked to the next clause at its depth or the
+statement's end, and a positional column's `#` is blanked, leaving the number — found over
+`sql::skip_noncode`, since a number is no token. Three were not the parser's: `QUALIFY` and
+`ASOF` end a table reference (`is_table_ref_continuation`) rather than being read as an alias,
+a CTAS's `AS FROM` is a body where `query_may_open_with_from`, and a field read off a value
+(`{'a': 1}.a`, an `AccessExpr::Dot`) is recorded as no column.
+`duckdb_clauses_the_parser_lacks_are_no_error` pins all six and that an error elsewhere in such
+a statement, or a column the catalogue lacks, still shows.
 **A clause the grammar lacks inside an
 ordinary statement is read past rather than given up at**: `grammar_gap_masks` finds T-SQL's
 query hint `OPTION (…)` at the top level, `WITH ROLLUP`/`WITH CUBE` after a `GROUP BY` at the
