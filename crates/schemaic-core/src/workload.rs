@@ -480,8 +480,12 @@ fn table_overlaps(t: &TableInfo, idle: &dyn Fn(&str) -> bool) -> Vec<(String, In
     let mut out: Vec<(String, IndexProblem)> = Vec::new();
     let mut reported = std::collections::HashSet::new();
     // Exact duplicates first: each group keeps its best and reports the rest.
+    // **Each index joins one group** — its keeper included, which is never
+    // reported, so a keeper later in definition order once built a second
+    // group from the indexes after it and reported them again.
+    let mut grouped = std::collections::HashSet::new();
     for (i, a) in ixs.iter().enumerate() {
-        if reported.contains(&a.name) {
+        if grouped.contains(&a.name) {
             continue;
         }
         let mut group: Vec<&IndexInfo> = vec![a];
@@ -489,6 +493,7 @@ fn table_overlaps(t: &TableInfo, idle: &dyn Fn(&str) -> bool) -> Vec<(String, In
         if group.len() < 2 {
             continue;
         }
+        grouped.extend(group.iter().map(|g| g.name.clone()));
         group.sort_by(|x, y| keeper_rank(x, idle).cmp(&keeper_rank(y, idle)));
         let keep = group[0].name.clone();
         for dup in &group[1..] {
@@ -1248,6 +1253,32 @@ mod tests {
         assert_eq!(
             problems(&index_health(&defs, &stats)),
             vec![("ix_px", &IndexProblem::Unused)]
+        );
+    }
+
+    /// **A duplicate is one row, whichever of its group is kept.** With the
+    /// kept index not first in definition order, the keeper built a group of
+    /// its own from the indexes after it, and `c` was reported twice.
+    #[test]
+    fn a_duplicate_is_reported_once_when_the_kept_index_is_not_first() {
+        let defs = vec![table(
+            "t",
+            vec![ix("a", &["x"]), ix("b", &["x"]), ix("c", &["x"])],
+        )];
+        let stats = SchemaStats::new(vec![tstat(
+            "t",
+            vec![
+                istat("a", Some(0), None),
+                istat("b", Some(5), None),
+                istat("c", Some(0), None),
+            ],
+        )]);
+        assert_eq!(
+            problems(&index_health(&defs, &stats)),
+            vec![
+                ("a", &IndexProblem::Duplicate { of: "b".into() }),
+                ("c", &IndexProblem::Duplicate { of: "b".into() }),
+            ]
         );
     }
 

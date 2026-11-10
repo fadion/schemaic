@@ -98,7 +98,10 @@ reported unused, with the Performance view's *Drop index* on the row
 (`a_clustered_index_is_never_reported_unused`). An index already reported as a
 duplicate or a prefix is **reported once, as the overlap**: that finding holds whatever the
 counters say, and two rows for one index read as two problems
-(`an_unread_duplicate_is_reported_once_as_the_duplicate`). And **the index a finding names as its
+(`an_unread_duplicate_is_reported_once_as_the_duplicate`) — and a duplicate is one row whichever
+of its group is kept, each index joining one group with its keeper (a keeper later in definition
+order once built a second group from the indexes after it,
+`a_duplicate_is_reported_once_when_the_kept_index_is_not_first`). And **the index a finding names as its
 `of` or `by` is never reported unused**: the two rows were each sound alone and, both followed,
 dropped every index on the column
 (`the_index_a_finding_names_as_its_stand_in_is_not_reported_unused`). **Usage decides which of a
