@@ -36,6 +36,10 @@ one database too**, and needs none named: its listing is `duckdb_tables()` and `
 held to `current_database()` and `NOT internal`, and its `describe` reads `duckdb_columns()`,
 comparing the name in any case (DuckDB matches one so), a bare name in `current_schema()` and
 `schema.table` in that schema, with `PRI` and a single-column `UNI` from `duckdb_constraints()`.
+Both run on the linked engine in a test, on an in-memory `DataSession` — a key, a single-column
+and a two-column unique, a default, a view, and `sales.orders` finding `"Sales"."Orders"`
+(`duckdb_tables_and_describe_run_on_the_linked_engine`): the catalogue columns they name are the
+kind a DuckDB release renames, and only the read gate had seen the text.
 **PostgreSQL's listing reads `pg_class`, not `information_schema.tables`**, which has no
 materialized views: relkinds `r`/`p`/`v`/`m`/`f`, partitions left out (`NOT relispartition` —
 their parent is the table; the GUI's tree lists them, nested under it, under `schema_tree.rs`),

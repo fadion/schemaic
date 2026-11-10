@@ -402,6 +402,85 @@ mod tests {
         assert_eq!(rows[4][3], "'x'");
     }
 
+    /// `sql` run on a DuckDB [`schemaic_db::duckdb::DataSession`] — in memory,
+    /// no file — after each statement of `setup`, as the grid shows its cells.
+    fn duckdb_rows(setup: &[&str], sql: &str) -> Vec<Vec<String>> {
+        let session = schemaic_db::duckdb::DataSession::open().unwrap();
+        let db = schemaic_db::Db::from_parts(
+            schemaic_db::Engine::DuckDb,
+            String::new(),
+            0,
+            String::new(),
+            String::new(),
+            session.target().to_string(),
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let token = tokio_util::sync::CancellationToken::new;
+            for s in setup {
+                db.fetch_query(None, s, 1, token()).await.unwrap();
+            }
+            let rs = db.fetch_query(None, sql, 100, token()).await.unwrap();
+            (0..rs.row_count())
+                .map(|r| {
+                    (0..rs.columns.len())
+                        .map(|c| {
+                            rs.cell(r, c)
+                                .map_or_else(String::new, |v| v.display().to_string())
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+    }
+
+    /// **DuckDB's catalogue SQL runs on the linked engine** — its column
+    /// names and its list-valued `constraint_column_names` are the kind a
+    /// release renames, and only the read gate had seen this text. A key, a
+    /// single-column unique, a default, a view, and a `Schema.Table` looked up
+    /// in another case.
+    #[test]
+    fn duckdb_tables_and_describe_run_on_the_linked_engine() {
+        let setup = [
+            "CREATE SCHEMA \"Sales\"",
+            "CREATE TABLE \"Sales\".\"Orders\" (id INTEGER PRIMARY KEY, code VARCHAR UNIQUE, \
+             note VARCHAR DEFAULT 'x', a INTEGER, b INTEGER, UNIQUE (a, b))",
+            "CREATE VIEW main.recent AS SELECT 1 AS n",
+        ];
+        let tables = duckdb_rows(&setup, &tables_sql(SqlDialect::DuckDb, None).unwrap());
+        assert_eq!(
+            tables,
+            vec![
+                vec!["Sales".to_string(), "Orders".into(), "table".into()],
+                vec!["main".to_string(), "recent".into(), "view".into()],
+            ]
+        );
+        let cols = duckdb_rows(
+            &setup,
+            &describe_sql(SqlDialect::DuckDb, None, "sales.orders").unwrap(),
+        );
+        let names: Vec<&str> = cols.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(names, ["id", "code", "note", "a", "b"]);
+        assert_eq!(cols[0][4], "PRI");
+        assert_eq!(cols[0][2], "NO");
+        assert_eq!(cols[1][4], "UNI");
+        assert_eq!(cols[2][2], "YES");
+        assert!(cols[2][3].contains('x'), "{:?}", cols[2]);
+        // A unique pair is no uniqueness of either column.
+        assert_eq!(cols[3][4], "");
+        assert_eq!(cols[4][4], "");
+        // A bare name is the session's current schema.
+        let view = duckdb_rows(
+            &setup,
+            &describe_sql(SqlDialect::DuckDb, None, "recent").unwrap(),
+        );
+        assert_eq!(view.len(), 1);
+        assert_eq!(view[0][0], "n");
+    }
+
     /// **PostgreSQL describes what `tables` lists**, and nothing else:
     /// `to_regclass` finds an index or a sequence too, which was printed as a
     /// table. And a partial unique index is no uniqueness of the column.
