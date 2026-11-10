@@ -1068,6 +1068,24 @@ impl Harness {
         }
     }
 
+    /// The prefix of the CLI's own diagnostics on a one-shot's stderr, **when
+    /// stderr carries anything else**: dsh's default mode writes the model's
+    /// live reasoning there (its README), so a failed run's stderr is mostly
+    /// thinking, and its `dsh:` lines are the failure
+    /// ([`crate::cli_failure_message`]). `None` where stderr is the CLI's
+    /// alone.
+    pub fn stderr_diagnostic_prefix(self) -> Option<&'static str> {
+        match self {
+            Harness::DeepSeek => Some("dsh:"),
+            Harness::Claude
+            | Harness::Codex
+            | Harness::Antigravity
+            | Harness::OpenCode
+            | Harness::Copilot
+            | Harness::Cursor => None,
+        }
+    }
+
     /// Can a previous turn be continued by id?
     ///
     /// **No longer the complement of [`Harness::is_persistent`], and the reason

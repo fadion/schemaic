@@ -1087,7 +1087,13 @@ sent to check an installation that was not the one that failed — the same wron
 Claude-only inline rule existed to prevent, arriving by a different door the moment all four
 harnesses could run a one-shot. The stderr → stdout → status order is unchanged, and it is that
 order because the CLI writes some fatal errors (an expired OAuth session among them) to stdout
-with an empty stderr, so surfacing stderr alone yields a blank. On Claude Code 2.1.289 a
+with an empty stderr, so surfacing stderr alone yields a blank. **Where stderr also carries the
+model's reasoning, only the CLI's own lines count**: dsh's default mode — a DeepSeek one-shot's —
+writes the live reasoning to stderr, so a run that reasoned and then failed showed kilobytes of
+thinking as the error. `Harness::stderr_diagnostic_prefix` is `dsh:` for DeepSeek and `None`
+for the rest, and stderr is read as its lines with that prefix alone, a reasoning-only stderr
+falling through to the exit status (`a_deepseek_failure_is_its_dsh_lines_not_the_reasoning`).
+On Claude Code 2.1.289 a
 `stream-json` session's expired login does not reach this order at all: it arrives as JSON in a
 turn that ends cleanly, and is read out of that turn's `result` (`claude_error_text`, under
 `stream.rs`). What it answers is a `CliFailure` rather than a `String` (under `lib.rs`), so the

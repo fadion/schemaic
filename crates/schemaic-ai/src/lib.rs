@@ -655,6 +655,20 @@ pub fn cli_failure_message(
     stdout: &str,
     stderr: &str,
 ) -> CliFailure {
+    // Where stderr also carries the model's reasoning, only the CLI's own
+    // lines are its failure — `Harness::stderr_diagnostic_prefix`.
+    let own: String;
+    let stderr = match harness.stderr_diagnostic_prefix() {
+        Some(p) => {
+            own = stderr
+                .lines()
+                .filter(|l| l.trim_start().starts_with(p))
+                .collect::<Vec<_>>()
+                .join("\n");
+            own.as_str()
+        }
+        None => stderr,
+    };
     let err = stderr.trim();
     if !err.is_empty() {
         return CliFailure::Said(err.to_string());
@@ -1621,6 +1635,32 @@ mod tests {
         assert_eq!(
             cli_failure_message(Harness::Codex, Some(1), "", "no such model").to_string(),
             "no such model"
+        );
+    }
+
+    /// **DeepSeek's one-shot stderr is the model's reasoning**, its default
+    /// mode's channel for it (dsh's README), with dsh's own diagnostics as
+    /// `dsh:` lines. A run that reasoned and then failed showed kilobytes of
+    /// thinking as the error; only the `dsh:` lines are the failure.
+    #[test]
+    fn a_deepseek_failure_is_its_dsh_lines_not_the_reasoning() {
+        use crate::harness::Harness;
+        let stderr = "The user wants a query.\nLet me think about the tables…\n\
+            I should join orders and customers.\n\
+            dsh: step limit reached (8)\n";
+        assert_eq!(
+            cli_failure_message(Harness::DeepSeek, Some(1), "\n", stderr).to_string(),
+            "dsh: step limit reached (8)"
+        );
+        // Reasoning and nothing of dsh's: the exit status, not the thinking.
+        assert_eq!(
+            cli_failure_message(Harness::DeepSeek, Some(1), "\n", "Thinking hard.\n").to_string(),
+            cli_failure_message(Harness::DeepSeek, Some(1), "", "").to_string()
+        );
+        // Every other harness keeps its whole stderr.
+        assert_eq!(
+            cli_failure_message(Harness::Codex, Some(1), "", "a\ndsh: b").to_string(),
+            "a\ndsh: b"
         );
     }
 
