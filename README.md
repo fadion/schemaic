@@ -1,6 +1,6 @@
 # Schemaic
 
-A fast, native SQL editor for MySQL, MariaDB, PostgreSQL, SQL Server and SQLite,
+A fast, native SQL editor for MySQL, MariaDB, PostgreSQL, SQL Server, SQLite and DuckDB,
 written in Rust, with an editable results grid, visual schema editing, and
 schema-aware intelligence, built to feel instant.
 
@@ -36,8 +36,9 @@ schema-aware intelligence, built to feel instant.
   save and run `.sql` files.
 - **Results grid.** Edit cells and write them back, add, duplicate and delete
   rows, filter and sort on the server, freeze columns, and paste a block from a
-  spreadsheet. Binary cells preview as images or hex. Chart a result as bars, a
-  line or a histogram, compare two results row by row, and export to CSV, JSON,
+  spreadsheet. Binary cells preview as images or hex. Chart a result as bars,
+  stacked bars, a line, a scatter or a histogram, compare two results row by
+  row, and export to CSV, JSON,
   SQL, Markdown, HTML or Excel.
 - **Transactions.** A per-tab manual mode with explicit commit and rollback on
   every engine but SQLite, an optional statement timeout, and a log of every
@@ -64,10 +65,10 @@ schema-aware intelligence, built to feel instant.
   DBeaver, DataGrip and the other JetBrains IDEs, `~/.my.cnf`, `~/.pgpass`,
   `~/.pg_service.conf` or the database containers Docker is running.
   Per-connection colours, environment badges, init SQL and a read-only mode.
-- **Terminal.** An embedded shell, and a one-click `mysql`, `psql`, `sqlite3` or
-  `sqlcmd` session on the active connection.
+- **Terminal.** An embedded shell, and a one-click `mysql`, `psql`, `sqlite3`,
+  `sqlcmd` or `duckdb` session on the active connection.
 - **AI assistant.** Drives your own Claude Code, Codex, Antigravity, OpenCode,
-  GitHub Copilot or Cursor. Fix a failed query, rewrite the statement under the
+  GitHub Copilot, Cursor or DeepSeek Harness. Fix a failed query, rewrite the statement under the
   caret (Ctrl+K), explain or optimise it, or generate realistic rows. It reads
   your schema through a built-in [MCP server](#mcp-server), proposes table
   changes through the same preview as a hand edit, and sees only as much data
@@ -262,9 +263,11 @@ runtime, which the packages declare.
 
 ## Build & run
 
-Requires a recent Rust toolchain (edition 2024) and a C compiler, since SQLite is
-compiled in from source: the MSVC tools on Windows, `xcode-select --install` on
-macOS, `gcc` on Linux. No database client libraries are needed.
+Requires a recent Rust toolchain (edition 2024) and a C and C++ compiler, since
+SQLite (C) and DuckDB (C++) are compiled in from source: the MSVC tools on
+Windows, `xcode-select --install` on macOS, `build-essential` (`gcc` and `g++`)
+on Linux. No database client libraries are needed. The first build compiles
+DuckDB's amalgamation, which takes several minutes; later builds reuse it.
 
 ```sh
 cargo run -p schemaic-app
