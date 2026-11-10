@@ -33,12 +33,16 @@ the database's name and the date and time.
 - *PostgreSQL* — a custom-format `.dump`, which `pg_restore` can restore from selectively.
 - *SQLite* — a copy of the database file, which you can open as a connection of its own.
 - *DuckDB* — a new `.duckdb` file holding every schema, table, view, sequence and macro, with the
-  rows. Open it as a connection of its own. The file you pick must not exist yet: Schemaic won't
-  write over one.
+  rows. Open it as a connection of its own.
 - *SQL Server* — there's no file dialog. The server writes a `.bak` into its own default backup
   folder, as a copy-only backup that leaves your scheduled backup chain alone. A second backup
   of the same database within the same minute replaces the first. Since this one is written by
   the server, it's greyed out on a read-only connection.
+
+On SQLite and DuckDB you can pick an existing file to replace it. The copy is written to
+`<name>.part` first and replaces your file only once it's complete, so a backup that fails leaves
+the old file as it was. If the finished copy can't take its place — the file is open in another
+program, say — it stays as `<name>.part`, and the error names it.
 
 ## Restoring
 

@@ -408,11 +408,14 @@ everything".
 *Back up*): a compacted, consistent copy taken under the read transaction the statement holds, so
 a write landing meanwhile is in the copy entirely or not at all. The target is a path the user
 picked, bound as `?1` rather than spliced in. It writes nothing to the source, which is why a
-read-only connection may take one. **SQLite refuses a target that already exists, and that
-refusal is passed on** rather than the file being removed first — so picking an existing file in
-the save dialog ends in "The backup failed: …" in the terminal panel. The test copies into a
-second shared in-memory database, opened first as an empty one, which `VACUUM INTO` accepts as a
-target (`a_backup_copies_the_database_whole`), so the suite touches no file.
+read-only connection may take one. **SQLite refuses a target that already exists**, and the
+target is still never removed first: `Db::backup_to_file` runs the copy into the `.part` sibling
+and renames it over the target only once it is whole (`staged_backup`, *db/overview.md*) — before
+that, picking an existing file in the save dialog, which had already asked "Replace?", ended in
+"The backup failed: …" in the terminal panel. The test copies into a second shared in-memory
+database, opened first as an empty one, which `VACUUM INTO` accepts as a target
+(`a_backup_copies_the_database_whole`), so the suite touches no file — and so it calls
+`backup_to` directly, a memory URI having no `.part` to rename.
 **The live check never compiles a `PRAGMA`** (`prepare_check`, security review S11). Live
 validation prepares whatever the user is typing, and a prepare is not inert here: SQLite runs some
 pragmas while *preparing* them rather than when stepping, and a few of those set process-wide state

@@ -5122,7 +5122,10 @@ mod tests {
             )
             .expect("seed");
         let (copy, _) = shared_memory("backup_copy");
-        db.backup_to_file("file:backup_copy?mode=memory&cache=shared")
+        // The copy itself, not `Db::backup_to_file`'s staging around it, which
+        // renames a `.part` file and has no memory URI to rename
+        // (`staged_backup`'s own tests in `lib.rs`).
+        backup_to(&db, "file:backup_copy?mode=memory&cache=shared".to_string())
             .await
             .expect("the backup runs");
         let n: i64 = copy

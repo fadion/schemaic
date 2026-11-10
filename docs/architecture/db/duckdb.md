@@ -224,7 +224,9 @@ is one connection for the whole file and wraps nothing, with SQLite's runtime-fl
 (`backup_to`, behind `Db::backup_to_file`): every schema, table, view, sequence and macro with its
 rows, into a **new** file. A target that already exists is refused before anything runs, as
 SQLite's `VACUUM INTO` refuses one, because `ATTACH` would open it and copy *into* what it holds
-(`a_backup_copies_every_table_with_its_rows`, into `:memory:`). `Db::explain` builds `EXPLAIN` or
+(`a_backup_copies_every_table_with_its_rows`, into `:memory:`). That refusal no longer reaches a
+user who chose to replace a file: `Db::backup_to_file` hands it the `.part` sibling and renames
+the whole copy over the target (`staged_backup`, *db/overview.md*). `Db::explain` builds `EXPLAIN` or
 `EXPLAIN ANALYZE` in the dispatcher, on a read-only transaction where it is asked `read_only`, and
 `fetch_table` — the Live Monitor — is a generated `SELECT * … LIMIT` there too.
 **Grid write-back reads its provenance from the statement, because the driver reports none.**

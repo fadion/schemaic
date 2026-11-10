@@ -799,6 +799,25 @@ its two producers (`a_failed_begin_is_not_the_statements_failure`,
 `backup_to_file(target)` takes a *file* instead, and answers on the two embedded engines alone
 (`sqlite::backup_to`, `duckdb::backup_to`); the three server engines get `DbError::Refused`, inline in the dispatcher,
 their backups being their own tools run in the terminal (`core::launch`).
+**Both embedded copies run through `staged_backup`, into the target's `.part` sibling**
+(`export::part_file`), which is renamed over the target only once the copy is whole. Both
+engines' copies refuse a target that exists, and Windows' save dialog had already asked
+"Replace?" — so after a yes, *Back up* ended in "already exists". Staging honours the yes without
+risking the file: the sibling is cleared first of a fragment an earlier backup left, a failed copy
+is discarded and never touches the target, and `std::fs::rename` replaces an existing target on
+Windows as elsewhere. A whole copy that cannot be renamed in — the target held open — is **kept**,
+and the error names it ("the backup is complete in …, but it could not replace …"), since it is
+the one good copy there is. The engines' own refusals stay: they now only ever see the `.part`
+path. The three file operations sit behind a private `StagingFs` trait (`RealFs` in the app) so
+the order is tested without a file — `a_backup_replaces_its_target_only_with_a_whole_copy`,
+`a_copy_that_cannot_replace_its_target_is_kept_and_named`. **It keeps half of
+`persist::create_part`'s policy** (security review S31): the sibling is cleared with
+`remove_file`, which unlinks a planted link rather than following it, and on Unix `RealFs::publish`
+gives the finished copy the replaced target's permissions, or `0600` for a new file, *before* the
+rename — so nothing under the target's name is ever wider than the file it replaced. The other
+half it cannot keep: the engine creates the sibling itself (DuckDB's `ATTACH` refuses a file that
+exists, even an empty one), so there is no `create_new` and the copy has the default mode while it
+is being written, as a backup always had.
 **`Db::fetch_blob` is the binary-cell panel's whole backend** — one connection, one `SELECT`, one
 row, like everything else here. `Ok(None)` means the cell is SQL `NULL` **or** the row is gone,
 and both are "there are no bytes to show" rather than an error the panel would have to phrase.

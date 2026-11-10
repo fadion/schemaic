@@ -2040,14 +2040,94 @@ pub const CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 /// because nobody is waiting on a timer for them to give up.
 pub const WORKLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The three file operations a staged backup needs — a seam, so the order
+/// they run in is tested without a file ([`staged_backup`]).
+trait StagingFs {
+    /// Remove whatever sits at the staging path: a fragment a failed backup
+    /// left. The engines' copies refuse a target that exists.
+    fn clear(&self, part: &std::path::Path) -> std::io::Result<()>;
+    /// Rename the finished copy over the target.
+    fn publish(&self, part: &std::path::Path, target: &std::path::Path) -> std::io::Result<()>;
+    /// Remove a copy that failed part-way.
+    fn discard(&self, part: &std::path::Path);
+}
+
+/// The filesystem itself.
+struct RealFs;
+
+impl StagingFs for RealFs {
+    fn clear(&self, part: &std::path::Path) -> std::io::Result<()> {
+        match std::fs::remove_file(part) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+    fn publish(&self, part: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+        // The engine made the copy, so it has the default mode, not the
+        // `.part` policy every export writer keeps (`persist::create_part`,
+        // security review S31): a replaced file's own permissions, else
+        // owner-only. Set before the rename, so the copy is never under the
+        // target's name with a mode wider than the file it replaced.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(target)
+                .map(|m| m.permissions())
+                .unwrap_or_else(|_| std::fs::Permissions::from_mode(0o600));
+            std::fs::set_permissions(part, mode)?;
+        }
+        // Replaces an existing target, on Windows as elsewhere.
+        std::fs::rename(part, target)
+    }
+    fn discard(&self, part: &std::path::Path) {
+        let _ = std::fs::remove_file(part);
+    }
+}
+
+/// Run `copy` into `target`'s `.part` sibling ([`schemaic_core::export::part_file`]),
+/// then rename it over `target`.
+///
+/// **The user may have chosen to replace a file**, and the save dialog asked
+/// them first; the engines' copies (`VACUUM INTO`, DuckDB's `ATTACH` and
+/// `COPY FROM DATABASE`) refuse a target that exists, so a yes there used to
+/// end in "already exists". Staging honours it without risking it: the
+/// target is touched only by the rename of a whole copy, a failed copy is
+/// removed and leaves the target as it was, and a copy that cannot be renamed
+/// in — the target held open elsewhere — is kept and named in the error.
+async fn staged_backup<F, Fut>(fs: &impl StagingFs, target: &str, copy: F) -> Result<(), DbError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), DbError>>,
+{
+    let target_path = std::path::Path::new(target);
+    let part = schemaic_core::export::part_file(target_path);
+    fs.clear(&part)
+        .map_err(|e| DbError::Query(format!("{}: {e}", part.display())))?;
+    if let Err(e) = copy(part.to_string_lossy().into_owned()).await {
+        fs.discard(&part);
+        return Err(e);
+    }
+    fs.publish(&part, target_path).map_err(|e| {
+        DbError::Query(format!(
+            "the backup is complete in {}, but it could not replace {target}: {e}",
+            part.display()
+        ))
+    })
+}
+
 impl Db {
-    /// Copy a SQLite database whole to the file `target` (`sqlite::backup_to`).
-    /// The server engines back up through their own tools, which the app runs
-    /// in the terminal; asked of one, this refuses.
+    /// Copy a SQLite or DuckDB database whole to the file `target`, replacing
+    /// one already there only once the copy is whole ([`staged_backup`]). The
+    /// server engines back up through their own tools, which the app runs in
+    /// the terminal; asked of one, this refuses.
     pub async fn backup_to_file(&self, target: &str) -> Result<(), DbError> {
         match self.engine {
-            Engine::Sqlite => sqlite::backup_to(self, target.to_string()).await,
-            Engine::DuckDb => duckdb::backup_to(self, target.to_string()).await,
+            Engine::Sqlite => {
+                staged_backup(&RealFs, target, |part| sqlite::backup_to(self, part)).await
+            }
+            Engine::DuckDb => {
+                staged_backup(&RealFs, target, |part| duckdb::backup_to(self, part)).await
+            }
             Engine::MySql | Engine::Postgres | Engine::MsSql => {
                 Err(DbError::Refused(DbRefusal::BackupInTerminal))
             }
@@ -3892,6 +3972,106 @@ pub(crate) fn parse_typed(s: String, type_name: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The file operations a staged backup asks for, recorded in order, with
+    /// the ones told to fail failing.
+    #[derive(Default)]
+    struct FakeFs {
+        calls: std::sync::Mutex<Vec<String>>,
+        publish_fails: bool,
+    }
+
+    impl StagingFs for FakeFs {
+        fn clear(&self, part: &std::path::Path) -> std::io::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("clear {}", part.display()));
+            Ok(())
+        }
+        fn publish(&self, part: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "publish {} -> {}",
+                part.display(),
+                target.display()
+            ));
+            if self.publish_fails {
+                Err(std::io::Error::other("in use"))
+            } else {
+                Ok(())
+            }
+        }
+        fn discard(&self, part: &std::path::Path) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("discard {}", part.display()));
+        }
+    }
+
+    /// **A backup onto a file the user chose to replace replaces it — only
+    /// once the copy is whole.** Windows' save dialog asked "Replace?", and
+    /// after a yes the backup refused with "already exists". The copy goes to
+    /// the `.part` sibling, which is renamed over the target on success; on a
+    /// failed copy the sibling is removed and the target never touched.
+    #[tokio::test]
+    async fn a_backup_replaces_its_target_only_with_a_whole_copy() {
+        let fs = FakeFs::default();
+        let wrote = std::sync::Mutex::new(None);
+        // A bare name, so the expected paths carry no separator to differ by
+        // platform.
+        staged_backup(&fs, "shop.duckdb", |part| {
+            *wrote.lock().unwrap() = Some(part.clone());
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(wrote.lock().unwrap().as_deref(), Some("shop.duckdb.part"));
+        assert_eq!(
+            *fs.calls.lock().unwrap(),
+            [
+                "clear shop.duckdb.part",
+                "publish shop.duckdb.part -> shop.duckdb"
+            ]
+        );
+
+        let fs = FakeFs::default();
+        let r = staged_backup(&fs, "shop.duckdb", |_| async {
+            Err(DbError::Query("disk full".into()))
+        })
+        .await;
+        assert!(matches!(r, Err(DbError::Query(m)) if m == "disk full"));
+        assert_eq!(
+            *fs.calls.lock().unwrap(),
+            ["clear shop.duckdb.part", "discard shop.duckdb.part"],
+            "a failed copy must not reach the target"
+        );
+    }
+
+    /// A whole copy that cannot be renamed into place — the target held open
+    /// elsewhere — is kept, and the error says where.
+    #[tokio::test]
+    async fn a_copy_that_cannot_replace_its_target_is_kept_and_named() {
+        let fs = FakeFs {
+            publish_fails: true,
+            ..Default::default()
+        };
+        let r = staged_backup(&fs, "shop.duckdb", |_| async { Ok(()) }).await;
+        let Err(DbError::Query(m)) = r else {
+            panic!("{r:?}")
+        };
+        assert!(
+            m.contains("shop.duckdb.part") && m.contains("in use"),
+            "{m}"
+        );
+        assert!(
+            !fs.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("discard"))
+        );
+    }
 
     #[test]
     fn a_rejected_statement_is_the_statements_failure() {
