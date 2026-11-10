@@ -78,7 +78,10 @@ below one it is `perf-sub-ms` at two places, because rounded it would read `0 ms
 lives. Calls and rows are plurals on `i18n::count` (`the_counted_figures_read_in_both_numbers`).
 A ready list ends *Counted since …* where the source dates its counters. **The statement's text
 is copied by a right-click only** (*Copy statement*, on the generic `popup_menu` channel at the
-pointer); the rows have no keyboard route to it.
+pointer); the rows have no keyboard route to it. **A text that carries a credential is neither
+shown nor copied**: `statement_row` asks `workload::withholds` — the rule the MCP tool and
+`schemaic statements` print through — and draws `perf-statement-withheld`, faint, with no menu,
+the figures staying.
 **Index findings each carry a *Drop index*, and SQL Server's suggestions a *Create index*, and both are
 draft edits**. Both, and the source's copy, are `row_icon`s: a glyph (`TRASH_2`, `PLUS`, `COPY`)
 with its label as the tooltip, on the list editors' face — `table_designer`'s row buttons, 15px in

@@ -18,8 +18,17 @@ stable spelling the MCP `order` argument and `schemaic statements --order` take
 `statement_limit` clamps a requested count into `1..=MAX_STATEMENT_LIMIT` (500), `None` being
 `DEFAULT_STATEMENT_LIMIT` (50), so an agent asking for "all" cannot make a fetch carry every digest
 a busy server has seen. The text is data to show and never to run — and it is *data* in the gating
-sense too: PostgreSQL and MySQL replace literals with placeholders, but Query Store keeps a
+sense too: MySQL's digests replace literals with placeholders, but `pg_stat_statements` replaces
+only a constant the jumbler sees (through PostgreSQL 15 a utility statement is stored verbatim, and
+from 16 a `PASSWORD 'x'` is still kept, being a `DefElem`'s string) and Query Store keeps a
 statement as it was sent, which is why `top_statements` is a row-data tool (`cli/mcp.md`).
+**A text that carries a credential is withheld on every perf surface, whatever the data level**:
+`withholds(query, dialect)` is `sql::carries_credential` — the rule `history.json` and the Writes
+log already keep — and `statement_text` gives `WITHHELD_STATEMENT` in its place, the figures
+staying. `cli::perf::statements_result` asks it, so the MCP `top_statements` tool and `schemaic
+statements` print the same withheld row, and the *Performance* view shows its own words for it and
+offers no copy (`a_ranked_statement_carrying_a_credential_is_withheld`). Consent to send row data
+was never consent to send `ALTER ROLE app PASSWORD '…'` to the AI provider.
 **An absent source is said, never drawn as an empty list**, which is the roadmap's trap and the
 reason `StatementReport` is `Ready { statements, since }` or `Unavailable(Unavailable)` rather
 than a `Vec`: an empty table reads as "nothing is slow". `since` is when the counters started, as

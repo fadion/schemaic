@@ -624,9 +624,11 @@ for one list (`cli/args.md`).
 for every one — index health and sizes rank every table and index name in a database, the overview
 `list_schema` gives with sizes, and the statements and the locks name tables too — so *Schema
 context: None* withholds them and `NO_SCHEMA_ACCESS` names them. `reads_row_data` is `true` for
-`top_statements`, because **other people's statements are their data**: PostgreSQL and MySQL
-replace literals with placeholders, but Query Store keeps the text as sent, `WHERE email = 'x@y'`
-and all; and for `current_locks`, because a MySQL 8 lock row names the locked record's key values
+`top_statements`, because **other people's statements are their data**: MySQL's digests replace
+literals with placeholders, but `pg_stat_statements` keeps a utility statement's text (verbatim
+through PostgreSQL 15) and Query Store keeps the text as sent, `WHERE email = 'x@y'` and all — and
+a statement carrying a credential is withheld from the answer at every level, by
+`workload::statement_text` inside `perf::statements_result` (`core/workload.md`); and for `current_locks`, because a MySQL 8 lock row names the locked record's key values
 (`data_locks.LOCK_DATA`), one row's worth of data per lock. So below `AiData::Full` those two are
 withheld and refused, and all three `NO_DATA_ACCESS` wordings name them; `index_health` and
 `table_sizes`, names and sizes only, are offered at every data level. None is `needs_panel`, and

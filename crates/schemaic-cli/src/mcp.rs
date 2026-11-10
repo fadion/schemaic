@@ -824,9 +824,12 @@ impl McpTool {
             // an existence oracle over values, one key per call. So `explain`
             // stands wherever `run_query` does and nowhere else.
             McpTool::RunQuery | McpTool::Explain | McpTool::SampleRows => true,
-            // **Other people's statements are their data.** PostgreSQL and
-            // MySQL replace literals with placeholders, but SQL Server's Query
-            // Store keeps the text as sent — `WHERE email = 'x@y'` and all.
+            // **Other people's statements are their data.** MySQL's digests
+            // replace literals with placeholders, but `pg_stat_statements`
+            // keeps a utility statement's text (verbatim through PostgreSQL
+            // 15), and SQL Server's Query Store keeps the text as sent —
+            // `WHERE email = 'x@y'` and all. A statement carrying a credential
+            // is withheld at every level besides (`perf::statements_result`).
             McpTool::TopStatements => true,
             // A lock row names what is locked, and on MySQL that is the
             // record's key values (`data_locks.LOCK_DATA`) — one row's worth
@@ -1728,7 +1731,7 @@ async fn top_statements(db: &Db, database: Option<&str>, args: &Value) -> Answer
             }
             let n = statements.len();
             let mut out = format_table_cells(
-                &crate::perf::statements_result(&statements),
+                &crate::perf::statements_result(&statements, dialect_of(db)),
                 STATEMENT_CHARS,
             );
             if let Some(since) = since {

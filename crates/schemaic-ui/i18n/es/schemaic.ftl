@@ -2929,6 +2929,7 @@ perf-src-qs-missing = Este servidor no tiene Query Store, que llegó con SQL Ser
 perf-src-no-permission = Este inicio de sesión no puede leer las estadísticas de sentencias: { $error }
 perf-src-enable = Para activarlo, ejecuta esto en una pestaña de consulta:
 perf-statements-none = El origen de estadísticas está activado pero aún no ha registrado ninguna sentencia.
+perf-statement-withheld = Oculta: esta sentencia contiene una credencial.
 perf-since = Contado desde { $since }.
 # A statement's figures, joined by middle dots under its text.
 perf-total = { $time } en total

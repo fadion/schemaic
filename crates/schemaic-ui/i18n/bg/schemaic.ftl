@@ -2932,6 +2932,7 @@ perf-src-qs-missing = Този сървър няма Query Store, който с�
 perf-src-no-permission = Този вход няма право да чете статистиката за изразите: { $error }
 perf-src-enable = За да го включите, изпълнете това в раздел за заявки:
 perf-statements-none = Източникът на статистика е включен, но още не е записал нито един израз.
+perf-statement-withheld = Скрит: този израз съдържа идентификационни данни.
 perf-since = Отчетено от { $since }.
 # A statement's figures, joined by middle dots under its text.
 perf-total = { $time } общо

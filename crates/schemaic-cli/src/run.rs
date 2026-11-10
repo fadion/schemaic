@@ -2302,7 +2302,9 @@ async fn statements(
     };
     match report {
         StatementReport::Ready { statements, since } => {
-            if let Err(exit) = emit_rows(&crate::perf::statements_result(&statements), out) {
+            let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
+            let rows = crate::perf::statements_result(&statements, dialect);
+            if let Err(exit) = emit_rows(&rows, out) {
                 return exit;
             }
             if statements.is_empty() {

@@ -3029,6 +3029,7 @@ perf-src-qs-missing = Acest server nu are Query Store, apărut odată cu SQL Ser
 perf-src-no-permission = Acest login nu are voie să citească statisticile instrucțiunilor: { $error }
 perf-src-enable = Pentru a-l activa, rulează aceasta într-o filă de interogare:
 perf-statements-none = Sursa de statistici este activă, dar nu a înregistrat încă nicio instrucțiune.
+perf-statement-withheld = Ascunsă: această instrucțiune conține date de autentificare.
 perf-since = Numărat din { $since }.
 # A statement's figures, joined by middle dots under its text.
 perf-total = { $time } în total

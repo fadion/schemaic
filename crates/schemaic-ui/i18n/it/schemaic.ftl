@@ -2935,6 +2935,7 @@ perf-src-qs-missing = Questo server non ha Query Store, arrivato con SQL Server 
 perf-src-no-permission = Questo login non può leggere le statistiche sulle istruzioni: { $error }
 perf-src-enable = Per attivarlo, esegui questo in una scheda di query:
 perf-statements-none = La fonte delle statistiche è attiva ma non ha ancora registrato istruzioni.
+perf-statement-withheld = Nascosta: questa istruzione contiene credenziali.
 perf-since = Conteggio dal { $since }.
 # A statement's figures, joined by middle dots under its text.
 perf-total = { $time } in totale

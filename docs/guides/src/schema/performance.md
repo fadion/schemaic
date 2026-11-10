@@ -21,6 +21,11 @@ The statements the server has spent most time on, ranked by **Total time**, **Me
 Right-click a row and choose **Copy statement** to take it into a query tab. A line at the end
 says when the counting started: every figure is since then.
 
+A statement that sets a password, such as `ALTER ROLE app PASSWORD '…'`, keeps its figures but
+not its text: the row says it was withheld and has no **Copy statement**. `schemaic statements`
+and the AI's `top_statements` tool withhold it the same way, so the password never reaches the AI
+provider.
+
 The figures come from a source that has to be turned on in the server. When it's off, the view
 says which source and why. Where one statement turns it on, the view shows it with a copy icon
 beside it (**Copy**); run it in a query tab yourself, since Schemaic never runs it for you.

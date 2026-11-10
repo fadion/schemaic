@@ -10,6 +10,7 @@
 //! there is one — for the user to run. The tool never runs it.
 
 use schemaic_core::activity::LockList;
+use schemaic_core::intel::SqlDialect;
 use schemaic_core::model::{Column, ResultSet, Value};
 use schemaic_core::schema::DbSchema;
 use schemaic_core::stats::SchemaStats;
@@ -52,8 +53,10 @@ pub fn unavailable_text(u: &Unavailable) -> String {
     }
 }
 
-/// The ranked statements.
-pub fn statements_result(v: &[StatementStat]) -> ResultSet {
+/// The ranked statements, each text that carries a credential withheld
+/// ([`wl::statement_text`]) — what both the MCP `top_statements` tool and
+/// `schemaic statements` print, so neither can forget to ask.
+pub fn statements_result(v: &[StatementStat], dialect: SqlDialect) -> ResultSet {
     ResultSet::from_rows(
         vec![
             col("total_ms", "DOUBLE"),
@@ -71,7 +74,7 @@ pub fn statements_result(v: &[StatementStat]) -> ResultSet {
                     Value::UInt(s.calls),
                     opt_uint(s.rows),
                     opt_text(s.database.as_deref()),
-                    text(s.query.clone()),
+                    text(wl::statement_text(&s.query, dialect).to_string()),
                 ]
             })
             .collect(),
@@ -351,19 +354,41 @@ mod tests {
 
     #[test]
     fn statements_lead_with_the_cost_and_end_with_the_text() {
-        let rs = statements_result(&[StatementStat {
-            query: "SELECT * FROM t WHERE id = ?".into(),
-            database: Some("app".into()),
-            calls: 3,
-            total_ms: 1.234_56,
-            mean_ms: 0.411_52,
-            rows: None,
-        }]);
+        let rs = statements_result(
+            &[StatementStat {
+                query: "SELECT * FROM t WHERE id = ?".into(),
+                database: Some("app".into()),
+                calls: 3,
+                total_ms: 1.234_56,
+                mean_ms: 0.411_52,
+                rows: None,
+            }],
+            SqlDialect::MySql,
+        );
         assert_eq!(rs.columns[0].name, "total_ms");
         assert_eq!(cell(&rs, 0, 0), "1.235");
         assert_eq!(cell(&rs, 0, 2), "3");
         assert!(rs.cell(0, 3).is_some_and(|c| c.is_null()));
         assert_eq!(cell(&rs, 0, 5), "SELECT * FROM t WHERE id = ?");
+    }
+
+    /// **`pg_stat_statements` keeps a role's password.** What the MCP tool
+    /// and `schemaic statements` print withholds the text and keeps the
+    /// figures.
+    #[test]
+    fn a_statement_carrying_a_password_is_withheld_and_its_figures_kept() {
+        let rs = statements_result(
+            &[StatementStat {
+                query: "ALTER ROLE app PASSWORD 'S3cret!'".into(),
+                calls: 1,
+                total_ms: 2.0,
+                ..Default::default()
+            }],
+            SqlDialect::Postgres,
+        );
+        assert!(!cell(&rs, 0, 5).contains("S3cret"), "{}", cell(&rs, 0, 5));
+        assert_eq!(cell(&rs, 0, 5), wl::WITHHELD_STATEMENT);
+        assert_eq!(cell(&rs, 0, 2), "1");
     }
 
     #[test]

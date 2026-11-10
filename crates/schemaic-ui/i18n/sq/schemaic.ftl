@@ -2932,6 +2932,7 @@ perf-src-qs-missing = Ky server nuk ka Query Store, që erdhi me SQL Server 2016
 perf-src-no-permission = Ky login nuk lejohet të lexojë statistikat e urdhrave: { $error }
 perf-src-enable = Për ta aktivizuar, ekzekutoni këtë në një skedë kërkese:
 perf-statements-none = Burimi i statistikave është aktiv por nuk ka regjistruar ende urdhra.
+perf-statement-withheld = E fshehur: ky urdhër përmban kredenciale.
 perf-since = Numëruar që nga { $since }.
 # A statement's figures, joined by middle dots under its text.
 perf-total = { $time } gjithsej

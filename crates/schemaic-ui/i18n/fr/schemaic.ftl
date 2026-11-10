@@ -2935,6 +2935,7 @@ perf-src-qs-missing = Ce serveur n'a pas Query Store, apparu avec SQL Server 201
 perf-src-no-permission = Ce compte n'est pas autorisé à lire les statistiques sur les instructions : { $error }
 perf-src-enable = Pour l'activer, exécutez ceci dans un onglet de requête :
 perf-statements-none = La source de statistiques est activée mais n'a encore enregistré aucune instruction.
+perf-statement-withheld = Masquée : cette instruction contient des identifiants.
 perf-since = Comptabilisé depuis { $since }.
 # A statement's figures, joined by middle dots under its text.
 perf-total = { $time } au total

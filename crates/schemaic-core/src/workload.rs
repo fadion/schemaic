@@ -97,9 +97,11 @@ impl StatementOrder {
 /// last reset.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StatementStat {
-    /// The statement as the engine normalised it — literals replaced by
-    /// placeholders (`$1`, `?`) on PostgreSQL and MySQL; Query Store keeps
-    /// the text as sent. Data to show, never to run.
+    /// The statement as the engine recorded it — literals replaced by
+    /// placeholders (`$1`, `?`) where the source normalises them, which
+    /// `pg_stat_statements` does not do for a utility statement's password;
+    /// Query Store keeps the text as sent. Data to show, never to run, and
+    /// shown only through [`statement_text`] / [`withholds`].
     pub query: String,
     /// The database it ran in, where the source records one.
     pub database: Option<String>,
@@ -108,6 +110,37 @@ pub struct StatementStat {
     pub mean_ms: f64,
     /// Rows returned or affected in total, where the source counts them.
     pub rows: Option<u64>,
+}
+
+/// What a ranked statement that carries a credential shows in place of its
+/// text — [`statement_text`].
+pub const WITHHELD_STATEMENT: &str = "(withheld: this statement carries a credential)";
+
+/// Does this ranked statement's text carry a credential, so that no perf
+/// surface shows it — [`crate::sql::carries_credential`], the rule
+/// `history.json` and the Writes log already keep.
+///
+/// **A statistics source's text is not always normalised.** Through
+/// PostgreSQL 15 `pg_stat_statements` stores a utility statement verbatim,
+/// and from 16 a `PASSWORD 'x'` is still kept, being a `DefElem`'s string and
+/// not a constant the jumbler replaces; Query Store keeps every text as sent.
+/// So `CREATE ROLE app LOGIN PASSWORD 'S3cret!'` reached the AI provider
+/// through `top_statements`, consent to send row data never having been
+/// consent to send a role's password.
+pub fn withholds(query: &str, dialect: SqlDialect) -> bool {
+    crate::sql::carries_credential(query, dialect)
+}
+
+/// A ranked statement's text as the MCP `top_statements` tool and
+/// `schemaic statements` show it: [`WITHHELD_STATEMENT`] where
+/// [`withholds`] says so, the text otherwise. The figures stay — what it
+/// cost is no secret.
+pub fn statement_text(query: &str, dialect: SqlDialect) -> &str {
+    if withholds(query, dialect) {
+        WITHHELD_STATEMENT
+    } else {
+        query
+    }
 }
 
 /// Why there is no statement list to show — each with what would turn the
@@ -1399,5 +1432,30 @@ mod tests {
             ranked.iter().map(|m| m.table.as_str()).collect::<Vec<_>>(),
             vec!["high", "mid"]
         );
+    }
+
+    /// A role's password in a statistics source's text never leaves through a
+    /// perf surface; a statement that only names a `password` column does.
+    #[test]
+    fn a_ranked_statement_carrying_a_credential_is_withheld() {
+        for (q, d) in [
+            ("ALTER ROLE app PASSWORD 'S3cret!'", SqlDialect::Postgres),
+            (
+                "CREATE ROLE app LOGIN PASSWORD 'S3cret!'",
+                SqlDialect::Postgres,
+            ),
+            (
+                "ALTER LOGIN app WITH PASSWORD = 'S3cret!'",
+                SqlDialect::MsSql,
+            ),
+            ("CREATE USER `a`@`%` IDENTIFIED BY ?", SqlDialect::MySql),
+        ] {
+            assert!(withholds(q, d), "{q}");
+            assert_eq!(statement_text(q, d), WITHHELD_STATEMENT, "{q}");
+        }
+        let plain = "SELECT password FROM users WHERE id = $1";
+        assert!(!withholds(plain, SqlDialect::Postgres));
+        assert_eq!(statement_text(plain, SqlDialect::Postgres), plain);
+        assert_eq!(statement_text("", SqlDialect::Postgres), "");
     }
 }

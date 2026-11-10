@@ -28,6 +28,7 @@ use floem::keyboard::{Key, NamedKey};
 use floem::prelude::*;
 use floem::reactive::create_effect;
 
+use schemaic_core::intel::SqlDialect;
 use schemaic_core::workload::{
     IndexFinding, IndexProblem, MissingIndex, SizeEntry, StatementOrder, StatementReport,
     StatementStat, Unavailable,
@@ -371,7 +372,7 @@ fn body(ctx: &PerfCtx, t: &PerfTarget, st: PerfState, slow: RwSignal<bool>) -> A
         PerfState::Loaded(data) => match &*data {
             PerfData::Statements(StatementReport::Unavailable(u)) => unavailable(u),
             PerfData::Statements(StatementReport::Ready { statements, since }) => {
-                statements_list(ctx, statements, since.as_deref())
+                statements_list(ctx, t.dialect, statements, since.as_deref())
             }
             PerfData::Indexes {
                 findings,
@@ -457,7 +458,12 @@ fn ms(f: f64) -> String {
     }
 }
 
-fn statements_list(ctx: &PerfCtx, v: &[StatementStat], since: Option<&str>) -> AnyView {
+fn statements_list(
+    ctx: &PerfCtx,
+    dialect: SqlDialect,
+    v: &[StatementStat],
+    since: Option<&str>,
+) -> AnyView {
     if v.is_empty() {
         return message(
             icons::CIRCLE_QUESTION,
@@ -465,7 +471,7 @@ fn statements_list(ctx: &PerfCtx, v: &[StatementStat], since: Option<&str>) -> A
             tr!("perf-statements-none"),
         );
     }
-    let mut rows: Vec<AnyView> = v.iter().map(|s| statement_row(ctx, s)).collect();
+    let mut rows: Vec<AnyView> = v.iter().map(|s| statement_row(ctx, dialect, s)).collect();
     if let Some(since) = since {
         rows.push(message(
             icons::CLOCK,
@@ -480,7 +486,10 @@ fn statements_list(ctx: &PerfCtx, v: &[StatementStat], since: Option<&str>) -> A
 
 /// One statement: its text, two lines then clipped, and its figures under it.
 /// Right-click copies the whole text — the one thing to do with it here.
-fn statement_row(ctx: &PerfCtx, s: &StatementStat) -> AnyView {
+/// A text that carries a credential ([`schemaic_core::workload::withholds`])
+/// is shown as withheld and offers no copy, as the MCP tool and the CLI
+/// withhold it.
+fn statement_row(ctx: &PerfCtx, dialect: SqlDialect, s: &StatementStat) -> AnyView {
     let figures = {
         let mut parts = vec![
             tr!("perf-total", time = ms(s.total_ms)),
@@ -499,13 +508,23 @@ fn statement_row(ctx: &PerfCtx, s: &StatementStat) -> AnyView {
         }
         parts.join(" \u{00b7} ")
     };
+    let withheld = schemaic_core::workload::withholds(&s.query, dialect);
+    let shown = if withheld {
+        tr!("perf-statement-withheld")
+    } else {
+        schemaic_core::history::preview(&s.query)
+    };
     let sql = s.query.clone();
     let overlay = ctx.overlay;
     v_stack((
-        text(schemaic_core::history::preview(&s.query)).style(|s| {
+        text(shown).style(move |s| {
             s.font_family(MONO_FAMILY.to_string())
                 .font_size(font_body())
-                .color(theme::text())
+                .color(if withheld {
+                    theme::text_faint()
+                } else {
+                    theme::text()
+                })
                 .width_full()
                 .max_height((font_body() as f64) * 1.4 * 2.0)
                 .line_height(1.4)
@@ -514,6 +533,9 @@ fn statement_row(ctx: &PerfCtx, s: &StatementStat) -> AnyView {
     ))
     .clip()
     .on_secondary_click_stop(move |_| {
+        if withheld {
+            return;
+        }
         let sql = sql.clone();
         overlay.popup_anchor.set(None);
         overlay

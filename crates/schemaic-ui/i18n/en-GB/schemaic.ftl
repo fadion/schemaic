@@ -3430,6 +3430,7 @@ perf-src-qs-missing = This server has no Query Store, which came with SQL Server
 perf-src-no-permission = This login may not read the statement statistics: { $error }
 perf-src-enable = To turn it on, run this in a query tab:
 perf-statements-none = The statistics source is on but has recorded no statements yet.
+perf-statement-withheld = Withheld: this statement carries a credential.
 perf-since = Counted since { $since }.
 # A statement's figures, joined by middle dots under its text.
 perf-total = { $time } total

@@ -2932,6 +2932,7 @@ perf-src-qs-missing = Deze server heeft geen Query Store; dat kwam met SQL Serve
 perf-src-no-permission = Deze login mag de instructiestatistieken niet lezen: { $error }
 perf-src-enable = Voer dit uit in een querytabblad om het in te schakelen:
 perf-statements-none = De statistiekenbron staat aan, maar heeft nog geen instructies geregistreerd.
+perf-statement-withheld = Verborgen: deze instructie bevat inloggegevens.
 perf-since = Geteld sinds { $since }.
 # A statement's figures, joined by middle dots under its text.
 perf-total = { $time } totaal

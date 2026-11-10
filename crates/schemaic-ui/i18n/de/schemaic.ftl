@@ -2803,6 +2803,7 @@ perf-src-qs-missing = Dieser Server hat keinen Query Store; den gibt es erst sei
 perf-src-no-permission = Dieses Login darf die Anweisungsstatistik nicht lesen: { $error }
 perf-src-enable = Führe zum Einschalten Folgendes in einem Abfrage-Tab aus:
 perf-statements-none = Die Statistikquelle ist eingeschaltet, hat aber noch keine Anweisungen erfasst.
+perf-statement-withheld = Zurückgehalten: Diese Anweisung enthält Anmeldedaten.
 perf-since = Gezählt seit { $since }.
 # A statement's figures, joined by middle dots under its text.
 perf-total = { $time } gesamt
