@@ -32,12 +32,18 @@ engine has to answer it rather than inherit a row; this one would be inherited. 
 command is omitted with no saved connection, beside *Server Variables* and for its reason — a row
 that closes the palette and does nothing reads as broken — and is not dimmed on a down
 connection, leaving that to the fetch. All three call
-`open_for_active(conn, overlay, tabs_ui.active_db)`, which resolves the active connection's
+`open_for_active(conn, overlay, overlays::focused_database_on(&tabs_ui, active_conn))`, which resolves the active connection's
 name and dialect (a no-op with none), resets the list to Statements, the order to Total time and
 the state to `Loading` on the way in — `server_vars_view::open_for_server`'s rule, so a second
 opening never flashes the last one's list — and sets `OverlayUi::perf` to a `PerfTarget {
 conn_id, name, database, dialect }`, captured at open for `VarsTarget`'s reason. The database is
-the **active tab's**, an empty one filtered to `None`, and it is in the title
+the **active tab's, only when that tab is on the active connection** — `focused_database_on`, a
+reading of `tabsel::scoped_database` with no fallback, which the gear's and the blank space's
+*Users* take too — and `None` otherwise, so the view asks for one. All three passed `active_db`
+as it was, and the focused tab routinely sits on another connection: a tab on *dev* bound to
+`shop` opened Performance on *prod*'s `shop`, with *Drop* and *Create index* against it
+(`no_server_view_opens_on_the_focused_tabs_database_unchecked`, a gate over every
+`open_for_active` and `users_view::open_for_server` call). An empty name is filtered to `None`, and the database is in the title
 (*Performance — <connection> · <database>*). `PerfCtx` holds `OverlayUi`, `ConnUi`, `SchemaUi`,
 `DdlUi` and the one fetch, `SchemaActions::perf`, and is built at its one call site in
 `modals.rs`.

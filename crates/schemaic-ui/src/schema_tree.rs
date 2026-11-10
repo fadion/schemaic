@@ -1033,16 +1033,24 @@ fn blank_space_menu(ui: &Ui) -> Vec<widgets::MenuEntry> {
                 ui.conn,
                 ui.overlay,
                 ui.conn.active_conn.get_untracked(),
-                ui.tabs_ui.active_db.get_untracked().as_deref(),
+                crate::overlays::focused_database_on(
+                    &ui.tabs_ui,
+                    ui.conn.active_conn.get_untracked(),
+                )
+                .as_deref(),
             ),
             BlankKind::ServerVariables => {
                 crate::server_vars_view::open_for_active(ui.conn, ui.overlay)
             }
-            // On the query toolbar's database, as the gear's entry is.
+            // On the focused tab's database when that tab is on this
+            // connection, as the gear's entry is (`focused_database_on`).
             BlankKind::Performance => crate::perf_view::open_for_active(
                 ui.conn,
                 ui.overlay,
-                ui.tabs_ui.active_db.get_untracked(),
+                crate::overlays::focused_database_on(
+                    &ui.tabs_ui,
+                    ui.conn.active_conn.get_untracked(),
+                ),
             ),
         })
         .disabled(e.disabled)

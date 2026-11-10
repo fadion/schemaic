@@ -552,9 +552,11 @@ tested (they share `history.rs`'s shape; a new one belongs here, not in the UI):
   fallback. Switching connections doesn't move the focused tab and a tab keeps the connection
   it was opened on, so the focused tab routinely names a database that lives somewhere else;
   handing that name to the active connection's `Db` is how the MCP endpoint came to ask MariaDB
-  for `chinook`. It is here rather than in each of its four callers — the AI's turn context
+  for `chinook`. It is here rather than in each of its callers — the AI's turn context
   (`app/ai.rs`), the terminal's DB-CLI button (`app/main.rs`), the AI proposal card and the chat
-  code block's **Insert**/**Run** (both `ui/ai_panel.rs`) — because the last two are not
+  code block's **Insert**/**Run** (both `ui/ai_panel.rs`), and Performance and Users through
+  `ui/overlays.rs`'s `focused_database_on`, whose *Drop* and *Create index* had gone to another
+  server's database of the same name (`ui/perf_view.md`) — because the two in `ai_panel` are not
   harmless. The card's answer goes to
   `ddl_preview::preview_proposal`, which pairs it with `edit_ctx`'s *active* connection and
   stamps that `conn_id` into the plan `run_ddl` executes, so getting it wrong runs an `ALTER`

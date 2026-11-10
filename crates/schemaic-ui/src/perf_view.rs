@@ -948,6 +948,47 @@ fn footer(
 mod tests {
     use crate::i18n::tr;
 
+    /// **Performance and Users never open on another server's database.**
+    /// Every opener passed the focused tab's `active_db` as it was, whatever
+    /// connection that tab is on, so the view read — and offered *Drop* and
+    /// *Create index* against — a database of the wrong server. Each call now
+    /// resolves through `overlays::focused_database_on`; a call written with
+    /// `active_db` again fails here.
+    #[test]
+    fn no_server_view_opens_on_the_focused_tabs_database_unchecked() {
+        let mut offenders = Vec::new();
+        let mut calls = 0usize;
+        for (file, src) in crate::source_gate::crate_sources() {
+            for needle in [
+                "perf_view::open_for_active(",
+                "users_view::open_for_server(",
+            ] {
+                for (at, _) in src.match_indices(needle) {
+                    calls += 1;
+                    // The argument list, to its closing paren.
+                    let args = &src[at + needle.len()..];
+                    let mut depth = 1usize;
+                    let end = args
+                        .char_indices()
+                        .find(|&(_, c)| {
+                            match c {
+                                '(' => depth += 1,
+                                ')' => depth -= 1,
+                                _ => {}
+                            }
+                            depth == 0
+                        })
+                        .map_or(args.len(), |(i, _)| i);
+                    if args[..end].contains("active_db") {
+                        offenders.push(format!("{file}: {needle}{}", &args[..end]));
+                    }
+                }
+            }
+        }
+        assert!(calls >= 5, "the openers moved: {calls} calls found");
+        assert!(offenders.is_empty(), "{offenders:#?}");
+    }
+
     #[test]
     fn the_counted_figures_read_in_both_numbers() {
         assert_eq!(tr!("perf-calls", n = 1, shown = "1"), "1 call");

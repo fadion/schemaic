@@ -300,6 +300,25 @@ pub(crate) struct ObjectEntries {
     pub drop: bool,
 }
 
+/// The database a server-wide view opened from the tree's connection reads:
+/// the focused tab's, **only when that tab is on `active_conn`**
+/// ([`schemaic_core::tabsel::scoped_database`]), and none otherwise, so the
+/// view asks for one.
+///
+/// Performance and Users are opened from the selected connection, and the
+/// focused tab routinely sits on another: they took `active_db` as it was, so
+/// a tab on *dev* bound to `shop` opened Performance on *prod*'s `shop` —
+/// and offered *Drop* and *Create index* against it. The gear's entries, the
+/// tree's blank-space menu and the palette all resolve through this one.
+pub(crate) fn focused_database_on(tabs_ui: &TabsUi, active_conn: u64) -> Option<String> {
+    let tab = tabs_ui.tabs.with_untracked(|v| {
+        v.iter()
+            .find(|t| t.id == tabs_ui.active.get_untracked())
+            .map(|t| (t.conn_id.get_untracked(), t.database.get_untracked()))
+    });
+    schemaic_core::tabsel::scoped_database(tab, active_conn, None)
+}
+
 /// The target the schema tree's **Drop database** runs against: server-level,
 /// where `DdlScope::Server` wants the database the run must *avoid* — the one
 /// being dropped. It carried none, so on PostgreSQL the maintenance
@@ -1597,11 +1616,12 @@ pub(crate) fn schema_settings_overlay(
                             // privileges can be read from — see
                             // `users_view::open_for_server`.
                             GearKind::Users => {
-                                let database = tabs_ui.active_db.get_untracked();
+                                let active = conn.active_conn.get_untracked();
+                                let database = focused_database_on(&tabs_ui, active);
                                 crate::users_view::open_for_server(
                                     conn,
                                     overlay,
-                                    conn.active_conn.get_untracked(),
+                                    active,
                                     database.as_deref(),
                                 );
                             }
@@ -1611,7 +1631,7 @@ pub(crate) fn schema_settings_overlay(
                             GearKind::Performance => crate::perf_view::open_for_active(
                                 conn,
                                 overlay,
-                                tabs_ui.active_db.get_untracked(),
+                                focused_database_on(&tabs_ui, conn.active_conn.get_untracked()),
                             ),
                             // The read-only refusal is inside `open_for_new`,
                             // so every home of this action is guarded by
@@ -4950,9 +4970,11 @@ fn palette_commands(ui: &Ui, close: Rc<dyn Fn()>) -> Vec<Command> {
                 Rc::new({
                     let conn = ui.conn;
                     let overlay = ui.overlay;
-                    let active_db = ui.tabs_ui.active_db;
+                    let tabs_ui = ui.tabs_ui;
                     move || {
-                        crate::perf_view::open_for_active(conn, overlay, active_db.get_untracked())
+                        let database =
+                            focused_database_on(&tabs_ui, conn.active_conn.get_untracked());
+                        crate::perf_view::open_for_active(conn, overlay, database)
                     }
                 }),
                 &close,

@@ -9,7 +9,8 @@ reads. Anything it suggests you change goes through the SQL preview first.
 Choose **Performance** from the **SCHEMA** panel's gear menu, from a right-click on the tree's
 empty space, or from the command palette. It
 opens on the active connection and the database chosen in the query toolbar, both named in the
-title.
+title. If the tab you're in is on another connection, it opens with no database, since that
+tab's database belongs to the other server.
 
 **Statements** works without a database. **Indexes** and **Sizes** are about one database, so
 choose one in the query toolbar first.
