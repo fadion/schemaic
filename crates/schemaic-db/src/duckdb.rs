@@ -1700,14 +1700,20 @@ fn positional_strings(v: DValue) -> Vec<Option<String>> {
 /// `duckdb_functions()` reports the two as sibling lists, an untyped
 /// parameter's type `NULL` (measured on 2.0.0); left out, a typed macro was
 /// restated untyped. A default (`b := 2`) is in neither list —
-/// [`macro_hides_defaults`].
+/// [`macro_hides_defaults`]. **Each name through the quoter**
+/// (`ident_if_needed`, the form shows the list and the statement runs it): a
+/// reserved word or a name with a space, joined in bare, made *Copy DDL*, the
+/// dump and every edit of the macro fail to parse.
 fn macro_parameters(names: &[String], types: &[Option<String>]) -> String {
     names
         .iter()
         .enumerate()
-        .map(|(i, n)| match types.get(i).cloned().flatten() {
-            Some(t) if !t.is_empty() => format!("{n} {t}"),
-            _ => n.clone(),
+        .map(|(i, n)| {
+            let n = schemaic_core::export::ident_if_needed(n, D);
+            match types.get(i).cloned().flatten() {
+                Some(t) if !t.is_empty() => format!("{n} {t}"),
+                _ => n,
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -3521,6 +3527,34 @@ mod tests {
             .query_row("SELECT count(*) FROM tov(1, 2)", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// **A parameter whose name needs quoting is restated quoted**: a
+    /// reserved word or a name with a space was joined in bare, so *Copy
+    /// DDL*, the dump and every edit of the macro failed to parse — an
+    /// overload's parameters too.
+    #[test]
+    fn a_macro_parameter_that_needs_quoting_is_quoted() {
+        let db = mem("macro-quoted-params");
+        seed(
+            &db,
+            "CREATE MACRO q(\"select\", \"my b\") AS \"select\" + \"my b\";
+             CREATE MACRO ov(a) AS a, (a, \"from\") AS a * \"from\";",
+        );
+        let ms = macros_of(&db);
+        let dst = mem("macro-quoted-params-dst");
+        let (_i, c) = connect(&dst).unwrap();
+        for name in ["q", "ov"] {
+            let sql = macro_named(&ms, name, "").create_sql(SqlDialect::DuckDb, true);
+            c.execute_batch(&sql)
+                .unwrap_or_else(|e| panic!("{e}\n{sql}"));
+        }
+        let (q, ov): (i64, i64) = c
+            .query_row("SELECT q(1, 2), ov(3, 4)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((q, ov), (3, 12));
     }
 
     /// A path with no file behind it is refused before DuckDB is asked —

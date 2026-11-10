@@ -200,7 +200,9 @@ MySQL's emitter, and *Copy DDL* on a macro wrote `CREATE FUNCTION … NOT DETERM
 argument list is `macro_parameters` over `parameters` and `parameter_types`, the second read
 position by position (`positional_strings`, an untyped parameter's type being `NULL`), so a typed
 macro reads as `a INTEGER, b INTEGER`; before, it was read by name alone and *Copy DDL* and the
-dump restated it untyped. **A parameter's default is not in the catalogue**: it lists `b := 2`
+dump restated it untyped. Each name goes through `ident_if_needed`, so `"select"` or `"my b"` is
+restated quoted — joined bare, *Copy DDL*, the dump and every edit of the macro failed to parse
+(`a_macro_parameter_that_needs_quoting_is_quoted`). **A parameter's default is not in the catalogue**: it lists `b := 2`
 as `b` and holds the value in no column (measured on 2.0.0), so a text built from it declares the
 parameter without it. **Whether a macro has one is found by binding** (`macro_hides_defaults`):
 a default is the one thing that lets a call pass fewer arguments than an overload declares, so for each `k`
