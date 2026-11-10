@@ -3460,6 +3460,7 @@ perf-sizes-tables = Largest tables
 perf-sizes-indexes = Largest indexes
 perf-sizes-no-index-sizes = This engine reports index sizes per table, not per index.
 perf-sizes-no-indexes = This database has no indexes to size.
+perf-sizes-not-reported = This engine reports no table or index sizes, only row estimates.
 perf-rows-estimate = ~{ $shown } rows
 
 ## Edit snippet modal (snippet_edit.rs)

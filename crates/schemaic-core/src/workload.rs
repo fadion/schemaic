@@ -789,18 +789,37 @@ impl MissingIndex {
     }
 }
 
-/// Does this engine report its index sizes only per table — some table has
-/// index bytes, and no index has a figure of its own? MySQL's
-/// `INDEX_LENGTH` is one number for all of a table's indexes. An empty index
-/// ranking means *that* only when this holds; otherwise it means there are
-/// no indexes to rank.
+/// Does this engine report its index sizes only per table — some index
+/// exists (listed, or counted in a table's index bytes), and no index has a
+/// figure of its own? MySQL's `INDEX_LENGTH` is one number for all of a
+/// table's indexes. An empty index ranking means *that* only when this holds;
+/// otherwise it means there are no indexes to rank.
+///
+/// **Whether indexes exist, not how many bytes they hold.** It read bytes,
+/// and InnoDB's `INDEX_LENGTH` counts secondary indexes only — the clustered
+/// primary key is in `DATA_LENGTH` — so a database of primary keys alone was
+/// told it had "no indexes to size", and `schemaic sizes --indexes` exited 0.
 pub fn index_sizes_per_table_only(stats: &SchemaStats) -> bool {
     let tables = stats.tables();
-    tables.iter().any(|t| t.index_bytes.unwrap_or(0) > 0)
+    let some_index = tables
+        .iter()
+        .any(|t| !t.indexes.is_empty() || t.index_bytes.unwrap_or(0) > 0);
+    some_index
         && !tables
             .iter()
             .flat_map(|t| &t.indexes)
             .any(|i| i.bytes.is_some())
+}
+
+/// Does this engine report how many bytes a table or an index takes? Not
+/// DuckDB, whose `duckdb_tables()` estimates rows only, so its size ranking is
+/// no answer rather than an empty one — said, never drawn as an empty list.
+/// Exhaustive, so another engine answers here.
+pub fn reports_sizes(dialect: SqlDialect) -> bool {
+    match dialect {
+        SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite | SqlDialect::MsSql => true,
+        SqlDialect::DuckDb => false,
+    }
 }
 
 /// The DMV's column list — `[a], [b]]c], [d]` — as names. A `]` inside a
@@ -1460,6 +1479,33 @@ mod tests {
         // A database with no indexes at all is not the per-table case.
         let bare = tstat("t", vec![]);
         assert!(!index_sizes_per_table_only(&SchemaStats::new(vec![bare])));
+    }
+
+    /// **A MySQL database of primary keys only still has indexes.** InnoDB's
+    /// `INDEX_LENGTH` counts secondary indexes alone, the clustered key
+    /// being in `DATA_LENGTH`, so every table read `Some(0)` — and the
+    /// predicate, reading bytes, said "no indexes to size" (exit 0, no rows).
+    #[test]
+    fn a_primary_key_only_mysql_database_sizes_indexes_per_table() {
+        let mut my = tstat("t", vec![istat("PRIMARY", Some(1), None)]);
+        my.data_bytes = Some(16_384);
+        my.index_bytes = Some(0);
+        assert!(index_sizes_per_table_only(&SchemaStats::new(vec![my])));
+    }
+
+    /// DuckDB reports no byte figure for a table or an index, so a size
+    /// ranking there is not an empty answer but no answer.
+    #[test]
+    fn only_duckdb_reports_no_sizes() {
+        assert!(!reports_sizes(SqlDialect::DuckDb));
+        for d in [
+            SqlDialect::MySql,
+            SqlDialect::Postgres,
+            SqlDialect::Sqlite,
+            SqlDialect::MsSql,
+        ] {
+            assert!(reports_sizes(d), "{d:?}");
+        }
     }
 
     #[test]

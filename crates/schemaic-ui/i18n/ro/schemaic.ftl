@@ -3061,6 +3061,7 @@ perf-sizes-tables = Cele mai mari tabele
 perf-sizes-indexes = Cele mai mari indexuri
 perf-sizes-no-index-sizes = Acest motor raportează dimensiunile indexurilor pe tabel, nu pe index.
 perf-sizes-no-indexes = Această bază de date nu are indexuri de măsurat.
+perf-sizes-not-reported = Acest motor nu raportează dimensiuni de tabele sau de indexuri, doar estimări ale rândurilor.
 perf-rows-estimate = ~{ $shown } rânduri
 
 ## Edit snippet modal (snippet_edit.rs)

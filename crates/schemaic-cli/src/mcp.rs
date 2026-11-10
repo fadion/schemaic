@@ -1899,6 +1899,13 @@ async fn table_sizes(db: &Db, database: Option<&str>, args: &Value) -> (String, 
         Ok(n) => n,
         Err(e) => return (e, true),
     };
+    // Said, never drawn as an empty list: DuckDB estimates rows only.
+    if !schemaic_core::workload::reports_sizes(dialect_of(db)) {
+        return (
+            "This engine reports no table or index sizes, only row estimates.".to_string(),
+            false,
+        );
+    }
     let stats = match perf_stats(db, database).await {
         Ok(s) => s,
         Err(e) => return e,

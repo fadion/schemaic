@@ -142,13 +142,14 @@ Four commands read what the app's [Performance](../schema/performance.md) view a
   `performance_schema`'s digests on MySQL and MariaDB, and the database's Query Store on SQL
   Server ([what turning each on takes](mcp.md#performance-tools)). When the source is off it says
   why on stderr and exits 2, with `hint: to turn it on, run:` and the statement where one does it.
-  It never runs it. SQLite keeps no statistics, so it exits 2 there too.
+  It never runs it. SQLite and DuckDB keep no statistics, so it exits 2 there too.
 - *Usage counts start again* when the server restarts or its statistics are reset, so an index
   `indexes` calls unused may only be unused lately. The note on stderr says so, or that the server
   keeps no counts and only duplicates and prefixes are listed.
 - *Missing indexes.* On SQL Server, `indexes --missing` lists the indexes the optimiser recorded
   as missing instead, with a `ddl` column holding the `CREATE INDEX` for each. Elsewhere it exits 2.
 - *Index sizes.* MySQL and MariaDB size indexes per table, not per index, so `sizes --indexes`
-  exits 2 there.
-- *Locks.* SQLite has no server sessions, so `locks` exits 2 there. MariaDB lists only locks
+  exits 2 there, even on a database whose tables have only primary keys. DuckDB reports no sizes
+  at all, so `sizes` exits 2 there, with or without `--indexes`.
+- *Locks.* SQLite and DuckDB have no server sessions, so `locks` exits 2 there. MariaDB lists only locks
   someone is waiting on, and says so on stderr.

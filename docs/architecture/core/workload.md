@@ -69,7 +69,10 @@ why that was wrong: a cluster brought up by `pg_upgrade` keeps the extension obj
 someone runs `ALTER EXTENSION … UPDATE`, so a 16 server with extension 1.7 failed with *column
 s.total_exec_time does not exist* rather than listing
 (`the_statement_columns_follow_the_extensions_version_not_the_servers`). The capabilities are
-`supports_statement_stats`, false on SQLite alone, and `supports_missing_index_hints`, true on SQL
+`supports_statement_stats`, false on SQLite and DuckDB (embedded, so no server keeps a
+statement history), `reports_sizes`, false on DuckDB alone (its `duckdb_tables()` estimates rows
+and no bytes, so a size ranking there is no answer rather than an empty one), and
+`supports_missing_index_hints`, true on SQL
 Server alone — PostgreSQL and MySQL record nothing of the kind, and inferring one from the
 statement list would be guessing.
 **Index health adds no catalogue read of its own.** `index_health(tables, stats)` sweeps the
@@ -173,7 +176,12 @@ edit itself is `MissingIndex::add_to`**, which pushes `index_info()` onto a draf
 the draft edit for the preview rather than a script — one decision of how a suggestion becomes an
 index, two front ends (`ui/perf_view.md`). `index_sizes_per_table_only` is the other question a
 size list needs answered: an empty index ranking means "this engine sizes indexes per table"
-only when some table has index bytes and no index has a figure of its own, and otherwise that
-there are no indexes (`only_a_table_wide_index_figure_means_sizes_are_per_table`). Verified
+only when **some index exists** — listed, or counted in a table's index bytes — and none has a
+figure of its own, and otherwise that there are no indexes
+(`only_a_table_wide_index_figure_means_sizes_are_per_table`). It asked for index *bytes*, and
+InnoDB's `INDEX_LENGTH` counts secondary indexes only (the clustered primary key is in
+`DATA_LENGTH`), so a MySQL database of primary keys alone was told it had "no indexes to size",
+in the view, the MCP tool and `schemaic sizes --indexes` with exit 0
+(`a_primary_key_only_mysql_database_sizes_indexes_per_table`). Verified
 live by the change's author: duplicate and redundant detection on MariaDB 10.11, and that same
 statement from a real SQL Server's DMVs through `index_health`.

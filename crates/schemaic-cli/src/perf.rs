@@ -333,6 +333,146 @@ pub fn usage_note(stats: &SchemaStats) -> &'static str {
     }
 }
 
+/// A line the CLI writes to stderr beside its rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Note {
+    /// `schemaic: …` — what the answer is, or why there is none.
+    Warn(String),
+    /// `hint: …` — what to do about the line before it.
+    Hint(String),
+}
+
+/// What a `schemaic` performance command prints and how it exits, decided
+/// from what the read returned — pure, so the contract "exit 2 when the
+/// server cannot answer, exit 0 when it answered empty" is tested rather
+/// than written inline after a live `connect`, which is where a wrong exit 0
+/// once sat unseen.
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    /// The rows, written to stdout first; `None` when there is no answer.
+    pub rows: Option<ResultSet>,
+    pub notes: Vec<Note>,
+    /// Did the server answer? `false` is exit 2: the answer is not there,
+    /// and a script must not read its absence as an empty list.
+    pub answered: bool,
+}
+
+fn warn(s: impl Into<String>) -> Note {
+    Note::Warn(s.into())
+}
+
+/// `schemaic statements`: a source that is off is no answer, with the one
+/// statement that turns it on (never run); one that is on and has counted
+/// nothing yet is an empty answer, with a note.
+pub fn statements_outcome(report: &wl::StatementReport, dialect: SqlDialect) -> Outcome {
+    match report {
+        wl::StatementReport::Ready { statements, since } => {
+            let mut notes = Vec::new();
+            if statements.is_empty() {
+                notes.push(warn(
+                    "the statistics source is on but has recorded no statements yet",
+                ));
+            }
+            if let Some(since) = since {
+                notes.push(warn(format!("counted since {since}")));
+            }
+            Outcome {
+                rows: Some(statements_result(statements, dialect)),
+                notes,
+                answered: true,
+            }
+        }
+        wl::StatementReport::Unavailable(u) => {
+            let mut notes = vec![warn(u.reason())];
+            if let Some(sql) = u.enable_sql() {
+                notes.push(Note::Hint(format!("to turn it on, run: {sql}")));
+            }
+            Outcome {
+                rows: None,
+                notes,
+                answered: false,
+            }
+        }
+    }
+}
+
+/// `schemaic sizes`: the largest `limit` tables, or with `of_indexes` the
+/// largest indexes. **No answer** where the engine reports no sizes at all
+/// ([`wl::reports_sizes`], DuckDB) or, under `of_indexes`, sizes indexes per
+/// table only ([`wl::index_sizes_per_table_only`], MySQL — a database of
+/// primary keys alone included); an empty answer where the database has no
+/// tables, or no indexes, to size.
+pub fn sizes_outcome(
+    stats: &SchemaStats,
+    dialect: SqlDialect,
+    database: &str,
+    of_indexes: bool,
+    limit: usize,
+) -> Outcome {
+    let none = |notes: Vec<Note>| Outcome {
+        rows: None,
+        notes,
+        answered: false,
+    };
+    if !wl::reports_sizes(dialect) {
+        return none(vec![warn(
+            "this engine reports no table or index sizes, only row estimates",
+        )]);
+    }
+    let (tables, indexes) = wl::largest(stats, limit);
+    if !of_indexes {
+        let notes = if tables.is_empty() {
+            vec![warn(format!("{database} reported no table sizes"))]
+        } else {
+            Vec::new()
+        };
+        return Outcome {
+            rows: Some(table_sizes_result(&tables)),
+            notes,
+            answered: true,
+        };
+    }
+    if indexes.is_empty() && wl::index_sizes_per_table_only(stats) {
+        return none(vec![warn(
+            "this engine reports index sizes per table, not per index",
+        )]);
+    }
+    let notes = if indexes.is_empty() {
+        vec![warn(format!("{database} has no indexes to size"))]
+    } else {
+        Vec::new()
+    };
+    Outcome {
+        rows: Some(index_sizes_result(&indexes)),
+        notes,
+        answered: true,
+    }
+}
+
+/// `schemaic locks`: the list, with the MCP tool's wording for an empty one
+/// and for a server that lists contended locks only, so the two say one
+/// thing of one server. (An engine with no server sessions is refused before
+/// anything is opened, by `supports_activity`.)
+pub fn locks_outcome(list: &LockList) -> Outcome {
+    let mut notes = Vec::new();
+    match (list.locks.is_empty(), list.contended_only) {
+        (true, true) => notes.push(warn(
+            "no session is waiting on a lock (this server lists contended locks only)",
+        )),
+        (true, false) => notes.push(warn("no locks are held or waited for")),
+        (false, true) => notes.push(warn("this server lists contended locks only")),
+        (false, false) => {}
+    }
+    if list.truncated {
+        notes.push(warn("the list was capped; more locks exist"));
+    }
+    Outcome {
+        rows: Some(locks_result(list)),
+        notes,
+        answered: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +510,118 @@ mod tests {
         assert_eq!(cell(&rs, 0, 2), "3");
         assert!(rs.cell(0, 3).is_some_and(|c| c.is_null()));
         assert_eq!(cell(&rs, 0, 5), "SELECT * FROM t WHERE id = ?");
+    }
+
+    // ── The perf commands' exit decisions (S6.2-L6-01) ──
+
+    fn stats_of(tables: Vec<schemaic_core::stats::TableStats>) -> SchemaStats {
+        SchemaStats::new(tables)
+    }
+
+    fn table_stats(
+        name: &str,
+        data: Option<u64>,
+        index: Option<u64>,
+        indexes: Vec<(&str, Option<u64>)>,
+    ) -> schemaic_core::stats::TableStats {
+        schemaic_core::stats::TableStats {
+            table: name.into(),
+            data_bytes: data,
+            index_bytes: index,
+            indexes: indexes
+                .into_iter()
+                .map(|(n, b)| schemaic_core::stats::IndexStats {
+                    name: n.into(),
+                    bytes: b,
+                    is_primary: n == "PRIMARY",
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_statement_source_that_is_off_is_no_answer_with_the_statement_that_turns_it_on() {
+        let o = statements_outcome(
+            &wl::StatementReport::Unavailable(Unavailable::ExtensionNotInstalled),
+            SqlDialect::Postgres,
+        );
+        assert!(!o.answered);
+        assert!(o.rows.is_none());
+        assert!(o.notes.contains(&Note::Hint(
+            "to turn it on, run: CREATE EXTENSION pg_stat_statements;".into()
+        )));
+    }
+
+    #[test]
+    fn a_statement_source_with_nothing_counted_is_an_empty_answer() {
+        let o = statements_outcome(
+            &wl::StatementReport::Ready {
+                statements: vec![],
+                since: None,
+            },
+            SqlDialect::Postgres,
+        );
+        assert!(o.answered);
+        assert_eq!(o.rows.map(|r| r.row_count()), Some(0));
+        assert_eq!(o.notes.len(), 1);
+    }
+
+    /// **S6.2-L1-01**: a MySQL database of primary keys only — `PRIMARY`
+    /// listed with no figure, `INDEX_LENGTH` 0 — is the per-table case, exit
+    /// 2, not "no indexes to size" and exit 0.
+    #[test]
+    fn index_sizes_on_a_primary_key_only_mysql_database_are_no_answer() {
+        let stats = stats_of(vec![table_stats(
+            "t",
+            Some(16_384),
+            Some(0),
+            vec![("PRIMARY", None)],
+        )]);
+        let o = sizes_outcome(&stats, SqlDialect::MySql, "shop", true, 20);
+        assert!(!o.answered, "{o:?}");
+        assert!(o.rows.is_none());
+        // The tables are still sized.
+        let o = sizes_outcome(&stats, SqlDialect::MySql, "shop", false, 20);
+        assert!(o.answered);
+        assert_eq!(o.rows.map(|r| r.row_count()), Some(1));
+    }
+
+    #[test]
+    fn index_sizes_on_a_database_with_no_indexes_are_an_empty_answer() {
+        let stats = stats_of(vec![table_stats("t", Some(8_192), Some(0), vec![])]);
+        let o = sizes_outcome(&stats, SqlDialect::Postgres, "shop", true, 20);
+        assert!(o.answered);
+        assert_eq!(
+            o.notes,
+            vec![Note::Warn("shop has no indexes to size".into())]
+        );
+    }
+
+    /// **R2-L8-04**: DuckDB reports no byte figures, so neither ranking is
+    /// an empty answer.
+    #[test]
+    fn sizes_on_duckdb_are_no_answer_and_say_why() {
+        let stats = stats_of(vec![table_stats("t", None, None, vec![])]);
+        for of_indexes in [false, true] {
+            let o = sizes_outcome(&stats, SqlDialect::DuckDb, "memory", of_indexes, 20);
+            assert!(!o.answered, "{of_indexes}");
+            assert!(o.rows.is_none());
+            assert!(
+                matches!(&o.notes[..], [Note::Warn(m)] if m.contains("no table or index sizes"))
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_lock_list_is_an_answer_that_says_which_empty() {
+        let o = locks_outcome(&LockList {
+            contended_only: true,
+            ..Default::default()
+        });
+        assert!(o.answered);
+        assert!(matches!(&o.notes[..], [Note::Warn(m)] if m.contains("contended locks only")));
     }
 
     /// **`pg_stat_statements` keeps a role's password.** What the MCP tool

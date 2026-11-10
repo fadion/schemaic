@@ -136,6 +136,11 @@ A DuckDB connection is a database file on this machine, like SQLite's; see
 
 There's no **Restore from file**: to restore a backup, open the copy as a connection, as on SQLite.
 
+**Performance** shows index health only. DuckDB keeps no statement statistics and has no server
+sessions, so there are no statements or locks to list, and it reports no table or index sizes,
+only an estimate of each table's rows: the **Sizes** list says so, and `schemaic sizes` and
+`statements` exit 2. See [Performance](../schema/performance.md).
+
 There are no users to manage, as on SQLite. The AI assistant and the command line read only the
 database's own tables: DuckDB's readers for files on your computer, such as `read_csv`, are
 refused there. See [Data access](../ai/data-access.md).

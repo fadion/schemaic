@@ -2277,7 +2277,6 @@ async fn statements(
     limit: usize,
     timeout: Duration,
 ) -> Exit {
-    use schemaic_core::workload::StatementReport;
     let conn = match select_conn(conns, &target.conn) {
         Ok(c) => c,
         Err(exit) => return exit,
@@ -2300,28 +2299,28 @@ async fn statements(
         Ok(r) => r,
         Err(exit) => return exit,
     };
-    match report {
-        StatementReport::Ready { statements, since } => {
-            let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
-            let rows = crate::perf::statements_result(&statements, dialect);
-            if let Err(exit) = emit_rows(&rows, out) {
-                return exit;
-            }
-            if statements.is_empty() {
-                warn("the statistics source is on but has recorded no statements yet");
-            }
-            if let Some(since) = since {
-                warn(&format!("counted since {since}"));
-            }
-            Exit::Ok
+    let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
+    perf_exit(crate::perf::statements_outcome(&report, dialect), out)
+}
+
+/// Print a performance command's [`crate::perf::Outcome`] — its rows, then
+/// its notes — and exit by it: 2 where the server had no answer.
+fn perf_exit(outcome: crate::perf::Outcome, out: Output) -> Exit {
+    if let Some(rows) = &outcome.rows
+        && let Err(exit) = emit_rows(rows, out)
+    {
+        return exit;
+    }
+    for note in &outcome.notes {
+        match note {
+            crate::perf::Note::Warn(m) => warn(m),
+            crate::perf::Note::Hint(m) => hint(m),
         }
-        StatementReport::Unavailable(u) => {
-            warn(&u.reason());
-            if let Some(sql) = u.enable_sql() {
-                hint(&format!("to turn it on, run: {sql}"));
-            }
-            Exit::Usage
-        }
+    }
+    if outcome.answered {
+        Exit::Ok
+    } else {
+        Exit::Usage
     }
 }
 
@@ -2420,7 +2419,9 @@ async fn indexes(
 /// **An engine that sizes indexes per table only is exit 2 under
 /// `--indexes`**, which is a question it cannot answer — told apart from a
 /// database that simply has no indexes, which is exit 0 and no rows
-/// ([`schemaic_core::workload::index_sizes_per_table_only`]).
+/// ([`schemaic_core::workload::index_sizes_per_table_only`]) — and so is one
+/// that reports no sizes at all (DuckDB). Decided by
+/// [`crate::perf::sizes_outcome`].
 async fn sizes(
     conns: &[Connection],
     target: &Target,
@@ -2429,7 +2430,6 @@ async fn sizes(
     limit: usize,
     timeout: Duration,
 ) -> Exit {
-    use schemaic_core::workload as wl;
     let conn = match select_conn(conns, &target.conn) {
         Ok(c) => c,
         Err(exit) => return exit,
@@ -2450,27 +2450,11 @@ async fn sizes(
             Ok(s) => s,
             Err(exit) => return exit,
         };
-    let (tables, indexes) = wl::largest(&stats, limit);
-    if !of_indexes {
-        if let Err(exit) = emit_rows(&crate::perf::table_sizes_result(&tables), out) {
-            return exit;
-        }
-        if tables.is_empty() {
-            warn(&format!("{database} reported no table sizes"));
-        }
-        return Exit::Ok;
-    }
-    if indexes.is_empty() && wl::index_sizes_per_table_only(&stats) {
-        warn("this engine reports index sizes per table, not per index");
-        return Exit::Usage;
-    }
-    if let Err(exit) = emit_rows(&crate::perf::index_sizes_result(&indexes), out) {
-        return exit;
-    }
-    if indexes.is_empty() {
-        warn(&format!("{database} has no indexes to size"));
-    }
-    Exit::Ok
+    let dialect = schemaic_core::intel::SqlDialect::from_db_type(&conn.db_type);
+    perf_exit(
+        crate::perf::sizes_outcome(&stats, dialect, &database, of_indexes, limit),
+        out,
+    )
 }
 
 /// `schemaic locks` — the locks sessions hold and wait for
@@ -2496,22 +2480,7 @@ async fn locks(conns: &[Connection], args: &ConnArgs, out: Output, timeout: Dura
         Ok(l) => l,
         Err(exit) => return exit,
     };
-    if let Err(exit) = emit_rows(&crate::perf::locks_result(&list), out) {
-        return exit;
-    }
-    // The MCP tool's wording, so the two say one thing of one server.
-    match (list.locks.is_empty(), list.contended_only) {
-        (true, true) => {
-            warn("no session is waiting on a lock (this server lists contended locks only)")
-        }
-        (true, false) => warn("no locks are held or waited for"),
-        (false, true) => warn("this server lists contended locks only"),
-        (false, false) => {}
-    }
-    if list.truncated {
-        warn("the list was capped; more locks exist");
-    }
-    Exit::Ok
+    perf_exit(crate::perf::locks_outcome(&list), out)
 }
 
 /// Did this statement fail because it ran with no database — so the

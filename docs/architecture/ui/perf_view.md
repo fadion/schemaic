@@ -22,7 +22,9 @@ and before `Create database` (skeleton group 2, beside `tree-server-variables` i
 (*Performance*), an `instant` command. The gear row — and the blank-space row, wherever that
 menu is raised at all — is **present whenever a connection exists and asks no capability** —
 every engine has something to show, SQLite its index health and its
-`dbstat` sizes with no statement history, which the view says — and dimmed on a **down**
+`dbstat` sizes with no statement history, DuckDB its index health with no statement history and
+no sizes (`workload::reports_sizes`; *Sizes* says `perf-sizes-not-reported` rather than "reported
+no table sizes"), which the view says — and dimmed on a **down**
 connection but not on a read-only one: it is a read, and its *Drop* and *Create index* land in the
 preview, which carries the read-only refusal. That is a departure from the row above it, which
 asks `server_vars::supports_server_vars` although every engine answers `true`, so that a fifth

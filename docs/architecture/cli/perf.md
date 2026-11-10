@@ -43,3 +43,18 @@ every `index_health` answer ends with, chosen by `workload::usage_counted`: wher
 counted, that the counts run from the last restart or statistics reset, so an index only a
 monthly job uses can look unused; where nothing was, that no index can be called unused and only
 duplicates and prefixes are shown (`the_usage_note_says_when_nothing_was_counted`).
+**And how a `schemaic` performance command exits is decided here**, as a pure function of what its
+read returned — `statements_outcome(report, dialect)`, `sizes_outcome(stats, dialect, database,
+of_indexes, limit)` and `locks_outcome(list)`, each a `perf::Outcome`: the rows (`None` when there
+is no answer), the stderr lines as `Note::Warn` and `Note::Hint`, and whether the server
+`answered`, which `run.rs`'s `perf_exit` maps to exit 0 or 2. The contract is "exit 2 when the
+server cannot answer, exit 0 when it answered empty": a statement source that is off is no answer,
+with the statement that turns it on as a hint; one that has counted nothing is an empty answer
+with a note; `sizes` on an engine that reports no sizes (`workload::reports_sizes`, DuckDB) is no
+answer with or without `--indexes`, as is `--indexes` where indexes are sized per table — MySQL's
+primary-key-only database included — while a database with no indexes is an empty answer; and an
+empty lock list says which empty it is in the MCP tool's words. The decisions were inline in the
+runners after a live `connect`, which is how the primary-key-only exit 0 went unseen
+(`index_sizes_on_a_primary_key_only_mysql_database_are_no_answer`,
+`sizes_on_duckdb_are_no_answer_and_say_why`,
+`a_statement_source_that_is_off_is_no_answer_with_the_statement_that_turns_it_on`).

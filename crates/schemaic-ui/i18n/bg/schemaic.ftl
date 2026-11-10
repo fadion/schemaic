@@ -2962,6 +2962,7 @@ perf-sizes-tables = Най-големи таблици
 perf-sizes-indexes = Най-големи индекси
 perf-sizes-no-index-sizes = Тази система съобщава размерите на индексите по таблица, а не по индекс.
 perf-sizes-no-indexes = Тази база данни няма индекси, чийто размер да се покаже.
+perf-sizes-not-reported = Тази система не съобщава размери на таблици и индекси, а само приблизителен брой редове.
 perf-rows-estimate = ~{ $shown } реда
 
 ## Edit snippet modal (snippet_edit.rs)

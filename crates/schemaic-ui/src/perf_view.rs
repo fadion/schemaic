@@ -391,7 +391,7 @@ fn body(ctx: &PerfCtx, t: &PerfTarget, st: PerfState, slow: RwSignal<bool>) -> A
                 tables,
                 indexes,
                 per_table,
-            } => sizes_list(tables, indexes, *per_table),
+            } => sizes_list(t.dialect, tables, indexes, *per_table),
         },
     }
 }
@@ -788,7 +788,21 @@ fn missing_row(ctx: &PerfCtx, t: &PerfTarget, m: &MissingIndex) -> AnyView {
         .into_any()
 }
 
-fn sizes_list(tables: &[SizeEntry], indexes: &[SizeEntry], per_table: bool) -> AnyView {
+fn sizes_list(
+    dialect: SqlDialect,
+    tables: &[SizeEntry],
+    indexes: &[SizeEntry],
+    per_table: bool,
+) -> AnyView {
+    // Said, never drawn as an empty list: DuckDB estimates rows only, and
+    // "this database reported no table sizes" read as if it were empty.
+    if !schemaic_core::workload::reports_sizes(dialect) {
+        return message(
+            icons::CIRCLE_QUESTION,
+            theme::text_faint,
+            tr!("perf-sizes-not-reported"),
+        );
+    }
     if tables.is_empty() {
         return message(
             icons::CIRCLE_QUESTION,

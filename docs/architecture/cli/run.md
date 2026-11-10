@@ -261,7 +261,10 @@ line under 2. That is `statements` on a source that is off or unreadable
 (`activity::supports_activity`), **both asked of the saved connection's dialect before
 connecting**; and `sizes --indexes` with an empty list where `workload::index_sizes_per_table_only`
 says the engine sizes indexes per table, which only the read can tell, told apart from a database
-with no indexes (exit 0). `indexes` and `sizes` need a database — `perf_database`, which is
+with no indexes (exit 0) — a MySQL database of primary keys alone included, which read "no indexes
+to size" and exit 0 while the predicate asked for index bytes — and `sizes` with or without
+`--indexes` on an engine that reports no sizes at all (`workload::reports_sizes`, DuckDB), which
+printed an empty table and exited 0. `indexes` and `sizes` need a database — `perf_database`, which is
 `database_for` or a `warn`, the no-database `hint:`'s `Refused` arm and exit 2, before anything
 is dialled — while `statements` passes `database_for`'s `Option` through, `fetch_top_statements`
 resolving `None` to the connection's own, and `locks` has no `-d` at all. **Every read goes through
@@ -278,8 +281,14 @@ view's figure, where the tool takes `PERF_ROWS`), paired with their DDL by `perf
 printed through `missing_with_ddl_result`, **the DDL a column of the row** rather than the tool's
 numbered text below the table (`cli/perf.md`), then a note to check each against `schemaic
 indexes` before creating it. Nothing is run. `sizes` is `workload::largest` over
-`fetch_table_stats` at `--limit`. These four runners have no unit test of their own; their
-argument surface is `args.rs`'s, their tables `perf.rs`'s.
+`fetch_table_stats` at `--limit`. **What `statements`, `sizes` and `locks` print and how they
+exit is decided in `perf.rs`, not here**: `perf::statements_outcome`, `sizes_outcome` and
+`locks_outcome` turn what the read returned into a `perf::Outcome` — the rows, the `Note::Warn`/
+`Note::Hint` lines and whether the server `answered` — and `perf_exit` prints it and maps
+`answered: false` to `Exit::Usage`, so the exit contract is unit-tested (`cli/perf.md`) where it
+had been written inline after a live `connect`, which is where the primary-key-only exit 0 sat
+unseen. The runners themselves still have no unit test; their argument surface is `args.rs`'s,
+their tables and outcomes `perf.rs`'s.
 **`export` is `run_export`, `run_query`'s order with the format judged first.** The format is
 the command line's to get right, so it is resolved before a connection is selected:
 `ExportFormat::from_name(--format)`, else `ExportFormat::for_path(--output)`, and neither is a

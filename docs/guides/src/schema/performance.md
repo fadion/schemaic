@@ -30,7 +30,7 @@ The figures come from a source that has to be turned on in the server. When it's
 says which source and why. Where one statement turns it on, the view shows it with a copy icon
 beside it (**Copy**); run it in a query tab yourself, since Schemaic never runs it for you.
 [Performance tools](../cli/mcp.md#performance-tools) lists each engine's source and what turning
-it on takes. SQLite keeps no statement statistics, and the view says so.
+it on takes. SQLite and DuckDB keep no statement statistics, and the view says so.
 
 ## Indexes
 
@@ -72,7 +72,8 @@ view.
 
 **Largest tables** lists tables by size, with an estimate of their rows. **Largest indexes** lists
 indexes by size. MySQL and MariaDB report index size per table rather than per index, so there
-that list says so instead.
+that list says so instead, even when every table has only a primary key. DuckDB reports no sizes
+at all, only an estimate of each table's rows, and the view says so.
 
 ## Keeping it current
 

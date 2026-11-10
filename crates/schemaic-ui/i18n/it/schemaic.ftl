@@ -2965,6 +2965,7 @@ perf-sizes-tables = Tabelle più grandi
 perf-sizes-indexes = Indici più grandi
 perf-sizes-no-index-sizes = Questo motore riporta le dimensioni degli indici per tabella, non per indice.
 perf-sizes-no-indexes = Questo database non ha indici da misurare.
+perf-sizes-not-reported = Questo motore non riporta dimensioni di tabelle né di indici, solo stime delle righe.
 perf-rows-estimate = ~{ $shown } righe
 
 ## Edit snippet modal (snippet_edit.rs)

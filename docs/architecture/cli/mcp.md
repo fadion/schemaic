@@ -599,7 +599,9 @@ contended locks only; its description sends the model to the user, and the panel
 session*, for a session that should end. `table_sizes {database?, limit?}` is `workload::largest`
 over `fetch_table_stats`, and rather than printing an empty second table says which empty it is —
 the engine reports index sizes per table, or the database has none — by
-`workload::index_sizes_per_table_only`, the question the app's view asks too. `index_health {database?}` reads the database's schema (`with_deadline`)
+`workload::index_sizes_per_table_only`, the question the app's view asks too — and on an engine
+that reports no sizes at all (`workload::reports_sizes`, DuckDB) says so before reading anything,
+rather than "reported no table sizes". `index_health {database?}` reads the database's schema (`with_deadline`)
 and its stats and prints `workload::index_health`'s findings and `perf::usage_note`, and its
 description tells the model to say "unused since …", never "never used". **The findings are held
 to `MCP_ROW_CAP`** (`format_findings`), as `run_query`'s rows and a plan are, in
