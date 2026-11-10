@@ -61,13 +61,22 @@ remember. `every_fixed_row_reads_as_chords` fails on a row `Chord::parse` cannot
 would otherwise fall out of that list in silence, and `no_default_is_a_fixed_key` on a command
 default the table has since claimed, which `Keymap::load` would report to every user with no
 `keymap.json` at all. **A row is therefore also how a key the app does not bind itself is
-protected.** The Editor group lists two of floem's own editor bindings (`keypress::add_default_*`)
-— `Alt+Shift+↑ / Alt+Shift+↓`, copy the line up or down, and `Ctrl+Alt+↑ / Ctrl+Alt+↓`, add a
-cursor above or below — because the editor answers a Global command before its own keys, so a
-command moved onto one took it from the editor in silence; listed, they are fixed keys no command
-can be moved onto. **Ctrl+PgUp/PgDn, floem's scroll, is deliberately not listed**: it is the
-conventional tab-cycling key, and there the user's choice should win in the editor too (the
-change's author's call). **`chord_of` reads a press as a chord: an ASCII letter by its logical
+protected.** The Editor group lists floem's own editor bindings (`keypress::add_default_*`)
+that no refusal already covers — `Alt+Shift+↑ / Alt+Shift+↓`, copy the line up or down,
+`Ctrl+Alt+↑ / Ctrl+Alt+↓`, add a cursor, `Ctrl+L`, `Ctrl+Shift+L` and `Ctrl+U` (select the line,
+select every occurrence, undo a cursor change), `Ctrl+Ins` (copy) off macOS, and on macOS alone,
+behind `#[cfg(target_os = "macos")]` on the row, Cmd+Shift+K (delete line), Cmd+Shift+Enter (new
+line above) and Ctrl+E (line end, a control press `primary_held` reads as the primary there) —
+because the editor answers a Global command before its own keys, so a command moved onto one
+took it from the editor in silence; listed, they are fixed keys no command can be moved onto.
+**`every_floem_editor_binding_is_fixed_refused_or_an_exception` walks floem's own
+`KeypressMap::default()` for the host platform** and fails on any binding that is neither a fixed
+row, refused (`Chord::refusal_on`) nor a named exception, so a floem bump that adds one fails
+there (the macOS rows on the macOS CI leg); five keys had been missed when only the first two rows
+were added by hand. `every_documented_letter_is_still_bound` counts floem's letters as bound for
+the same reason. **Ctrl+PgUp/PgDn, floem's scroll, is the test's one exception, deliberately**:
+it is the conventional tab-cycling key, and there the user's choice should win in the editor too
+(the change's author's call). **`chord_of` reads a press as a chord: an ASCII letter by its logical
 character, anything else by its physical key's US character** (`chord_from`, `us_char`). A
 letter follows the layout, so Ctrl+Z is where the Z is on AZERTY; a digit, punctuation, a letter
 Shift or AltGr has changed and a non-Latin letter are read by the key they sit on, so

@@ -135,6 +135,13 @@ Find anywhere (<kbd>Ctrl</kbd>+<kbd>P</kbd>) does the same.
 | <kbd>Alt</kbd>+<kbd>↑</kbd> / <kbd>Alt</kbd>+<kbd>↓</kbd> | Move line up / down |
 | <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>↓</kbd> | Copy line up / down |
 | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>↑</kbd> / <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>↓</kbd> | Add a cursor above / below |
+| <kbd>Ctrl</kbd>+<kbd>L</kbd> | Select the current line |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd> | Select every occurrence of the selection |
+| <kbd>Ctrl</kbd>+<kbd>U</kbd> | Undo the last cursor or selection change |
+| <kbd>Ctrl</kbd>+<kbd>Insert</kbd> | Copy (not on macOS) |
+| <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>K</kbd> | Delete line (macOS) |
+| <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>Enter</kbd> | New line above (macOS) |
+| <kbd>Ctrl</kbd>+<kbd>E</kbd> | Go to line end (macOS) |
 | <kbd>Alt</kbd>+<kbd>Enter</kbd> | Apply the quick fix under the caret |
 | <kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> | Indent / outdent |
 | <kbd>Tab</kbd> / <kbd>Ctrl</kbd>+<kbd>→</kbd> | Take the inline prediction (→ too, at a line's end) / its next word |

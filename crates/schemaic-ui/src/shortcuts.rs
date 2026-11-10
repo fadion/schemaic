@@ -550,6 +550,22 @@ pub(crate) const SHORTCUTS: &[ShortcutGroup] = &[
             ("Ctrl+Alt+↑ / Ctrl+Alt+↓", || {
                 tr!("shortcuts-add-cursor")
             }),
+            // `every_floem_editor_binding_is_fixed_refused_or_an_exception`
+            // walks floem's map for these; on macOS `Ctrl` here is Cmd, which
+            // is what floem binds there too.
+            ("Ctrl+L", || tr!("shortcuts-select-line")),
+            ("Ctrl+Shift+L", || tr!("shortcuts-select-all-occurrences")),
+            ("Ctrl+U", || tr!("shortcuts-undo-cursor")),
+            #[cfg(not(target_os = "macos"))]
+            ("Ctrl+Ins", || tr!("shortcuts-copy")),
+            // macOS alone: Cmd+Shift+K, Cmd+Shift+Enter, and Ctrl+E — a
+            // control-key press `primary_held` reads as the primary there.
+            #[cfg(target_os = "macos")]
+            ("Ctrl+Shift+K", || tr!("shortcuts-delete-line")),
+            #[cfg(target_os = "macos")]
+            ("Ctrl+Shift+Enter", || tr!("shortcuts-new-line-above")),
+            #[cfg(target_os = "macos")]
+            ("Ctrl+E", || tr!("shortcuts-line-end")),
             ("Alt+Enter", || tr!("shortcuts-quick-fix")),
             ("Tab / Shift+Tab", || tr!("shortcuts-indent")),
             ("Tab / Ctrl+→", || tr!("shortcuts-take-prediction")),
@@ -1332,6 +1348,21 @@ mod tests {
             let src = std::fs::read_to_string(src_dir().join(name)).expect("read source");
             found.extend(bound_letters(&src));
         }
+        // And what floem's editor binds itself (`keypress::add_default_*`):
+        // the rows that fix its keys document a binding no handler here spells.
+        for kp in floem::views::editor::keypress::KeypressMap::default()
+            .keymaps
+            .keys()
+        {
+            if let floem::views::editor::keypress::key::KeyInput::Keyboard(Key::Character(s), _) =
+                &kp.key
+                && !kp.mods.is_empty()
+                && let [c] = s.as_bytes()
+                && c.is_ascii_alphabetic()
+            {
+                found.insert(c.to_ascii_lowercase() as char);
+            }
+        }
         let mut stale = Vec::new();
         for (group, rows) in SHORTCUTS {
             for (keys, desc) in *rows {
@@ -1939,5 +1970,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **Every key floem's editor binds is a fixed row, refused, or a named
+    /// exception.** The editor answers a keymap command before floem's own
+    /// keys, so a command moved onto one of them silently took it — Ctrl+L,
+    /// Ctrl+Shift+L, Ctrl+U, Alt+Shift+I and Ctrl+Insert had been missed, and
+    /// on macOS Cmd+Shift+K, Cmd+Shift+Enter and Ctrl+E. Walked from floem's
+    /// own default map for this platform, so the next floem bump that adds a
+    /// key fails here rather than in a user's editor.
+    #[test]
+    fn every_floem_editor_binding_is_fixed_refused_or_an_exception() {
+        use floem::views::editor::keypress::KeypressMap;
+        use floem::views::editor::keypress::key::KeyInput;
+        use schemaic_core::keymap::{Key as K, Platform};
+        // Left bindable on purpose: a page scroll nobody misses beside
+        // PgUp/PgDn themselves, and the natural home of Next/Previous tab.
+        let exceptions = [
+            Chord::parse("Ctrl+PgUp").unwrap(),
+            Chord::parse("Ctrl+PgDn").unwrap(),
+        ];
+        let fixed = fixed_keys();
+        let mut missing = BTreeSet::new();
+        let mut seen = 0;
+        for kp in KeypressMap::default().keymaps.keys() {
+            let KeyInput::Keyboard(key, physical) = &kp.key else {
+                continue;
+            };
+            let m = kp.mods;
+            let primary = primary_from(m.control(), m.meta(), super::PRIMARY_IS_CMD);
+            let Some(chord) = chord_from(key, physical, primary, m.alt(), m.shift()) else {
+                continue;
+            };
+            seen += 1;
+            let ok = chord.refusal_on(Platform::CURRENT).is_some()
+                || fixed.iter().any(|f| {
+                    f.chord == chord && matches!(f.context, Context::Editor | Context::Global)
+                })
+                || exceptions.contains(&chord)
+                // A plain letter types itself; floem binds none, but the
+                // table's own rule reads it.
+                || matches!(chord.key, K::Char(_)) && !chord.primary && !chord.alt;
+            if !ok {
+                missing.insert(chord.to_string());
+            }
+        }
+        assert!(
+            seen > 40,
+            "floem's map read as {seen} keys; the walk has gone blind"
+        );
+        assert!(
+            missing.is_empty(),
+            "floem binds these in the editor, and a command could take them: {missing:?}"
+        );
     }
 }

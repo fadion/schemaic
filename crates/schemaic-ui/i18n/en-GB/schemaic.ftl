@@ -270,6 +270,12 @@ shortcuts-single-line = Make single line
 shortcuts-move-line = Move line up / down
 shortcuts-copy-line = Copy line up / down
 shortcuts-add-cursor = Add a cursor above / below
+shortcuts-select-line = Select the current line
+shortcuts-select-all-occurrences = Select every occurrence of the selection
+shortcuts-undo-cursor = Undo the last cursor or selection change
+shortcuts-delete-line = Delete line
+shortcuts-new-line-above = New line above
+shortcuts-line-end = Go to line end
 shortcuts-quick-fix = Apply the quick fix under the caret
 shortcuts-indent = Indent / outdent
 # Its keys are "Tab / Ctrl+→": the first half is Tab (or →), the second Ctrl+→.
