@@ -16,8 +16,9 @@ use schemaic_core::data_file::{CsvDelimiter, CsvHeader, CsvReadOptions};
 use crate::i18n::tr;
 use crate::theme;
 use crate::widgets::{
-    ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, focus_root_with_ring, form_gap,
-    form_setting, modal_footer, modal_pad_h, modal_title, modal_w, panel_style, segmented_tabs,
+    ACTION_TAB, ActionKind, FocusRing, action_button, action_gap, dismiss_layer,
+    focus_root_with_ring, form_gap, form_setting, modal_footer, modal_pad_h, modal_title, modal_w,
+    panel_style, segmented_tabs,
 };
 
 /// What raises the dialog: the view, the options it reads with now, and what
@@ -150,7 +151,11 @@ pub(crate) fn csv_options_overlay(open: RwSignal<Option<CsvOptionsRequest>>) -> 
             .on_click_stop(|_| {})
             .style(|s| panel_style(s).width(panel_w()));
 
-            focus_root_with_ring(container(panel), root_ring)
+            // Two segmented choices and nothing to lose, so a backdrop click
+            // closes it, as every modal outside floem-gotchas' named
+            // no-click-away set does.
+            let away = close.clone();
+            focus_root_with_ring(stack((dismiss_layer(move || away()), panel)), root_ring)
                 .on_key_down(Key::Named(NamedKey::Escape), |_| true, move |_| close())
                 .style(|s| {
                     s.size_full()

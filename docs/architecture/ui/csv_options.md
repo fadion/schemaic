@@ -30,5 +30,6 @@ It is the fourth member of `snippet_edit.rs`'s tuple element in the modal layer'
 beside `alias_rename.rs` and `usages_view.rs` — that stack is at floem's 16-arity limit, and none
 of the four is up beside another, each being modal — so the element fills the layer while it is
 open, `ddl_modals_up` has a `csv_options` arm, and the file is on `PAINTS_A_BACKDROP`. Escape and
-✕ close it, and there is no click-away. Its words are the catalogue's (`tree-csv-read-options`,
+✕ close it, and so does a backdrop click (`dismiss_layer`): it holds two segmented choices and
+nothing a stray click could lose, so it is outside `floem-gotchas.md`'s no-click-away set. Its words are the catalogue's (`tree-csv-read-options`,
 `csv-options-*`); Cancel is the shared `dialog-cancel`.
