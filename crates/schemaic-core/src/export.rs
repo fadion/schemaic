@@ -817,7 +817,19 @@ pub fn csv_field_plain(s: &str) -> String {
     }
 }
 
-/// A cell as a SQL literal (non-finite float → NULL; strings escaped).
+/// NaN or an infinity as a literal `dialect` reads back as itself —
+/// [`crate::import::non_finite_literal`], the import's answer — or `NULL`
+/// where the engine holds no such value, so no source of its own has one.
+///
+/// **It was `NULL` everywhere**, and a dump restored a nullable column's NaN
+/// as NULL while a `NOT NULL` one stopped the restore (measured on DuckDB
+/// 2.0; PostgreSQL 16 takes the same spellings).
+fn non_finite_literal(f: f64, dialect: SqlDialect) -> String {
+    crate::import::non_finite_literal(f, dialect).unwrap_or_else(|| "NULL".to_string())
+}
+
+/// A cell as a SQL literal (non-finite float spelled per engine,
+/// [`non_finite_literal`]; strings escaped).
 ///
 /// **Backslashes are dialect-critical.** MySQL treats `\` as an escape character
 /// inside a string literal, so it must be doubled. PostgreSQL, under its default
@@ -829,7 +841,7 @@ pub fn sql_literal(v: &Value, dialect: SqlDialect) -> String {
         Value::Null => "NULL".to_string(),
         Value::Int(i) => i.to_string(),
         Value::UInt(u) => u.to_string(),
-        Value::Float(f) if !f.is_finite() => "NULL".to_string(),
+        Value::Float(f) if !f.is_finite() => non_finite_literal(*f, dialect),
         Value::Float(f) => float_literal(*f),
         Value::Str(s) => match dialect {
             SqlDialect::MySql => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''")),
@@ -4723,9 +4735,35 @@ mod tests {
         assert_eq!(sql_literal(&Value::Float(f64::NAN), MySql), "NULL");
         assert_eq!(sql_literal(&Value::Float(f64::INFINITY), MySql), "NULL");
         assert_eq!(
+            sql_literal(&Value::Float(f64::NAN), SqlDialect::MsSql),
+            "NULL"
+        );
+        assert_eq!(
             sql_literal(&Value::Str("O'Hara".to_string()), MySql),
             "'O''Hara'"
         );
+    }
+
+    /// **NaN and the infinities are spelled where the engine holds them**:
+    /// written NULL, a nullable column restored the wrong value and a `NOT
+    /// NULL` one stopped the restore. MySQL and SQL Server hold neither, so
+    /// no source of theirs has one; SQLite holds the infinities as a literal
+    /// past `f64`'s range and turns a NaN into NULL itself.
+    #[test]
+    fn a_non_finite_float_is_spelled_where_the_engine_holds_one() {
+        let lit = |f: f64, d| sql_literal(&Value::Float(f), d);
+        assert_eq!(lit(f64::NAN, SqlDialect::DuckDb), "'NaN'::DOUBLE");
+        assert_eq!(lit(f64::INFINITY, SqlDialect::DuckDb), "'Infinity'::DOUBLE");
+        assert_eq!(
+            lit(f64::NEG_INFINITY, SqlDialect::DuckDb),
+            "'-Infinity'::DOUBLE"
+        );
+        assert_eq!(lit(f64::NAN, Postgres), "'NaN'::float8");
+        assert_eq!(lit(f64::INFINITY, Postgres), "'Infinity'::float8");
+        assert_eq!(lit(f64::NEG_INFINITY, Postgres), "'-Infinity'::float8");
+        assert_eq!(lit(f64::INFINITY, Sqlite), "9e999");
+        assert_eq!(lit(f64::NEG_INFINITY, Sqlite), "-9e999");
+        assert_eq!(lit(f64::NAN, Sqlite), "NULL");
     }
 
     /// **A float far from 1 is written with an exponent.** Rust prints an `f64`

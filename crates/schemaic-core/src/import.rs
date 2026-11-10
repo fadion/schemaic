@@ -3095,10 +3095,10 @@ fn sqlite_quoted(s: &str) -> bool {
         && s.parse::<f64>().is_ok()
 }
 
-/// A value as an import writes it: [`crate::export::sql_literal`], except a
-/// **non-finite float**, which the export writes `NULL` — a stated rule for a
-/// file, and a silent loss in a table being reproduced. Here it is the
-/// engine's own literal where it has one ([`non_finite_literal`]).
+/// A value as an import writes it: [`crate::export::sql_literal`], a
+/// **non-finite float** the engine's own literal where it has one
+/// ([`non_finite_literal`]) — which the export now writes too, having written
+/// `NULL`, so the two agree.
 pub fn import_literal(v: &Value, dialect: SqlDialect) -> String {
     match v {
         Value::Float(f) if !f.is_finite() => non_finite_literal(*f, dialect)
@@ -4088,10 +4088,10 @@ mod tests {
                 .unwrap()
                 .ends_with("VALUES (NULL, 9e999, -9e999, 0.5)")
         );
-        // The export keeps its own rule.
+        // And the export writes the same now, having written `NULL`.
         assert_eq!(
             crate::export::sql_literal(&Value::Float(f64::INFINITY), Postgres),
-            "NULL"
+            "'Infinity'::float8"
         );
     }
 

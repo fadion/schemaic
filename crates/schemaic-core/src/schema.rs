@@ -14002,15 +14002,19 @@ mod tests {
     }
 
     #[test]
-    fn follow_target_renders_a_nonfinite_float_as_null() {
+    fn follow_target_never_renders_a_bare_nonfinite_float() {
         use crate::intel::SqlDialect;
         // Not reachable from a real key column (floats are refused as WHERE keys),
         // but the shared literal must never emit a bare `NaN` — that's a parse
-        // error on both engines. Both dialects agree on NULL.
+        // error on both engines. MySQL, which holds no NaN, says NULL;
+        // PostgreSQL spells its own (`export::sql_literal`).
         let f = fk(&["m"], Some("public"), "m", &["v"]);
-        for d in [SqlDialect::MySql, SqlDialect::Postgres] {
+        for (d, want) in [
+            (SqlDialect::MySql, "= NULL"),
+            (SqlDialect::Postgres, "= 'NaN'::float8"),
+        ] {
             let ft = follow_target(&f, &[Value::Float(f64::NAN)], "db", d).unwrap();
-            assert!(ft.sql.ends_with("= NULL"), "{d:?}: {}", ft.sql);
+            assert!(ft.sql.ends_with(want), "{d:?}: {}", ft.sql);
         }
     }
 

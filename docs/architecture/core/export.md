@@ -7,7 +7,14 @@ that read back exactly): Rust prints an `f64` without one, so `1e300` was a 301-
 which T-SQL reads as a `numeric` and refuses past 38 digits (Msg 1007, Msg 103 past 128
 characters) — a SQL Server dump holding one could not be restored. The exponent form is a
 float literal on all four engines; an ordinary value keeps the plain form
-(`a_float_far_from_one_is_written_with_an_exponent`). **Rows arrive through a pull source,
+(`a_float_far_from_one_is_written_with_an_exponent`). **A NaN or an infinity is spelled where the
+engine holds one** (`non_finite_literal`, over `import::non_finite_literal`): `'NaN'::DOUBLE`
+and `'±Infinity'::DOUBLE` on DuckDB, `'NaN'::float8` and `'±Infinity'::float8` on PostgreSQL
+(16, measured), `±9e999` on SQLite, whose NaN is `NULL` already, and `NULL` on MySQL and SQL
+Server, whose floats hold neither. It was `NULL` everywhere, so a dump restored a nullable
+column's NaN as NULL with no note and a `NOT NULL` one stopped the restore
+(`a_non_finite_float_is_spelled_where_the_engine_holds_one`; end to end,
+`a_dump_restores_nan_and_the_infinities` in `db::duckdb`). **Rows arrive through a pull source,
 not as a `&ResultSet`**: `RowChunks::next_chunk` hands over one `RowChunk { rs, order }` at a
 time and `ExportFormat::stream_to` renders from it, returning an `ExportTally`. Every entry
 point took a whole result until the whole-table export landed, which made "export" mean

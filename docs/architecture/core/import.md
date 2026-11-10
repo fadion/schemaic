@@ -81,9 +81,10 @@ batch is never written and the load's transaction rolls back: these texts go int
 would be a wrong value rather than a refusal
 (`a_carried_cell_is_written_as_its_form_and_checked_first`,
 `overriding_puts_the_clause_before_values_where_the_engine_has_one`). **A `Value` cell goes
-through `import_literal`**, which is `sql_literal` except for a non-finite float: the export
-writes that `NULL`, a stated rule for a file and a silent loss in a table being reproduced, so
-here `non_finite_literal` writes the engine's own — `'NaN'::float8`, `'Infinity'::float8`,
+through `import_literal`**, which is `sql_literal`, a non-finite float written by
+`non_finite_literal` as the engine's own — which `sql_literal` now asks too (it wrote `NULL`, and
+a dump restored a NaN as NULL or stopped on a `NOT NULL` column; *core/export.md*) —
+`'NaN'::float8`, `'Infinity'::float8`,
 `'-Infinity'::float8` on PostgreSQL; `9e999`/`-9e999` on SQLite, and `NULL` for its NaN, which
 SQLite stores as `NULL` anyway — while MySQL and SQL Server, which cannot hold one, keep the
 `NULL` (`a_non_finite_float_is_written_as_the_engines_own_literal`; SQLite's

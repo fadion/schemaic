@@ -5063,6 +5063,24 @@ mod tests {
         assert_eq!(tags(&dst), vec![vec!["n"], vec!["-"], vec!["t"]]);
     }
 
+    /// **NaN and the infinities come back as themselves**: written NULL, a
+    /// nullable column restored the wrong value with no note, and a `NOT
+    /// NULL` one stopped the restore.
+    #[test]
+    fn a_dump_restores_nan_and_the_infinities() {
+        use schemaic_core::script::ExecEnd;
+        let src = mem("dump-nonfinite-src");
+        seed(
+            &src,
+            "CREATE TABLE f(id INTEGER, v DOUBLE NOT NULL, r FLOAT);
+             INSERT INTO f VALUES (1, 'nan', 'inf'), (2, 'inf', '-inf'), (3, '-inf', 'nan');",
+        );
+        let file = dump_file(&src, schemaic_core::dump::DumpOptions::default());
+        let dst = mem("dump-nonfinite-dst");
+        assert_eq!(restore_file(&dst, &file), ExecEnd::Done, "{file}");
+        assert_eq!(fingerprint(&dst), fingerprint(&src), "{file}");
+    }
+
     /// **The grid shows them as DuckDB writes them**, or, where the driver
     /// has already lost the value, says so rather than showing another one.
     #[test]
