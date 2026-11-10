@@ -2153,6 +2153,26 @@ fn grid_ctrl_command(key: &str, m: floem::keyboard::Modifiers) -> Option<GridCtr
     }
 }
 
+/// Does `key` with `m` commit the staged edits — **Ctrl+Enter (Cmd+Enter on
+/// macOS) and nothing more**? Ctrl+Shift+Enter or Ctrl+Alt+Enter is no binding
+/// of the grid's, and committing on a chord a Global command was moved to
+/// would write the staged edits by surprise.
+fn grid_commits(key: &floem::keyboard::Key, m: floem::keyboard::Modifiers) -> bool {
+    use floem::keyboard::{Key, NamedKey};
+    matches!(key, Key::Named(NamedKey::Enter))
+        && (m.control() || m.meta())
+        && !m.shift()
+        && !m.alt()
+}
+
+/// Does `key` with `m` step the keyboard into the results strip — **plain F6
+/// only**: a modified F6 is no binding of the grid's, and a Global command may
+/// have been put on one.
+fn grid_enters_strip(key: &floem::keyboard::Key, m: floem::keyboard::Modifiers) -> bool {
+    use floem::keyboard::{Key, NamedKey};
+    matches!(key, Key::Named(NamedKey::F6)) && m.is_empty()
+}
+
 /// The move a navigation key makes in the grid, or `None` when the key is not
 /// one the grid moves on.
 ///
@@ -5731,11 +5751,9 @@ fn grid_view(rs: Arc<ResultSet>, gctx: GridCtx) -> impl IntoView {
                     // last left. It also arms `keyboard_nav`, so the ring it lands on
                     // is visible.
                     //
-                    // Plain F6 only: a modified F6 is no binding of the grid's,
-                    // and a Global command may have been put on one.
+                    // Plain F6 only — `grid_enters_strip`.
                     if let Event::KeyDown(ke) = e
-                        && ke.key.logical_key == Key::Named(NamedKey::F6)
-                        && ke.modifiers.is_empty()
+                        && grid_enters_strip(&ke.key.logical_key, ke.modifiers)
                         && let Some(from) = gs.focus_id.get_untracked()
                     {
                         strip_entry.step_from(from, false);
@@ -8846,7 +8864,6 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
     // shift-click and drag-select. `set_active` keeps the anchor put and moves
     // only the active end.
     let shift = m.shift();
-    let ctrl = m.control() || m.meta();
     let active_opt = gs.active.get_untracked();
     let (r, c) = active_opt.unwrap_or((0, 0));
     let last_r = rows - 1;
@@ -8889,10 +8906,8 @@ fn grid_key(gs: GridState, nrows: usize, ncols: usize, e: &Event) -> EventPropag
                 gs.anchor.set(None);
             }
         }
-        // Ctrl alone: Ctrl+Shift+Enter or Ctrl+Alt+Enter is no binding of the
-        // grid's, and committing on a chord a Global command was moved to
-        // would write the staged edits by surprise.
-        Key::Named(NamedKey::Enter) if ctrl && !m.shift() && !m.alt() => commit_grid(gs),
+        // Ctrl alone — `grid_commits`.
+        k @ Key::Named(NamedKey::Enter) if grid_commits(k, m) => commit_grid(gs),
         // **`m.is_empty()`, because this handler is not only the grid's.** The
         // results strip hands `grid_key` *every* modified key it declines
         // (`widgets::strip_defers` is `!mods.is_empty()` minus three), so with
@@ -15376,6 +15391,44 @@ mod tests {
             );
         }
         assert_eq!(grid_ctrl_command("x", mods(true, false, false)), None);
+    }
+
+    /// **Ctrl+Enter alone commits.** Ctrl+Shift+Enter and Ctrl+Alt+Enter are
+    /// no bindings of the grid's, and a Global command may be moved onto one:
+    /// an arm matching Ctrl alone would write the staged edits by surprise.
+    /// Plain F6 alone steps into the results strip, for the same reason.
+    #[test]
+    fn only_a_bare_ctrl_enter_commits_and_only_a_plain_f6_enters_the_strip() {
+        use floem::keyboard::{Key, Modifiers, NamedKey};
+        let enter = Key::Named(NamedKey::Enter);
+        assert!(grid_commits(&enter, mods(true, false, false)));
+        let mut meta = Modifiers::empty();
+        meta.set(Modifiers::META, true);
+        assert!(grid_commits(&enter, meta), "Cmd+Enter on macOS");
+        for m in [
+            mods(true, true, false),
+            mods(true, false, true),
+            mods(true, true, true),
+            mods(false, false, false),
+            mods(false, true, false),
+            mods(false, false, true),
+        ] {
+            assert!(!grid_commits(&enter, m), "{m:?}");
+        }
+        assert!(!grid_commits(
+            &Key::Named(NamedKey::Tab),
+            mods(true, false, false)
+        ));
+        let f6 = Key::Named(NamedKey::F6);
+        assert!(grid_enters_strip(&f6, Modifiers::empty()));
+        for m in [
+            mods(true, false, false),
+            mods(false, true, false),
+            mods(false, false, true),
+        ] {
+            assert!(!grid_enters_strip(&f6, m), "{m:?}");
+        }
+        assert!(!grid_enters_strip(&enter, Modifiers::empty()));
     }
 
     /// **The arrows walk the columns that are drawn.** With `1` hidden out of

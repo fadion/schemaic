@@ -19,8 +19,8 @@ forms no meaning, and since commands became rebindable a Global command may sit 
 Ctrl+Enter) — the window root's `NavKeys::handle` hears only what the focused tree lets through.
 The F10 arm is held to the same rule, **Shift alone**, since Ctrl+Shift+F10 is a chord a command
 may have; the Menu key takes whatever modifiers come with it.
-It is the schema tree's half of the grid's `grid_nav` (`data-grid.md`); no test pins it, the
-decision living in the view.
+It is the schema tree's half of the grid's `grid_nav` (`data-grid.md`), decided by the pure
+`tree_hears(modifiers)` the handler asks (`the_tree_declines_ctrl_alt_and_cmd_presses`).
 **Every word the panel writes itself comes from the catalogue** (`tree-*`):
 the `SCHEMA` title, in the loading dots too; the two header tooltips; the search placeholder,
 through `FieldCfg::placeholder_of`; *Loading*, *No tables*, `failed_row`'s *Failed to connect*

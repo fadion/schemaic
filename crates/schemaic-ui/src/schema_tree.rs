@@ -107,6 +107,15 @@ fn nav_select(nav: Nav, key: String) {
     nav.reveal.set(Some(key));
 }
 
+/// Does the tree's own key handling hear a press with `m` held? **Not with
+/// Ctrl, Alt or Cmd**: the tree gives Enter and the arrows no meaning with
+/// them, and a Global command may be bound to one (Ctrl+Enter, Alt+←) — the
+/// window's handler hears only what the tree lets through. Shift is the
+/// tree's own, as in a list.
+fn tree_hears(m: floem::keyboard::Modifiers) -> bool {
+    !(m.control() || m.alt() || m.meta())
+}
+
 // ── Tree identity: one place that builds every node's key ────────────────────
 //
 // Keys are shared by the expand/collapse set, the nav cursor, and the persisted
@@ -1496,8 +1505,7 @@ pub(crate) fn schema_panel(ui: Ui) -> impl IntoView {
             // those forms no meaning, and a Global command may be bound to one
             // (Ctrl+Enter, Alt+←) — the window's handler hears only what the
             // tree lets through.
-            let m = ke.modifiers;
-            if m.control() || m.alt() || m.meta() {
+            if !tree_hears(ke.modifiers) {
                 return EventPropagation::Continue;
             }
             if matches!(ke.key.logical_key, Key::Named(NamedKey::Enter)) {
@@ -3727,6 +3735,25 @@ fn schema_search(filter: RwSignal<String>) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tree declines Ctrl, Alt and Cmd with its keys, so a Global command
+    /// bound to Ctrl+Enter or Alt+← still reaches the window; plain and
+    /// Shift presses are its own.
+    #[test]
+    fn the_tree_declines_ctrl_alt_and_cmd_presses() {
+        use floem::keyboard::Modifiers;
+        assert!(tree_hears(Modifiers::empty()));
+        assert!(tree_hears(Modifiers::SHIFT));
+        for m in [
+            Modifiers::CONTROL,
+            Modifiers::ALT,
+            Modifiers::META,
+            Modifiers::CONTROL | Modifiers::SHIFT,
+            Modifiers::ALT | Modifiers::SHIFT,
+        ] {
+            assert!(!tree_hears(m), "{m:?}");
+        }
+    }
 
     fn tbl(ns: Option<&str>, name: &str) -> TableInfo {
         TableInfo {

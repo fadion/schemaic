@@ -239,7 +239,12 @@ this bundle's.
   `a_navigation_key_the_grid_gives_no_meaning_reaches_the_window` pin both sides of the pure
   function; nothing reads `grid_key` to prove it calls it, as the Ctrl-letter gate does. The grid
   body's **F6** arm is plain F6 only for the same reason — it matched F6 with any modifiers, so
-  Shift+F6 or Ctrl+F6 entered the toolbar strip whatever command was on it.
+  Shift+F6 or Ctrl+F6 entered the toolbar strip whatever command was on it — and the **commit
+  arm is bare Ctrl+Enter** (Cmd+Enter on macOS), since Ctrl+Shift+Enter or Ctrl+Alt+Enter is a
+  chord a Global command may sit on, and an arm matching Ctrl alone would write the staged edits
+  by surprise. Both are pure, `grid_enters_strip` and `grid_commits`, which the handler asks
+  (`only_a_bare_ctrl_enter_commits_and_only_a_plain_f6_enters_the_strip`, seen red against an
+  `if ctrl`-only `grid_commits`).
 - **Paste (Ctrl+V / the cell menu) stages, it does not write.** Every pasted cell goes through the
   same `GridState::stage`/`stage_new` a typed edit does, so it lands as ordinary green edits and
   the write-back plan, the one-row safety net and Commit/Discard all apply unchanged — a paste is
