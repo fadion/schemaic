@@ -6139,7 +6139,10 @@ mod tests {
             "rebuilt: {plan:#?}"
         );
         assert_eq!(
-            cells(&db, "SELECT comment FROM duckdb_indexes() WHERE index_name = 'i'"),
+            cells(
+                &db,
+                "SELECT comment FROM duckdb_indexes() WHERE index_name = 'i'"
+            ),
             vec![vec!["hello"]],
             "{plan:#?}"
         );

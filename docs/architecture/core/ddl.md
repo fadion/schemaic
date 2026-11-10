@@ -2005,12 +2005,16 @@ COLUMN` per restated one after the `COMMENT ON VIEW`, under the same name the se
 `Change::risk_lines` names the lost ones as `Risk::ViewColumnCommentsCleared` — one function
 answering both, so the script and its warning cannot disagree. The names are read off the
 statement: the explicit column list where there is one, parsed as `SELECT <list>` for one parser
-and one set of quoting rules, else the body's own through `intel::select_output_names`, matched
-case-insensitively. A column the edit removed takes its comment with it — that is the edit, and a
-`COMMENT ON COLUMN` naming it would fail the whole plan. Which is why, **where the names cannot be
-read** — a `*`, an unnamed expression, a set operation — nothing is restated and every comment
-is reported lost rather than guessed at
-(`a_views_column_comments_are_restated_where_the_body_names_the_column`,
+and one set of quoting rules, **and past its end the body's own** (DuckDB keeps them: `v (x) AS
+SELECT a, b` has columns `x, b`, and a list read alone dropped `b`'s comment with no risk line),
+else the body's own through `intel::select_output_names`, matched case-insensitively. A column the
+edit removed takes its comment with it — that is the edit, and a `COMMENT ON COLUMN` naming it
+would fail the whole plan — but only where every name is known. Which is why, **where a name
+cannot be known** — a `*`, an unnamed expression, a set operation, a list shorter than an
+unreadable body, or two outputs of one name, which DuckDB renames `a, a_1` without the statement
+saying so — a comment matching no known name is reported lost rather than guessed at or dropped
+unsaid (`a_views_column_comments_follow_a_short_list_and_report_a_renamed_duplicate`,
+`a_views_column_comments_are_restated_where_the_body_names_the_column`,
 `a_views_column_comments_are_lost_where_the_body_cannot_be_read`,
 `a_views_column_comments_are_restated_only_where_the_replace_clears_them`, and
 `a_duckdb_view_replace_restates_or_names_its_column_comments` for the statement and the risk line

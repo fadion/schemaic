@@ -14988,15 +14988,17 @@ pub fn replace_clears_comment(dialect: SqlDialect) -> bool {
 /// `COMMENT ON COLUMN` after the replace puts each back — but only on a column
 /// the **new** body still has: one naming a column the edit took away fails,
 /// and with it the whole plan. So the new body's column names are read off the
-/// statement — the explicit column list where there is one, else the
-/// `SELECT`'s own ([`crate::intel::select_output_names`]) — and a comment is
+/// statement — the explicit column list where there is one, the `SELECT`'s
+/// own past its end ([`crate::intel::select_output_names`]) — and a comment is
 /// restated where its column is among them (case-insensitively: DuckDB's
-/// names are). A column the edit dropped takes its comment with it, which is
-/// the edit.
+/// names are). Where every name is known, a column the edit dropped takes its
+/// comment with it, which is the edit.
 ///
-/// **Where the names cannot be read** — a `*`, an unnamed expression, a set
-/// operation — no comment is restated and every one is returned as lost:
-/// guessing would fail the plan on the first column that is gone, so the
+/// **Where a name cannot be known** — a `*`, an unnamed expression, a set
+/// operation, a list shorter than an unreadable body, two outputs of one name
+/// (DuckDB renames the second `a_1`) — a comment that matches no known name is
+/// returned as lost: guessing would fail the plan on the first column that is
+/// gone, and dropping it unsaid would clear it with no risk line, so the
 /// preview says instead which comments the replace clears.
 ///
 /// `(restated, lost)`: `(column, comment)` pairs, and column names.
@@ -15010,26 +15012,53 @@ pub fn view_comments_restated(
     }
     // An explicit list read as a `SELECT` of it: the same parser, the same
     // quoting rules, and a name per item.
-    let names = match draft.options.column_list.as_deref() {
+    let body = crate::intel::select_output_names(draft.select.trim(), dialect);
+    // `(names, certain)`: certain when every column's name is known.
+    let (names, certain) = match draft.options.column_list.as_deref() {
         Some(list) if !list.trim().is_empty() => {
-            crate::intel::select_output_names(&format!("SELECT {list}"), dialect)
+            match crate::intel::select_output_names(&format!("SELECT {list}"), dialect) {
+                // **A list shorter than the body names only its own
+                // positions**; DuckDB keeps the body's names past it
+                // (measured: `v (x) AS SELECT a, b` has columns `x, b`).
+                Some(mut listed) => match body {
+                    Some(body) => {
+                        if body.len() > listed.len() {
+                            listed.extend(body[listed.len()..].iter().cloned());
+                        }
+                        (listed, true)
+                    }
+                    // The body's count is unknown, so a column past the list
+                    // may be any name at all.
+                    None => (listed, false),
+                },
+                None => (Vec::new(), false),
+            }
         }
-        _ => crate::intel::select_output_names(draft.select.trim(), dialect),
+        _ => match body {
+            Some(body) => (body, true),
+            None => (Vec::new(), false),
+        },
     };
-    match names {
-        Some(names) => (
-            comments
-                .iter()
-                .filter(|(c, _)| names.iter().any(|n| n.eq_ignore_ascii_case(c)))
-                .cloned()
-                .collect(),
-            Vec::new(),
-        ),
-        None => (
-            Vec::new(),
-            comments.iter().map(|(c, _)| c.clone()).collect(),
-        ),
-    }
+    // **Two outputs of one name are renamed by DuckDB** (`a, a` → `a, a_1`),
+    // which the statement does not say: a comment on such a renamed column
+    // matches nothing here, and is reported rather than dropped unsaid.
+    let unique = names
+        .iter()
+        .enumerate()
+        .all(|(i, n)| !names[..i].iter().any(|m| m.eq_ignore_ascii_case(n)));
+    let certain = certain && unique;
+    let (restated, unmatched): (Vec<_>, Vec<_>) = comments
+        .iter()
+        .cloned()
+        .partition(|(c, _)| names.iter().any(|n| n.eq_ignore_ascii_case(c)));
+    // Certain names leave an unmatched comment to a column the edit dropped,
+    // which takes its comment with it — that is the edit.
+    let lost = if certain {
+        Vec::new()
+    } else {
+        unmatched.into_iter().map(|(c, _)| c).collect()
+    };
+    (restated, lost)
 }
 
 /// Does a **scripted copy** of a view or a routine — *Copy DDL*, the `.sql`
@@ -30007,10 +30036,34 @@ mod tests {
             view_comments_restated(&commented_view("SELECT a, b FROM t", None), DuckDb),
             (vec![pair("a", "A")], vec![])
         );
-        // An explicit column list names the columns, not the body.
+        // An explicit column list names the columns it covers; past it the
+        // body's own names do, and a `*` body's are unknown — `a` may be one
+        // of them, so its comment is said to be cleared, not dropped unsaid.
         assert_eq!(
             view_comments_restated(&commented_view("SELECT * FROM t", Some("\"C\", z")), DuckDb),
-            (vec![pair("C", "see")], vec![])
+            (vec![pair("C", "see")], vec!["a".to_string()])
+        );
+    }
+
+    /// **A list shorter than the body, and a name DuckDB de-duplicated**: the
+    /// positions past the list keep the body's names (`v (x) AS SELECT a, b`
+    /// names its columns `x, b`), and where two outputs share a name DuckDB
+    /// renames the second (`a, a_1`), which the body does not say — so a
+    /// comment there is reported cleared rather than dropped without a word.
+    #[test]
+    fn a_views_column_comments_follow_a_short_list_and_report_a_renamed_duplicate() {
+        let pair = |c: &str, t: &str| (c.to_string(), t.to_string());
+        let mut short = commented_view("SELECT a, b FROM t", Some("x"));
+        short.options.column_comments = vec![pair("b", "bee")];
+        assert_eq!(
+            view_comments_restated(&short, DuckDb),
+            (vec![pair("b", "bee")], vec![])
+        );
+        let mut dup = commented_view("SELECT a, a FROM t", None);
+        dup.options.column_comments = vec![pair("a", "first"), pair("a_1", "second")];
+        assert_eq!(
+            view_comments_restated(&dup, DuckDb),
+            (vec![pair("a", "first")], vec!["a_1".to_string()])
         );
     }
 
