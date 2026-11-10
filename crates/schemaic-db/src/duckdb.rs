@@ -91,6 +91,98 @@ fn query_err(e: duckdb::Error) -> DbError {
     DbError::Query(e.to_string())
 }
 
+// ── One statement, by DuckDB's own count ────────────────────────────────────
+
+/// A parse-only DuckDB connection, on an in-memory database of its own that
+/// holds nothing and never runs a statement: what [`one_statement`] asks.
+struct Parser {
+    /// Held for the process, so `con` always has its database.
+    _db: duckdb::ffi::duckdb_database,
+    con: duckdb::ffi::duckdb_connection,
+}
+
+// SAFETY: the two handles are only ever used behind `PARSER`'s mutex, one
+// call at a time, and DuckDB's C API allows a connection to be used from any
+// thread as long as it is not used from two at once.
+unsafe impl Send for Parser {}
+
+/// The process's [`Parser`], opened on first use; `None` when DuckDB would not
+/// open one, which [`one_statement`] answers by refusing.
+static PARSER: LazyLock<Mutex<Option<Parser>>> = LazyLock::new(|| {
+    use duckdb::ffi;
+    let mut db: ffi::duckdb_database = std::ptr::null_mut();
+    let mut con: ffi::duckdb_connection = std::ptr::null_mut();
+    // SAFETY: `duckdb_open` with a null path opens an in-memory database into
+    // `db`, and `duckdb_connect` a connection on it into `con`; each is
+    // checked before the next is made, and a failed one is closed again.
+    unsafe {
+        if ffi::duckdb_open(std::ptr::null(), &mut db) != ffi::DuckDBSuccess {
+            ffi::duckdb_close(&mut db);
+            return Mutex::new(None);
+        }
+        if ffi::duckdb_connect(db, &mut con) != ffi::DuckDBSuccess {
+            ffi::duckdb_close(&mut db);
+            return Mutex::new(None);
+        }
+    }
+    Mutex::new(Some(Parser { _db: db, con }))
+});
+
+/// How many statements **DuckDB's own parser** reads `sql` as, or its parse
+/// error. Nothing is prepared and nothing runs: `duckdb_extract_statements`
+/// only parses, on [`PARSER`]'s empty database.
+fn statement_count(sql: &str) -> Result<u64, DbError> {
+    use duckdb::ffi;
+    let text = std::ffi::CString::new(sql)
+        .map_err(|_| DbError::Query("the statement holds a NUL character".into()))?;
+    let guard = PARSER.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(p) = guard.as_ref() else {
+        return Err(DbError::Query(
+            "DuckDB's parser could not be opened to check the statement".into(),
+        ));
+    };
+    let mut extracted: ffi::duckdb_extracted_statements = std::ptr::null_mut();
+    // SAFETY: `p.con` is a live connection (above), `text` outlives the call,
+    // and `extracted` is destroyed on every path once it has been read; the
+    // error string it hands back is owned by `extracted` and copied first.
+    unsafe {
+        let n = ffi::duckdb_extract_statements(p.con, text.as_ptr(), &mut extracted);
+        let out = if n == 0 {
+            let e = ffi::duckdb_extract_statements_error(extracted);
+            let msg = if e.is_null() {
+                "the statement could not be parsed".to_string()
+            } else {
+                std::ffi::CStr::from_ptr(e).to_string_lossy().into_owned()
+            };
+            Err(DbError::Query(msg))
+        } else {
+            Ok(n)
+        };
+        ffi::duckdb_destroy_extracted(&mut extracted);
+        out
+    }
+}
+
+/// Prepare `sql` **only where DuckDB reads it as one statement**.
+///
+/// The driver's `prepare` *executes* every statement but the last
+/// (duckdb 1.20000.1, `InnerConnection::prepare`), and DuckDB's scanner and
+/// core's lexer need not agree on where one ends — a lone `\r` ends a `--`
+/// comment for DuckDB. A text core took for one `SELECT` therefore ran a
+/// hidden `DELETE` as the user typed (live validation), or a `COMMIT` out of a
+/// read-only run's `READ ONLY` transaction. So every path that prepares text
+/// asks DuckDB's own parser first, and refuses several before anything runs —
+/// the boundary check that holds whatever the two lexers next disagree on.
+fn prepare_one<'c>(conn: &'c DuckConn, sql: &str) -> Result<duckdb::Statement<'c>, DbError> {
+    match statement_count(sql)? {
+        1 => conn.prepare(sql).map_err(query_err),
+        n => Err(DbError::Query(format!(
+            "DuckDB reads this text as {n} statements, and runs one at a time here: \
+             run them separately"
+        ))),
+    }
+}
+
 // ── The instance registry ───────────────────────────────────────────────────
 
 /// One open DuckDB database: the connection every operation's own is cloned
@@ -565,7 +657,7 @@ fn run_query(
 ) -> Result<ResultSet, DbError> {
     let row_cap = dest.cap();
     let start = Instant::now();
-    let mut stmt = conn.prepare(sql).map_err(query_err)?;
+    let mut stmt = prepare_one(conn, sql)?;
     let mut rows = stmt.query([]).map_err(query_err)?;
     let (columns, kinds): (Vec<Column>, Vec<LogicalTypeId>) = {
         let st = rows
@@ -1205,7 +1297,9 @@ pub(crate) async fn fetch_databases(db: &Db) -> Result<Vec<String>, DbError> {
     }
 }
 
-/// Validate `sql` without running it: DuckDB's `prepare` parses and binds.
+/// Validate `sql` without running it: DuckDB's `prepare` parses and binds —
+/// and only once DuckDB's own parser has read it as one statement
+/// ([`prepare_one`]), since the driver's `prepare` runs all but the last.
 ///
 /// A statement that acts while it is prepared is not prepared at all — the
 /// heads below change the session or the instance (`SET`, `PRAGMA`, `ATTACH`,
@@ -1240,10 +1334,7 @@ pub(crate) async fn prepare_check(db: &Db, sql: &str) -> Result<(), DbError> {
         return Ok(());
     }
     let sql = sql.to_string();
-    with_conn(db, move |conn| {
-        conn.prepare(&sql).map(|_| ()).map_err(query_err)
-    })
-    .await
+    with_conn(db, move |conn| prepare_one(conn, &sql).map(|_| ())).await
 }
 
 /// The Server variables viewer's list: the engine's version, then every
@@ -2723,9 +2814,10 @@ fn refetch_on(
             .collect();
         let mut params = Vec::new();
         let w = where_clause(&key, &mut params);
-        let mut stmt = conn
-            .prepare(&format!("SELECT {cols} FROM {table} WHERE {w} LIMIT 1"))
-            .map_err(query_err)?;
+        let mut stmt = prepare_one(
+            conn,
+            &format!("SELECT {cols} FROM {table} WHERE {w} LIMIT 1"),
+        )?;
         let mut got = stmt
             .query(duckdb::params_from_iter(params))
             .map_err(query_err)?;
@@ -2772,7 +2864,7 @@ fn blob_on(conn: &DuckConn, r: &BlobRef) -> Result<Option<BlobValue>, DbError> {
         "SELECT {col} FROM {} WHERE {w} LIMIT 1",
         table_sql(r.schema.as_deref(), &r.table)
     );
-    let mut stmt = conn.prepare(&sql).map_err(query_err)?;
+    let mut stmt = prepare_one(conn, &sql)?;
     let mut got = stmt
         .query(duckdb::params_from_iter(params))
         .map_err(query_err)?;
@@ -3443,6 +3535,59 @@ mod tests {
         assert_eq!(n.cell(0, 0).unwrap().to_value(), Value::Int(0));
         // And the next operation is not left inside that transaction.
         assert!(rt.block_on(q(&db, "INSERT INTO t VALUES (2)")).is_ok());
+    }
+
+    /// **Live validation executes nothing, whatever DuckDB reads the text
+    /// as.** The driver's `prepare` *runs* every statement but the last, and
+    /// core's lexer and DuckDB's disagree on where a `--` comment ends (a lone
+    /// `\r` ends one for DuckDB), so a text core takes for one `SELECT` could
+    /// delete rows as the user typed. Refused at the boundary instead.
+    #[test]
+    fn validation_runs_no_statement_hidden_behind_a_comment() {
+        let db = mem("prepare-hidden");
+        seed(&db, "CREATE TABLE t(x INT); INSERT INTO t VALUES (1), (2)");
+        let rt = rt();
+        let r = rt.block_on(prepare_check(
+            &db,
+            "SELECT 1 --c\r; DELETE FROM t; SELECT 1",
+        ));
+        assert!(r.is_err(), "{r:?}");
+        let n = rt.block_on(q(&db, "SELECT count(*) AS n FROM t")).unwrap();
+        assert_eq!(n.cell(0, 0).unwrap().to_value(), Value::Int(2));
+        // One statement still validates, a trailing `;` and comment included.
+        assert!(
+            rt.block_on(prepare_check(&db, "SELECT x FROM t; -- done"))
+                .is_ok()
+        );
+    }
+
+    /// **A read-only run cannot `COMMIT` its way out.** The hidden `COMMIT`
+    /// would end the `READ ONLY` transaction and the `CREATE` after it would
+    /// run in autocommit; the text is refused before anything runs.
+    #[test]
+    fn a_read_only_run_runs_no_hidden_commit() {
+        let db = mem("ro-hidden-commit");
+        let rt = rt();
+        let r = rt.block_on(db.fetch_query_enforced(
+            None,
+            "SELECT 1 --c\r; COMMIT; CREATE TABLE z(i INT); SELECT 2",
+            10,
+            CancellationToken::new(),
+            crate::Enforce::ReadOnly,
+        ));
+        assert!(r.is_err(), "{r:?}");
+        let n = rt
+            .block_on(q(
+                &db,
+                "SELECT count(*) AS n FROM duckdb_tables() WHERE table_name = 'z'",
+            ))
+            .unwrap();
+        assert_eq!(n.cell(0, 0).unwrap().to_value(), Value::Int(0));
+        // A plain run of the same text is refused the same way.
+        assert!(
+            rt.block_on(q(&db, "SELECT 1 --c\r; CREATE TABLE z(i INT); SELECT 2"))
+                .is_err()
+        );
     }
 
     #[test]

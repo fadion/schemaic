@@ -104,6 +104,19 @@ on SQLite. `prepare_check` — the live validation, run as the user types — do
 statement whose head acts at prepare time or changes the session or the instance (`SET`, `PRAGMA`,
 `ATTACH`, `INSTALL`/`LOAD`, `USE`, `CHECKPOINT`, `COPY`, the transaction words and the rest of its
 list), the reason SQLite's skips a `PRAGMA`; those go unchecked and their run reports them.
+**Every prepare of statement text is one statement by DuckDB's own count** (`prepare_one`):
+the driver's `prepare` (duckdb 1.20000.1, `InnerConnection::prepare`) *executes* every statement
+but the last, and DuckDB's scanner and core's lexer need not agree on where one ends — a lone
+`\r` ends a `--` comment for DuckDB and did not for core. A text core took for one `SELECT`
+therefore ran a hidden `DELETE` from live validation, with nobody pressing Run, and a hidden
+`COMMIT` ended a read-only run's `READ ONLY` transaction so the `CREATE` after it ran in
+autocommit. `run_query` (so `fetch_query`, `run_batch`, a Manual tab's `pinned_query` and the
+plan's `EXPLAIN`), `prepare_check`, `refetch_on` and `blob_on` all go through `prepare_one`, which
+asks `duckdb_extract_statements` on a parse-only in-memory database of the process's own
+(`statement_count`, `PARSER` — the extraction only parses) and refuses any count but one before
+anything is prepared (`validation_runs_no_statement_hidden_behind_a_comment`,
+`a_read_only_run_runs_no_hidden_commit`). It is the boundary check, not the lexer, that closes
+this: a lexer fix closes one disagreement, and this refuses the next.
 **Introspection is DuckDB's own catalog functions** — `duckdb_schemas/tables/views/columns/
 constraints/indexes/sequences/functions()`, each scoped to `current_database()` and, where the
 function has the column, `NOT internal` — so an `ATTACH`ed database, which lives only as long as

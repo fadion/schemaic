@@ -338,6 +338,15 @@ Re-introducing the anti-patterns these guard against is a regression:
   every handle it serves besides (`mcp::serve`), so its generated reads — `sample_rows`,
   `describe_table`'s samples — are sealed too; the Live Monitor's is the editor's, attended. No
   source gate reads the `.sealed()` calls the way this one reads the `Enforce`.
+  **On DuckDB the session half also needs the text to be one statement by DuckDB's count**,
+  because its driver's `prepare` *executes* every statement but the last. Where core's lexer and
+  DuckDB's scanner disagree on where a statement ends — a lone `\r` after `--` was such a text —
+  the gate judged one `SELECT` while the driver ran a hidden `COMMIT` out of the `READ ONLY`
+  transaction and a `CREATE` after it in autocommit; live validation, advertised as non-executing,
+  ran a hidden `DELETE`. So every DuckDB prepare of text goes through `db::duckdb::prepare_one`,
+  which asks DuckDB's own parser for the count and refuses any but one before anything runs
+  (`a_read_only_run_runs_no_hidden_commit`). That boundary check is the fix, not the lexer's: it is
+  what refuses the *next* disagreement between the two.
   **A generated read needs the session half more, not less, because it has no text half at all**
   (security review S8). The Live Monitor's `Db::fetch_table`, `schemaic dump` and the folder
   export (`cli/dump.rs`), and AI Fill's and Seed's `SELECT … LIMIT 20` sample in `main.rs` each
