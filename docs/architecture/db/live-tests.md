@@ -1123,10 +1123,16 @@ a panicking test left a real login on a real server, named but present. It now d
 on its own thread with its own runtime, on `Scratch::drop`'s terms — a drop is synchronous and
 blocking on the current runtime from inside one deadlocks — and prints rather than panicking while
 panicking. CI runs the tier as a blocking `live` job with three service
-containers, **under `timeout-minutes: 15`**: the tier has both a channel that can wait forever and
-a `DROP DATABASE` a held transaction can block, and without a ceiling a wedged test holds a runner
-for the six-hour default while the failure reads as "still running" rather than as itself
-(generous against a cold service container — the whole tier runs in ~10 s locally). The lint job
+containers, **with a ceiling on each test step** (8 minutes, and 5 for the SQL Server 2025 run).
+The tier has both a channel that can wait forever and a `DROP DATABASE` a held transaction can
+block. Without a ceiling, a wedged test holds a runner for the six-hour default, and the failure
+reads as "still running" rather than as itself (the limits are generous against a cold service
+container; the whole tier runs in ~10 s locally). **The compile is a step of its own**
+(`--no-run`, 35 minutes), because the bundled DuckDB's C++ takes most of a quarter of an hour on
+a cold cache. When the limit was one 15 minutes for the whole job, the first run with DuckDB spent
+all of it compiling and was killed before a test ran. rust-cache saves only after a job succeeds,
+so every run after it would have started cold too. The job's own `timeout-minutes` is now only
+the steps' limits added up, plus room for the containers. The lint job
 compiles it via `--features schemaic-db/live-tests`, since otherwise it
 would be the one code in the repository no push compiles.
 **The SQL Server legs, 2022's and 2025's, run on the default 2 MiB test thread** — no

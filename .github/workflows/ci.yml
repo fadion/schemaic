@@ -167,7 +167,16 @@ jobs:
     # ceiling a wedged test holds a runner for the full six-hour default, and the
     # failure reads as "still running" rather than as itself. Generous against a
     # cold service container — the whole tier runs in ~10 s locally.
-    timeout-minutes: 15
+    #
+    # **The ceiling is per step, not per job.** The compile has its own step
+    # and its own allowance. `schemaic-db` bundles DuckDB, whose C++ alone
+    # takes most of a quarter of an hour on a cold cache. The first run with it
+    # spent the whole of a 15-minute job ceiling compiling and was killed before
+    # a test ran. rust-cache saves only after a job succeeds, so every later run
+    # would have started cold and been killed the same way. The test steps keep
+    # tight limits of their own, and those are what catch a wedged test. The job
+    # ceiling is only the sum of the steps' limits plus room for the containers.
+    timeout-minutes: 55
     services:
       # MariaDB is a leg of its own rather than a MySQL stand-in: the two
       # diverge in exactly what the DB layer reads — `information_schema`,
@@ -258,7 +267,11 @@ jobs:
       # is granted rights on `MYSQL_DATABASE` alone, so it cannot create the
       # scratch database each test works in. PostgreSQL's `POSTGRES_USER` is the
       # cluster superuser and needs no such exception.
+      - name: Build (live)
+        timeout-minutes: 35
+        run: cargo test -p schemaic-db --features live-tests --no-run
       - name: Test (live)
+        timeout-minutes: 8
         run: cargo test -p schemaic-db --features live-tests
         env:
           SCHEMAIC_IT_MARIADB_USER: root
@@ -274,6 +287,7 @@ jobs:
       # refuses in CI (`endpoint::engines_var`), since a leg it leaves out
       # reports as a pass having asserted nothing.
       - name: Test (live, SQL Server 2025)
+        timeout-minutes: 5
         run: "cargo test -p schemaic-db --features live-tests --test live -- mssql::"
         env:
           SCHEMAIC_IT_MSSQL_PORT: "1434"
