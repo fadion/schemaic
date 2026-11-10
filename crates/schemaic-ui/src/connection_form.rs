@@ -290,8 +290,15 @@ fn path_field_with(
                     tabindex + 2,
                     move || action(),
                 );
+                // Stretched, not centred: the field stretches this row to its
+                // own height, and a lone Browse fills it — centring the pair
+                // left both at their label's height, short of the box.
                 h_stack((browse, more))
-                    .style(|s| s.flex_row().items_center().gap(theme::scaled(4.0)))
+                    .style(|s| {
+                        s.flex_row()
+                            .align_items(Some(floem::taffy::style::AlignItems::Stretch))
+                            .gap(theme::scaled(4.0))
+                    })
                     .into_any()
             }
         }
@@ -1991,7 +1998,9 @@ fn file_fields(
                 .apply_if(bad(), |s| s.color(theme::error()))
         }),
     ))
-    .style(|s| s.flex_col().gap(theme::scaled(20.0)).width_full())
+    // A hint sits 6px under its field, as the TLS rows' do; the group's 20px
+    // read as a stray paragraph.
+    .style(|s| s.flex_col().gap(theme::scaled(6.0)).width_full())
 }
 
 #[allow(clippy::too_many_arguments)] // a UI builder; grouping into a struct adds no clarity
