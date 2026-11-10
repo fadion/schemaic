@@ -1246,10 +1246,11 @@
     Linux; the diagram PNG has a fallback of its own (`export_options`, under `erd_raster.rs`).
     With the isolation marks off (above), a right-to-left value placed in a message is not
     protected from reordering the sentence round it either.
-  - **Three tests guard what the compiler cannot**: `every_catalogue_parses_cleanly`, because a
+  - **Four tests guard what the compiler cannot**: `every_catalogue_parses_cleanly`, because a
     malformed translation is only logged at run time and falls back to English unseen;
-    `no_translation_outlives_its_english_message`, for a renamed or deleted English id; and
-    `a_translation_reads_only_the_variables_english_is_given`. A message a translation lacks is
+    `no_translation_outlives_its_english_message`, for a renamed or deleted English id;
+    `a_translation_reads_only_the_variables_english_is_given`; and its converse,
+    `no_translation_drops_a_variable_english_shows`. A message a translation lacks is
     not caught, by design: it reads in English (`a_message_german_lacks_reads_in_english`).
 - **Reactive text**: use `dyn_container` (no `floem::views::label`).
 - **There is no accessibility tree, and there is nothing in this repository that can add one.**

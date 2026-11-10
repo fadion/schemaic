@@ -3184,6 +3184,37 @@ mod tests {
         }
     }
 
+    /// **And no translation drops a variable its English message shows.** The
+    /// test above checks one direction only; a German `chart-caption-skipped`
+    /// without `{ $skipped }`, or a `perf-title` without `{ $connection }`,
+    /// would silently lose the count or name English shows with every test
+    /// green. `ALLOWED` is where a language that has to drop one (a plural
+    /// select whose arms omit the count, say) is written down by id.
+    #[test]
+    fn no_translation_drops_a_variable_english_shows() {
+        const ALLOWED: &[(&str, &str, &str)] = &[]; // (catalogue, id, variable)
+        let english = variables("en-GB/schemaic.ftl");
+        for path in Catalogues::iter().filter(|p| !p.starts_with("en-GB/")) {
+            for (id, vars) in variables(&path) {
+                let Some(given) = english.get(&id) else {
+                    continue;
+                };
+                let dropped: Vec<&String> = given
+                    .difference(&vars)
+                    .filter(|v| {
+                        !ALLOWED
+                            .iter()
+                            .any(|(p, i, x)| path.starts_with(p) && *i == id && x == v)
+                    })
+                    .collect();
+                assert!(
+                    dropped.is_empty(),
+                    "{path} `{id}` drops {dropped:?}, which its English message shows"
+                );
+            }
+        }
+    }
+
     fn ids(path: &str) -> Vec<String> {
         let file = Catalogues::get(path).expect(path);
         let text = std::str::from_utf8(&file.data).expect("utf-8").to_string();
