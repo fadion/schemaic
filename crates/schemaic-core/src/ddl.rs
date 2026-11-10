@@ -29677,9 +29677,9 @@ mod tests {
     }
 
     /// **A new DuckDB function starts as a macro DuckDB takes.** The blank
-    /// was MySQL's — Returns `INT`, a `BEGIN RETURN 0; END` body — so Create
-    /// > Function emitted `CREATE MACRO f() AS BEGIN …`, which DuckDB
-    /// refuses, until both fields were rewritten.
+    /// was MySQL's — Returns `INT`, a `BEGIN RETURN 0; END` body — so
+    /// *Create › Function* emitted `CREATE MACRO f() AS BEGIN …`, which
+    /// DuckDB refuses, until both fields were rewritten.
     #[test]
     fn a_blank_duckdb_function_is_a_scalar_macro() {
         use crate::schema::RoutineKind;
