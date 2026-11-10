@@ -370,6 +370,14 @@ Recovery, if it happens anyway: `git show HEAD:<path> > <path>` per file. Plain 
 
 ## Commits & releases
 
+- **Sync with the remote before starting work and before every commit**, on whatever branch you
+  are on: `git fetch`, then compare the branch with its upstream
+  (`git rev-list --left-right --count HEAD...@{u}`). If it is behind, bring the remote in first. If
+  it has diverged, stop and ask the user how to bring the two together, and do it before going on.
+  Work goes on from more than one machine and session, so a local branch can fall behind without
+  anyone here pushing. A release was once cut on another machine while 111 commits piled up here
+  on the stale `main`, and the divergence, with its merge conflict, only came to light at release
+  time.
 - **Never commit unless the user explicitly asks.** Making edits does not imply committing — leave
   changes in the working tree. Same for `git tag`/`git push`. Amending is fine when the user is
   iterating on a commit.
