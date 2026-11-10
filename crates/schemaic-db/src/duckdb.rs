@@ -2605,15 +2605,27 @@ where
     }
 }
 
-/// A table a grid write names, as `"schema"."table"`.
+/// A table a grid write, re-read or blob read names, as
+/// `"catalog"."schema"."table"` — the origin's own catalog, the one
+/// [`origins_of`] proved the read against.
 ///
-/// **Not catalog-qualified**, and that is safe for the reason SQLite's bare
-/// name is: the statement runs on a fresh connection whose catalog is the
-/// file's, and [`origins_of`] attributes nothing outside it — a result read
-/// after a `USE` of an attached database has no origin at all, so no write can
-/// name one of its tables.
-fn table_sql(schema: Option<&str>, table: &str) -> String {
+/// **Catalog-qualified because a Manual tab's connection outlives the read.**
+/// A fresh connection's catalog is the file's, but the pinned one carries
+/// whatever the tab did since: a `USE` of an attached database holding a table
+/// of the same name, or a temporary table of that name, which a `main.p` would
+/// resolve to first. Both had the write land in the other table, report
+/// `Ok(1)` and re-read from it (`a_manual_grid_write_lands_in_the_table_it_was_read_from`).
+/// A three-part name reaches neither: the temporary catalog is `temp`. A
+/// write with no catalog or no schema (none is ever attributed so) keeps the
+/// shorter name.
+fn table_sql(database: &str, schema: Option<&str>, table: &str) -> String {
     match schema {
+        Some(s) if !database.is_empty() => format!(
+            "{}.{}.{}",
+            crate::ident_duckdb(database),
+            crate::ident_duckdb(s),
+            crate::ident_duckdb(table)
+        ),
         Some(s) => format!("{}.{}", crate::ident_duckdb(s), crate::ident_duckdb(table)),
         None => crate::ident_duckdb(table),
     }
@@ -2672,7 +2684,7 @@ fn statement_for(step: WriteStep<'_>) -> (String, Vec<DValue>) {
             let w = where_clause(&d.key, &mut params);
             format!(
                 "DELETE FROM {} WHERE {w}",
-                table_sql(d.schema.as_deref(), &d.table)
+                table_sql(&d.database, d.schema.as_deref(), &d.table)
             )
         }
         WriteStep::Update(u) => {
@@ -2692,11 +2704,11 @@ fn statement_for(step: WriteStep<'_>) -> (String, Vec<DValue>) {
             let w = where_clause(&u.key, &mut params);
             format!(
                 "UPDATE {} SET {sets} WHERE {w}",
-                table_sql(u.schema.as_deref(), &u.table)
+                table_sql(&u.database, u.schema.as_deref(), &u.table)
             )
         }
         WriteStep::Insert(i) => {
-            let table = table_sql(i.schema.as_deref(), &i.table);
+            let table = table_sql(&i.database, i.schema.as_deref(), &i.table);
             if i.cols.is_empty() {
                 format!("INSERT INTO {table} DEFAULT VALUES")
             } else {
@@ -2800,7 +2812,11 @@ fn refetch_on(
         .map(|c| crate::ident_duckdb(c))
         .collect::<Vec<_>>()
         .join(", ");
-    let table = table_sql(template.schema.as_deref(), &template.table);
+    let table = table_sql(
+        &template.database,
+        template.schema.as_deref(),
+        &template.table,
+    );
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         // Key then confirming columns, the order `edit::refetch_key`
@@ -2862,7 +2878,7 @@ fn blob_on(conn: &DuckConn, r: &BlobRef) -> Result<Option<BlobValue>, DbError> {
     let col = crate::ident_duckdb(&r.column);
     let sql = format!(
         "SELECT {col} FROM {} WHERE {w} LIMIT 1",
-        table_sql(r.schema.as_deref(), &r.table)
+        table_sql(&r.database, r.schema.as_deref(), &r.table)
     );
     let mut stmt = prepare_one(conn, &sql)?;
     let mut got = stmt
@@ -4784,6 +4800,75 @@ mod tests {
             s.commit().await.unwrap();
         });
         assert_eq!(names(&db, &rt), ["1:uno:x"]);
+    }
+
+    /// **A Manual tab's grid write names the table's catalog**, so what the
+    /// tab did to its connection since the read — a `USE` of an attached
+    /// database holding a table of the same name, a temporary table of that
+    /// name — cannot move the write. Both were written into the other table,
+    /// reported `Ok(1)`, and re-read from it, so the grid showed the edit
+    /// landed.
+    #[test]
+    fn a_manual_grid_write_lands_in_the_table_it_was_read_from() {
+        let db = provenance_db("manual-write-catalog");
+        let rt = rt();
+        rt.block_on(async {
+            let s = crate::Session::open(&db, None).await.unwrap();
+            let read = tab_run(&s, "SELECT * FROM p").await.result.unwrap();
+            assert_eq!(read.columns[0].origin.as_ref().unwrap().database, "memory");
+            for sql in [
+                "ATTACH ':memory:' AS x",
+                "CREATE TABLE x.main.p(id INTEGER PRIMARY KEY, name VARCHAR, note VARCHAR)",
+                "INSERT INTO x.main.p VALUES (1, 'away', NULL)",
+            ] {
+                let out = tab_run(&s, sql).await;
+                assert_eq!(out.stmt, StmtOutcome::Ok, "{sql}: {:?}", out.result);
+            }
+            // One transaction writes one database, so the setup commits first.
+            s.commit().await.unwrap();
+            let out = tab_run(&s, "USE x").await;
+            assert_eq!(out.stmt, StmtOutcome::Ok, "{:?}", out.result);
+            let write = GridWrite {
+                updates: vec![edit(vec![("name", CellEdit::Text("home".into()))], 1)],
+                ..Default::default()
+            };
+            let out = s.commit_writes(&write, CancellationToken::new()).await;
+            assert_eq!(out.result.unwrap(), 1);
+            let away = tab_run(&s, "SELECT name FROM x.main.p")
+                .await
+                .result
+                .unwrap();
+            assert_eq!(away.cell(0, 0).unwrap().display().to_string(), "away");
+            s.commit().await.unwrap();
+            // And a temporary table shadowing the name, back on the file.
+            for sql in [
+                "USE memory",
+                "CREATE TEMP TABLE p AS SELECT id, 'temp' AS name, note FROM memory.main.p",
+            ] {
+                let out = tab_run(&s, sql).await;
+                assert_eq!(out.stmt, StmtOutcome::Ok, "{sql}: {:?}", out.result);
+            }
+            s.commit().await.unwrap();
+            s.ensure_tx().await.unwrap();
+            let write = GridWrite {
+                updates: vec![edit(vec![("note", CellEdit::Text("y".into()))], 1)],
+                ..Default::default()
+            };
+            assert_eq!(
+                s.commit_writes(&write, CancellationToken::new())
+                    .await
+                    .result
+                    .unwrap(),
+                1
+            );
+            let temp = tab_run(&s, "SELECT coalesce(note, '-') FROM temp.main.p")
+                .await
+                .result
+                .unwrap();
+            assert_eq!(temp.cell(0, 0).unwrap().display().to_string(), "x");
+            s.commit().await.unwrap();
+        });
+        assert_eq!(names(&db, &rt), ["1:home:y"]);
     }
 
     /// **A failed grid commit inside a Manual transaction takes the whole

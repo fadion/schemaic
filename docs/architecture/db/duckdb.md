@@ -282,9 +282,15 @@ read-only, and `SELECT rowid, * FROM k` over a keyless one not editable at all.
 an operation's own connection on the blocking pool, with Stop reaching a running statement through
 its interrupt handle, the shape of `sqlite::commit_writes`. As there, a cancel answers
 `DbError::Cancelled` at once rather than awaiting the worker, whose interrupted statement then
-fails into the closure's `ROLLBACK`. A write names `"schema"."table"` (`table_sql`), never the
-catalog, which is safe for the reason SQLite's bare name is: the statement runs on a fresh
-connection on the file's own catalog, and `origins_of` attributes nothing outside it. Key values
+fails into the closure's `ROLLBACK`. **A write, a re-read and a blob read name
+`"catalog"."schema"."table"`** (`table_sql`), the catalog being the origin's own — the one
+`origins_of` proved the read against. Two-part names were safe on a fresh connection, whose
+catalog is the file's, and they were not on a Manual tab's pinned one, which carries whatever the
+tab did since the read: after a `USE` of an attached database holding a table of the same name,
+or a temporary table of that name (which `main.p` resolves to first), the write landed in the
+other table, reported `Ok(1)` and was re-read from it
+(`a_manual_grid_write_lands_in_the_table_it_was_read_from`). A three-part name reaches neither —
+a temporary table's catalog is `temp`. Key values
 bind as typed `DValue`s, a text key cast by DuckDB to the column's type at bind (measured on 2.0
 for integers, decimals, zoned timestamps, intervals, booleans, UUIDs and `HUGEINT`s past `i64` —
 the forms `cell_of` writes), and a `NULL` key compares `IS NULL`. A staged `CellEdit::Default` is
