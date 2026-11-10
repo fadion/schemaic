@@ -503,20 +503,14 @@ pub(crate) async fn fetch_query(
     let read_only = enforce.is_some_and(crate::Enforce::refuses_writes);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let mut moved = std::mem::replace(dest, crate::RowDest::Capped(0));
+    let worker_cancel = cancel.clone();
     let work = tokio::task::spawn_blocking(move || {
         let (_inst, conn) = match connect(&db) {
             Ok(c) => c,
             Err(e) => return (Err(e), moved),
         };
         let _ = tx.send(conn.interrupt_handle());
-        let home = catalog(&conn).ok();
-        if read_only && let Err(e) = conn.execute_batch("BEGIN TRANSACTION READ ONLY") {
-            return (Err(query_err(e)), moved);
-        }
-        let rs = run_query(&conn, home.as_deref(), &sql, &mut moved);
-        if read_only {
-            let _ = conn.execute_batch("ROLLBACK");
-        }
+        let rs = fetch_on(&conn, &sql, &mut moved, read_only, &worker_cancel);
         (rs, moved)
     });
     let interrupt = rx.await.ok();
@@ -536,6 +530,41 @@ pub(crate) async fn fetch_query(
         }
         None => Err(DbError::Cancelled),
     }
+}
+
+/// [`fetch_query`]'s work once connected, on the operation's own connection:
+/// the file's catalog, the read-only transaction where asked, the statement.
+///
+/// **The token is asked here, right before the statement**, and after it: a
+/// Stop that arrived while the read was still connecting reached the
+/// interrupt handle before anything ran, and DuckDB clears a pending
+/// interrupt when the next query starts, so `fetch_query` answered
+/// *Cancelled* while the statement ran to its end holding the instance and
+/// the file's lock — and the CLI's `--timeout` waited on it at exit.
+fn fetch_on(
+    conn: &DuckConn,
+    sql: &str,
+    dest: &mut crate::RowDest,
+    read_only: bool,
+    cancel: &CancellationToken,
+) -> Result<ResultSet, DbError> {
+    let home = catalog(conn).ok();
+    if read_only {
+        conn.execute_batch("BEGIN TRANSACTION READ ONLY")
+            .map_err(query_err)?;
+    }
+    let rs = if cancel.is_cancelled() {
+        Err(DbError::Cancelled)
+    } else {
+        match run_query(conn, home.as_deref(), sql, dest) {
+            Err(_) if cancel.is_cancelled() => Err(DbError::Cancelled),
+            other => other,
+        }
+    };
+    if read_only {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    rs
 }
 
 /// Run a statement list in order on **one connection** — so a `SET`, a
@@ -3813,6 +3842,32 @@ mod tests {
         assert_eq!(n.cell(0, 0).unwrap().to_value(), Value::Int(0));
         // And the next operation is not left inside that transaction.
         assert!(rt.block_on(q(&db, "INSERT INTO t VALUES (2)")).is_ok());
+    }
+
+    /// **A Stop that lands before the statement starts stops it.** A cancel
+    /// that arrived while the read was still connecting reached the
+    /// interrupt handle before the statement began, and DuckDB clears a
+    /// pending interrupt when the next query starts — so `fetch_query`
+    /// answered *Cancelled* at once and the query then ran to its end,
+    /// holding the instance and the file's lock (20 of 20 in the review's
+    /// measurement). The worker asks the token itself, and the connection is
+    /// not left inside the read-only transaction.
+    #[test]
+    fn a_cancel_before_the_statement_starts_stops_it() {
+        let db = mem("cancel-before-statement");
+        let (_i, conn) = connect(&db).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let r = fetch_on(
+            &conn,
+            "SELECT 1",
+            &mut crate::RowDest::Capped(10),
+            true,
+            &cancel,
+        );
+        assert!(matches!(r, Err(DbError::Cancelled)), "{r:?}");
+        conn.execute_batch("CREATE TABLE after_cancel(x INT)")
+            .expect("not left read-only");
     }
 
     /// **An init SQL the form accepts is one a sealed handle runs.** A sealed

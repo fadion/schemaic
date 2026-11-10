@@ -129,7 +129,11 @@ back after, on the same cloned connection so the next operation is not left insi
 (`a_read_only_run_refuses_a_write_by_its_effect`). That holds the session half of the read-only
 invariant; it does not stop a file read, which is the seal's job. `run_batch` and `fetch_query`
 take the connection's interrupt handle before any work, so Stop reaches a running statement, as
-on SQLite. `prepare_check` — the live validation, run as the user types — does not prepare a
+on SQLite. **The workers ask the token themselves too**, right before each statement
+(`fetch_on`, and `run_batch`'s loop): an interrupt that lands before a statement starts is
+cleared when it starts, so a Stop during a slow connect answered *Cancelled* at once while the
+query then ran to its end with the instance and the file's lock held — and the CLI's `--timeout`
+waited on it at exit (`a_cancel_before_the_statement_starts_stops_it`). `prepare_check` — the live validation, run as the user types — does not prepare a
 statement whose head acts at prepare time or changes the session or the instance (`SET`, `PRAGMA`,
 `ATTACH`, `INSTALL`/`LOAD`, `USE`, `CHECKPOINT`, `COPY`, the transaction words and the rest of its
 list), the reason SQLite's skips a `PRAGMA`; those go unchecked and their run reports them.
