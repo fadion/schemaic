@@ -42,6 +42,23 @@ impl SqlDialect {
         matches!(self, SqlDialect::MySql)
     }
 
+    /// Does a bare CR end a `--` line comment, as `\n` does?
+    ///
+    /// PostgreSQL's scanner says so (`scan.l`: `newline [\n\r]`), DuckDB's is
+    /// the same scanner, and SQL Server does too (measured on 2022 and 2025:
+    /// `SELECT 1 --x` + CR + ` + 41` answers 42). MySQL (`sql_lex.cc`, measured
+    /// on MariaDB 10.11) and SQLite (`tokenize.c`) end one at `\n` alone. A
+    /// lexer that ends the comment later than the server hides what follows
+    /// the CR from every gate built on it — on a read-only PostgreSQL
+    /// connection, a `; COMMIT; BEGIN READ WRITE; DELETE …` that the simple
+    /// protocol then ran. Exhaustive, so another engine answers here.
+    fn cr_ends_line_comment(self) -> bool {
+        match self {
+            SqlDialect::Postgres | SqlDialect::DuckDb | SqlDialect::MsSql => true,
+            SqlDialect::MySql | SqlDialect::Sqlite => false,
+        }
+    }
+
     /// Is `#` a line comment? MySQL only — PostgreSQL spells operators with it
     /// (`#>`/`#>>`/`#-`), and SQLite doesn't accept the character at all, so
     /// treating it as a comment there would swallow a line the server would have
@@ -214,7 +231,8 @@ pub fn holds_code(text: &str, dialect: SqlDialect) -> bool {
 }
 
 /// If `b[i..]` starts a comment, return the index just past it. Handles `--`
-/// (whitespace after it required per [`SqlDialect::dash_comment_needs_space`]),
+/// (whitespace after it required per [`SqlDialect::dash_comment_needs_space`],
+/// ended by a bare CR too per [`SqlDialect::cr_ends_line_comment`]),
 /// `#` line comments (per [`SqlDialect::hash_line_comment`]), and `/* … */` block
 /// comments (every dialect; nesting per [`SqlDialect::nested_block_comments`] —
 /// ending a PostgreSQL comment at its first `*/` read the rest of it as the
@@ -229,8 +247,9 @@ pub(crate) fn skip_comment(b: &[u8], i: usize, dialect: SqlDialect) -> Option<us
         && b[i + 1] == b'-'
         && (!dialect.dash_comment_needs_space() || i + 2 >= n || b[i + 2].is_ascii_whitespace())
     {
+        let cr_ends = dialect.cr_ends_line_comment();
         let mut j = i + 2;
-        while j < n && b[j] != b'\n' {
+        while j < n && b[j] != b'\n' && !(cr_ends && b[j] == b'\r') {
             j += 1;
         }
         return Some(j);
@@ -11559,6 +11578,40 @@ line */",
         for d in [SqlDialect::MySql, SqlDialect::Postgres, SqlDialect::Sqlite] {
             assert_eq!(super::skip_noncode(b"", 0, d), None);
         }
+    }
+
+    /// **A bare CR ends a `--` comment where the server says it does** —
+    /// PostgreSQL (`scan.l`: `newline [\n\r]`), DuckDB (the same scanner) and
+    /// SQL Server (measured on 2022 and 2025: `sp_executesql` of
+    /// `SELECT 1 --x` + CR + ` + 41` answers 42). Ending every comment at
+    /// `\n` alone hid `; COMMIT; BEGIN READ WRITE; DELETE …` from both gates on
+    /// a read-only PostgreSQL connection, whose simple protocol then ran it.
+    #[test]
+    fn a_bare_cr_ends_a_dash_comment_where_the_server_ends_it() {
+        let text = "SELECT 1 --x\r; DELETE FROM t";
+        for d in [SqlDialect::Postgres, SqlDialect::DuckDb, SqlDialect::MsSql] {
+            assert_eq!(super::statement_ranges(text, d).len(), 2, "{d:?}");
+            assert!(super::contains_write(text, d), "{d:?}");
+            let hidden = "SELECT 1 --x\r; COMMIT; BEGIN READ WRITE; DELETE FROM t";
+            assert!(super::read_only_reason(hidden, d).is_err(), "{d:?}");
+            assert!(holds_code("--x\rSELECT 1", d), "{d:?}");
+        }
+        let call = "SELECT 1 --x\r, pg_read_file('x')";
+        assert!(super::read_only_reason(call, SqlDialect::Postgres).is_err());
+    }
+
+    /// MySQL (`sql_lex.cc`, measured on MariaDB 10.11: `SELECT 1 -- x` + CR +
+    /// ` + 41` answers 1) and SQLite (`tokenize.c`) run a `--` — and MySQL's
+    /// `#` — comment to `\n` only, so a CR there stays inside the comment.
+    #[test]
+    fn a_bare_cr_stays_inside_a_comment_where_the_server_keeps_it() {
+        for d in [SqlDialect::MySql, SqlDialect::Sqlite] {
+            let text = "SELECT 1 -- x\r; DELETE FROM t";
+            assert_eq!(super::statement_ranges(text, d).len(), 1, "{d:?}");
+            assert!(!holds_code("-- x\rSELECT 1", d), "{d:?}");
+        }
+        let hash = "SELECT 1 #x\r; DELETE FROM t";
+        assert_eq!(super::statement_ranges(hash, SqlDialect::MySql).len(), 1);
     }
 
     // ── The write guard (`run_verdict`) ──

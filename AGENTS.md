@@ -161,7 +161,9 @@ substitute for the statement, and none of these is a style preference.
   predicates that were not about writes — the post-commit re-fetch was the last of them, and the
   census meant to catch it could not see its call, which was spelled `(run)(sql)`.
 - **One SQL boundary lexer** — everything scanning SQL for string/comment/quote boundaries builds
-  on `core::sql::skip_noncode`, and it is dialect-aware.
+  on `core::sql::skip_noncode`, and it is dialect-aware — down to where a `--` comment ends
+  (`sql::SqlDialect::cr_ends_line_comment`: a bare CR ends one where the server's scanner says
+  so, and a gate that ends it later than the server lets the server run what the gate never saw).
 - **Structure-aware SQL analysis goes through `core::intel`** (a real per-dialect AST), not a new
   hand-rolled scanner. The DB stays the semantic authority. Two stated exceptions: the read-only
   gate's PostgreSQL function scan, which has to fail closed where an AST visitor fails open; and

@@ -645,7 +645,10 @@ Re-introducing the anti-patterns these guard against is a regression:
   `read_only_reason`, `has_top_level_where`/`unsafe_reason`/`first_unsafe`/`contains_write`) take a
   `SqlDialect`, so pass the connection's dialect (Postgres `#` is an operator not a comment, `$tag$…$tag$`
   is a string, `"…"` an identifier, `\`-escapes only in MySQL / PG `E'…'`; SQLite takes `"x"`,
-  `` `x` `` *and* `[x]` as identifiers and has no backslash escape at all). **It is dialect-aware
+  `` `x` `` *and* `[x]` as identifiers and has no backslash escape at all; a bare CR ends a `--`
+  comment on PostgreSQL, DuckDB and SQL Server and not on MySQL or SQLite —
+  `SqlDialect::cr_ends_line_comment`, and ending it later than the server hid a
+  `; COMMIT; BEGIN READ WRITE; DELETE …` from the read-only gate). **It is dialect-aware
   about statement *boundaries* too, not only tokens:** on SQLite a `;` inside a `CREATE TRIGGER`'s
   `BEGIN … END` block does not end the statement. SQLite has no `DELIMITER` directive to hide those
   semicolons behind, so without this `statement_bounds` cut a trigger in half and Run Everything

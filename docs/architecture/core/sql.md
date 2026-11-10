@@ -5,7 +5,7 @@ read-only gate, `edit_distance`. The *single* SQL boundary lexer; `intel` (scope
 diagnostics)/`sql_highlight`/`sqlfmt` all build on it so string/`#`/`--`/`/* */`/backtick
 boundaries agree by construction.
 **The per-dialect rules are a capability table on `SqlDialect`**, one predicate per divergence
-(`dash_comment_needs_space`, `hash_line_comment`, `backslash_escapes`, `e_string_backslash`,
+(`dash_comment_needs_space`, `cr_ends_line_comment`, `hash_line_comment`, `backslash_escapes`, `e_string_backslash`,
 `double_quote_is_ident`, `backtick_ident`, `bracket_ident`, `bracket_doubles`, `dollar_quoted`,
 `nested_block_comments`, `delimiter_directive`, `batch_separator`), and they are predicates
 because the question stopped being binary. SQL Server filled in the table as a fourth row:
@@ -81,7 +81,16 @@ every-row DELETE with no ask — and a quote in the comment's tail opened a "str
 real second statement from every gate (`a_nested_block_comment_ends_where_its_dialect_ends_it`;
 PG 16 was checked to read `SELECT /* a /* b */ c */ 42` as one comment). The highlighter's
 continuation of a comment across lines still looks for the first `*/`, a colouring matter
-only. The
+only. **`cr_ends_line_comment` was another**: `skip_comment` ended every `--` comment at `\n`,
+while PostgreSQL's scanner (`scan.l`: `newline [\n\r]`), DuckDB's (the same scanner) and SQL Server
+(measured on 2022 and 2025 through `sp_executesql`, whose text held no `\n`) end one at a bare CR
+too. So `SELECT 1 --x` + CR + `; COMMIT; BEGIN READ WRITE; DELETE …` was one commented read to
+`read_only_reason`, and on a read-only PostgreSQL connection the simple protocol ran all five
+statements, the `BEGIN READ WRITE` lifting the session default; a CR before
+`, pg_read_file(…)` hid the call from the function allowlist the same way. MySQL (measured on
+MariaDB 10.11) and SQLite (`tokenize.c`) keep the CR inside the comment, `#` included
+(`a_bare_cr_ends_a_dash_comment_where_the_server_ends_it`,
+`a_bare_cr_stays_inside_a_comment_where_the_server_keeps_it`). The
 scanner used to ask `dialect == Postgres` / `!= MySql`, which silently sorts any *third* engine
 onto whichever side each comparison happens to put it — with nothing failing to compile, since
 `!=` is exhaustive over any number of variants. Three of those defaults were wrong for SQLite
