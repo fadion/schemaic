@@ -197,6 +197,11 @@ struct Instance {
 static INSTANCES: LazyLock<Mutex<HashMap<String, Weak<Instance>>>> =
     LazyLock::new(Default::default);
 
+/// One lock per file being opened, so two opens of one file queue on it while
+/// opens of other files — and every lookup — go on ([`instance_opened_by`]).
+/// Entries stay for the process; each is an empty mutex.
+static OPENING: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = LazyLock::new(Default::default);
+
 /// The test suites' in-memory databases, held for the process: an in-memory
 /// instance *is* its data, so letting it close between two operations of one
 /// test would empty it. Only the suites' own `memory:` targets reach here
@@ -280,30 +285,71 @@ fn instance(db: &Db) -> Result<Arc<Instance>, DbError> {
 /// one that has closed would otherwise open an empty database that looked
 /// like it worked, which is the missing file's refusal over again.
 fn instance_with(db: &Db, make_memory: bool) -> Result<Arc<Instance>, DbError> {
-    let (key, target) = open_target(&db.file, std::path::Path::is_file)?;
-    let mut map = INSTANCES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(inst) = map.get(&key).and_then(Weak::upgrade) {
-        if inst.sealed != db.sealed {
-            return Err(DbError::Refused(DbRefusal::DuckDbSealedElsewhere));
-        }
-        return Ok(inst);
-    }
+    instance_opened_by(db, make_memory, open_instance)
+}
+
+/// Open the database `target` names, as `db` asks (sealed or not).
+fn open_instance(db: &Db, target: &Target) -> Result<DuckConn, DbError> {
     let connect_err = |e: duckdb::Error| DbError::Connect(format!("{}: {e}", db.file));
-    let conn = match target {
+    match target {
         Target::File(path) => {
-            DuckConn::open_with_flags(&path, config(db.sealed, true).map_err(connect_err)?)
-                .map_err(connect_err)?
-        }
-        Target::Memory if !make_memory => {
-            return Err(DbError::Refused(DbRefusal::DuckDbSessionClosed(
-                db.file.trim().to_string(),
-            )));
+            DuckConn::open_with_flags(path, config(db.sealed, true).map_err(connect_err)?)
+                .map_err(connect_err)
         }
         Target::Memory => {
             DuckConn::open_in_memory_with_flags(config(db.sealed, false).map_err(connect_err)?)
-                .map_err(connect_err)?
+                .map_err(connect_err)
         }
+    }
+}
+
+/// [`instance_with`], with the open a parameter — so a slow one is reachable
+/// from a test that touches no file.
+fn instance_opened_by(
+    db: &Db,
+    make_memory: bool,
+    open: impl FnOnce(&Db, &Target) -> Result<DuckConn, DbError>,
+) -> Result<Arc<Instance>, DbError> {
+    let (key, target) = open_target(&db.file, std::path::Path::is_file)?;
+    let live = |map: &HashMap<String, Weak<Instance>>| -> Option<Result<Arc<Instance>, DbError>> {
+        let inst = map.get(&key).and_then(Weak::upgrade)?;
+        Some(if inst.sealed != db.sealed {
+            Err(DbError::Refused(DbRefusal::DuckDbSealedElsewhere))
+        } else {
+            Ok(inst)
+        })
     };
+    // **The registry's lock is never held across an open**: a file on a
+    // share that has gone away, or a long WAL replay, blocks in it for as
+    // long as the OS lets it, and every DuckDB operation in the process —
+    // other files, data sessions, *Open data file* on the UI thread — waited
+    // on the one lock. Opens of one file still queue on that file's own
+    // lock, since DuckDB refuses a second instance on a file in-process.
+    let opening = {
+        let map = INSTANCES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = live(&map) {
+            return r;
+        }
+        drop(map);
+        OPENING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.clone())
+            .or_default()
+            .clone()
+    };
+    let _one_at_a_time = opening.lock().unwrap_or_else(|e| e.into_inner());
+    // Another open of the file may have finished while this one waited.
+    if let Some(r) = live(&INSTANCES.lock().unwrap_or_else(|e| e.into_inner())) {
+        return r;
+    }
+    if target == Target::Memory && !make_memory {
+        return Err(DbError::Refused(DbRefusal::DuckDbSessionClosed(
+            db.file.trim().to_string(),
+        )));
+    }
+    let conn = open(db, &target)?;
+    let mut map = INSTANCES.lock().unwrap_or_else(|e| e.into_inner());
     let inst = Arc::new(Instance {
         root: Mutex::new(conn),
         sealed: db.sealed,
@@ -3642,6 +3688,41 @@ mod tests {
             instance_with(&db, false),
             Err(DbError::Refused(DbRefusal::DuckDbSessionClosed(t))) if t == db.file
         ));
+    }
+
+    /// **One slow open stalls only its own file.** The registry's lock was
+    /// held across the open, so a file on a share that had gone away (or a
+    /// long WAL replay) stalled every DuckDB operation in the process, other
+    /// files and data sessions included — and *Open data file*, which takes
+    /// the lock on the UI thread, froze the window.
+    #[test]
+    fn a_slow_open_does_not_stall_another_files() {
+        let slow = mem("registry-slow-open");
+        let other = mem("registry-other-file");
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (opening, started) = std::sync::mpsc::channel::<()>();
+        let blocked = std::thread::spawn(move || {
+            instance_opened_by(&slow, true, |db, target| {
+                opening.send(()).unwrap();
+                let _ = wait.recv_timeout(std::time::Duration::from_secs(10));
+                open_instance(db, target)
+            })
+            .map(|_| ())
+        });
+        started
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(instance_with(&other, true).map(|_| ()));
+        });
+        let fast = finished.recv_timeout(std::time::Duration::from_secs(3));
+        release.send(()).unwrap();
+        assert!(
+            matches!(fast, Ok(Ok(()))),
+            "another file's open waited on the slow one: {fast:?}"
+        );
+        blocked.join().unwrap().unwrap();
     }
 
     /// The view takes a name nothing in the session's `main` has — a table or

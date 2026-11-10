@@ -22,7 +22,13 @@ every operation takes **its own connection** (`duckdb::Connection::try_clone`) o
 instance** (`instance`), and the registry, `INSTANCES`, holds a `Weak<Instance>` keyed by the
 file's **canonical** path — so two spellings of one file share the instance rather than the
 second being refused the lock — and the instance closes, releasing the file to the DuckDB CLI or
-any other program, the moment the last operation holding it ends. That is this engine's
+any other program, the moment the last operation holding it ends. **The registry's lock is never
+held across an open** (`instance_opened_by`): it was, so a file on a share that had gone away, or a
+long WAL replay, stalled every DuckDB operation in the process — other files, data sessions, and
+*Open data file*, which takes the lock on the UI thread, froze the window. A lookup takes it
+briefly; a miss takes the file's own lock in `OPENING`, looks again, opens with neither held and
+inserts, so two opens of one file queue on that file alone
+(`a_slow_open_does_not_stall_another_files`). That is this engine's
 exception to the one-connection-per-operation invariant, and it is narrower than it sounds:
 connections are still per operation, and only the database underneath them is shared while they
 overlap (`overlapping_operations_share_one_instance`). A Manual tab's pinned connection (below) is
