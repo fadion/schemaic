@@ -201,11 +201,13 @@ fn endpoint_plumbing(harness: Harness) -> EndpointPlumbing {
         // reused across sessions — so, like OpenCode's, it carries only the
         // endpoint file's path, and the endpoint file is what this session owns.
         // Cursor's `mcp.json` is in a reused workspace too, and holds the path.
+        // DeepSeek's overlay likewise: rewritten per session in a reused home.
         Harness::Codex
         | Harness::Antigravity
         | Harness::OpenCode
         | Harness::Copilot
-        | Harness::Cursor => EndpointPlumbing {
+        | Harness::Cursor
+        | Harness::DeepSeek => EndpointPlumbing {
             mcp_config: false,
             endpoint_file: true,
         },
@@ -1074,7 +1076,19 @@ pub(crate) struct InlinePlan {
     /// refused instead.
     cwd: PathBuf,
     env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    /// What [`dsh_seal_refusal`] dumps before the generation runs — the
+    /// launch, the seal environment and the overlay — on the harness whose
+    /// seal has to be re-earned against the composed profile. `None` elsewhere.
+    seal_check: Option<SealCheck>,
 }
+
+/// What [`dsh_seal_refusal`] is handed: the launch, the seal environment the
+/// run will get, and the overlay to dump.
+type SealCheck = (
+    crate::agent_cli::Launch,
+    Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    PathBuf,
+);
 
 /// May a one-shot generation run on this harness at this grade?
 ///
@@ -1123,7 +1137,8 @@ pub(crate) fn inline_plan(
         }
         schemaic_ai::harness::InlineOutput::Stdout => None,
     };
-    let env = inline_env(harness)?;
+    let isolation = inline_isolation(harness, model, effort)?;
+    let overlay = isolation.overlay.clone();
     let spec = schemaic_ai::harness::InlineSpec {
         intent: intent.to_string(),
         system: system.to_string(),
@@ -1137,6 +1152,10 @@ pub(crate) fn inline_plan(
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        overlay: overlay
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
     };
     let args = schemaic_ai::harness::inline_argv(harness, &spec);
     // What is actually started — Cursor's launcher script becomes the node it
@@ -1144,6 +1163,15 @@ pub(crate) fn inline_plan(
     // argv and the program that will really be spawned.
     let launch = crate::agent_cli::launch(harness, &bin);
     let args: Vec<String> = launch.prefix.iter().cloned().chain(args).collect();
+    // The program's own environment first (DeepSeek's `ELECTRON_RUN_AS_NODE`),
+    // then the isolation's — the two never name one variable.
+    let env: Vec<(std::ffi::OsString, std::ffi::OsString)> = launch
+        .env
+        .iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .chain(isolation.env.iter().cloned())
+        .collect();
+    let seal_check = overlay.map(|o| (launch.clone(), isolation.env.clone(), o));
     let bin = launch.program;
     // See `Harness::prompt_on_stdin`: on a harness that takes it there, the
     // prompt is absent from `args` above and travels here instead.
@@ -1183,6 +1211,7 @@ pub(crate) fn inline_plan(
         last_message,
         cwd,
         env,
+        seal_check,
     })
 }
 
@@ -1202,20 +1231,123 @@ pub(crate) fn inline_plan(
 /// nothing of its own. The arms for harnesses whose `env_seal` is false refuse
 /// rather than return an empty environment: a harness flipped to `true` with
 /// no writer here then fails closed instead of running unisolated.
+///
+/// The environment half of [`inline_isolation`], which `inline_plan` calls.
+#[cfg(test)]
 fn inline_env(harness: Harness) -> Result<Vec<(std::ffi::OsString, std::ffi::OsString)>, String> {
+    inline_isolation(harness, "", "").map(|i| i.env)
+}
+
+/// What a one-shot's isolation wrote: the environment the child gets, and the
+/// overlay that seals it where the harness has one (DeepSeek's).
+struct InlineIsolation {
+    env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    overlay: Option<PathBuf>,
+}
+
+/// `inline_env` with the overlay, which needs the model and effort a
+/// DeepSeek one-shot is composed with: headless takes neither as a flag.
+fn inline_isolation(
+    harness: Harness,
+    model: &str,
+    effort: &str,
+) -> Result<InlineIsolation, String> {
+    let env_only = |env| InlineIsolation { env, overlay: None };
     if !harness.env_seal() {
-        return Ok(Vec::new());
+        return Ok(env_only(Vec::new()));
     }
     match harness {
         Harness::OpenCode => crate::opencode::OpenCodeConfig::write_inline()
-            .map(|c| c.env())
+            .map(|c| env_only(c.env()))
             .ok_or_else(|| tr!("ai-inline-no-opencode-config")),
         Harness::Copilot => crate::copilot::CopilotHome::write_inline()
-            .map(|h| h.env())
+            .map(|h| env_only(h.env()))
             .ok_or_else(|| tr!("ai-inline-no-copilot-home")),
+        Harness::DeepSeek => crate::deepseek::DshHome::write_inline(model, effort)
+            .map(|h| InlineIsolation {
+                env: h.env(),
+                overlay: Some(h.overlay().to_path_buf()),
+            })
+            .ok_or_else(|| tr!("ai-inline-no-deepseek-home")),
         Harness::Claude | Harness::Codex | Harness::Antigravity | Harness::Cursor => {
             Err(tr!("ai-inline-no-env-writer", cli = harness.label()))
         }
+    }
+}
+
+/// Why a DeepSeek run must not start, or `None` when it is sealed: its
+/// composed profile — this overlay over this home — is dumped
+/// (`--dump-config`, which boots nothing) and read for any plugin that would
+/// still hand the model a tool.
+///
+/// **The overlay is a denylist of plugin ids**, and that is what this answers
+/// for: a dsh update adding a tool plugin under an id the overlay has never
+/// named would be live, with the panel reporting `Sealed`. Read by plugin
+/// *name* (`dsh_unsealed_rows`), it is found and the run refused. A dump that
+/// fails, or that does not show itself to be the headless profile, refuses too
+/// — no rows is not the same as no tools.
+///
+/// The child gets exactly the environment the run will, from the same clear
+/// list, so the dump is of the composition the run would mount.
+async fn dsh_seal_refusal(
+    launch: &crate::agent_cli::Launch,
+    seal_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    overlay: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Option<String> {
+    let unchecked = |error: String| Some(tr!("ai-deepseek-seal-unchecked", error = error));
+    let args: Vec<String> = launch
+        .prefix
+        .iter()
+        .cloned()
+        .chain(crate::deepseek::dump_args(overlay))
+        .collect();
+    // The verdict every spawn here asks — this one's argv is a few paths, but a
+    // shim the launch did not resolve would still be refused by Windows with a
+    // reason that names the wrong cause.
+    if let Some(why) = schemaic_ai::spawn_refusal(
+        Harness::DeepSeek,
+        &launch.program,
+        &args,
+        schemaic_ai::arg_limit(),
+        schemaic_ai::SCHEMA_AND_QUERY_LEVERS,
+    ) {
+        return unchecked(schemaic_ui::i18n::spawn_refusal_text(&why));
+    }
+    let mut cmd = Command::new(&launch.program);
+    crate::agent_cli::hide_console_window(cmd.as_std_mut());
+    cmd.args(&args);
+    for k in inherited_env_to_clear() {
+        cmd.env_remove(k);
+    }
+    cmd.envs(launch.env.iter().map(|(k, v)| (k, v)));
+    cmd.envs(seal_env.iter().map(|(k, v)| (k, v)));
+    cmd.env(schemaic_core::AGENT_CHILD_ENV, "1");
+    cmd.current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return unchecked(e.to_string()),
+        Err(_) => return unchecked("timed out".to_string()),
+    };
+    let dump = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() || !schemaic_ai::harness::dsh_dump_is_headless(&dump) {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let why = stderr
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("exit {:?}", out.status.code()));
+        return unchecked(why);
+    }
+    let rows = schemaic_ai::harness::dsh_unsealed_rows(&dump);
+    match rows.is_empty() {
+        true => None,
+        false => Some(tr!("ai-deepseek-unsealed", rows = rows.join(", "))),
     }
 }
 
@@ -1241,7 +1373,8 @@ fn inline_cwd(harness: Harness) -> Result<PathBuf, String> {
         | Harness::Codex
         | Harness::Antigravity
         | Harness::OpenCode
-        | Harness::Copilot => Err(tr!("ai-inline-no-rules-writer", cli = harness.label())),
+        | Harness::Copilot
+        | Harness::DeepSeek => Err(tr!("ai-inline-no-rules-writer", cli = harness.label())),
     }
 }
 
@@ -1259,6 +1392,7 @@ fn inherited_env_to_clear() -> impl Iterator<Item = &'static str> {
     crate::opencode::OpenCodeConfig::env_remove()
         .iter()
         .chain(crate::copilot::CopilotHome::env_remove())
+        .chain(crate::deepseek::DshHome::env_remove())
         .copied()
         .chain(std::iter::once(schemaic_core::PASSWORD_ENV))
 }
@@ -1279,6 +1413,14 @@ fn inline_reply_path() -> Option<PathBuf> {
 
 /// Run one inline generation to completion and hand back the reply text.
 pub(crate) async fn run_inline(plan: InlinePlan) -> Result<String, String> {
+    // Before anything is spawned: a profile that would still hand the model a
+    // tool is refused here, not discovered afterwards.
+    if let Some((launch, seal_env, overlay)) = &plan.seal_check
+        && let Some(why) = dsh_seal_refusal(launch, seal_env, overlay, &plan.cwd).await
+    {
+        let _ = std::fs::remove_dir(&plan.cwd);
+        return Err(why);
+    }
     let mut cmd = Command::new(&plan.bin);
     crate::agent_cli::hide_console_window(cmd.as_std_mut());
     cmd.args(&plan.args)
@@ -1753,6 +1895,9 @@ fn isolation_refusal(harness: Harness, wrote: bool) -> Option<String> {
         // **Refused, because a missing file fails open.** Measured: with no
         // permissions file a headless Cursor turn wrote a file unprompted.
         Harness::Cursor => Some(tr!("ai-refused-no-cursor-rules")),
+        // **The overlay is the seal**, so a missing one is a session with every
+        // built-in tool: refused, OpenCode's shape.
+        Harness::DeepSeek => Some(tr!("ai-refused-no-deepseek-home")),
         Harness::Claude | Harness::Codex | Harness::Antigravity => None,
     }
 }
@@ -1813,7 +1958,8 @@ fn spawn_refusal(harness: Harness, constraint: Constraint) -> Option<String> {
         | Harness::Antigravity
         | Harness::OpenCode
         | Harness::Copilot
-        | Harness::Cursor => None,
+        | Harness::Cursor
+        | Harness::DeepSeek => None,
     }
 }
 
@@ -1940,6 +2086,7 @@ pub(crate) fn start_ai_session(
         let mut oc_config: Option<crate::opencode::OpenCodeConfig> = None;
         let mut copilot_home: Option<crate::copilot::CopilotHome> = None;
         let mut cursor_ws: Option<crate::cursor::CursorWorkspace> = None;
+        let mut dsh_home: Option<crate::deepseek::DshHome> = None;
         // See `TurnPump::note`: a session that cannot reach the database has to
         // say so, on every path that produces one.
         let mut degraded: Option<String> = None;
@@ -2008,6 +2155,18 @@ pub(crate) fn start_ai_session(
                     degraded = Some(no_tools_note(&tr!("ai-no-endpoint-file")));
                 }
             }
+            // **DeepSeek's overlay is its seal and its sign-in**, so it is
+            // written with or without an endpoint — without one it has no
+            // server row and the session says it has no tools, Cursor's shape.
+            // The model and effort ride in it too: headless takes neither as a
+            // flag.
+            (Harness::DeepSeek, ep) => {
+                let ep = ep.map(|p| p.to_string_lossy().into_owned());
+                dsh_home = crate::deepseek::DshHome::write(&exe, ep.as_deref(), &model, &effort);
+                if ep.is_none() {
+                    degraded = Some(no_tools_note(&tr!("ai-no-endpoint-file")));
+                }
+            }
             _ => {}
         }
         // **The three harnesses that refuse rather than degrading**, when what
@@ -2031,6 +2190,7 @@ pub(crate) fn start_ai_session(
             }),
             Harness::Copilot => copilot_home.as_ref().map(|h| seal_env = h.env()),
             Harness::Cursor => cursor_ws.as_ref().map(|_| ()),
+            Harness::DeepSeek => dsh_home.as_ref().map(|h| seal_env = h.env()),
             Harness::Claude | Harness::Codex | Harness::Antigravity => Some(()),
         }
         .is_some();
@@ -2051,10 +2211,17 @@ pub(crate) fn start_ai_session(
             return (tx, private);
         }
         // Copilot's per-turn argv names both of these; the others ignore them.
+        // DeepSeek's names its overlay in the same field — the one file its
+        // turn is told to read.
         let copilot_mcp = copilot_home
             .as_ref()
             .and_then(|h| h.mcp_config())
+            .or(dsh_home.as_ref().map(|h| h.overlay()))
             .map(|p| p.to_string_lossy().into_owned());
+        // What `dsh_seal_refusal` dumps once, before the first turn.
+        let dsh_check = dsh_home
+            .as_ref()
+            .map(|h| (seal_env.clone(), h.overlay().to_path_buf()));
         let allowed_tools: Vec<String> = allowed.iter().map(|t| t.to_string()).collect();
         // Where each turn's child runs: Cursor's workspace — the directory its
         // permissions file is found from — and `cwd` for every other harness.
@@ -2113,6 +2280,17 @@ pub(crate) fn start_ai_session(
             if let Some(why) = degraded {
                 pump.note(why);
             }
+            // **DeepSeek's seal, re-earned before the first turn** against the
+            // composed profile — see `dsh_seal_refusal`. A refusal answers every
+            // turn of the session, as the constraint refusal does, rather than
+            // the first one only.
+            let sealed_refusal = match &dsh_check {
+                Some((env, overlay)) => {
+                    let launch = crate::agent_cli::launch(harness, &bin);
+                    dsh_seal_refusal(&launch, env, overlay, &child_cwd).await
+                }
+                None => None,
+            };
             let mut thread: Option<String> = None;
             while let Some(msg) = rx.recv().await {
                 let prompt = match msg {
@@ -2122,6 +2300,10 @@ pub(crate) fn start_ai_session(
                     // pressed stop on an idle panel.
                     SessionMsg::Interrupt => continue,
                 };
+                if let Some(why) = &sealed_refusal {
+                    pump.fail(why.clone());
+                    continue;
+                }
                 let spec = schemaic_ai::harness::TurnSpec {
                     prompt,
                     // Sent on every turn and dropped by `turn_args` on the
@@ -2187,14 +2369,17 @@ pub(crate) fn start_ai_session(
                 for k in inherited_env_to_clear() {
                     cmd.env_remove(k);
                 }
+                // The program's own environment (DeepSeek's
+                // `ELECTRON_RUN_AS_NODE`), then the isolation's.
+                cmd.envs(launch.env.iter().map(|(k, v)| (k, v)));
                 cmd.envs(seal_env.iter().map(|(k, v)| (k, v)));
                 cmd.current_dir(&child_cwd);
                 // See `run_inline`: the marker the command line refuses under.
                 cmd.env(schemaic_core::AGENT_CHILD_ENV, "1");
                 let child = cmd
                     // **Piped exactly when the prompt travels on it**, which is
-                    // `Harness::prompt_on_stdin` — Codex, Copilot and Cursor,
-                    // each measured to take a piped prompt; Codex's own help
+                    // `Harness::prompt_on_stdin` — Codex, Copilot, Cursor and
+                    // DeepSeek, each measured to take a piped prompt; Codex's own help
                     // says the instructions are read from stdin when no
                     // positional is given.
                     //
@@ -5414,12 +5599,20 @@ mod tests {
             "XDG_CONFIG_HOME",
             "OPENCODE_DISABLE_PROJECT_CONFIG",
             "COPILOT_HOME",
+            "DSH_HOME",
+            "DSH_PERMISSION_MODE",
+            "DSH_TELEMETRY_MODE",
+            // DeepSeek's launch variable: cleared, the CLI would open the
+            // desktop app's window instead of running.
+            "ELECTRON_RUN_AS_NODE",
         ] {
             assert!(!cleared.contains(&lever), "{lever} is cleared");
         }
-        // Both harnesses' lists are in it, not only the one that came first.
+        // Every harness's list is in it, not only the one that came first.
         assert!(cleared.contains(&"OPENCODE_CONFIG"), "{cleared:?}");
         assert!(cleared.contains(&"COPILOT_ALLOW_ALL"), "{cleared:?}");
+        // PTC mode's code runner, which the plugin denylist cannot see.
+        assert!(cleared.contains(&"DSH_TOOLS_MODE"), "{cleared:?}");
     }
 
     /// The harnesses whose isolation is *not* an environment get an empty one,

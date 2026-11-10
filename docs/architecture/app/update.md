@@ -336,9 +336,9 @@ different program — a stdio JSON-RPC server whose stdout is the protocol strea
 write to stdout ahead of it. The two flag sets never co-occur: `--veloapp-*` comes from the
 installer or the updater, and `--mcp-serve` comes from **whichever agent CLI the user picked** —
 Claude spawning this binary out of the `--mcp-config` file Schemaic writes it, and Codex,
-Antigravity, OpenCode, Copilot and Cursor out of their own configuration with `--endpoint-file`
-beside it. So the ordering between them is free, and this way the protocol stream stays clean
-whichever of the six opened it.
+Antigravity, OpenCode, Copilot, Cursor and DeepSeek out of their own configuration with
+`--endpoint-file` beside it. So the ordering between them is free, and this way the protocol
+stream stays clean whichever of the seven opened it.
 **The headless-CLI branch sits between those two, and being *before* Velopack is the load-bearing
 part.** `schemaic list`/`databases`/`ping`/`tables`/`describe`/`query`/`explain`/`export`/`dump`/`compare`/`exec`/`mcp`/`version`/`completions` return from `main` ahead of the hook, the file
 logger, the fonts and Floem: none of that belongs in a one-shot command, and `auto_apply_on_startup` is free

@@ -10,8 +10,8 @@ config. `CursorWorkspace::write(exe, Some(endpoint_file), allowed)` writes
 earlier session left, so the CLI is not handed a server pointing at a file that no longer
 exists; `write_inline` writes the same denials with nothing allowed and no server under
 `instance_root("cursor-inline")`. `root()` is where the child is started and `has_server()`
-whether `approve` is owed. `sweep` runs from `main.rs` after `copilot::sweep`, on the same
-background thread.
+whether `approve` is owed. `sweep` runs from `main.rs` after `copilot::sweep`
+and `deepseek::sweep`, on the same background thread.
 **The restriction is a file, and a missing file fails open.** Cursor has no flag that empties its
 tools and no sandbox measured to hold headless; what holds is the project permissions file, and
 what it holds and what it does not is under `harness.rs`. Measured on the 2026.09.23 build: with

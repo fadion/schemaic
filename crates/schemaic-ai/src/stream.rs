@@ -201,6 +201,60 @@ pub struct StreamParser {
     /// is set apart from it rather than run on into it. See
     /// [`claude_error_text`].
     claude_spoke: bool,
+    /// DeepSeek only: what the turn has said and spent so far. See
+    /// [`StreamParser::push_deepseek`].
+    dsh: DshTurn,
+}
+
+/// A DeepSeek turn in flight: usage summed over its steps, and whether the
+/// last thing printed was prose — so a second spoken step starts a paragraph
+/// rather than running on into the first.
+#[derive(Default)]
+struct DshTurn {
+    input: Option<u64>,
+    output: Option<u64>,
+    spoke: bool,
+    /// Why the turn failed, from `status`/`turn_end` — said when `final`
+    /// closes it, since a failed turn writes no prose of its own.
+    failure: Option<String>,
+}
+
+impl DshTurn {
+    /// `text` as the next thing printed: a paragraph of its own when the turn
+    /// has already spoken.
+    fn say(&mut self, text: &str) -> StreamEvent {
+        let out = match self.spoke {
+            true => format!("\n\n{}", text.trim_start()),
+            false => text.trim_start().to_string(),
+        };
+        self.spoke = true;
+        StreamEvent::TextDelta(out)
+    }
+}
+
+/// The reason a dsh failure gives — `message`, and its `code` when there is
+/// one ("Insufficient Balance (ACCOUNT_QUOTA)") — or `None` when it names
+/// nothing.
+fn dsh_failure_text(error: Option<&serde_json::Value>) -> Option<String> {
+    let e = error?;
+    let message = e.get("message").and_then(|m| m.as_str())?.trim();
+    if message.is_empty() {
+        return None;
+    }
+    Some(match e.get("code").and_then(|c| c.as_str()) {
+        Some(code) if !code.is_empty() => format!("{message} ({code})"),
+        _ => message.to_string(),
+    })
+}
+
+/// The text of a DeepSeek `tool_result`: the string itself, or an object's
+/// JSON — its README caps strings but does not promise the result is one.
+fn dsh_result_text(v: &serde_json::Value) -> String {
+    match v.get("result") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    }
 }
 
 /// The reason a Claude `result` gives for a turn that **failed**, when it gives
@@ -447,6 +501,7 @@ impl StreamParser {
             oc: OpenCodeTurn::default(),
             last_line: LineKind::Blank,
             claude_spoke: false,
+            dsh: DshTurn::default(),
         }
     }
 
@@ -577,6 +632,7 @@ impl StreamParser {
             Harness::OpenCode => self.push_opencode(&v),
             Harness::Copilot => self.push_copilot(&v),
             Harness::Cursor => self.push_cursor(&v),
+            Harness::DeepSeek => self.push_deepseek(&v),
         };
         // **A turn boundary clears the per-turn state, and it has to now that a
         // stream can hold more than one turn.** `seen_tools` is keyed by whatever
@@ -1034,6 +1090,148 @@ impl StreamParser {
             // checkpoints), `assistant.turn_start`/`turn_end`,
             // `assistant.reasoning`, `tool_call_delta`, `user.message`: none is
             // transcript. Reasoning is dropped for the reason Codex's is.
+            _ => Vec::new(),
+        }
+    }
+
+    /// `dsh --profile headless --json` (0.2.1-rc.2).
+    ///
+    /// **Whole steps, not tokens.** `text` is projected from a committed
+    /// assistant message, so each one is a step's prose entire and is printed
+    /// as it comes; `final` restates the answer and is *not* printed, or every
+    /// reply would appear twice. `thinking` is dropped, as every dialect's
+    /// reasoning is here.
+    ///
+    /// **Two ways to end.** A turn ends on `final`, whose `reason.kind` is
+    /// `completed` for a success — an in-turn failure (measured: an account
+    /// with no balance) still writes `final`, empty, with an error reason. A
+    /// failure *outside* a turn writes `error` and no `final` at all, so that
+    /// ends the turn too.
+    ///
+    /// **Usage is per step**, on `status`/`step_end`; a turn's is their sum,
+    /// each step being a request of its own, the cached part of its prompt
+    /// included as Cursor's is.
+    fn push_deepseek(&mut self, v: &serde_json::Value) -> Vec<StreamEvent> {
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("");
+        match ty {
+            "session" => {
+                self.dsh = DshTurn::default();
+                match s("sessionId") {
+                    "" => Vec::new(),
+                    id => vec![StreamEvent::SessionStarted { id: id.to_string() }],
+                }
+            }
+            "text" => {
+                let t = s("text");
+                if t.trim().is_empty() {
+                    return Vec::new();
+                }
+                vec![self.dsh.say(t)]
+            }
+            // An in-turn failure's reason travels here and nowhere else: the
+            // `final` after it is empty (measured, the 402 balance error).
+            "status" if s("phase") == "turn_end" => {
+                if v.pointer("/reason/kind").and_then(|k| k.as_str()) == Some("error") {
+                    self.dsh.failure = dsh_failure_text(v.pointer("/reason/error"));
+                }
+                Vec::new()
+            }
+            "tool_call" => {
+                self.dsh.spoke = false;
+                let id = s("callId").to_string();
+                if !self.first_sight(&id) {
+                    return Vec::new();
+                }
+                vec![StreamEvent::ToolUse {
+                    name: match s("tool") {
+                        "" => "tool".to_string(),
+                        t => t.to_string(),
+                    },
+                    sql: v
+                        .pointer("/input/sql")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string),
+                    id: Some(id),
+                }]
+            }
+            "tool_result" => {
+                self.dsh.spoke = false;
+                let id = s("callId").to_string();
+                let mut out = Vec::new();
+                // A result nothing announced opens its own chip, rather than
+                // landing on whichever call is still open — Copilot's guard.
+                if self.first_sight(&id) {
+                    out.push(StreamEvent::ToolUse {
+                        name: "tool".to_string(),
+                        sql: None,
+                        id: Some(id.clone()),
+                    });
+                }
+                if self.first_sight(&format!("{id}\u{0}done")) {
+                    out.push(StreamEvent::ToolResult {
+                        text: dsh_result_text(v),
+                        is_error: s("status") != "completed",
+                        id: Some(id),
+                    });
+                }
+                out
+            }
+            "status" if s("phase") == "step_end" => {
+                let at = |k: &str| v.pointer(&format!("/usage/{k}")).and_then(|n| n.as_u64());
+                let step_in = match (at("inputTokens"), at("cacheReadTokens")) {
+                    (None, None) => None,
+                    (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+                };
+                let add = |sum: Option<u64>, n: Option<u64>| match (sum, n) {
+                    (None, None) => None,
+                    (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+                };
+                self.dsh.input = add(self.dsh.input, step_in);
+                self.dsh.output = add(self.dsh.output, at("outputTokens"));
+                Vec::new()
+            }
+            "final" => {
+                let mut out = Vec::new();
+                if let Some(id) = v.get("sessionId").and_then(|x| x.as_str())
+                    && !id.is_empty()
+                {
+                    out.push(StreamEvent::SessionStarted { id: id.to_string() });
+                }
+                let kind = v.pointer("/reason/kind").and_then(|k| k.as_str());
+                // **Said, or the reply is an empty error bubble** — the
+                // failure `claude_error_text` exists for. Only on a failed
+                // turn: a successful `final` restates prose already printed.
+                if kind != Some("completed")
+                    && let Some(why) = self.dsh.failure.take()
+                {
+                    out.push(self.dsh.say(&why));
+                }
+                out.push(StreamEvent::TurnDone {
+                    // An absent reason is a failure here, unlike Copilot's
+                    // absent exit code: measured, an in-turn failure's `final`
+                    // carries none, while every success said `completed`.
+                    is_error: kind != Some("completed"),
+                    stats: TurnStats {
+                        duration_ms: None,
+                        input_tokens: self.dsh.input,
+                        output_tokens: self.dsh.output,
+                    },
+                });
+                out
+            }
+            "error" => {
+                let mut out = Vec::new();
+                if let Some(why) = dsh_failure_text(Some(v)) {
+                    out.push(self.dsh.say(&why));
+                }
+                out.push(StreamEvent::TurnDone {
+                    is_error: true,
+                    stats: TurnStats::default(),
+                });
+                out
+            }
+            // `status` turn/step boundaries, `thinking`: not transcript.
             _ => Vec::new(),
         }
     }
@@ -3617,6 +3815,210 @@ mod cursor_tests {
                     .any(|e| matches!(e, StreamEvent::TurnDone { is_error: true, .. })),
                 "{line}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod deepseek_tests {
+    use super::*;
+
+    fn drive(lines: &[&str]) -> Vec<StreamEvent> {
+        let mut p = StreamParser::new(Harness::DeepSeek);
+        lines.iter().flat_map(|l| p.push(l)).collect()
+    }
+
+    fn text_of(evs: &[StreamEvent]) -> String {
+        evs.iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A real turn — `dsh --profile headless --json` 0.2.1-rc.2, sealed by
+    /// Schemaic's overlay and given `schemaic mcp` over a SQLite file — with
+    /// the thinking text cut short, two results cut to their opening and the
+    /// working directory anonymised. Four tool calls across four steps, then
+    /// the answer.
+    const DSH_REAL_TURN: &[&str] = &[
+        r#"{"type":"session","sessionId":"session-3330cd81-e848-4259-b094-6bd4d4c45a81","cwd":"C:\\cfg\\deepseek\\pid-1"}"#,
+        r#"{"type":"status","phase":"turn_start","turn":1}"#,
+        r#"{"type":"status","phase":"step_start","turn":1,"step":1}"#,
+        r#"{"type":"thinking","text":"The user wants me to find how many moons Jupiter has."}"#,
+        r#"{"type":"tool_call","callId":"call_00_gdW8yl7PQM3LFGEPEECG4272","tool":"mcp__schemaic__search_objects","input":{"query":"planets"}}"#,
+        r###"{"type":"tool_result","callId":"call_00_gdW8yl7PQM3LFGEPEECG4272","status":"completed","result":"## main\n- planets\n(1 match)\n"}"###,
+        r#"{"type":"tool_call","callId":"call_01_hIV9bw95U0zoj1HW8Y2Y8692","tool":"mcp__schemaic__list_databases","input":{}}"#,
+        r#"{"type":"tool_result","callId":"call_01_hIV9bw95U0zoj1HW8Y2Y8692","status":"completed","result":"- main (default)\n(1 database)\n"}"#,
+        r#"{"type":"status","phase":"step_end","turn":1,"step":1,"usage":{"inputTokens":2726,"outputTokens":106,"cacheReadTokens":0,"cacheWriteTokens":0,"totalTokens":2832}}"#,
+        r#"{"type":"status","phase":"step_start","turn":1,"step":2}"#,
+        r#"{"type":"thinking","text":"Let me describe the planets table."}"#,
+        r#"{"type":"tool_call","callId":"call_00_jOAOduPDQioUmjgNvgJl6055","tool":"mcp__schemaic__describe_table","input":{"table":"planets","database":"main"}}"#,
+        r####"{"type":"tool_result","callId":"call_00_jOAOduPDQioUmjgNvgJl6055","status":"completed","result":"### planets\nDatabase: main\n"}"####,
+        r#"{"type":"status","phase":"step_end","turn":1,"step":2,"usage":{"inputTokens":204,"outputTokens":68,"cacheReadTokens":2688,"cacheWriteTokens":0,"totalTokens":2960}}"#,
+        r#"{"type":"status","phase":"step_start","turn":1,"step":3}"#,
+        r#"{"type":"thinking","text":""}"#,
+        r#"{"type":"tool_call","callId":"call_00_ET_7kaWzhqtabh4D3VyRXLl0787","tool":"mcp__schemaic__run_query","input":{"sql":"SELECT moons FROM planets WHERE name = 'Jupiter'","database":"main"}}"#,
+        r#"{"type":"tool_result","callId":"call_00_ET_7kaWzhqtabh4D3VyRXLl0787","status":"completed","result":"| moons |\n| --- |\n| 95 |\n\n(1 rows)"}"#,
+        r#"{"type":"status","phase":"step_end","turn":1,"step":3,"usage":{"inputTokens":220,"outputTokens":70,"cacheReadTokens":2816,"cacheWriteTokens":0,"totalTokens":3106}}"#,
+        r#"{"type":"status","phase":"step_start","turn":1,"step":4}"#,
+        r#"{"type":"thinking","text":""}"#,
+        r#"{"type":"text","text":"95"}"#,
+        r#"{"type":"status","phase":"step_end","turn":1,"step":4,"usage":{"inputTokens":187,"outputTokens":2,"cacheReadTokens":2944,"cacheWriteTokens":0,"totalTokens":3133}}"#,
+        r#"{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"completed"}}"#,
+        r#"{"type":"final","sessionId":"session-3330cd81-e848-4259-b094-6bd4d4c45a81","reason":{"kind":"completed"},"text":"95"}"#,
+    ];
+
+    #[test]
+    fn the_session_id_opens_the_turn_so_the_next_one_can_resume() {
+        let evs = drive(DSH_REAL_TURN);
+        assert!(
+            matches!(&evs[0], StreamEvent::SessionStarted { id } if id == "session-3330cd81-e848-4259-b094-6bd4d4c45a81"),
+            "{evs:?}"
+        );
+    }
+
+    #[test]
+    fn every_tool_call_is_announced_and_answered_by_its_own_id() {
+        let evs = drive(DSH_REAL_TURN);
+        let uses: Vec<(&str, Option<&str>)> = evs
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUse { name, sql, .. } => Some((name.as_str(), sql.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            uses,
+            vec![
+                ("mcp__schemaic__search_objects", None),
+                ("mcp__schemaic__list_databases", None),
+                ("mcp__schemaic__describe_table", None),
+                (
+                    "mcp__schemaic__run_query",
+                    Some("SELECT moons FROM planets WHERE name = 'Jupiter'")
+                ),
+            ]
+        );
+        let results: Vec<(Option<&str>, bool)> = evs
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolResult { id, is_error, .. } => Some((id.as_deref(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 4, "{evs:?}");
+        assert!(results.iter().all(|(_, err)| !err), "{results:?}");
+        assert_eq!(
+            results[3].0,
+            Some("call_00_ET_7kaWzhqtabh4D3VyRXLl0787"),
+            "the query's result pairs with the query"
+        );
+    }
+
+    /// The answer is the `text` events, once: `final` restates it, and
+    /// printing that too would show "9595". Thinking is not transcript.
+    #[test]
+    fn the_answer_is_printed_once_and_the_thinking_not_at_all() {
+        assert_eq!(text_of(&drive(DSH_REAL_TURN)), "95");
+    }
+
+    /// The turn ends on `final`, and its usage is every step's: each step is a
+    /// request of its own, so the turn's cost is their sum, the cached part of
+    /// each prompt included (as Cursor's is counted).
+    #[test]
+    fn the_turn_ends_on_final_with_every_step_s_usage() {
+        let evs = drive(DSH_REAL_TURN);
+        let done: Vec<&StreamEvent> = evs
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::TurnDone { .. }))
+            .collect();
+        assert_eq!(done.len(), 1, "{evs:?}");
+        match done[0] {
+            StreamEvent::TurnDone { is_error, stats } => {
+                assert!(!is_error);
+                assert_eq!(stats.input_tokens, Some(2726 + 2892 + 3036 + 3131));
+                assert_eq!(stats.output_tokens, Some(106 + 68 + 70 + 2));
+            }
+            _ => unreachable!(),
+        }
+        assert!(matches!(evs.last(), Some(StreamEvent::TurnDone { .. })));
+    }
+
+    /// Measured: an account with no balance ends the turn in-turn, with an
+    /// error reason and an empty `final`, and exits 1. Not a success with no
+    /// words.
+    #[test]
+    fn a_turn_that_failed_in_turn_ends_as_an_error() {
+        let evs = drive(&[
+            r#"{"type":"session","sessionId":"session-b22223f2","cwd":"C:\\cfg"}"#,
+            r#"{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"error","error":{"message":"Insufficient Balance","code":"ACCOUNT_QUOTA","status":402}}}"#,
+            r#"{"type":"final","text":""}"#,
+        ]);
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, StreamEvent::TurnDone { is_error: true, .. })),
+            "{evs:?}"
+        );
+        // **And the reason reaches the panel.** The turn wrote no prose, so
+        // without it the reply is an empty error bubble — the failure
+        // `claude_error_text` was written for.
+        assert_eq!(text_of(&evs), "Insufficient Balance (ACCOUNT_QUOTA)");
+    }
+
+    /// A failure outside a turn writes `error` and **no** `final` (its
+    /// README), so `error` has to end the turn itself, or the panel waits on a
+    /// stream that has stopped.
+    #[test]
+    fn an_error_outside_a_turn_ends_it() {
+        let evs = drive(&[r#"{"type":"error","message":"unknown session id"}"#]);
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, StreamEvent::TurnDone { is_error: true, .. })),
+            "{evs:?}"
+        );
+        assert_eq!(text_of(&evs), "unknown session id");
+    }
+
+    /// A failure after the turn has spoken is set apart from what it said.
+    #[test]
+    fn a_failure_after_prose_is_its_own_paragraph() {
+        let evs = drive(&[
+            r#"{"type":"session","sessionId":"s","cwd":"C:\\cfg"}"#,
+            r#"{"type":"text","text":"Looking."}"#,
+            r#"{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"error","error":{"message":"Request timed out"}}}"#,
+            r#"{"type":"final","text":""}"#,
+        ]);
+        assert_eq!(text_of(&evs), "Looking.\n\nRequest timed out");
+    }
+
+    /// Two steps that both speak, with no tool call between them, are two
+    /// paragraphs, not one run-together sentence.
+    #[test]
+    fn two_spoken_steps_read_as_two_paragraphs() {
+        let evs = drive(&[
+            r#"{"type":"session","sessionId":"s","cwd":"C:\\cfg"}"#,
+            r#"{"type":"text","text":"First."}"#,
+            r#"{"type":"text","text":"Second."}"#,
+        ]);
+        assert_eq!(text_of(&evs), "First.\n\nSecond.");
+    }
+
+    /// A result whose status is not `completed` is a failed call, red on the
+    /// chip, and an object-shaped result still reads as text.
+    #[test]
+    fn a_failed_tool_call_is_an_error_and_a_structured_result_is_still_text() {
+        let evs = drive(&[
+            r#"{"type":"tool_call","callId":"c1","tool":"mcp__schemaic__run_query","input":{"sql":"SELECT x"}}"#,
+            r#"{"type":"tool_result","callId":"c1","status":"error","result":{"message":"no such column: x"}}"#,
+        ]);
+        match evs.last() {
+            Some(StreamEvent::ToolResult { is_error, text, .. }) => {
+                assert!(is_error);
+                assert!(text.contains("no such column: x"), "{text}");
+            }
+            other => panic!("{other:?}"),
         }
     }
 }

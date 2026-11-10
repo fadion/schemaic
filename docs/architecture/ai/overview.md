@@ -1,12 +1,12 @@
 # `schemaic-ai`
 
 `schemaic-ai` — agent-CLI sessions (stream-json) and turn parsing, for whichever CLI the user has
-installed. `harness.rs` and `stream.rs` model six of them (`claude`, `codex`, `antigravity`,
-`opencode`, `copilot`, `cursor`), and **all six are driven, with database tools**. Each is
-selectable from the settings modal's *Agent CLI* dropdown, persisted as `UiState::ai_harness`,
-carried on `AiSettings::harness`, resolved and interrogated by `app/agent_cli.rs`, and spawned by
-`app/ai.rs` — Claude and Antigravity as one persistent child per conversation, Codex, OpenCode,
-GitHub Copilot and Cursor as one process per turn.
+installed. `harness.rs` and `stream.rs` model seven of them (`claude`, `codex`, `antigravity`,
+`opencode`, `copilot`, `cursor`, `deepseek`), and **all seven are driven, with database tools**.
+Each is selectable from the settings modal's *Agent CLI* dropdown, persisted as
+`UiState::ai_harness`, carried on `AiSettings::harness`, resolved and interrogated by
+`app/agent_cli.rs`, and spawned by `app/ai.rs` — Claude and Antigravity as one persistent child per
+conversation, Codex, OpenCode, GitHub Copilot, Cursor and DeepSeek Harness as one process per turn.
 **The dropdown's first entry is none of them**: *Disabled*, `harness::Agent::Disabled`, persisted
 as `persist::AI_DISABLED_KEY` in the same field. A new install starts there and an upgrade does
 not (`persist.rs`), and what off withholds is an invariant — *An assistant that is off sends
@@ -35,7 +35,7 @@ counterpart of `turn_args`, and Claude's arm of it is `inline_args`, which was t
 path for as long as all three features spawned `claude` regardless of the selection. Why they did,
 and the bug that made that the safe answer at the time, is under `app/agent_cli.rs`. A
 harness key `main.rs` does not recognise is `tracing::warn!`ed and starts the assistant off.
-**Getting the tools to each harness is six different mechanisms, and only Claude's is per
+**Getting the tools to each harness is seven different mechanisms, and only Claude's is per
 invocation.** Claude gets a `--mcp-config` file in a directory of Schemaic's own (`ai::mcp_dir()`,
 and it was the temp dir until the credentials in it were moved somewhere only this user can
 list). **That the flag is handed a *path* is an invariant, not a call-site habit**, and this crate
@@ -72,6 +72,13 @@ Cursor is configured by **the directory it is started in**: `app/cursor.rs` writ
 schemaic` there once per session, because a project server loads only once approved. It has no
 flag that empties its tools and no sandbox that holds headless, so the file is not one lever among
 several — see `harness.rs` for what it holds and what it does not.
+DeepSeek Harness is configured by **a composition handed over by file**: a dsh run is a list of
+plugins, and `app/deepseek.rs` writes an overlay that `--patch` lays over the headless profile —
+every built-in tool plugin disabled, the sign-in switched back on, the model and effort set, and our
+server inserted as an MCP-client row — into a `DSH_HOME` of Schemaic's own. The overlay is a
+denylist of plugin ids, so it is not trusted on its own: the composed profile is dumped and read by
+plugin *name* before a session's first turn and before every one-shot (`harness.rs`, and
+`ai::dsh_seal_refusal` under `app/overview.md`).
 **The isolation is not symmetric either, and Antigravity has none at all** — the one asymmetry the
 list above would otherwise pass over while naming every other. Claude gets `--strict-mcp-config`
 and Codex has its whole `mcp_servers` table assigned out from under it, and both of those
@@ -85,7 +92,8 @@ and it is asked as `harness::Harness::isolates_mcp_servers` so the surface that 
 *user* can read it too: `Constraint::notice` says in the panel that this harness's MCP surface is
 not Schemaic's to restrict.
 **OpenCode displaces them as well, and is the first that did it without touching anything of the
-user's** (Copilot, below, is the second) — `XDG_CONFIG_HOME` pointed at Schemaic's own directory takes their registered servers
+user's** (Copilot, below, is the second, and DeepSeek the third) —
+`XDG_CONFIG_HOME` pointed at Schemaic's own directory takes their registered servers
 out of the resolved config entirely (measured: they vanish from `opencode debug config`), and
 because nothing of theirs was edited there is nothing to put back. It does have a startup sweep,
 but for a different currency: the roots are Schemaic's own, so a leftover costs disk rather than a
@@ -114,8 +122,8 @@ file under `~/.copilot/`, so every home is seeded with the user's `config.json` 
 "augments config from ~/.copilot/mcp-config.json", so on its own it puts our server in beside
 theirs. And the inherited environment carries levers of its own here too — an exported
 `COPILOT_ALLOW_ALL` approves every tool — so `CopilotHome::env_remove` is the second list the child
-is cleared of; `ai::inherited_env_to_clear` chains the two, and every
-harness's child is cleared of both.
+is cleared of; `ai::inherited_env_to_clear` chains the two — and DeepSeek's third — and every
+harness's child is cleared of all of them.
 **Cursor cannot displace them, which makes it the second harness with no isolation.** Its
 user-level `~/.cursor/mcp.json` is read from a path the CLI hard-codes to the home directory —
 not `CURSOR_CONFIG_DIR` (read out of its bundle) — so the config-directory move that works for
@@ -127,10 +135,18 @@ allows them — unless the user's own settings do. So `isolates_mcp_servers` is 
 Antigravity, and its notice says so in its own words. `--approve-mcps`, which would load the
 project server without the per-session `mcp enable`, is never passed: it approves every server in
 reach, a user's plugins' among them.
+**DeepSeek Harness displaces them by Copilot's move, and its servers are rows like everything
+else.** An MCP server in a dsh run is a plugin row of the composition, and the user's own rows come
+from the profile and home patches under their `~/.dsh`; under a `DSH_HOME` of Schemaic's the only
+one is the row the overlay inserts, so `isolates_mcp_servers` is true. The dump check backs it:
+an enabled MCP-client row other than `mcp-schemaic` refuses the session. The inherited
+environment has its lever here too — an exported `DSH_TOOLS_MODE` swaps the tool layer for a code
+runner no plugin row names — which is `DshHome::env_remove` (`app/deepseek.rs`).
 **The spawned session is sealed to what Schemaic hands it, and that is `build_session_args`'s
 three flags rather than `DISALLOWED_TOOLS`.** That statement is now *graded* rather than boolean,
-because not every CLI can honour it in full — `claude`, `opencode` and `copilot` can, Claude and
-Copilot by a flag each and OpenCode by configuration, and Codex, Antigravity and Cursor cannot.
+because not every CLI can honour it in full — `claude`, `opencode`, `copilot` and `dsh` can, Claude
+and Copilot by a flag each, OpenCode by configuration and DeepSeek by composition, and Codex,
+Antigravity and Cursor cannot.
 `harness::Constraint` is the grade, and reporting
 "sealed" for every harness would be the denylist-era bug a second time: a guard that reads
 as total over a set nobody measured. The denylist named ten built-in tools and read like
@@ -189,8 +205,9 @@ neutral: a child given no `current_dir` inherits Schemaic's own, which is where 
 `no_agent_spawn_sets_its_working_directory_conditionally` scans `ai.rs` for the `if let Some`
 spelling the three spawn sites used to have, and counts `Command::new(` against both
 `current_dir(` and `cmd.env(schemaic_core::AGENT_CHILD_ENV, "1")` — the marker the command line
-refuses under (security review S2, under `harness.rs`) — so a fourth spawn missing either shows
-up as an imbalance. All three sit **ahead of the variadic `--allowedTools`/`--disallowedTools`**, which would
+refuses under (security review S2, under `harness.rs`) — so a spawn missing either shows up as an
+imbalance; the fourth, DeepSeek's `--dump-config` check (`ai::dsh_seal_refusal`), sets both.
+All three sit **ahead of the variadic `--allowedTools`/`--disallowedTools`**, which would
 otherwise swallow a later flag's name as a tool name, and both
 `the_session_loads_no_mcp_server_and_no_config_dir_of_its_own_finding` and the test above pin that
 order. **They did not prompt — they ran.** Driving the old flag set with
@@ -235,7 +252,7 @@ stdout only as a fallback for a CLI that prints its usage there.
 `build_session_args` and `inline_args` both take one and
 turn it into argv through the single private `seal_args`, so Claude's session and one-shot paths
 cannot come to seal themselves differently — the one-shot paths being the ones with no surface
-that would show it if they did. `CliSeal` is Claude's alone: the other five are sealed by their
+that would show it if they did. `CliSeal` is Claude's alone: the other six are sealed by their
 own arm of `harness::turn_args` or `harness::inline_argv`, and `InlineSpec::seal` is carried past
 them unread. A version number would only stand in for the answer `--help`
 gives directly, and would need a table mapping releases to flags that nothing in this repository
@@ -315,7 +332,8 @@ server: no `--mcp-config` (Claude's `--strict-mcp-config` then leaves it with no
 carrying `mcp_servers` on Codex, an OpenCode config with the `mcp` block left out, on Copilot
 no `--additional-mcp-config` and an allowlist naming a tool nothing provides, and on Cursor a
 working directory of its own whose permissions file allows nothing and which has no `mcp.json`
-at all. The whole
+at all, and on DeepSeek an overlay of its own, in a `deepseek-inline` home, that disables every
+tool plugin and inserts no server. The whole
 request is in the prompt (`no_inline_generation_is_given_a_server_or_a_session` over
 `Harness::ALL`, `a_one_shot_generation_is_given_no_tools_and_no_servers` for Claude's arm, and
 `inline_args_flags_in_order` holds its exact argv). **On Antigravity that is a statement about the

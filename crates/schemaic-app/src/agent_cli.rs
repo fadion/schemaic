@@ -69,6 +69,7 @@ fn env_vars(h: Harness) -> &'static [&'static str] {
         Harness::OpenCode => &["SCHEMAIC_OPENCODE_BIN"],
         Harness::Copilot => &["SCHEMAIC_COPILOT_BIN"],
         Harness::Cursor => &["SCHEMAIC_CURSOR_BIN"],
+        Harness::DeepSeek => &["SCHEMAIC_DEEPSEEK_BIN"],
     }
 }
 
@@ -220,6 +221,27 @@ fn known_locations(h: Harness) -> Vec<std::path::PathBuf> {
                 );
             }
         }
+        // **Inside the desktop app's install, and off `PATH`** unless the user
+        // asked its settings to add it. `dsh.cmd` is what is found; what is
+        // started is decided by [`launch`], which goes straight to the
+        // executable behind it. Other platforms' layouts were not measured, so
+        // there only the override and `PATH` find it.
+        Harness::DeepSeek => {
+            if cfg!(windows)
+                && let Some(local) = local
+            {
+                out.push(
+                    std::path::PathBuf::from(local)
+                        .join("Programs")
+                        .join("DeepSeek Harness")
+                        .join("resources")
+                        .join("runtime")
+                        .join("cli")
+                        .join("bin")
+                        .join("dsh.cmd"),
+                );
+            }
+        }
     }
     out
 }
@@ -231,6 +253,15 @@ pub(crate) struct Launch {
     pub(crate) program: String,
     /// Arguments that go before the harness's own.
     pub(crate) prefix: Vec<String>,
+    /// Environment the program needs to *be* the CLI at all — set on every
+    /// spawn of it, the help probe included.
+    ///
+    /// **DeepSeek's is the reason this exists**: its CLI is the desktop app's
+    /// own Electron binary told to run as Node (`ELECTRON_RUN_AS_NODE=1`).
+    /// Started without that variable the same executable opens the desktop
+    /// app's window — so a probe that forgot it would put a GUI on screen at
+    /// every Schemaic launch, rather than read a help page.
+    pub(crate) env: Vec<(String, String)>,
 }
 
 impl Launch {
@@ -238,15 +269,17 @@ impl Launch {
         Self {
             program: bin.to_string(),
             prefix: Vec::new(),
+            env: Vec::new(),
         }
     }
 
-    /// The launch as a `std` command, prefix included, harness arguments to
-    /// follow.
+    /// The launch as a `std` command, prefix and environment included, harness
+    /// arguments to follow.
     pub(crate) fn std_command(&self) -> std::process::Command {
         let mut c = std::process::Command::new(&self.program);
         hide_console_window(&mut c);
         c.args(&self.prefix);
+        c.envs(self.env.iter().map(|(k, v)| (k, v)));
         c
     }
 }
@@ -298,10 +331,58 @@ pub(crate) fn launch(h: Harness, bin: &str) -> Launch {
             Some(exe) => Launch::direct(&exe.to_string_lossy()),
             None => Launch::direct(bin),
         },
+        Harness::DeepSeek => dsh_electron_launch(bin).unwrap_or_else(|| Launch::direct(bin)),
         Harness::Claude | Harness::Codex | Harness::Antigravity | Harness::OpenCode => {
             Launch::direct(bin)
         }
     }
+}
+
+/// The DeepSeek desktop app's Electron binary run as Node on the CLI script,
+/// when `bin` is the `dsh.cmd` its install ships.
+///
+/// **Cursor's hazard again, and Copilot's.** `dsh.cmd` sets
+/// `ELECTRON_RUN_AS_NODE=1` and runs `DeepSeek Harness.exe --expose-internals
+/// <app.asar>\dsh\node_modules\@deepseek-ai\dsh-desktop-host\lib\cli.js` —
+/// nothing more (read from the shipped 0.2.1-rc.2 script). Ending the `.cmd`
+/// would leave that executable running, so it is what is started instead, its
+/// environment carried by [`Launch::env`].
+///
+/// The layout is the installer's: the script under
+/// `<install>\resources\runtime\cli\bin\`, the executable at `<install>\`, the
+/// archive at `<install>\resources\app.asar`. The script inside the archive
+/// cannot be checked from outside Electron, so the archive is.
+fn dsh_electron_launch(bin: &str) -> Option<Launch> {
+    let path = std::path::Path::new(bin);
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext != "cmd" {
+        return None;
+    }
+    let resources = path.parent()?.parent()?.parent()?.parent()?;
+    let install = resources.parent()?;
+    let exe = install.join("DeepSeek Harness.exe");
+    let asar = resources.join("app.asar");
+    if !exe.is_file() || !asar.is_file() {
+        return None;
+    }
+    let cli = asar
+        .join("dsh")
+        .join("node_modules")
+        .join("@deepseek-ai")
+        .join("dsh-desktop-host")
+        .join("lib")
+        .join("cli.js");
+    Some(Launch {
+        program: exe.to_string_lossy().into_owned(),
+        prefix: vec![
+            "--expose-internals".into(),
+            cli.to_string_lossy().into_owned(),
+        ],
+        env: vec![("ELECTRON_RUN_AS_NODE".into(), "1".into())],
+    })
 }
 
 /// The per-platform package npm installs the real Copilot binary in, as its
@@ -363,6 +444,7 @@ fn cursor_node_launch(bin: &str) -> Option<Launch> {
         (node.is_file() && index.is_file()).then(|| Launch {
             program: node.to_string_lossy().into_owned(),
             prefix: vec![index.to_string_lossy().into_owned()],
+            env: Vec::new(),
         })
     };
     if let Some(l) = pair(dir) {
@@ -773,8 +855,14 @@ mod tests {
                 .collect()
         };
         assert_eq!(args(Harness::Codex), vec!["exec", "--help"]);
+        // DeepSeek's grade rests on the headless profile's page, not the
+        // launcher's, which lists neither `--json` nor `--session-id`.
+        assert_eq!(
+            args(Harness::DeepSeek),
+            vec!["--profile", "headless", "--help"]
+        );
         for h in Harness::ALL {
-            if h == Harness::Codex {
+            if matches!(h, Harness::Codex | Harness::DeepSeek) {
                 continue;
             }
             assert_eq!(args(h), vec!["--help"], "{h:?}");
@@ -886,7 +974,10 @@ mod tests {
                     // and the pass-through; the layout was measured, and a
                     // test reading the real one would break the no-filesystem
                     // rule.
-                    let script_ok = h == Harness::Cursor && name.ends_with(".cmd");
+                    // DeepSeek's is the same shape: the desktop install's
+                    // `dsh.cmd`, behind which `launch` starts the executable.
+                    let script_ok =
+                        matches!(h, Harness::Cursor | Harness::DeepSeek) && name.ends_with(".cmd");
                     assert!(
                         name.ends_with(".exe") || script_ok,
                         "{name} needs an extension"

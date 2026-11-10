@@ -873,7 +873,7 @@ with `Constraint::notice`'s sentence, drawn in the interface's language by
 which was Gemini and only Gemini — and with that harness deleted every variant the enum names is
 driven, so the unestablished constraint is the only refusal left. **The arm was rewritten rather
 than removed**: it is now an exhaustive
-`match harness { Claude | Codex | Antigravity | OpenCode | Copilot | Cursor => None }`,
+`match harness { Claude | Codex | Antigravity | OpenCode | Copilot | Cursor | DeepSeek => None }`,
 so the *next* harness added to the enum lands here as a non-exhaustive-match error and has to be
 decided. A `None` fall-through would instead spawn it on an argv read off documentation, which
 dies on its first unknown flag and gets reported as an installation problem — the one thing that
@@ -886,9 +886,10 @@ Stop, and nothing anywhere said why. The comment here claimed the opposite — t
 re-entered and met the same check — which is the shape of drift this document exists to catch, in a
 comment rather than a paragraph. `refuse_every_turn` is the cheap way to make that claim true: a
 task holding `rx` open that re-states the reason per turn (and ignores `Interrupt`, since Stop on an
-idle panel is not a question). **All five** non-spawning returns take it — the constraint one, the
-OpenCode config-write failure, Copilot's home-write failure and Cursor's workspace-write failure
-(the same `refused` block, an arm each further down), and the persistent branch's oversize
+idle panel is not a question). **All six** non-spawning returns take it — the constraint one, the
+OpenCode config-write failure, Copilot's home-write failure, Cursor's workspace-write failure and
+DeepSeek's overlay-write failure (the same `refused` block, an arm each further down), and the
+persistent branch's oversize
 refusal, which was the one left
 behind and had the same silence to show for it: it returned a `tx` whose `rx` it had just dropped,
 `needs_respawn` saw no settings change, and every later question was a discarded `Err`.
@@ -903,9 +904,10 @@ both halves — a runnable grade refuses nobody, and `Unknown` refuses everybody
 naming the harnesses by hand, so a harness added to the enum is covered the moment it compiles.
 **There are two session models behind one channel, and the seam is `SessionMsg`.**
 `start_ai_session` branches on `harness.is_persistent()`: Claude and Antigravity each keep one
-bidirectional child per conversation, while Codex, OpenCode, Copilot and Cursor spawn **one
-process per turn**, continuity coming from an id captured off `StreamEvent::SessionStarted`
-(`thread.started`/`sessionID`, Copilot's closing `result`, Cursor's opening `system`/`init`) and
+bidirectional child per conversation, while Codex, OpenCode, Copilot, Cursor and DeepSeek spawn
+**one process per turn**, continuity coming from an id captured off `StreamEvent::SessionStarted`
+(`thread.started`/`sessionID`, Copilot's closing `result`, Cursor's opening `system`/`init`,
+DeepSeek's opening `session`) and
 handed to the next turn as `TurnSpec::resume`.
 **The interface upstream did not change**, and that is the point:
 `AiSession::stdin_tx` carries a typed `SessionMsg::{Turn, Interrupt}` rather than the raw stdin
@@ -946,7 +948,8 @@ per-turn branch's Antigravity arm and its `_registration` block were **deleted r
 unreachable**, because configuration for a harness that no longer takes that path is the copy that
 quietly stops matching the one that runs.
 **The per-turn child's stdin is piped exactly when the prompt travels on it**
-(`Harness::turn_stdin_prompt`, which is `Harness::prompt_on_stdin` — Codex, Copilot and Cursor)
+(`Harness::turn_stdin_prompt`, which is `Harness::prompt_on_stdin` — Codex, Copilot, Cursor and
+DeepSeek)
 **and `Stdio::null()` otherwise**, and the old unconditional `null()` is the reason the "otherwise" has
 to stay: measured, and still true on codex-cli 0.153.4, `codex exec` prints *"Reading additional
 input from stdin…"* when stdin is a pipe at EOF, and appends piped stdin to the prompt as a
@@ -960,9 +963,11 @@ the instructions are whole.
 is resolved per turn.** Where is per session; *what* is not, because Cursor's launcher is the
 newest `versions\<v>\` directory and the CLI updates itself into a new one, so a path resolved
 when the session opened can name a version since replaced; one directory read per turn keeps
-every spawn on the one that is there. `agent_cli::launch(harness, &bin)` gives the program and the arguments
-that go ahead of the harness's own — for Cursor on Windows the newest version's `node.exe` and its
-`index.js` rather than the `.cmd` that was found, for the reason under `agent_cli.rs` — and
+every spawn on the one that is there. `agent_cli::launch(harness, &bin)` gives the program, the
+arguments that go ahead of the harness's own and the environment the program needs to be the CLI at all —
+for Cursor on Windows the newest version's `node.exe` and its `index.js` rather than the `.cmd`
+that was found, for DeepSeek the desktop app's executable with `ELECTRON_RUN_AS_NODE=1`, set on
+the child ahead of the isolation's variables, for the reasons under `agent_cli.rs` — and
 `spawn_refusal`'s size check measures that program and that argv, prefix included, since that is
 what is spawned. `child_cwd` is Cursor's workspace root, because its permissions file is found
 from the working directory, and `cwd` for everyone else. **Cursor's one approval runs before the
@@ -971,6 +976,23 @@ goes through `spawn_blocking` as Antigravity's registration does, and a failure 
 no-database-tools note rather than a refusal — the calls would be refused anyway, and the
 permissions file that makes the session safe was already written. It is owed only when the
 workspace configures a server (`CursorWorkspace::has_server`).
+**DeepSeek's seal is re-earned before the first turn, and a failure there answers every turn.**
+The overlay disables tool plugins by id, so a dsh update that adds one under a new id would be live
+while the panel says `Sealed`. `dsh_seal_refusal(launch, seal_env, overlay, cwd)` runs the same
+launch with `deepseek::dump_args` — `--profile headless --patch <overlay> --dump-config`, which
+boots nothing and calls no model (measured: 0.2 s) — in the turn's working directory, cleared of
+`inherited_env_to_clear()` and given exactly the environment the run will get, so what it reads is
+the composition the run would mount. It refuses when the dump fails, when it does not show itself
+to be the headless profile (`harness::dsh_dump_is_headless`), or when `harness::dsh_unsealed_rows`
+lists anything (`ai-deepseek-seal-unchecked`, `ai-deepseek-unsealed`, the latter naming the rows).
+It is a spawn like the others, so it asks `spawn_refusal`, sets `AGENT_CHILD_ENV` and a working
+directory and hides its console, and it is held to a 30-second ceiling. The session task asks it
+once, after the degraded-tools note, and holds the answer as `sealed_refusal`: every question then
+gets `pump.fail` with it, as the constraint refusal answers every turn rather than the first.
+**One-shots ask it too**, before anything is spawned: `InlinePlan::seal_check` carries the launch,
+the isolation's environment and the overlay, and `run_inline` refuses on its answer, removing the
+generation's working directory as it goes. Checked against real dumps: the sealed composition
+answered nothing, and one with only the sign-in rows patched listed every live tool row.
 And every harness folds its events through **one**
 `TurnPump` — prose and chips accumulate, a snapshot goes out when anything changed, `TurnDone`
 closes the turn and resets, and `fail()` always sends so the panel cannot spin. Claude was
@@ -1110,7 +1132,11 @@ on the route for the same reason** — its `mcp.json` is in a workspace reused a
 reason: the permissions file is written regardless, because that is the half that cannot be
 missing, and `mcp.json` is not (one an earlier session left is removed), so the session runs
 with no server and says so. It is refused only when the workspace itself cannot be written, since
-a missing permissions file fails open for writes. **The refusing half is `isolation_refusal(harness,
+a missing permissions file fails open for writes. **DeepSeek is on the route for Copilot's reason**
+— its overlay is rewritten per session in a `DSH_HOME` reused across them (`crate::deepseek`) —
+and degrades Cursor's way: the overlay is written regardless, because it is the seal and the
+sign-in, with no server row, and the session says it has no tools; it is refused when the overlay
+itself cannot be written. **The refusing half is `isolation_refusal(harness,
 wrote)`**, pure: the harnesses that refuse when their directory could not be written are exactly
 those whose restriction *is* a directory of ours — `env_seal` or `restricts_by_workspace_rules`
 — and `a_harness_restricted_by_a_directory_refuses_without_it` holds that over `Harness::ALL`.
@@ -1278,7 +1304,9 @@ running, which `antigravity.rs`'s sweep and `ai.rs`'s own sweep both ask through
 environment pointing it there — also below), `copilot.rs` (the `COPILOT_HOME` that harness is
 isolated by and the MCP config inside it, on `opencode.rs`'s per-instance roots — also below),
 `cursor.rs` (the working directory that harness is restricted by, its one MCP approval, and the
-sweep of what the CLI keeps about that directory in the user's own Cursor config — also below) and
+sweep of what the CLI keeps about that directory in the user's own Cursor config — also below),
+`deepseek.rs` (the `DSH_HOME` that harness is isolated by and the `--patch` overlay inside it that
+seals it, on the same per-instance roots — also below) and
 `ai.rs` (`AiSession`/`start_ai_session` streaming,
 MCP-config plumbing, `ai_context`/`inline_system_prompt`). Reactive wiring (`app_view` closures)
 stays in `main.rs`.
@@ -1327,7 +1355,8 @@ reached that function — but a one-shot can be Codex or Antigravity now, whose 
 sandbox flag, so `spawn_refusal` is asked here for the same reason it is asked there, and the
 oversize check sits beside it — measuring what will really be spawned, since `agent_cli::launch`
 is resolved first and its program and prefix replace the bare binary in the plan (Cursor's node,
-on Windows). `inline_reply_path` is Codex's `-o` file, in `mcp_dir()` and named
+on Windows), its environment going into the plan's ahead of the isolation's.
+`inline_reply_path` is Codex's `-o` file, in `mcp_dir()` and named
 with `MCP_FILE_PREFIX` so `sweep_stale_mcp_configs` collects it if the process dies between
 the spawn and the read; `run_inline` reads and removes it whatever the exit status, so a failed run
 that still wrote one leaves nothing for the sweeper. **And so does the oversize refusal**, which
@@ -1347,26 +1376,34 @@ as them on the next Ctrl+K, and Claude — the default harness — has only the 
 and that. It also clears OpenCode's config variables **before** setting ours, the order the session
 path states in a comment and this one had backwards, and clears them unconditionally rather than
 behind `harness == Harness::OpenCode`. **That list is `inherited_env_to_clear()` now, one function
-both spawns call**: OpenCode's `env_remove` chained with Copilot's, so the one-shot and the chat
-turn cannot come to clear different sets. It used to be OpenCode's list alone, which was complete
+the per-turn, one-shot and seal-check spawns all call**: OpenCode's `env_remove` chained with
+Copilot's and DeepSeek's, so the one-shot, the chat turn and DeepSeek's seal check cannot come to
+clear different sets. It used to be OpenCode's list alone, which was complete
 only while OpenCode was the only harness isolated by its environment. **And the CLI's `--url`
 password variable after them** — `schemaic_core::PASSWORD_ENV` (`SCHEMAIC_PASSWORD`), moved from
 `cli/run.rs` into core so this crate could name it: exported in the terminal the app was started
 from, it reached every harness's shell, where a `printenv` hands an agent the database password
 (release review R1-L2-02, `the_clis_password_variable_is_cleared_from_every_agent`).
 `no_seal_variable_is_also_cleared` pins the disjointness the clear-then-set order leans on — no
-lever (`XDG_CONFIG_HOME`, `OPENCODE_DISABLE_PROJECT_CONFIG`, `COPILOT_HOME`) is ever in the list,
-since a lever there would strip its own harness's isolation while the panel reported it sealed —
-and that both lists are in it, not only the first. (A comment here already cited that test by
-name before it existed; it exists now.)
+lever (`XDG_CONFIG_HOME`, `OPENCODE_DISABLE_PROJECT_CONFIG`, `COPILOT_HOME`, `DSH_HOME`,
+`DSH_PERMISSION_MODE`, `DSH_TELEMETRY_MODE`, and DeepSeek's launch variable `ELECTRON_RUN_AS_NODE`)
+is ever in the list, since a lever there would strip its own harness's isolation while the panel
+reported it sealed — and that every list is in it, not only the first: `OPENCODE_CONFIG`,
+`COPILOT_ALLOW_ALL` and `DSH_TOOLS_MODE` are each asserted. (A comment here already cited that
+test by name before it existed; it exists now.)
 **Which environment is built is `inline_env(harness)`, and it asks `env_seal` and then matches the
 harness exhaustively.** It used to be `match harness.env_seal() { true =>
 OpenCodeConfig::write_inline() … }` — the capability asked, then one harness's writer assumed — so
 the moment a second harness answered `true` it would have been "isolated" by OpenCode's config and
 nothing of its own. Now OpenCode gets `OpenCodeConfig::write_inline`, Copilot gets
-`CopilotHome::write_inline`, and a failure to write either **refuses the generation** rather than
-running it bare, each for its own reason: OpenCode's `--agent` would fall back to `build` and its
-`bash`, Copilot would start the user's MCP servers and load their hooks. The arms for the
+`CopilotHome::write_inline`, DeepSeek gets `DshHome::write_inline(model, effort)`, and a failure to
+write any of them **refuses the generation** rather than running it bare, each for its own reason:
+OpenCode's `--agent` would fall back to `build` and its `bash`, Copilot would start the user's MCP
+servers and load their hooks, and DeepSeek would run with no overlay and so every built-in tool.
+**The function is `inline_isolation(harness, model, effort)` now, and `inline_env` a test-only
+wrapper over it**: DeepSeek's one-shot needs the model and effort written into its overlay, since
+headless takes neither as a flag, and hands back the overlay's path beside the environment
+(`InlineIsolation { env, overlay }`) for `InlineSpec::overlay` and the seal check. The arms for the
 harnesses whose `env_seal` is false **refuse too** rather than return an empty environment — they
 are reached only if one is flipped to `true` without a writer here, and that has to fail closed
 instead of running unisolated. `a_harness_not_isolated_by_its_environment_gets_an_empty_one` is
@@ -1384,7 +1421,7 @@ the reply file as the size refusal does.
 then `intel::sql_reply` (the parse gate above), and a reply that will not parse becomes
 `Failed("The model did not return SQL")` rather than an edit. It takes the runner's
 `Result<String, String>` rather than the raw `(success, stdout, stderr)` it used to, because reading
-the reply is no longer one thing — five harnesses answer on stdout and Codex answers in a file —
+the reply is no longer one thing — six harnesses answer on stdout and Codex answers in a file —
 and that decision belongs with the argv that made it. The composition is what the caller
 relies on, so it is pinned *here* as well as in `intel` —
 `inline_outcome_drops_a_tool_diagnostic_riding_on_the_sql` puts the chatter inside the fences,

@@ -2,8 +2,8 @@
 
 `agent_cli.rs` — finding the agent CLI, and asking it what it accepts. It was `claude_cli.rs`
 until the settings gained a harness, and the rename is not cosmetic: the module now looks for
-six binaries and interrogates whichever one is selected, so leaving it named for one of them
-while it probes the other five is the drift this document exists to catch.
+seven binaries and interrogates whichever one is selected, so leaving it named for one of them
+while it probes the other six is the drift this document exists to catch.
 `detect_bin(h)` asks three sources in order — `$SCHEMAIC_<HARNESS>_BIN` (Claude keeps
 `SCHEMAIC_CLAUDE_BIN`, which shipped before any other harness existed and someone's launcher may
 still set it), then that harness's **known install locations**, then a `PATH` search honouring
@@ -16,10 +16,14 @@ panel would have said so. The locations are Claude `~/.local/bin`, Codex
 `~/.opencode/bin`, `~/.local/bin` and `~/.npm-global/lib/node_modules/opencode-ai/bin`, Copilot
 `%APPDATA%\npm\node_modules\@github\copilot\node_modules\@github\copilot-win32-<x64|arm64>` and
 `~/.local/bin`, Cursor `%LOCALAPPDATA%\cursor-agent\cursor-agent.cmd` on Windows and
-`~/.local/bin/cursor-agent` elsewhere — and each candidate ends in that harness's own executable
-(`a_known_location_ends_in_the_harnesss_own_executable`, which also holds the Windows
-extension on, `.exe` for every harness but Cursor, whose installer writes no executable of its
-own there — only the launcher script, which `launch` below looks behind). Cursor's `bin` is
+`~/.local/bin/cursor-agent` elsewhere, DeepSeek Harness
+`%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd` on Windows and
+nothing elsewhere — its CLI ships inside the desktop app's install and is on `PATH` only if the
+user asked that app's settings to put it there, and no other platform's layout was measured, so
+there only `SCHEMAIC_DEEPSEEK_BIN` and `PATH` find it — and each candidate ends in that harness's
+own executable (`a_known_location_ends_in_the_harnesss_own_executable`, which also holds the
+Windows extension on, `.exe` for every harness but Cursor and DeepSeek, whose installers put only a
+launcher script there, which `launch` below looks behind). Cursor's `bin` is
 `cursor-agent` and not the shorter `agent` its installer also puts on `PATH`, because `agent` is
 a word other tools claim and a `PATH` search for it can find somebody else's.
 **For OpenCode the middle step is doing a second job**, and it is a Windows one: a
@@ -41,7 +45,7 @@ looked behind too**, by `launch`: under a non-default npm prefix — or named by
 `copilot_native_path` the default location is built from
 (`copilot_s_binary_is_found_beside_whichever_npm_prefix_holds_the_shim`).
 **Cursor's is not a shim to look past but a chain to start behind, and that is `launch(h, bin)
--> Launch { program, prefix }`.** Its Windows installer writes `cursor-agent.cmd`, which runs a
+-> Launch { program, prefix, env }`.** Its Windows installer writes `cursor-agent.cmd`, which runs a
 PowerShell script, which runs `versions\<newest>\node.exe index.js` — and ending a `.cmd` ends
 `cmd.exe` and leaves node running, so Stop and a dropped session's `kill_on_drop` would have
 stopped the panel waiting while the turn went on spending the user's quota. The launcher does
@@ -53,9 +57,24 @@ The version is chosen by the launcher's own rule, `newest_cursor_version` — `Y
 leaves to directory order, anything else in `versions\` ignored
 (`the_newest_cursor_version_is_picked_by_the_launcher_s_rule`). Anything that is not that layout
 is started as it is — an override pointing straight at a `node.exe`, a Unix install whose link is
-a real executable — and no harness but these two is rewritten at all
+a real executable — and no harness but these two and DeepSeek's is rewritten at all
 (`a_launcher_is_rewritten_only_to_something_that_exists`, which also holds a `.cmd` with nothing
-behind it to `Launch::direct` rather than an invented path, for both). The layout itself — the `.cmd` resolving to
+behind it to `Launch::direct` rather than an invented path, for Cursor and Copilot — not yet for
+DeepSeek, whose `dsh_electron_launch` answers `None` the same way when its files are missing).
+**DeepSeek's chain is one link long, and the link is an environment variable — which is why
+`Launch` has an `env`.** `dsh.cmd` (read from the shipped 0.2.1-rc.2 script) sets
+`ELECTRON_RUN_AS_NODE=1` and runs the desktop app's own `DeepSeek Harness.exe --expose-internals
+<resources>\app.asar\dsh\node_modules\@deepseek-ai\dsh-desktop-host\lib\cli.js`, and nothing more.
+Ending the `.cmd` would leave that executable running — Cursor's hazard — so `dsh_electron_launch`
+starts it directly, with `--expose-internals` and the script as the prefix and the variable in
+`env`, when the installer's layout is all there (the executable at the install root, the archive at
+`resources\app.asar`; the script inside the archive cannot be checked from outside Electron, so the
+archive is). **The variable is not optional, and it has to reach every spawn**: without it the
+same executable opens the desktop app's window, so a probe that forgot it would put a GUI on
+screen at every Schemaic launch rather than read a help page. So `Launch::std_command` applies it
+— which covers the help probe — and so do the per-turn spawn, `inline_plan`'s environment
+(ahead of the isolation's, the two never naming one variable) and `ai::dsh_seal_refusal`'s
+`--dump-config`. The layout itself — the `.cmd` resolving to
 a real install's newest `node.exe index.js` — was measured rather than tested, because a test
 reading the installed directory would break the suite's no-filesystem rule. `launch` is
 an exhaustive `match`, so the next harness decides rather than defaults, and the per-turn loop,
@@ -68,8 +87,9 @@ answers `direct` for Claude and Antigravity, the two harnesses that reach it.
 gets a window of its own unless the spawn sets `CREATE_NO_WINDOW` — and none of the agent spawns
 did, so the startup probe's `claude --help` flashed a console window on every launch, as every AI
 turn, inline generation, Cursor `mcp enable` and `agy mcp` call would have. `Launch::std_command`
-calls it, which covers `probe` and `cursor::approve`; the three tokio spawns in `ai.rs` (the
-one-shot, the per-turn loop, the persistent branch) pass `cmd.as_std_mut()`; and
+calls it, which covers `probe` and `cursor::approve`; the four tokio spawns in `ai.rs` (the
+one-shot, the per-turn loop, the persistent branch and DeepSeek's `--dump-config` check) pass
+`cmd.as_std_mut()`; and
 `antigravity::agy_mcp` calls it on its own `Command`. The child still gets a console, only an
 invisible one, which is what its own children (`reg.exe`, `node`) inherit. The other crates' spawns
 — `db::entra`, `db::cloud_iam`, `conn_sources`, `term::shell`, `main.rs`'s `open_url` — already set
@@ -109,7 +129,9 @@ from `Harness::help_args`, not from a literal `--help` here**, and the differenc
 config isolation: `--ignore-user-config` is documented on `codex exec --help` and not on the
 top-level page this used to ask, so `codex_isolates_config` was `false` on every real machine and
 every Codex session loaded the user's own `~/.codex/config.toml`. `exec` carries `--sandbox` too,
-so one spawn still answers all three. `schemaic-ai` states the measurement and names the tests.
+so one spawn still answers all three. DeepSeek's page is `--profile headless --help` for the same
+reason: the flags its grade rests on are the headless profile's and not on the launcher's page.
+`schemaic-ai` states the measurement and names the tests.
 **The invocation is built by `help_command(h, bin)` rather than spawned inline, so that argv has
 a test of its own.** The regression's own test lives in `schemaic-ai` and asserts
 `help_args()`'s *return* — which is the answer, not the question — so reverting this line to

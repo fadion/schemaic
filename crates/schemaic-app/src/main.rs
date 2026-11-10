@@ -39,6 +39,7 @@ mod antigravity;
 mod conn_sources;
 mod copilot;
 mod cursor;
+mod deepseek;
 // The dump's driver is `schemaic-cli`'s, so `schemaic dump` and the modal run
 // the one writer.
 use schemaic_cli::dump;
@@ -3228,6 +3229,9 @@ fn app_view(
             opencode::sweep();
             // Copilot's homes are rooted the same way and collected the same way.
             copilot::sweep();
+            // DeepSeek's homes too — the overlay and the session logs a turn
+            // resumes from both live under an instance root.
+            deepseek::sweep();
             // Cursor's workspaces too — and, like Antigravity's registration,
             // what the CLI kept about them in the user's own `~/.cursor`.
             cursor::sweep();

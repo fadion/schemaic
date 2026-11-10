@@ -170,17 +170,31 @@ pub enum Harness {
     /// read-only is a permissions file in its working directory. See
     /// [`Harness::restricts_by_workspace_rules`].
     Cursor,
+    /// `dsh --profile headless --json` — the DeepSeek Harness CLI, one process
+    /// per turn, `type`-tagged `session` / `status` / `text` / `tool_call` /
+    /// `tool_result` / `final` events.
+    ///
+    /// **Its text is per committed step, never per token**: a `text` event
+    /// carries a whole step's prose once the step commits, so
+    /// [`Harness::streams_deltas`] is false, as OpenCode's is.
+    ///
+    /// **Sealed by composition, not by a flag.** A dsh run is a list of plugins,
+    /// and the overlay Schemaic hands it with `--patch` disables every built-in
+    /// tool plugin and inserts the Schemaic MCP server — measured to take the
+    /// model from 24 tools to none but Schemaic's. See [`dsh_overlay_yaml`].
+    DeepSeek,
 }
 
 impl Harness {
     /// Every harness, in the order the settings UI offers them.
-    pub const ALL: [Harness; 6] = [
+    pub const ALL: [Harness; 7] = [
         Harness::Claude,
         Harness::Codex,
         Harness::Antigravity,
         Harness::OpenCode,
         Harness::Copilot,
         Harness::Cursor,
+        Harness::DeepSeek,
     ];
 
     /// The stable string form, matched back by [`Harness::from_key`].
@@ -203,6 +217,7 @@ impl Harness {
             Harness::OpenCode => "opencode",
             Harness::Copilot => "copilot",
             Harness::Cursor => "cursor",
+            Harness::DeepSeek => "deepseek",
         }
     }
 
@@ -216,6 +231,7 @@ impl Harness {
             Harness::OpenCode => "OpenCode",
             Harness::Copilot => "GitHub Copilot",
             Harness::Cursor => "Cursor",
+            Harness::DeepSeek => "DeepSeek Harness",
         }
     }
 
@@ -247,6 +263,9 @@ impl Harness {
             // every answer reads as a heading rather than a name.
             Harness::Copilot => "Copilot",
             Harness::Cursor => "Cursor",
+            // The model's maker, not the product: "DEEPSEEK HARNESS" over an
+            // answer reads as a heading, as "GITHUB COPILOT" did.
+            Harness::DeepSeek => "DeepSeek",
         }
     }
 
@@ -280,6 +299,10 @@ impl Harness {
             | Harness::OpenCode
             | Harness::Copilot
             | Harness::Cursor => &["--help"],
+            // The headless profile's own page, not the launcher's: it is the
+            // one that lists `--json` and `--session-id`, which the argv rests
+            // on, and printing it boots nothing (measured on 0.2.1-rc.2).
+            Harness::DeepSeek => &["--profile", "headless", "--help"],
         }
     }
 
@@ -296,6 +319,9 @@ impl Harness {
             // `cursor-agent`. The longer one: `agent` is a word other tools
             // claim, and a `PATH` search for it can find somebody else's.
             Harness::Cursor => "cursor-agent",
+            // The launcher the desktop app can put on `PATH` (its settings
+            // offer to); otherwise `agent_cli` finds it inside the install.
+            Harness::DeepSeek => "dsh",
         }
     }
 
@@ -335,7 +361,7 @@ pub enum Agent {
 impl Agent {
     /// Every choice, in the order the settings dropdown offers them: off first,
     /// then [`Harness::ALL`].
-    pub const ALL: [Agent; 7] = [
+    pub const ALL: [Agent; 8] = [
         Agent::Disabled,
         Agent::Cli(Harness::Claude),
         Agent::Cli(Harness::Codex),
@@ -343,6 +369,7 @@ impl Agent {
         Agent::Cli(Harness::OpenCode),
         Agent::Cli(Harness::Copilot),
         Agent::Cli(Harness::Cursor),
+        Agent::Cli(Harness::DeepSeek),
     ];
 
     /// The persisted key — [`Harness::key`], or the off key.
@@ -574,7 +601,8 @@ impl Harness {
             | Harness::Antigravity
             | Harness::OpenCode
             | Harness::Copilot
-            | Harness::Cursor => true,
+            | Harness::Cursor
+            | Harness::DeepSeek => true,
         }
     }
 
@@ -619,6 +647,10 @@ impl Harness {
             // `agent models` lists the account's catalogue, and it is long and
             // plan-specific; `auto` is the default every account has.
             Harness::Cursor => &["auto"],
+            // The two its catalogue lists (dsh 0.2.1-rc.2), both measured to
+            // run. The model goes in the overlay's `agent-default-model` row,
+            // not a flag: headless has no `--model`.
+            Harness::DeepSeek => &["deepseek-flash", "deepseek-v4-pro"],
         }
     }
 
@@ -669,6 +701,13 @@ impl Harness {
             // named variant (`gpt-5.3-codex-high`) or a bracket parameter
             // (`…[effort=high]`), both of which the model field passes through.
             Harness::Cursor => &[],
+            // Three of its provider's four, carried by the overlay's
+            // `reasoningEffort` rather than a flag; `low` on `deepseek-v4-pro`
+            // was measured accepted and recorded. **Not `off`**, the fourth:
+            // the settings box has no such level (`AiEffort`), so offering it
+            // here would advertise a level nobody can pick — and it is the one
+            // that was never run.
+            Harness::DeepSeek => &["low", "high", "max"],
         }
     }
 
@@ -711,7 +750,11 @@ impl Harness {
             // Cursor has a `--sandbox` flag, and it is not what restricts it:
             // what holds is a permissions file — see
             // `restricts_by_workspace_rules`.
-            Harness::Claude | Harness::OpenCode | Harness::Copilot | Harness::Cursor => false,
+            Harness::Claude
+            | Harness::OpenCode
+            | Harness::Copilot
+            | Harness::Cursor
+            | Harness::DeepSeek => false,
         }
     }
 
@@ -735,7 +778,8 @@ impl Harness {
             | Harness::Codex
             | Harness::Antigravity
             | Harness::OpenCode
-            | Harness::Copilot => false,
+            | Harness::Copilot
+            | Harness::DeepSeek => false,
         }
     }
 
@@ -757,7 +801,10 @@ impl Harness {
             | Harness::Antigravity
             | Harness::OpenCode
             | Harness::Copilot
-            | Harness::Cursor => false,
+            | Harness::Cursor
+            // A composition handed over by `--patch`, not a flag whose absence
+            // leaves a weaker grade.
+            | Harness::DeepSeek => false,
         }
     }
 
@@ -785,7 +832,13 @@ impl Harness {
     /// (`--available-tools`); its **isolation** is this variable.
     pub fn env_seal(self) -> bool {
         match self {
-            Harness::OpenCode | Harness::Copilot => true,
+            // **DeepSeek is the third**: `DSH_HOME` pointed at a directory of
+            // Schemaic's own, so the user's profile and home patch layers — which
+            // apply *before* `--patch` and could insert a tool plugin our
+            // overlay never names — are not read at all. Measured: a turn under
+            // a fresh home signed in (the credentials file is named by path in
+            // the overlay) and ran with Schemaic's tools only.
+            Harness::OpenCode | Harness::Copilot | Harness::DeepSeek => true,
             // Cursor's restriction is a *directory* too, but one it finds by
             // being started in it — its working directory — not one an
             // environment variable points at. See
@@ -810,7 +863,9 @@ impl Harness {
             | Harness::Antigravity
             | Harness::OpenCode
             | Harness::Copilot
-            | Harness::Cursor => false,
+            | Harness::Cursor
+            // `DSH_HOME` — see `env_seal`.
+            | Harness::DeepSeek => false,
         }
     }
 
@@ -853,7 +908,13 @@ impl Harness {
     /// user's own settings do.
     pub fn isolates_mcp_servers(self) -> bool {
         match self {
-            Harness::Claude | Harness::Codex | Harness::OpenCode | Harness::Copilot => true,
+            // DeepSeek's MCP servers are rows of its composition, and under a
+            // private `DSH_HOME` the only one is the row the overlay inserts.
+            Harness::Claude
+            | Harness::Codex
+            | Harness::OpenCode
+            | Harness::Copilot
+            | Harness::DeepSeek => true,
             Harness::Antigravity | Harness::Cursor => false,
         }
     }
@@ -887,7 +948,9 @@ impl Harness {
             // Cursor's `--stream-partial-output` deltas, followed by segment
             // restatements the parser must not print twice.
             Harness::Claude | Harness::Antigravity | Harness::Copilot | Harness::Cursor => true,
-            Harness::Codex | Harness::OpenCode => false,
+            // DeepSeek's `text` is a committed step, whole: measured, never a
+            // fragment.
+            Harness::Codex | Harness::OpenCode | Harness::DeepSeek => false,
         }
     }
 
@@ -909,7 +972,12 @@ impl Harness {
             Harness::Claude | Harness::Antigravity => true,
             // Copilot's `--acp` is a persistent protocol; it is not the one
             // measured. See the variant's doc.
-            Harness::Codex | Harness::OpenCode | Harness::Copilot | Harness::Cursor => false,
+            // DeepSeek's headless profile is one task per process by design.
+            Harness::Codex
+            | Harness::OpenCode
+            | Harness::Copilot
+            | Harness::Cursor
+            | Harness::DeepSeek => false,
         }
     }
 
@@ -992,7 +1060,10 @@ impl Harness {
     /// `text` output.
     pub fn prompt_on_stdin(self) -> bool {
         match self {
-            Harness::Codex | Harness::Copilot | Harness::Cursor => true,
+            // **DeepSeek is the fourth** (dsh 0.2.1-rc.2, 2026-11-10): with no
+            // positional and stdin piped, the headless profile reads the task
+            // from stdin — a two-line prompt answered from its second line.
+            Harness::Codex | Harness::Copilot | Harness::Cursor | Harness::DeepSeek => true,
             Harness::Claude | Harness::Antigravity | Harness::OpenCode => false,
         }
     }
@@ -1016,7 +1087,9 @@ impl Harness {
             | Harness::OpenCode
             | Harness::Antigravity
             | Harness::Copilot
-            | Harness::Cursor => true,
+            | Harness::Cursor
+            // `--session-id <id>`, measured to carry the thread into turn two.
+            | Harness::DeepSeek => true,
         }
     }
 
@@ -1040,9 +1113,11 @@ impl Harness {
                 });
                 format!("{v}\n")
             }
-            Harness::Codex | Harness::OpenCode | Harness::Copilot | Harness::Cursor => {
-                String::new()
-            }
+            Harness::Codex
+            | Harness::OpenCode
+            | Harness::Copilot
+            | Harness::Cursor
+            | Harness::DeepSeek => String::new(),
         }
     }
 
@@ -1061,7 +1136,8 @@ impl Harness {
             | Harness::Codex
             | Harness::OpenCode
             | Harness::Copilot
-            | Harness::Cursor => None,
+            | Harness::Cursor
+            | Harness::DeepSeek => None,
         }
     }
 
@@ -1079,7 +1155,8 @@ impl Harness {
             | Harness::Codex
             | Harness::OpenCode
             | Harness::Copilot
-            | Harness::Cursor => false,
+            | Harness::Cursor
+            | Harness::DeepSeek => false,
         }
     }
 }
@@ -1194,6 +1271,25 @@ pub fn constraint_from_help(h: Harness, help: &str) -> Constraint {
         Harness::Cursor => {
             if crate::mentions_flag(help, "--trust") {
                 Constraint::Restricted
+            } else {
+                Constraint::Unknown
+            }
+        }
+        // **Sealed, and the seal is a composition the help page cannot show.**
+        // The overlay (`dsh_overlay_yaml`) disables every built-in tool plugin;
+        // measured, the model went from 24 tools to none but Schemaic's. What
+        // the page *can* vouch for is the headless profile's own interface —
+        // `--json` and `--session-id`, which the argv and the resume rest on —
+        // so a launcher that lacks them is not the one measured.
+        //
+        // **A plugin list is a denylist, so the grade is re-earned per
+        // session**: `ai::start_ai_session` dumps the composed profile with the
+        // overlay (`--dump-config`, which boots nothing) and refuses when
+        // `dsh_unsealed_rows` finds any tool plugin still enabled — the case of
+        // a dsh update adding one the overlay has not heard of.
+        Harness::DeepSeek => {
+            if crate::mentions_flag(help, "--json") && crate::mentions_flag(help, "--session-id") {
+                Constraint::Sealed
             } else {
                 Constraint::Unknown
             }
@@ -1534,7 +1630,268 @@ pub fn turn_args(h: Harness, spec: &TurnSpec) -> Vec<String> {
             }
             a
         }
+        // `mcp_config` is the overlay here (`dsh_overlay_yaml`): the seal, the
+        // server, the sign-in and the model all travel in it, since headless
+        // takes none of them as a flag. The caller refuses a session whose
+        // overlay could not be written (`ai::isolation_refusal`), so the arm
+        // never runs without one; it still omits `--patch` rather than invent a
+        // path, and `a_dsh_turn_without_an_overlay_is_not_a_sealed_argv` says
+        // what that would mean.
+        Harness::DeepSeek => {
+            let mut a = dsh_profile_args(spec.mcp_config.as_deref());
+            a.push("--json".into());
+            if let Some(id) = spec.resume.as_deref().filter(|s| !s.is_empty()) {
+                a.push("--session-id".into());
+                a.push(id.into());
+            }
+            if !h.prompt_on_stdin() {
+                a.push(prefixed_prompt(turn_system(spec), &spec.prompt));
+            }
+            a
+        }
     }
+}
+
+/// `--profile headless`, and `--patch <overlay>` when there is one — the head
+/// of every dsh argv, turn and one-shot alike.
+fn dsh_profile_args(overlay: Option<&str>) -> Vec<String> {
+    let mut a: Vec<String> = vec!["--profile".into(), "headless".into()];
+    if let Some(p) = overlay.filter(|p| !p.is_empty()) {
+        a.push("--patch".into());
+        a.push(p.into());
+    }
+    a
+}
+
+/// The ids of the dsh headless profile's rows whose plugins hand the model a
+/// tool — every one disabled by [`dsh_overlay_yaml`].
+///
+/// Read off `dsh --profile headless --dump-config` (0.2.1-rc.2). Measured with
+/// all of these off: the model's tool list went from 24 — `pwsh`, `read`,
+/// `write`, `edit`, `web_fetch`, `subagent`, `workflow` and the rest — to none,
+/// and the request from 6201 input tokens to 249.
+///
+/// **A denylist, and the guard on that is [`dsh_unsealed_rows`]**: an id here
+/// that a later build drops costs nothing (the patch warns and moves on), while
+/// a tool plugin a later build adds would be live — so the composed profile is
+/// checked, by plugin name, before every session.
+pub const DSH_TOOL_ROWS: &[&str] = &[
+    "tool-pwsh",
+    "tool-bash",
+    "tool-fs",
+    "tool-fs-search",
+    "tool-web",
+    "tool-jobs",
+    "tool-skill",
+    "tool-subagent",
+    "tool-subagent-fork",
+    "tool-subagent-control",
+    "tool-subagent-list-agents",
+    "tool-workflow",
+    "tool-working-directory",
+    "tool-todo",
+    "tool-goal",
+];
+
+/// The id of the row [`dsh_overlay_yaml`] inserts for Schemaic's MCP server —
+/// the one MCP client [`dsh_unsealed_rows`] lets through.
+pub const DSH_MCP_ROW: &str = "mcp-schemaic";
+
+/// Plugins named `dsh-tool-…` that register no tool: the executors every tool
+/// call (Schemaic's included) runs through, and a timeout policy over them.
+const DSH_TOOL_NAMED_NON_TOOLS: &[&str] = &[
+    "@deepseek-ai/dsh-tool-executor-native",
+    "@deepseek-ai/dsh-tool-executor-ptc",
+    "@deepseek-ai/dsh-tool-call-timeout-policy",
+];
+
+/// Which DeepSeek model route a session signs in through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DshProvider {
+    /// The account the desktop app signs in with (`deepseek-account`), its
+    /// grant read from the user's own credentials file.
+    Account,
+    /// An API key in `DEEPSEEK_API_KEY` (`deepseek-official`).
+    ApiKey,
+}
+
+impl DshProvider {
+    fn id(self) -> &'static str {
+        match self {
+            DshProvider::Account => "deepseek-account",
+            DshProvider::ApiKey => "deepseek-official",
+        }
+    }
+}
+
+/// Everything [`dsh_overlay_yaml`] writes.
+#[derive(Clone, Debug)]
+pub struct DshOverlay<'a> {
+    /// This executable, which serves the MCP server.
+    pub exe: &'a str,
+    /// The session's endpoint file; `None` gives the session no server (and a
+    /// one-shot never has one).
+    pub endpoint_file: Option<&'a str>,
+    /// The user's own dsh credentials file, read in place — never copied.
+    pub credentials: &'a str,
+    pub provider: DshProvider,
+    /// As the user set it; trimmed, and the first suggestion when blank, since
+    /// the row needs a model to route at all.
+    pub model: &'a str,
+    /// As the user set it; clamped to [`Harness::DeepSeek`]'s own levels.
+    pub effort: &'a str,
+}
+
+/// A YAML single-quoted scalar: `'` doubled, and every control character a
+/// space. A value the user typed (the model) can therefore never become a key,
+/// a tag, a `!!js` expression or a line of its own — the profile loader
+/// evaluates `!!js`, so this is not cosmetic. No model id or path this writes
+/// holds a control character legitimately.
+fn yaml_quoted(s: &str) -> String {
+    let clean: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    format!("'{}'", clean.replace('\'', "''"))
+}
+
+/// The `--patch` overlay a DeepSeek run is composed with: the seal, the
+/// sign-in, the model, and Schemaic's MCP server.
+///
+/// - **The seal**: every row in [`DSH_TOOL_ROWS`] `disabled: true`.
+/// - **The sign-in**: headless ships with the credential store and the account
+///   plugins off ("keys and sign-ins saved by the GUI are ignored"), so the
+///   three rows are turned back on and the store pointed at the user's own
+///   file by path — under the private `DSH_HOME` it would otherwise look for
+///   one there. The account grant has no refresh flow (its README), so a
+///   second reader cannot rotate it out from under the desktop app.
+/// - **The model**: `agent-default-model`, whose config a patch replaces
+///   wholesale — hence provider and model are both always written.
+/// - **The server**: an `insert`, because a patch row naming an id the profile
+///   does not have is a warning and nothing else (measured: "patch: entry
+///   "mcp-schemaic" not found", and no tools).
+///
+/// Every value is a quoted scalar ([`yaml_quoted`]). The endpoint itself is not
+/// here, for the reason it is in no other harness's config: this file names the
+/// per-session endpoint file by path.
+pub fn dsh_overlay_yaml(o: &DshOverlay<'_>) -> String {
+    let model = match o.model.trim() {
+        "" => Harness::DeepSeek.suggested_models()[0],
+        m => m,
+    };
+    let mut y = String::from(
+        "# Written by Schemaic for one DeepSeek Harness run; rewritten each session.\n",
+    );
+    y.push_str(&format!(
+        "- id: credentials\n  disabled: false\n  config:\n    path: {}\n",
+        yaml_quoted(o.credentials)
+    ));
+    y.push_str("- id: authorization\n  disabled: false\n");
+    y.push_str("- id: deepseek-account\n  disabled: false\n");
+    y.push_str(&format!(
+        "- id: agent-default-model\n  config:\n    provider: {}\n    model: {}\n",
+        yaml_quoted(o.provider.id()),
+        yaml_quoted(model)
+    ));
+    if let Some(e) = Harness::DeepSeek.effort_arg(o.effort.trim()) {
+        y.push_str(&format!("    reasoningEffort: {}\n", yaml_quoted(e)));
+    }
+    for id in DSH_TOOL_ROWS {
+        y.push_str(&format!("- id: {id}\n  disabled: true\n"));
+    }
+    if let Some(ep) = o.endpoint_file {
+        y.push_str(&format!(
+            "- insert:\n    - id: {DSH_MCP_ROW}\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        serverName: {MCP_SERVER}\n        transport: stdio\n        command: {}\n        args: [{}, {}, {}]\n        failOnStartupError: true\n",
+            yaml_quoted(o.exe),
+            yaml_quoted("--mcp-serve"),
+            yaml_quoted("--endpoint-file"),
+            yaml_quoted(ep)
+        ));
+    }
+    y
+}
+
+/// The plugins in a composed dsh profile (`--dump-config`'s YAML) that would
+/// still hand the model a tool — empty when the session is sealed.
+///
+/// A row counts when its plugin is named `@deepseek-ai/dsh-tool-…` (bar the
+/// [`DSH_TOOL_NAMED_NON_TOOLS`]) or `…/tools`, or is an MCP client other than
+/// [`DSH_MCP_ROW`], or is outside the `@deepseek-ai/` scope entirely — and is
+/// not disabled by a literal `disabled: true`. A `!!js` expression is not
+/// literal and does not count: it is evaluated at boot, and this cannot know
+/// what it will say.
+///
+/// **By name, not by id**, which is the point of having it beside
+/// [`DSH_TOOL_ROWS`]: the overlay can only disable ids it has heard of, and
+/// this is what notices one it has not.
+pub fn dsh_unsealed_rows(dump: &str) -> Vec<String> {
+    struct Row {
+        indent: usize,
+        id: String,
+        name: String,
+        disabled: bool,
+    }
+    fn unquote(v: &str) -> String {
+        let v = v.trim();
+        match v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+            Some(inner) => inner.replace("''", "'"),
+            None => v.trim_matches('"').to_string(),
+        }
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    for line in dump.lines() {
+        let indent = line.len() - line.trim_start().len();
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("- id:") {
+            rows.push(Row {
+                indent,
+                id: unquote(rest),
+                name: String::new(),
+                disabled: false,
+            });
+            continue;
+        }
+        // A key of the row most recently opened, at exactly its own depth —
+        // `name` and `disabled` deeper down belong to its config.
+        let Some(row) = rows.last_mut() else { continue };
+        if indent != row.indent + 2 {
+            continue;
+        }
+        if let Some(v) = t.strip_prefix("name:") {
+            row.name = unquote(v);
+        } else if let Some(v) = t.strip_prefix("disabled:") {
+            row.disabled = v.trim() == "true";
+        }
+    }
+    rows.into_iter()
+        .filter(|r| !r.disabled)
+        .filter(|r| {
+            let n = r.name.as_str();
+            let tool =
+                n.starts_with("@deepseek-ai/dsh-tool-") && !DSH_TOOL_NAMED_NON_TOOLS.contains(&n);
+            let mcp = n == "@deepseek-ai/dsh-mcp-client" && r.id != DSH_MCP_ROW;
+            let foreign = !n.is_empty() && !n.starts_with("@deepseek-ai/");
+            tool || n.ends_with("/tools") || mcp || foreign
+        })
+        .map(|r| format!("{} ({})", r.id, r.name))
+        .collect()
+}
+
+/// Is `dump` a composed **headless** profile at all — the only kind
+/// [`dsh_unsealed_rows`]' empty answer means anything for?
+///
+/// An empty dump, a usage error printed in its place, or a build whose dump
+/// format changed all have no unsealed rows, and none of them shows the run is
+/// sealed. The runner row (`@deepseek-ai/dsh-headless`, the patch that makes the
+/// profile one-shot) is in every headless composition, so its presence is the
+/// evidence the rest was read.
+pub fn dsh_dump_is_headless(dump: &str) -> bool {
+    dump.lines().any(|l| {
+        l.trim_start()
+            .strip_prefix("name:")
+            .map(|v| v.trim().trim_matches('\'') == "@deepseek-ai/dsh-headless")
+            .unwrap_or(false)
+    })
 }
 
 /// What Cursor's permissions file denies, whatever the access level.
@@ -1719,7 +2076,11 @@ pub fn session_args(
             }
             a
         }
-        Harness::Codex | Harness::OpenCode | Harness::Copilot | Harness::Cursor => Vec::new(),
+        Harness::Codex
+        | Harness::OpenCode
+        | Harness::Copilot
+        | Harness::Cursor
+        | Harness::DeepSeek => Vec::new(),
     }
 }
 
@@ -1890,6 +2251,9 @@ pub struct InlineSpec {
     /// Where Codex should write its last message. Ignored by every harness
     /// whose [`inline_output`] is [`InlineOutput::Stdout`].
     pub last_message: String,
+    /// DeepSeek's `--patch` overlay ([`dsh_overlay_yaml`], with no server).
+    /// Ignored by every other harness.
+    pub overlay: String,
 }
 
 /// Where to read the reply for `h`.
@@ -1904,7 +2268,10 @@ pub fn inline_output(h: Harness) -> InlineOutput {
         | Harness::Antigravity
         | Harness::OpenCode
         | Harness::Copilot
-        | Harness::Cursor => InlineOutput::Stdout,
+        | Harness::Cursor
+        // Headless without `--json` prints the final answer alone on stdout;
+        // its reasoning goes to stderr.
+        | Harness::DeepSeek => InlineOutput::Stdout,
     }
 }
 
@@ -2084,6 +2451,15 @@ pub fn inline_argv(h: Harness, spec: &InlineSpec) -> Vec<String> {
                 a.push("--model".into());
                 a.push(model.to_string());
             }
+            if !h.prompt_on_stdin() {
+                a.push(prefixed_prompt(&spec.system, &spec.intent));
+            }
+            a
+        }
+        // The session's argv without the stream or a resume. The overlay is a
+        // one-shot's own — sealed, signed in, the model, and no server.
+        Harness::DeepSeek => {
+            let mut a = dsh_profile_args(Some(&spec.overlay));
             if !h.prompt_on_stdin() {
                 a.push(prefixed_prompt(&spec.system, &spec.intent));
             }
@@ -2696,13 +3072,19 @@ mod tests {
             Harness::OpenCode => "Usage: opencode\n  --pure\n  --help\n",
             Harness::Copilot => "Usage: copilot\n  --available-tools [<tools>...]\n  --help\n",
             Harness::Cursor => "Usage: agent\n  --trust\n  --help\n",
+            Harness::DeepSeek => {
+                "Usage: dsh --profile headless [options] [task...]\n  --json\n  --session-id <id>\n  -h, --help\n"
+            }
         };
         for h in Harness::ALL {
             let got = constraint_from_help(h, best(h));
             let want = match h {
                 // Empties the built-in set: `--tools ""`, an agent whose
                 // `tools` map is all false, and an allowlist naming only ours.
-                Harness::Claude | Harness::OpenCode | Harness::Copilot => Constraint::Sealed,
+                // DeepSeek's: every tool plugin disabled by the overlay.
+                Harness::Claude | Harness::OpenCode | Harness::Copilot | Harness::DeepSeek => {
+                    Constraint::Sealed
+                }
                 // A sandbox blocks side effects and leaves the readers live.
                 // There is no flag on either that empties the tool set, so
                 // neither can ever be `Sealed` — the claim this test exists to
@@ -3247,7 +3629,9 @@ mod tests {
         // …and the guard is not vacuous in the other direction either: a real
         // id does reach every harness's argv.
         s.model = "provider/some-model".into();
-        for h in Harness::ALL {
+        // DeepSeek's headless has no `--model`: its model is the overlay's,
+        // pinned by `dsh_overlay_carries_the_model_and_effort`.
+        for h in Harness::ALL.into_iter().filter(|h| *h != Harness::DeepSeek) {
             let a = spawn_argv(h, &s);
             let i = a
                 .iter()
@@ -4092,6 +4476,7 @@ mod copilot_tests {
                 seal: crate::CliSeal::ALL,
                 isolate_config: false,
                 last_message: String::new(),
+                overlay: String::new(),
             },
         );
         assert_eq!(
@@ -4173,6 +4558,7 @@ mod copilot_tests {
                 seal: crate::CliSeal::ALL,
                 isolate_config: true,
                 last_message: String::new(),
+                overlay: String::new(),
             },
         );
         for a in args_of(&s).iter().chain(inline.iter()) {
@@ -4243,6 +4629,7 @@ mod copilot_tests {
                 seal: crate::CliSeal::ALL,
                 isolate_config: false,
                 last_message: String::new(),
+                overlay: String::new(),
             },
         );
         assert!(inline.contains(&"-s".to_string()), "{inline:?}");
@@ -4350,6 +4737,7 @@ mod cursor_tests {
                 seal: crate::CliSeal::ALL,
                 isolate_config: true,
                 last_message: String::new(),
+                overlay: String::new(),
             },
         )
     }
@@ -4565,8 +4953,12 @@ mod speaker_label_tests {
         // heading rather than a speaker.
         assert_eq!(Harness::Copilot.label(), "GitHub Copilot");
         assert_eq!(Harness::Copilot.speaker_name(), "Copilot");
+        // The third, for Copilot's reason: the product is *DeepSeek Harness*,
+        // and "DEEPSEEK HARNESS" over an answer reads as a heading.
+        assert_eq!(Harness::DeepSeek.label(), "DeepSeek Harness");
+        assert_eq!(Harness::DeepSeek.speaker_name(), "DeepSeek");
         for h in Harness::ALL {
-            if matches!(h, Harness::Claude | Harness::Copilot) {
+            if matches!(h, Harness::Claude | Harness::Copilot | Harness::DeepSeek) {
                 continue;
             }
             assert_eq!(h.speaker_name(), h.label(), "{h:?}");
@@ -4633,9 +5025,15 @@ mod review_fix_tests {
     #[test]
     fn codex_is_probed_on_the_subcommand_that_documents_its_isolation() {
         assert_eq!(Harness::Codex.help_args(), &["exec", "--help"]);
+        // DeepSeek's launcher page is not its profile's: `--json` and
+        // `--session-id` are on `--profile headless --help` alone.
+        assert_eq!(
+            Harness::DeepSeek.help_args(),
+            &["--profile", "headless", "--help"]
+        );
         // The others have no subcommand to descend into.
         for h in Harness::ALL {
-            if h == Harness::Codex {
+            if matches!(h, Harness::Codex | Harness::DeepSeek) {
                 continue;
             }
             assert_eq!(h.help_args(), &["--help"], "{h:?}");
@@ -4726,7 +5124,9 @@ Options:
     /// A real model id still survives, untrimmed in the middle.
     #[test]
     fn a_model_with_surrounding_space_is_sent_trimmed() {
-        for h in Harness::ALL {
+        // DeepSeek's model travels in its overlay, trimmed there — see
+        // `dsh_overlay_carries_the_model_and_effort`.
+        for h in Harness::ALL.into_iter().filter(|h| *h != Harness::DeepSeek) {
             let spec = TurnSpec {
                 prompt: "hi".into(),
                 model: "  provider/some-model  ".into(),
@@ -4781,6 +5181,9 @@ Options:
                 // Rules in a file: no sandbox to promise, no update that
                 // would help, and the user's own servers start with it.
                 Harness::Cursor => (false, false, true),
+                // Seals by its overlay or grades `Unknown`, Copilot's shape:
+                // never reaches this grade, and promises nothing if it does.
+                Harness::DeepSeek => (false, false, false),
             };
             assert_eq!(says_sandbox, want_sandbox, "{h:?}: {notice}");
             assert_eq!(says_update, want_update, "{h:?}: {notice}");
@@ -4871,6 +5274,7 @@ mod inline_tests {
             seal: CliSeal::ALL,
             isolate_config: true,
             last_message: "C:/tmp/last.txt".into(),
+            overlay: "C:/tmp/overlay.yml".into(),
         }
     }
 
@@ -5146,6 +5550,12 @@ mod inline_tests {
                     !a.iter().any(|x| x.contains("effort")),
                     "Cursor was sent an effort flag it does not have: {a:?}"
                 ),
+                // Headless has no such flag; the level rides in the overlay's
+                // `reasoningEffort` — see `dsh_overlay_carries_the_model_and_effort`.
+                Harness::DeepSeek => assert!(
+                    !a.iter().any(|x| x.contains("effort")),
+                    "DeepSeek was sent an effort flag it does not have: {a:?}"
+                ),
                 // Named rather than `_`: a wildcard here sorted a new harness
                 // onto the `--effort` side without anyone deciding it.
                 Harness::Claude | Harness::Antigravity => {
@@ -5193,8 +5603,10 @@ mod inline_tests {
             assert!(!a.contains(&"--model".to_string()), "{h:?}: {a:?}");
             assert!(!a.contains(&"-m".to_string()), "{h:?}: {a:?}");
         }
-        // And it *is* passed when the user set one.
-        for h in Harness::ALL {
+        // And it *is* passed when the user set one — on argv by every harness
+        // that has the flag. DeepSeek's headless has none: its model is the
+        // overlay's (`dsh_overlay_carries_the_model_and_effort`).
+        for h in Harness::ALL.into_iter().filter(|h| *h != Harness::DeepSeek) {
             let a = inline_argv(h, &spec());
             assert_eq!(
                 flag_value(&a, "--model").as_deref(),
@@ -5362,5 +5774,280 @@ mod bidirectional_tests {
             !a.iter().any(|s| s.contains("tables: users(id)")),
             "the system context went in the argv: {a:?}"
         );
+    }
+}
+
+/// DeepSeek Harness: the overlay that seals and signs in a run, the check that
+/// re-earns the seal against the composed profile, and the argv around them.
+#[cfg(test)]
+mod deepseek_tests {
+    use super::*;
+
+    fn overlay(endpoint: Option<&str>, model: &str, effort: &str) -> String {
+        dsh_overlay_yaml(&DshOverlay {
+            exe: "C:/apps/schemaic.exe",
+            endpoint_file: endpoint,
+            credentials: "C:/home/.dsh/.credentials.yaml",
+            provider: DshProvider::Account,
+            model,
+            effort,
+        })
+    }
+
+    /// The fifteen rows measured to carry every built-in tool (0.2.1-rc.2),
+    /// named here rather than read back from the constant, so dropping one
+    /// from `DSH_TOOL_ROWS` fails rather than agreeing with itself.
+    #[test]
+    fn the_overlay_disables_every_tool_row_that_was_measured() {
+        let y = overlay(None, "", "");
+        for id in [
+            "tool-pwsh",
+            "tool-bash",
+            "tool-fs",
+            "tool-fs-search",
+            "tool-web",
+            "tool-jobs",
+            "tool-skill",
+            "tool-subagent",
+            "tool-subagent-fork",
+            "tool-subagent-control",
+            "tool-subagent-list-agents",
+            "tool-workflow",
+            "tool-working-directory",
+            "tool-todo",
+            "tool-goal",
+        ] {
+            assert!(
+                y.contains(&format!("- id: {id}\n  disabled: true\n")),
+                "{id} left enabled:\n{y}"
+            );
+        }
+    }
+
+    /// Headless switches the sign-in off; the overlay turns the three rows
+    /// back on and reads the user's own file by path.
+    #[test]
+    fn the_overlay_signs_in_from_the_user_s_own_credentials() {
+        let y = overlay(None, "", "");
+        for id in ["credentials", "authorization", "deepseek-account"] {
+            assert!(
+                y.contains(&format!("- id: {id}\n  disabled: false\n")),
+                "{id}:\n{y}"
+            );
+        }
+        assert!(
+            y.contains("    path: 'C:/home/.dsh/.credentials.yaml'\n"),
+            "{y}"
+        );
+        assert!(y.contains("    provider: 'deepseek-account'\n"), "{y}");
+        let key = dsh_overlay_yaml(&DshOverlay {
+            provider: DshProvider::ApiKey,
+            ..DshOverlay {
+                exe: "",
+                endpoint_file: None,
+                credentials: "",
+                provider: DshProvider::Account,
+                model: "",
+                effort: "",
+            }
+        });
+        assert!(key.contains("    provider: 'deepseek-official'\n"), "{key}");
+    }
+
+    /// Headless takes neither as a flag, so both ride here — the model
+    /// trimmed (and a blank one routed to the first suggestion, since the row
+    /// needs a model at all), the effort clamped to this harness's own levels.
+    #[test]
+    fn dsh_overlay_carries_the_model_and_effort() {
+        let y = overlay(None, "  deepseek-v4-pro  ", "low");
+        assert!(y.contains("    model: 'deepseek-v4-pro'\n"), "{y}");
+        assert!(y.contains("    reasoningEffort: 'low'\n"), "{y}");
+        let blank = overlay(None, "   ", "");
+        assert!(blank.contains("    model: 'deepseek-flash'\n"), "{blank}");
+        assert!(!blank.contains("reasoningEffort"), "{blank}");
+        // Claude's `xhigh` survives a harness switch; it is not this one's.
+        let carried = overlay(None, "deepseek-flash", "xhigh");
+        assert!(!carried.contains("reasoningEffort"), "{carried}");
+    }
+
+    /// The model is free text, and the loader evaluates `!!js`. A quote, a
+    /// tag or a newline must stay inside the one scalar it was typed into.
+    #[test]
+    fn a_typed_model_cannot_escape_its_scalar() {
+        let y = overlay(None, "x'\n- id: tool-pwsh\n  disabled: false\n!!js 1", "");
+        assert!(
+            y.contains("    model: 'x'' - id: tool-pwsh   disabled: false !!js 1'\n"),
+            "{y}"
+        );
+        assert!(!y.contains("\n- id: tool-pwsh\n  disabled: false"), "{y}");
+    }
+
+    /// The server is an `insert` — a plain row naming a new id is a warning
+    /// and nothing more (measured) — and only when there is an endpoint.
+    #[test]
+    fn the_server_is_inserted_only_with_an_endpoint() {
+        let none = overlay(None, "", "");
+        assert!(!none.contains("insert"), "{none}");
+        assert!(!none.contains("dsh-mcp-client"), "{none}");
+        let y = overlay(Some("C:/tmp/ep.json"), "", "");
+        assert!(y.contains("- insert:\n    - id: mcp-schemaic\n"), "{y}");
+        assert!(
+            y.contains("        command: 'C:/apps/schemaic.exe'\n"),
+            "{y}"
+        );
+        assert!(
+            y.contains("        args: ['--mcp-serve', '--endpoint-file', 'C:/tmp/ep.json']\n"),
+            "{y}"
+        );
+    }
+
+    /// A composed profile as `--dump-config` prints it (trimmed from a real
+    /// one), with every tool row disabled and Schemaic's server inserted.
+    const SEALED_DUMP: &str = "\
+# == @deepseek-ai/dsh-base
+- id: tool-plugin-manager
+  name: '@deepseek-ai/dsh-plugin-manager/tools'
+  disabled: true
+- id: timer
+  name: '@deepseek-ai/cordis-plugin-timer'
+- id: subagent
+  name: '@deepseek-ai/dsh-subagent'
+# == patched by overlay.yml
+- id: tool-subagent
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: subagent
+  disabled: true
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+  disabled: true
+# == @deepseek-ai/dsh-base
+- id: timeout-policy
+  name: '@deepseek-ai/dsh-tool-call-timeout-policy'
+- id: mcp-resources
+  name: '@deepseek-ai/dsh-mcp-resources'
+- id: tool-executor-native
+  name: '@deepseek-ai/dsh-tool-executor-native'
+- id: tool-executor-ptc
+  name: '@deepseek-ai/dsh-tool-executor-ptc'
+  disabled: true
+# == overlay.yml
+- id: mcp-schemaic
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: schemaic
+    transport: stdio
+";
+
+    #[test]
+    fn a_sealed_profile_has_no_unsealed_rows() {
+        assert_eq!(dsh_unsealed_rows(SEALED_DUMP), Vec::<String>::new());
+    }
+
+    /// **No rows is not the same as no tools.** An empty or garbled dump has
+    /// no unsealed rows either, so it is read only once it shows itself to be
+    /// the headless profile — the runner row every headless composition has.
+    #[test]
+    fn only_a_dump_of_the_headless_profile_can_vouch_for_the_seal() {
+        assert!(!dsh_dump_is_headless(""));
+        assert!(!dsh_dump_is_headless("Usage: dsh [--profile] <name>\n"));
+        assert!(!dsh_dump_is_headless(SEALED_DUMP));
+        let real =
+            format!("{SEALED_DUMP}- id: headless-runner\n  name: '@deepseek-ai/dsh-headless'\n");
+        assert!(dsh_dump_is_headless(&real));
+    }
+
+    /// **The point of checking by name**: a tool plugin a later build adds,
+    /// under an id the overlay has never heard of, is live — and found.
+    #[test]
+    fn a_tool_plugin_the_overlay_never_named_is_found() {
+        let dump =
+            format!("{SEALED_DUMP}- id: tool-new\n  name: '@deepseek-ai/dsh-tool-terminal'\n");
+        assert_eq!(
+            dsh_unsealed_rows(&dump),
+            vec!["tool-new (@deepseek-ai/dsh-tool-terminal)".to_string()]
+        );
+    }
+
+    /// A `!!js` expression is evaluated at boot and cannot be read here, so
+    /// it does not count as disabled; nor does a `disabled: true` belonging
+    /// to the row's config rather than the row.
+    #[test]
+    fn only_a_literal_row_level_disable_counts() {
+        let js = "- id: tool-bash\n  name: '@deepseek-ai/dsh-tool-bash'\n  disabled: !!js process.platform === 'win32'\n";
+        assert_eq!(dsh_unsealed_rows(js).len(), 1, "{js}");
+        let nested =
+            "- id: tool-web\n  name: '@deepseek-ai/dsh-tool-web'\n  config:\n    disabled: true\n";
+        assert_eq!(dsh_unsealed_rows(nested).len(), 1, "{nested}");
+    }
+
+    /// Another MCP client is someone else's server; a plugin outside the
+    /// vendor's scope is a plugin nobody here has read.
+    #[test]
+    fn a_foreign_server_or_plugin_is_found() {
+        let other_mcp = "- id: mcp-github\n  name: '@deepseek-ai/dsh-mcp-client'\n";
+        assert_eq!(dsh_unsealed_rows(other_mcp).len(), 1);
+        let foreign = "- id: x\n  name: 'some-plugin'\n";
+        assert_eq!(dsh_unsealed_rows(foreign).len(), 1);
+    }
+
+    #[test]
+    fn a_turn_names_the_profile_the_overlay_and_the_stream() {
+        let spec = TurnSpec {
+            prompt: "how many?".into(),
+            system: "tables: t".into(),
+            mcp_config: Some("C:/cfg/overlay.yml".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            turn_args(Harness::DeepSeek, &spec),
+            vec![
+                "--profile",
+                "headless",
+                "--patch",
+                "C:/cfg/overlay.yml",
+                "--json"
+            ]
+        );
+        let resumed = TurnSpec {
+            resume: Some("session-1".into()),
+            ..spec
+        };
+        let a = turn_args(Harness::DeepSeek, &resumed);
+        assert_eq!(&a[a.len() - 2..], &["--session-id", "session-1"]);
+    }
+
+    /// Without an overlay there is no seal — the argv says so by having no
+    /// `--patch`, rather than naming a path that was never written; the
+    /// caller refuses such a session before it gets here
+    /// (`ai::isolation_refusal`, which holds for every `env_seal` harness).
+    #[test]
+    fn a_dsh_turn_without_an_overlay_is_not_a_sealed_argv() {
+        let a = turn_args(Harness::DeepSeek, &TurnSpec::default());
+        assert!(!a.contains(&"--patch".to_string()), "{a:?}");
+        assert!(Harness::DeepSeek.env_seal());
+    }
+
+    #[test]
+    fn a_one_shot_is_sealed_and_prints_its_answer_alone() {
+        let a = inline_argv(
+            Harness::DeepSeek,
+            &InlineSpec {
+                intent: "count".into(),
+                system: String::new(),
+                model: String::new(),
+                effort: String::new(),
+                seal: crate::CliSeal::ALL,
+                isolate_config: false,
+                last_message: String::new(),
+                overlay: "C:/cfg/inline.yml".into(),
+            },
+        );
+        assert_eq!(
+            a,
+            vec!["--profile", "headless", "--patch", "C:/cfg/inline.yml"]
+        );
+        assert_eq!(inline_output(Harness::DeepSeek), InlineOutput::Stdout);
     }
 }

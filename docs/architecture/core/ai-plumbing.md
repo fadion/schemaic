@@ -381,7 +381,8 @@
   are 6, 5, 11, 8 and 7 bytes, so a length-only fold passed against all five. It holds `codex`
   apart from `crush` and `cline`, neither of which is a harness, and apart from an absent key and
   an empty one. `cursor` is six bytes, like `claude`, so the shipped pair is now asserted first,
-  and the synthetic keys stay for the next harness.
+  and the synthetic keys stay for the next harness. That next harness has arrived and made a
+  second shipped pair, asserted beside the first: `deepseek` is eight bytes, like `opencode`.
 - `chat.rs` — per-connection conversations persisted to `chats.json`. `ChatFile::of` replaces
   every tool `result` with `RESULT_OMITTED` before it reaches disk — a `run_query` result is up
   to 200 rows of real table data, and writing it verbatim exported user data to a plaintext

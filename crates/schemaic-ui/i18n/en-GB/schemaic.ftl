@@ -4762,6 +4762,11 @@ ai-antigravity-not-claimed = Schemaic could not claim Antigravity's configuratio
 ai-refused-no-opencode-config = Schemaic could not write the configuration that restricts OpenCode, so the assistant is disabled — running it without that file would give the session a shell. Check that the app's data directory is writable.
 ai-refused-no-copilot-home = Schemaic could not create GitHub Copilot's private home directory, so the assistant is disabled — without it the CLI would load your own Copilot configuration, including its MCP servers and hooks. Check that the app's data directory is writable.
 ai-refused-no-cursor-rules = Schemaic could not write the permissions file that keeps Cursor from writing files and running commands, so the assistant is disabled — without it Cursor writes files unprompted. Check that the app's data directory is writable.
+ai-refused-no-deepseek-home = Schemaic could not write the overlay that keeps DeepSeek Harness from writing files and running commands, so the assistant is disabled — without it the CLI has every built-in tool. Check that the app's data directory is writable.
+ai-inline-no-deepseek-home = Couldn't write DeepSeek Harness's private home and overlay, so the generation was not started (without them the CLI would run with every built-in tool).
+# $rows lists the plugins that would still give the model a tool, by id and package name.
+ai-deepseek-unsealed = DeepSeek Harness would still have tools Schemaic did not switch off ({ $rows }), so the assistant is disabled. This build of the CLI has tools this version of Schemaic does not know about: update Schemaic, or choose another agent CLI.
+ai-deepseek-seal-unchecked = Schemaic could not check which tools DeepSeek Harness would have ({ $error }), so the assistant is disabled.
 ai-launch-failed-turn = Couldn't launch the `{ $bin }` CLI ({ $error }). Ensure { $cli } is installed, or give it a path in Settings → AI.
 ai-launch-failed-session = Couldn't launch the `{ $bin }` CLI ({ $error }). Ensure { $cli } is installed (or set its path in Settings → AI).
 ai-turn-ended = The { $cli } turn ended unexpectedly: { $error }

@@ -1070,6 +1070,13 @@ mod tests {
         // **The shipped pair**: `claude` and `cursor` are both six bytes.
         assert_eq!("claude".len(), "cursor".len());
         assert_ne!(with("claude"), with("cursor"), "claude and cursor collided");
+        // The second: `opencode` and `deepseek`, eight bytes each.
+        assert_eq!("opencode".len(), "deepseek".len());
+        assert_ne!(
+            with("opencode"),
+            with("deepseek"),
+            "opencode and deepseek collided"
+        );
         // And synthetic ones, for the next harness.
         assert_eq!("codex".len(), "crush".len());
         assert_ne!(with("codex"), with("crush"), "equal-length keys collided");

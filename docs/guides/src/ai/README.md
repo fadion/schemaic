@@ -15,20 +15,42 @@ the panel.
 
 | Setting                 | What it does                                                                        |
 |-------------------------|-------------------------------------------------------------------------------------|
-| **Agent CLI**           | Which CLI to drive: Claude Code, Codex, Antigravity, OpenCode, GitHub Copilot or Cursor. **Disabled** turns the assistant off. |
+| **Agent CLI**           | Which CLI to drive: Claude Code, Codex, Antigravity, OpenCode, GitHub Copilot, Cursor or DeepSeek Harness. **Disabled** turns the assistant off. |
 | *CLI path*              | Where the CLI lives. Leave it empty and Schemaic finds it on its own, and shows the path it found. |
 | **Model**               | Any model id the CLI accepts. Empty uses the CLI's own default. The buttons under it are shortcuts, not the whole list. |
-| **Effort**              | How hard the model thinks. Only shown for CLIs that take it — Claude Code, Antigravity and OpenCode — with that CLI's own levels. |
+| **Effort**              | How hard the model thinks. Only shown for CLIs that take it — Claude Code, Antigravity, OpenCode and DeepSeek Harness — with that CLI's own levels. |
 | **Custom instructions** | Your house rules, sent with every question: naming conventions, the dialect quirks you care about. |
 | **Schema context**      | How much of the database's structure goes with every message — see below.          |
 
 You sign in to the CLI itself, the way you normally would. Schemaic stores no API key.
 
-Under **Agent CLI** a note says how tightly that CLI can be restricted. Claude Code, OpenCode and
-GitHub Copilot can be kept to Schemaic's tools alone. Codex and Antigravity run in a sandbox: their
+Under **Agent CLI** a note says how tightly that CLI can be restricted. Claude Code, OpenCode,
+GitHub Copilot and DeepSeek Harness can be kept to Schemaic's tools alone. Codex and Antigravity run in a sandbox: their
 own tools can read files on your machine but not write them or run commands. Cursor is held back
 by a permissions file instead of a sandbox. Antigravity and Cursor also bring along any MCP
 servers you've registered with them yourself, which Schemaic can't switch off.
+
+### DeepSeek Harness
+
+Schemaic drives the DeepSeek Harness desktop app's own CLI, `dsh`. On Windows it finds it inside
+the desktop app's install on its own. Elsewhere, put `dsh` on your `PATH` (the desktop app's
+settings can do that for you) or give its path in *CLI path*.
+
+- *Signing in* — it uses the account you're signed in with in the desktop app, read from your
+  `dsh` credentials file where it is and never copied. If `DEEPSEEK_API_KEY` is set in the
+  environment Schemaic was started from, it signs in with that key instead. Either way, usage is
+  billed to that account, and a question asked with no balance left fails with DeepSeek's error.
+- *Models* — empty uses `deepseek-flash`; `deepseek-v4-pro` is the other one offered.
+- *What it can use* — every one of its own tools (shell, files, web, subagents) is switched off,
+  leaving only Schemaic's. Your own `dsh` profile settings and plugins aren't loaded for
+  Schemaic's runs, Schemaic's conversations don't appear in the desktop app's history, and its
+  telemetry upload is off.
+- *A newer `dsh`* — before each conversation and each one-off request, Schemaic checks which
+  tools `dsh` would have. If a newer version brings one this version of Schemaic doesn't know,
+  the assistant is disabled with a message saying so: update Schemaic, or choose another agent
+  CLI.
+
+Its replies arrive a step at a time rather than word by word.
 
 ### Schema context
 

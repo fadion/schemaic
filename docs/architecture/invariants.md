@@ -574,7 +574,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   `schemaic_ai::build_session_args` and `inline_args` close that with `--tools ""` on a `claude`
   whose `--help` advertises the flag, and fall back to the twenty-nine-name denylist on one that
   does not rather than dying on an unknown option — see `schemaic-ai`, which is also where the
-  reason the denylist could not do it on its own is written down. The other five harnesses close it
+  reason the denylist could not do it on its own is written down. The other six harnesses close it
   by their own mechanism rather than by that flag, on the session path through `harness::turn_args`
   and on the one-shot path through `harness::inline_argv`, and how far each gets is `Constraint`.
 - **An assistant that is off sends nothing and starts no agent process — refused at the action, not
@@ -613,7 +613,7 @@ Re-introducing the anti-patterns these guard against is a regression:
   (`switching_off_stops_the_grid_fills_and_seeds_under_way`, with `GridAiJobs` and `OnceReply`
   unit-tested beside it). **"No process" includes the probe**: `warm_probe_cache`'s effect
   returns early while off, because the probe is a spawn and it runs at every launch (`agent_cli.rs`).
-  **The Antigravity, OpenCode, Copilot and Cursor sweeps run regardless**, and that is not a leak in
+  **The Antigravity, OpenCode, Copilot, DeepSeek and Cursor sweeps run regardless**, and that is not a leak in
   the rule: they withdraw what an earlier session granted — an `agy` registration and its standing
   tool rules, Schemaic's own per-instance homes, what Cursor kept in `~/.cursor` — and ask no model
   anything, and an assistant switched off after a crash is exactly the case whose leftovers should

@@ -1,7 +1,7 @@
 # `ai/harness.rs`
 
 `harness.rs` — which agent CLI is being driven, what it can do, and how it is constrained.
-`Harness` (`Claude`/`Codex`/`Antigravity`/`OpenCode`/`Copilot`/`Cursor`) is **a dialect
+`Harness` (`Claude`/`Codex`/`Antigravity`/`OpenCode`/`Copilot`/`Cursor`/`DeepSeek`) is **a dialect
 rather than a vendor**: the
 variant names the wire format a binary speaks, which is the only thing decoding needs to know,
 so a fork that still speaks its parent's JSONL is that parent here. `key`/`label`/`bin` are the
@@ -57,16 +57,18 @@ those on a *switch* and a restore is not one, so an unknown harness paired with
 model under "check your installation". The test above was green throughout, because it drove
 serde in isolation and never the composition with the caller that overwrote; it calls the rule
 now, which is the only reason it can fail.
-**`speaker_name` is a fourth string, and it differs from `label` in exactly two places on
+**`speaker_name` is a fourth string, and it differs from `label` in exactly three places on
 purpose**: `label` is "Claude Code", the product you install and point a path at, while a
 transcript header is naming a speaker and reads "Claude" — which is also the name that header
 carried before it learned to vary, so an existing conversation does not appear to change its
 mind about who wrote it. The second is Copilot's: the settings box names the product a user
 installs, "GitHub Copilot", while "GITHUB COPILOT" over every answer reads as a heading rather
-than a speaker, so the header says "COPILOT". The other four answer the same in both, spelled
-out rather than delegated to `label` so that a product name gaining a suffix cannot reach the
-transcript on its own (`the_speaker_name_is_the_product_name_except_where_it_is_deliberately_not`
-pins both divergences and the agreement of the rest). The free function `speaker_label(Option<&str>)` is the only thing that turns a
+than a speaker, so the header says "COPILOT". The third is DeepSeek's, for Copilot's reason:
+the product is "DeepSeek Harness" and the header says "DEEPSEEK". The other four answer the same
+in both, spelled out rather than delegated to `label` so that a product name gaining a suffix
+cannot reach the transcript on its own
+(`the_speaker_name_is_the_product_name_except_where_it_is_deliberately_not` pins all three
+divergences and the agreement of the rest). The free function `speaker_label(Option<&str>)` is the only thing that turns a
 persisted `ChatMessage::harness` back into a name: the uppercased speaker name, or `"ASSISTANT"`
 for `None` **and** for a key this build does not recognise. Both fall back rather than guess, for
 `from_key`'s reason — a transcript written before the field existed could have been produced by
@@ -122,6 +124,10 @@ lists included — was refused with *"Model "…" from --model flag is not avail
 router ran. A named chip is a chip that fails the turn for somebody; `auto` is the one id every
 plan takes. Cursor's is `auto` alone too, for a milder reason: `agent models` lists the
 account's own catalogue, long and plan-specific, and `auto` is the default every account has.
+DeepSeek's is the two its catalogue lists on 0.2.1-rc.2, `deepseek-flash` and `deepseek-v4-pro`,
+both measured to run — and the id reaches no flag at all, since headless has no `--model`: it is
+written into the overlay's `agent-default-model` row (`dsh_overlay_yaml`, below), trimmed, a blank
+field becoming the first suggestion because that row needs a model to route at all.
 **A capability that is a `bool` can still be too coarse, and `supports_effort` is where that
 showed.** It is true for Claude *and* Antigravity, so a site asking only it treated the two as
 interchangeable — and their `--effort` vocabularies are not: Claude takes a fourth level,
@@ -163,8 +169,14 @@ Cursor's list is empty for the plainer reason that it has **no flag at all**: ef
 the model id there, a named variant (`gpt-5.3-codex-high`) or a bracket parameter
 (`…[effort=high]`), both of which the free model field passes through untouched — so the row
 hides and the same test asserts nothing naming effort reaches its argv.
-**The seal is graded here, because the six do not answer it equally well.** `Constraint` is
-ordered `Unknown < Restricted < Sealed`, and **three** harnesses reach the top by three different
+DeepSeek's list is three of its provider's four, `low|high|max` — not `off`, which the settings
+box's `AiEffort` has no level for (`every_level_a_harness_takes_can_be_chosen_in_the_box` holds the
+two lists equal) and which was never run — and like its model it travels in the
+overlay rather than on the command line — `reasoningEffort` in the `agent-default-model` row,
+written only when `effort_arg` answers, so Claude's `xhigh` carried across a switch writes nothing
+(`dsh_overlay_carries_the_model_and_effort`; `low` on `deepseek-v4-pro` was measured accepted).
+**The seal is graded here, because the seven do not answer it equally well.** `Constraint` is
+ordered `Unknown < Restricted < Sealed`, and **four** harnesses reach the top by four different
 mechanisms. Claude does it with a flag: `--tools ""` empties the *built-in* set outright and
 leaves nothing but the allow-listed MCP tools. OpenCode does it with *configuration* — the agent
 definition `opencode_config_json` writes carries a `tools` map setting every documented built-in
@@ -203,6 +215,38 @@ nothing provides, and that allowlist was measured to resolve to **zero** tools. 
 always passes it. `an_empty_allowlist_is_never_an_empty_flag` pins the constant and both argv
 builders, and asserts no bare `--available-tools` appears on either — "tidying" the sentinel
 into an empty value is the edit that opens the shell.
+DeepSeek Harness does it by **composition**. A dsh run is a list of plugin rows, its built-in tools
+among them, and `dsh_overlay_yaml` writes the `--patch` overlay that lays `disabled: true` over
+every row in `DSH_TOOL_ROWS` — fifteen ids read off `dsh --profile headless --dump-config`
+(0.2.1-rc.2). Measured with all of them off, the model's tool list went from 24 — `pwsh`, `read`,
+`write`, `edit`, `web_fetch`, `subagent`, `workflow` among them — to none, and the request from
+6,201 input tokens to 249. The overlay is also the sign-in (headless ships with `credentials`,
+`authorization` and `deepseek-account` off, so it turns them back on, the store pointed at the
+user's own file — see `app/deepseek.rs`), the model, and the server, and **the server has to be an
+`insert`**: a patch row naming an id the profile does not have is a warning and nothing else —
+measured, *"patch: entry "mcp-schemaic" not found"*, and no tools
+(`the_server_is_inserted_only_with_an_endpoint`). **Every value is a single-quoted scalar with its
+control characters replaced** (`yaml_quoted`), because the profile loader evaluates `!!js` tags and
+the model id is free text: a quote, a tag or a newline typed into the field must stay inside the
+one scalar it was typed into (`a_typed_model_cannot_escape_its_scalar`).
+**An id list is a denylist, and the guard on that is a second reading by name.** An id the overlay
+names that a later build drops costs nothing — the patch warns and moves on — but a tool plugin a
+later build *adds* under an id nobody here has heard of would be live under a `Sealed` badge.
+`dsh_unsealed_rows` reads a composed profile and returns every row still enabled whose plugin is
+named `@deepseek-ai/dsh-tool-…` (bar `DSH_TOOL_NAMED_NON_TOOLS`, the two executors every call runs
+through and the call-timeout policy), or ends in `/tools`, or is an MCP client other than
+`DSH_MCP_ROW`, or lies outside the `@deepseek-ai/` scope altogether; only a literal row-level
+`disabled: true` counts, since a `!!js` expression is evaluated at boot and cannot be read here,
+and a `disabled` inside the row's `config` is not the row's
+(`a_tool_plugin_the_overlay_never_named_is_found`, `only_a_literal_row_level_disable_counts`,
+`a_foreign_server_or_plugin_is_found`). **No rows is not the same as no tools**: an empty dump, a
+usage error printed in its place and a changed dump format all have none, so the answer means
+something only once `dsh_dump_is_headless` has found the `@deepseek-ai/dsh-headless` runner row
+every headless composition carries
+(`only_a_dump_of_the_headless_profile_can_vouch_for_the_seal`). Checked against real dumps: the
+sealed profile answered empty, and one with only the sign-in rows patched listed all fourteen
+tool rows that were live. `ai::dsh_seal_refusal` runs the dump and asks both (under
+`app/overview.md`).
 Codex and Antigravity are both `Restricted`, each by its own lever: Codex by
 `sandbox_mode="read-only"`, Antigravity by `--sandbox`. Both
 stop writes and command side effects and both leave built-in tools that can still *read*
@@ -228,8 +272,9 @@ harness reached all three database ports and the keyring. So on Windows neither 
 `schemaic` at all. Antigravity's notebook and browser tools were *reported* unavailable in this
 mode by the model, which made no call, so that is not proven; and Linux and macOS are unmeasured
 — there Codex's Landlock and Seatbelt sandboxes let a command run and restrict its network and
-writes instead, so the answer may differ. All three agent spawns in `app/ai.rs` — `run_inline`, the
-session spawn and Antigravity's `spawn_child` — set `schemaic_core::AGENT_CHILD_ENV`
+writes instead, so the answer may differ. All four agent spawns in `app/ai.rs` — `run_inline`, the
+session spawn, Antigravity's `spawn_child` and DeepSeek's `--dump-config` check — set
+`schemaic_core::AGENT_CHILD_ENV`
 (`SCHEMAIC_AGENT_CHILD`) to `1`, which anything the agent's shell runs inherits, and the command
 line's `dispatch` refuses every command but `version` and `completions` under it with `Exit::Refused` (under
 `cli/run.rs`). **It is a speed bump, not a boundary.** A shell that knows the name can unset it,
@@ -321,8 +366,9 @@ tools execute *under* `--sandbox` and that one harness has no MCP isolation at a
 assurance the module contradicts eleven paragraphs above it, which is the asymmetry the grade
 exists to prevent. The claim is now scoped to *"its own built-in tools"*, and the fourth capability
 is `isolates_mcp_servers`: true for Claude (`--strict-mcp-config`), Codex (the whole `mcp_servers`
-table assigned out from under it), OpenCode (`XDG_CONFIG_HOME` redirection) and Copilot (its own
-`COPILOT_HOME`, with `--disable-builtin-mcps` and the allowlist behind it), false for
+table assigned out from under it), OpenCode (`XDG_CONFIG_HOME` redirection), Copilot (its own
+`COPILOT_HOME`, with `--disable-builtin-mcps` and the allowlist behind it) and DeepSeek (its own
+`DSH_HOME`, under which the only MCP-client row is the one the overlay inserts), false for
 Antigravity and Cursor, measured rather than assumed. When it is false the notice says so, in
 words each harness's measurement earned: Antigravity's sandbox sentence appends *"Any MCP servers
 you have registered with it are also available to this session, and Schemaic cannot restrict
@@ -345,8 +391,8 @@ green, and nothing pinned OpenCode's `Restricted` notice at all.
 `each_harness_is_told_what_is_actually_restricting_it` replaces both it and
 `only_a_flag_sealed_harness_is_told_an_update_would_help`, spelling out a
 `(sandbox, update, other-servers)` triple **per harness** in a `match`: Antigravity
-`(true, false, true)`, Codex `(true, false, false)`, Claude `(false, true, false)`, OpenCode
-and Copilot `(false, false, false)`, Cursor `(false, false, true)`. A change to any of the
+`(true, false, true)`, Codex `(true, false, false)`, Claude `(false, true, false)`, OpenCode,
+Copilot and DeepSeek `(false, false, false)`, Cursor `(false, false, true)`. A change to any of the
 predicates now has to be argued for in that table. It also asserts that a notice says
 *"permissions file"* and *"not by a sandbox"* exactly when `restricts_by_workspace_rules` is true,
 and that such a notice says its tools *"can still read files"* — the mechanism named, and the
@@ -386,6 +432,15 @@ measured alongside — without it a headless run in a directory the CLI has not 
 trust prompt and exits. Present is `Restricted`, absent is `Unknown`, and there is no arm that
 reaches `Sealed` (`the_grade_is_restricted_at_best_and_read_off_trust`, fixture rows copied from
 `agent --help` 2026.09.23).
+**DeepSeek's arm is OpenCode's shape too, and grades higher than the page can vouch for — which
+is why its grade is re-earned.** Its seal is a composition `--help` cannot show, so the arm greps
+the headless profile's own interface, `--json` and `--session-id`, which the argv and the resume
+rest on: both present is `Sealed`, either absent `Unknown`, with no `Restricted` between, since a
+launcher missing them is not the one measured. That page is the *profile's*, not the launcher's, so
+`help_args` answers `--profile headless --help` here — printing it boots nothing (measured on
+0.2.1-rc.2). The grade then holds only as far as the overlay's list of ids does, so
+`ai::start_ai_session` dumps the composed profile before a session's first turn, and `run_inline`
+before every one-shot, and refuses on any row `dsh_unsealed_rows` finds (above).
 **The other half of that grade is enforced at the call site, because this is a harness where
 a missing config does not fail closed.** `--agent schemaic` naming an agent that does not exist
 does not stop the run — it leaves it on OpenCode's own default `build` agent, which has `bash`.
@@ -398,17 +453,25 @@ the home; see `app/copilot.rs`.) **Cursor is the second harness this is true of,
 literally**: its file *is* the restriction, and without it writes go through unprompted, so a
 session whose workspace cannot be written is refused, and so is a one-shot (`ai::inline_cwd`).
 The grade's own comment says the same, since `--help` can confirm nothing about a file.
+**DeepSeek is the third, OpenCode's case exactly**: the overlay that could not be written is the
+seal, and a headless run without it has every built-in tool, so the session is refused and so is a
+one-shot (`ai::inline_isolation`); `a_dsh_turn_without_an_overlay_is_not_a_sealed_argv` holds the
+argv to omitting `--patch` rather than naming a path nobody wrote.
 **`env_seal` is the capability both of those ride on, and it is asked, never assumed.** It answers
 whether a harness's configuration is an *environment* Schemaic must set on the child and clear
-the user's copy of: OpenCode (`XDG_CONFIG_HOME`, which carries its seal) and Copilot
-(`COPILOT_HOME`, which carries its isolation — its seal is the flag). It exists because, by its own
+the user's copy of: OpenCode (`XDG_CONFIG_HOME`, which carries its seal), Copilot
+(`COPILOT_HOME`, which carries its isolation — its seal is the flag) and DeepSeek (`DSH_HOME`,
+which carries its isolation — its seal is the overlay `--patch` names, in that home, so the two
+are written together). It exists because, by its own
 doc, four call sites used to ask the question four ways, none compile-forced — a `match {
 OpenCode => …, _ => Vec::new() }` for the inline environment, an `== Harness::OpenCode` on the
 session spawn, an `== Harness::Codex` in the probe — each failing to the unsafe side for a new
 harness. **Copilot is the case that showed asking it is not enough on its own**: the
 one-shot path asked `env_seal()` and then called `OpenCodeConfig::write_inline()` for any `true`,
 so a second `true` would have been "isolated" by OpenCode's config and nothing of its own.
-`ai::inline_env` now asks `env_seal`, then matches the harness exhaustively — see `app/ai.rs`.
+`ai::inline_env` now asks `env_seal`, then matches the harness exhaustively — see `app/ai.rs` —
+and is a test-only wrapper over `inline_isolation`, which hands DeepSeek's overlay path back
+beside the environment.
 **Cursor answers `false`, although its restriction is a directory too**, because it finds that
 directory by being *started* in it — its working directory — rather than by a variable pointing
 at it; an `env_seal` of `true` would route it through `inline_env`, whose arm for it refuses. Its
@@ -438,8 +501,10 @@ always, the flag was never passed, and every Codex session loaded the user's own
 which are commands. `Harness::help_args` is the fix and is a **capability rather than a literal at
 the call site**, because the seam is where the bug lived: the pure decoder was tested with
 `codex exec --help` text pasted in by hand while `probe` fed it a different page, so both halves
-passed alone and neither was wrong on its own. It answers `["exec", "--help"]` for Codex and
-`["--help"]` for the other five, and the last element is always the help flag itself, since every
+passed alone and neither was wrong on its own. It answers `["exec", "--help"]` for Codex,
+`["--profile", "headless", "--help"]` for DeepSeek (whose launcher page does not list the
+headless profile's flags) and `["--help"]` for the other five, and the last element is always the
+help flag itself, since every
 harness's page still has to answer the grade question
 (`codex_is_probed_on_the_subcommand_that_documents_its_isolation`, which pins this function's
 *return* — the answer, not the question the probe asks; the argv itself is pinned in
@@ -467,8 +532,11 @@ carry `--endpoint-file <path>` and it has no `env` map at all
 (`the_mcp_config_names_our_server_by_path_and_nothing_else`). Cursor is the same case a third
 time: `cursor_mcp_config_json` is the `.cursor/mcp.json` in a workspace reused across sessions,
 its `args` carry `--endpoint-file <path>`, and it has no `env` map
-(`the_server_is_configured_by_path_and_nothing_else`). So the split is one harness carrying
-the endpoint against five carrying a path to it, for two different reasons: argv is public, and
+(`the_server_is_configured_by_path_and_nothing_else`). DeepSeek is the same case a fourth time:
+the overlay is rewritten per session in a `DSH_HOME` reused across them, and its inserted row's
+`args` are `--mcp-serve --endpoint-file <path>` with no environment at all. So the split is one
+harness carrying the endpoint against six carrying a path to it, for two different reasons: argv
+is public, and
 a reused directory is persistent (`main.rs`'s comment beside `--mcp-serve` says the same, and it
 named Gemini on the file side until that harness went).
 `codex_mcp_overrides` **replaces the whole `mcp_servers` table** (`mcp_servers={schemaic={…}}`)
@@ -621,7 +689,10 @@ on 1.0.88 (2026-09-26)**: with stdin piped and no `-p`, the piped text *is* the 
 (`the_prompt_never_reaches_the_command_line`). **Cursor is the third, measured 2026-09-26**: `-p`
 with no value and the prompt piped in answered the piped text, on `stream-json` and `text`
 output alike — and `-p` must then be followed by a flag, never by text, which its own
-`the_prompt_never_reaches_the_command_line` pins. The other three keep argv and each reason is
+`the_prompt_never_reaches_the_command_line` pins. **DeepSeek is the fourth, measured on 0.2.1-rc.2
+(2026-11-10)**: with no positional and stdin piped, the headless profile takes the piped text as
+the task — a two-line prompt answered from its second line. The other three keep argv and each
+reason is
 written at the capability: OpenCode's `run` documents a `message..` positional and no stdin, Antigravity
 reads stdin only under its *session* shape, and Claude's stdin form passes context *alongside* a
 positional rather than replacing one. **OpenCode's leg carries a date now — re-measured
@@ -642,7 +713,7 @@ ready for a flip: `stdin_prompt` is threaded through `InlinePlan`, `run_inline` 
 the capability is true, and `turn_stdin_prompt` covers the persistent shape, so moving one leg is
 this `match` arm and a measurement against the installed binary. `turn_stdin_prompt` and `inline_stdin_prompt` build what
 goes there from the same `prefixed_prompt` call the argv arm would have pushed — one
-construction, two destinations — and both Codex arms, like both Copilot and both Cursor arms,
+construction, two destinations — and both Codex arms, like both Copilot, Cursor and DeepSeek arms,
 omit the positional under the same predicate, which is what `the_prompt_travels_exactly_once` and
 `an_inline_prompt_travels_exactly_once` hold together over `Harness::ALL` (each asserts the two
 are exclusive, so a harness that claims stdin and still pushes sends the payload twice, and one
@@ -845,11 +916,23 @@ directory, which is why `ai.rs` starts this harness's child somewhere other than
 **Measured end to end on 2026.09.23-86fc751 under Windows 11 (2026-09-26)**, with this argv against
 the real `--mcp-serve` server over a SQLite endpoint: `run_query` ran, a resumed turn recalled
 the first, and a request to write was declined.
+**The DeepSeek argv is `--profile headless --patch <overlay> --json`, then `--session-id <id>`
+on a resumed turn**, the prompt on stdin, and almost everything that shapes the turn is in the
+file rather than the command line: headless has no `--model` and no effort flag, so the overlay
+carries both along with the seal, the sign-in and the server, and `TurnSpec::mcp_config` — the
+field that names Copilot's config — carries its path here
+(`a_turn_names_the_profile_the_overlay_and_the_stream`). `--session-id` was measured to carry a
+thread into turn two, and adoption is scoped to the working directory, which a session keeps for
+its life. Without an overlay the arm omits `--patch` rather than invent a path; the caller has
+refused such a session already. **Measured on 0.2.1-rc.2 under Windows (2026-11-10)**: the resume
+and the stdin prompt as above, and a sealed turn against Schemaic's MCP server (`schemaic mcp`)
+over a SQLite file, which is the stream fixture under `stream.rs`.
 **`inline_argv` is the closed counterpart of `turn_args`, and "closed" is the whole
 specification.** Ctrl+K, AI Fill and AI Seed each want one string back that a parser then reads,
-so `InlineSpec` carries intent, system, model, effort, seal, `isolate_config` and Codex's
-`last_message` and nothing else — there is no field for a server, an approval map or a resume id,
-because no arm may have one. On every harness the argv is free of `--mcp-config`, of any `-c`
+so `InlineSpec` carries intent, system, model, effort, seal, `isolate_config`, Codex's
+`last_message` and DeepSeek's `overlay` and nothing else — there is no field for a server, an
+approval map or a resume id, because no arm may have one, and the overlay a one-shot is handed is
+written with no server row. On every harness the argv is free of `--mcp-config`, of any `-c`
 that names a server, and of anything that resumes a thread this one-shot never saw
 (`no_inline_generation_is_given_a_server_or_a_session` runs the forbidden list over
 `Harness::ALL`, narrowing Codex's permitted `-c`s to `sandbox_mode=` and the empty
@@ -857,7 +940,7 @@ that names a server, and of anything that resumes a thread this one-shot never s
 `isolate_config`, and the reason is the finding below). Claude's arm delegates to
 `crate::inline_args`, which gained an `effort` parameter and is
 otherwise what it was: it was the whole of this path for as long as the other three spawned Claude
-regardless of the picker, and is now one of six.
+regardless of the picker, and is now one of seven.
 Measured against the installed binaries, Codex is `exec --ephemeral --skip-git-repo-check
 --sandbox read-only --color never`, then `--ignore-user-config` when the probe saw it, then
 `--model`, then `-c sandbox_mode="read-only"`, then `-c mcp_servers={}`, then `-o <file>` — and
@@ -871,7 +954,10 @@ empty one, for the fail-open above — and the same `--disable-builtin-mcps
 the prompt on stdin; Cursor is its session's argv with `text` for the stream and no resume,
 `-p --output-format text --trust --mode ask` plus `--model`, the prompt on stdin, run in a
 `cursor-inline` workspace whose permissions file allows nothing and configures no server
-(`a_one_shot_asks_for_text_and_carries_no_session`).
+(`a_one_shot_asks_for_text_and_carries_no_session`); DeepSeek is its session's argv without the
+stream or a resume, `--profile headless --patch <overlay>`, the overlay a `deepseek-inline` one
+with every tool row off and no server, and the prompt on stdin
+(`a_one_shot_is_sealed_and_prints_its_answer_alone`).
 **`--output-format text` is named on Antigravity and Copilot although it is
 the default**, because the session path asks that same binary for a JSON stream and a
 default that moved would put a JSONL envelope where a parser expects SQL.
@@ -922,7 +1008,7 @@ says in its own doc that the value arrives clamped, because `inline_argv` is its
 a second one would have to do the same.
 **Codex is the only harness whose reply is read from a file, and that is a contract rather than an
 observation.** `inline_output` is where that lives — `LastMessageFile` for Codex, `Stdout` for the
-other five — and the reason is that `codex exec` without `--json` prints *for a person*:
+other six — and the reason is that `codex exec` without `--json` prints *for a person*:
 measured, this build writes the final message alone, but that is a statement about a human-facing
 surface and not a promise, while `-o/--output-last-message` is documented as the file the last
 message is written to. `--color never` rides along for the same reason: escapes in a rendering
@@ -930,8 +1016,9 @@ nobody parses cost nothing, and escapes in a reply that lands in the editor do. 
 such split — measured, its decoration and model banner go to **stderr** and stdout carries the
 answer alone — and neither does Copilot, whose `-s` is "output only the agent response (no
 stats)" and measured as exactly that, one line of SQL, nor Cursor, whose `--output-format text`
-was measured as the answer alone, a fenced SQL block that `extract_sql` unwraps
-(`codex_writes_its_last_message_where_it_was_told_to`,
+was measured as the answer alone, a fenced SQL block that `extract_sql` unwraps, nor DeepSeek,
+whose headless profile without `--json` prints the final answer alone on stdout and its reasoning
+on stderr (`codex_writes_its_last_message_where_it_was_told_to`,
 `every_inline_generation_asks_for_plain_text`).
 **OpenCode's one-shot gets its own config, and the difference from the session's is the whole
 `mcp` block.** `opencode_inline_config_json` defines the same sealed `schemaic` agent and
@@ -951,10 +1038,11 @@ the life of a chat session. Measured against the installed `agy`, with a server 
 among its own, `list_schema`, `describe_table` and `propose_table_change` included; with no
 registration it lists Antigravity's built-ins alone. So "no inline generation is given a server"
 genuinely does not hold for Antigravity while a chat session holds the registration. It does hold
-for four of the other five, which are configured per invocation (Copilot's one-shot runs in a home of
-its own, `copilot-inline`, so a live session's `schemaic-mcp.json` is not even lying beside it),
-and this is written down because that sentence is exactly the one that would otherwise be read
-as covering all six. **Cursor's holds for our server and not for the user's**: its one-shot runs
+for five of the other six, which are configured per invocation (Copilot's one-shot runs in a home of
+its own, `copilot-inline`, so a live session's `schemaic-mcp.json` is not even lying beside it, and
+DeepSeek's in `deepseek-inline`, under an overlay with no server row), and this is written down
+because that sentence is exactly the one that would otherwise be read as covering all seven.
+**Cursor's holds for our server and not for the user's**: its one-shot runs
 in a `cursor-inline` workspace with no `mcp.json`, so a live session's server is not in reach,
 but the servers in the user's own `~/.cursor/mcp.json` are started on every run — a one-shot
 included — their tools refused unless the user's own settings allow them (see
@@ -1006,6 +1094,8 @@ every flag in both of its argvs was in a measured run (1.0.88): the session's fo
 flags in the end-to-end turns against the real server, and the one-shot's `--no-color` beside
 them in a `-s` run that answered with SQL alone. `cursor-agent` is the sixth, and both of its
 argvs were run as written (2026.09.23-86fc751): the session's in the end-to-end turns against the
-real server, the one-shot's in a `text` run that answered with a fenced SQL block. The one exception is the
+real server, the one-shot's in a `text` run that answered with a fenced SQL block. `dsh` is the
+seventh (0.2.1-rc.2): its session argv in the captured turn and the measured resume above, its
+`--dump-config` against real composed profiles. The one exception is the
 `codex exec resume` flag list described above, which is carried on *neither*: no page was read
 and no run was recorded.

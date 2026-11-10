@@ -1,9 +1,9 @@
 # `ai/stream.rs`
 
-`stream.rs` — one transcript vocabulary, six CLI dialects. Every harness decodes into the same
+`stream.rs` — one transcript vocabulary, seven CLI dialects. Every harness decodes into the same
 `StreamEvent`s the panel already renders, so the dialect stops at this module and nothing
 downstream learns which CLI produced a turn. **They do not even agree on where the discriminator
-lives**: Claude, Codex, OpenCode, Copilot and Cursor tag a line with `type` (Copilot nesting
+lives**: Claude, Codex, OpenCode, Copilot, Cursor and DeepSeek tag a line with `type` (Copilot nesting
 everything else under `data`), while Antigravity tags it with `event`
 and nests the payload under a key of the same name (`{"event":"init","init":{…}}`,
 `{"event":"step_update","step_update":{…}}`). A line shaped like the other three decodes to
@@ -28,8 +28,8 @@ and falls back to the whole string when the text is *not* an extension of what c
 rewritten message loses nothing rather than being diffed against a string it shares no prefix
 with. It is keyed by ids unique only within one *turn* — the narrower unit, and see the
 turn-boundary reset below for what made that distinction load-bearing — so a parser must not be
-shared between two concurrent streams either: one per turn for Codex, OpenCode, Copilot and
-Cursor, one per session for the two persistent harnesses.
+shared between two concurrent streams either: one per turn for Codex, OpenCode, Copilot, Cursor
+and DeepSeek, one per session for the two persistent harnesses.
 **Copilot sends both shapes, which is why `Coalescer::extend` exists.** Its
 `assistant.message_delta`s are true deltas, and then `assistant.message` restates the whole
 message. `extend` records each delta against the message id as sent, so that when the
@@ -62,12 +62,18 @@ arrives in one event, a measured 2964-character reply among them. `streams_delta
 it, and no amount of coalescing would help, because no partial text is ever written to decode.
 The visible cost is that there is no "it has started" moment to report: the panel's spinner runs
 until the text lands.
+**DeepSeek does not stream either, but it sends a step at a time rather than a turn.** Its `text`
+event is projected from a committed assistant message, so each is one step's prose entire — measured, never
+a fragment — and `push_deepseek` prints it as it comes, with no `Coalescer`. A turn that speaks in
+two steps with no tool call between them would otherwise run the second sentence on into the
+first's last word, so `DshTurn::spoke` starts it as a paragraph of its own
+(`two_spoken_steps_read_as_two_paragraphs`); a tool call or result clears it.
 **`streams_deltas` is a record, not a lever, and its doc now says so.** Nothing in the app calls
 it: it claimed the panel used it to decide whether a first token means "it has started", and the
 panel decides that from `m.pending && m.segs.is_empty() && m.notes.is_empty()` — the better
 rule, since it answers
 correctly for the harness that streams nothing. It is kept with `#[allow(dead_code)]` rather
-than deleted because it is a measured fact about six CLIs that this parser's whole design rests
+than deleted because it is a measured fact about seven CLIs that this parser's whole design rests
 on, and deleting a measurement to satisfy a warning is how a measurement gets taken twice.
 `supports_resume` and `supports_model_choice` are uncalled the same way and were left alone.
 **There are two pieces of that state now, and the second is `seen_tools`.** Two dialects restate
@@ -139,6 +145,13 @@ this harness the readers run unprompted** and a refused writer should be seen re
 one exception is `getMcpToolsToolCall`, the CLI looking up which MCP tools exist, which the model
 does before nearly every call, so a chip for it would sit beside every real one saying nothing
 (`a_builtin_reader_is_shown_and_the_catalogue_lookup_is_not`).
+DeepSeek sends a `tool_call` and a `tool_result`, keyed on `callId` and each through `first_sight`
+(`<id>\0done` for the result), and **its name needs no rebuilding**: `tool` already arrives as
+`mcp__schemaic__run_query`, and `input.sql` is the query the chip shows. A result nothing
+announced opens its own chip labelled `tool`, Copilot's guard; a `status` other than `completed`
+marks it an error, and a result that is an object rather than a string is shown as its JSON
+(`dsh_result_text` — the README caps strings but does not promise the result is one;
+`a_failed_tool_call_is_an_error_and_a_structured_result_is_still_text`).
 **All of that state is cleared at a turn boundary, and it only began mattering when a stream
 could hold more than one Antigravity turn.** `StreamParser::push` looks at the events it has just
 produced and, if any of them is a `TurnDone`, resets `seen_tools`, the `Coalescer`, the
@@ -209,7 +222,7 @@ list does not show.
 **`ToolUse` and `ToolResult` both carry an `id` now, and it is the pairing key rather than a
 convenience.** Every harness puts one on the wire — `tool_use.id` on Claude, `item.id` on
 Codex, `step_index` on Antigravity, `callID` on OpenCode, `toolCallId` on Copilot, `call_id` on
-Cursor — and without it a result can only be
+Cursor, `callId` on DeepSeek — and without it a result can only be
 attached by recency, which is exactly backwards for the ordinary parallel shape: the model
 makes two calls in one step, the tools the panel allow-lists being read-only ones
 a model routinely batches, and their results arrive in **call** order, so the first result
@@ -362,6 +375,26 @@ OpenCode's reason with less evidence — it was 0 in every measured turn, so whe
 the prompt or a count within it is unknown (`a_cursor_turn_counts_its_cached_input`). A provider
 refusal is Copilot's case again: stderr only, with no `result`, so it reaches the panel through
 the same not-`ended` arm.
+**DeepSeek's turn has two ways to end, and an absent verdict is a failed one.** `session` opens it
+with the `sessionId` the next turn's `--session-id` takes — first, so `SessionStarted` precedes
+everything — and resets `DshTurn`; `final` closes it, a success only when its `reason.kind` is
+`completed`. That is the opposite of Copilot's reading of an absent exit code, and measured: an
+in-turn failure (a 402, an account with no balance) still writes `final`, empty and with no
+reason, while every success said `completed` (`a_turn_that_failed_in_turn_ends_as_an_error`). A
+failure *outside* a turn writes `error` and no `final` at all (its README), so `error` ends the turn
+too, or the panel would wait on a stream that has stopped (`an_error_outside_a_turn_ends_it`).
+**Both say why**, since a failed turn wrote no prose and the reply would otherwise be an empty error
+bubble — the failure `claude_error_text` exists for: the in-turn reason arrives on the `status`
+event whose `phase` is `turn_end` (`reason.error.message`, and its `code`), is held in
+`DshTurn::failure` and said when `final` closes a failed turn; `error` says its own `message`.
+`dsh_failure_text` reads both as "message (code)", and `DshTurn::say` sets either apart from prose
+already printed (`a_failure_after_prose_is_its_own_paragraph`). **`final`'s text is not printed**, since it restates the answer the `text` events
+already gave (`the_answer_is_printed_once_and_the_thinking_not_at_all` — otherwise "9595"), and
+`thinking` is dropped as every dialect's reasoning is. **Usage is per step**, on `status` events
+whose `phase` is `step_end`, each step being a request of its own, so the turn's figures are their
+sum — input as `inputTokens` plus `cacheReadTokens`, Cursor's reading, and output as
+`outputTokens`; no duration is read, so `duration_ms` stays `None`
+(`the_turn_ends_on_final_with_every_step_s_usage`).
 **A Claude turn that fails before the model is called says why only in its `result`, and that
 is read now.** Reproduced with an expired login on Claude Code 2.1.289: the CLI writes a
 synthetic whole `assistant` message (`"model":"<synthetic>"`, `"error":"authentication_failed"`)
@@ -455,6 +488,13 @@ restatement's lack of both, which is the whole of the three-shape rule above; me
 the fixture agrees with whichever rule the code happens to have. It is driven through `TurnState`
 too: `a_real_cursor_turn_renders_prose_a_filled_chip_and_prose` asserts one chip — the catalogue
 lookup is not one — filled with the server's answer, between the two segments of prose.
+**DeepSeek's is trimmed too, and says how.** `DSH_REAL_TURN` is a real 0.2.1-rc.2 turn under
+`--profile headless --json`, sealed by Schemaic's overlay and given `schemaic mcp` over a SQLite
+file — four tool calls across four steps, then the answer — with the thinking text cut short, two
+results cut to their opening and the working directory anonymised; every `status`, `step_end`
+usage and the restating `final` are kept, since the per-step sum and the answer-once rule are read
+off them. Its tests drive it for the opening session id, each call paired with its own result by
+id, the answer printed once and the summed usage; it is not folded through `TurnState`.
 **The one shape inside a measured dialect that was itself unmeasured was the `Coalescer`'s, and
 it has now been measured.** *Whether Codex restates a message cumulatively* was an assumption
 this module is built on rather than something a binary had shown — no captured fixture contained

@@ -96,11 +96,12 @@ so a second window's session re-pointed the first window's **next question** at 
 with its credentials and its access level, while the first window's panel, transcript and deltas
 all named the first connection. `instance_root(kind)` is
 `persist::private_dir(kind)?.join(instance_tag())` with `instance_tag()` = `pid-<pid>`, and both
-`write` and `write_inline` go through it — and so do `app/copilot.rs`'s two homes and
-`app/cursor.rs`'s two workspaces, which is why
+`write` and `write_inline` go through it — and so do `app/copilot.rs`'s two homes,
+`app/cursor.rs`'s two workspaces and `app/deepseek.rs`'s two homes, which is why
 `instance_root`, `instance_path_in` and `instance_tag` are `pub(crate)`: a `COPILOT_HOME` carries
 a per-connection path too and is read by a process per turn, so it needs the same boundary for
-the same two reasons, and so does a Cursor workspace's `mcp.json` and permissions file.
+the same two reasons, and so does a Cursor workspace's `mcp.json` and permissions file, and a
+`DSH_HOME`'s overlay.
 One correction worth keeping, because the first telling
 of this got it wrong: the file was under `persist::private_dir` throughout, so it was per-*user*
 and never machine-wide, which is why the fix is a per-instance subdirectory rather than a move
@@ -122,12 +123,14 @@ Schemaic made for it, and nothing here is a credential. The walk itself is
 `copilot::sweep` calls it over its own two kinds, the recursive-removal argument carrying over
 unchanged because what is under a Copilot home was likewise written by Schemaic or by the CLI into
 a directory Schemaic made for it. `cursor::sweep` calls it over `cursor` and `cursor-inline` on
-the same argument — only after its own walk of the user's Cursor directory, described there.
+the same argument — only after its own walk of the user's Cursor directory, described there —
+and `deepseek::sweep` over `deepseek` and `deepseek-inline`, where the overlay is Schemaic's and the
+session logs the CLI's, and the user's credentials file is named by path rather than copied in.
 (The legacy `opencode/` clean-up runs for every kind it is
-given; under a Copilot or Cursor base there is no such directory to find.)
+given; under a Copilot, Cursor or DeepSeek base there is no such directory to find.)
 **`write` returning `None` must refuse the session, and `ai::start_ai_session` does.** This was
 the first harness where a missing config does not fail closed (Cursor is the second, see
-`cursor.rs`): `--agent schemaic` naming an agent that
+`cursor.rs`, and DeepSeek the third, see `deepseek.rs`): `--agent schemaic` naming an agent that
 does not exist leaves the run on OpenCode's own `build` agent, which has `bash`. So there is no
 degraded mode here of the kind the Codex path takes with `codex_isolation_only` — the user gets a
 message saying the assistant is disabled because the file that restricts it could not be written.
