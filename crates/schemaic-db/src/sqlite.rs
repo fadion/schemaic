@@ -394,7 +394,6 @@ fn value_of(raw: ValueRef<'_>) -> Value {
 /// SQLite genuinely does not assign a type to `count(*)` until it has run.
 fn columns_of(stmt: &rusqlite::Statement<'_>) -> Vec<Column> {
     stmt.columns()
-        .iter()
         .map(|c| Column {
             name: c.name().to_string(),
             type_name: c.decl_type().unwrap_or_default().to_string(),
@@ -538,7 +537,7 @@ fn attach_origins(
         return;
     }
 
-    for (idx, (col, meta)) in columns.iter_mut().zip(metas.iter()).enumerate() {
+    for (idx, (col, meta)) in columns.iter_mut().zip(metas).enumerate() {
         // All three or nothing: SQLite reports none of them for a column that is
         // an expression, a literal or an aggregate, which is exactly the set that
         // belongs to no base column.

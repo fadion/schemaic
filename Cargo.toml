@@ -120,7 +120,7 @@ futures-util = "0.3"
 # The driver is *blocking*, so every call runs inside `spawn_blocking`; that
 # suits the one-connection-per-operation invariant, which already opens and
 # closes a connection per call.
-rusqlite = { version = "0.40", features = [
+rusqlite = { version = "0.41", features = [
     "bundled",
     "column_decltype",
     "column_metadata",
