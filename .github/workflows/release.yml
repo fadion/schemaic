@@ -160,7 +160,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
+      # **Restore only, never save.** A tag run saves its cache under its own tag
+      # ref, which no later tag can read, so the ~3.2 GB a release saved was dead
+      # weight that pushed `main`'s caches past the repository's 10 GB limit.
+      # The restore is kept for the day `main` holds a `release` cache to find.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: false
 
       # Linux: build against an older glibc (2.31 = Ubuntu 20.04 / Debian 11) with
       # cargo-zigbuild, so the binary runs on distros older than the CI runner
