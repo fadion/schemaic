@@ -394,3 +394,8 @@ floem = { path = "vendor/floem" }
 # **tiberius 0.13.0, vendored and patched**, on the same terms as Floem above —
 # `vendor/tiberius/PATCHES.md` lists every change.
 tiberius = { path = "vendor/tiberius" }
+# **objc2 0.4.1, vendored and patched** — the macOS-only dependency of Floem's
+# winit fork (via icrate), which Rust 1.100 no longer compiles;
+# `vendor/objc2/PATCHES.md` says what changed. Only the 0.4 line is patched:
+# a newer objc2 elsewhere in the tree still comes from crates.io.
+objc2 = { path = "vendor/objc2" }
