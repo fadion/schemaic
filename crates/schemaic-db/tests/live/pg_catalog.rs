@@ -507,7 +507,7 @@ async fn server_function_names() -> Vec<String> {
     let names: Vec<String> = (0..rs.row_count())
         .filter_map(|r| rs.cell(r, 0).map(|c| c.text().to_ascii_lowercase()))
         .collect();
-    // The row cap is 10,000 and PostgreSQL 16 answers with 2,682, so a truncated
+    // The row cap is 10,000 and PostgreSQL 16 answers with about 2,700, so a truncated
     // result is not the worry — an *empty* one is. A query that returned nothing
     // would pass `every_function_the_server_reports_is_in_the_catalog`
     // vacuously, which is the decoration this tier exists to avoid.

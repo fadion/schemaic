@@ -50,7 +50,10 @@
 //! `live::pg_catalog::every_generated_cell_is_what_the_recipe_produces` rebuilds
 //! all three from the server and compares, so the instruction above is now safe
 //! to follow: measured at PostgreSQL 16.15, **0 deviations across all 2,682
-//! generated entries in either direction**.
+//! generated entries in either direction**. 16.16 added one function,
+//! `binary_upgrade_set_next_attribute_versions` (upstream commit `0c8ffa1ad2`),
+//! which CI's `postgres:16` image reported before the local server had it; its
+//! entry was written from `pg_proc.dat` by the three rules, which makes 2,683.
 //!
 //! **The snapshot is one version's, and nothing here notices a newer server.**
 //! These are 16.15's rows, used for whatever server is connected, so a function
@@ -662,6 +665,11 @@ pub const PG_FUNCTIONS: &[SqlFunction] = &[
         "binary_upgrade_set_next_array_pg_type_oid",
         "binary_upgrade_set_next_array_pg_type_oid(oid)",
         "For use by pg_upgrade",
+    ),
+    f(
+        "binary_upgrade_set_next_attribute_versions",
+        "binary_upgrade_set_next_attribute_versions(pg_lsn[])",
+        "For use by pg_upgrade (per-attribute versions)",
     ),
     f(
         "binary_upgrade_set_next_heap_pg_class_oid",
@@ -11182,7 +11190,7 @@ pub const PG_FUNCTIONS: &[SqlFunction] = &[
 /// `coalesce`, `cast`, `trim`, `greatest` and `least` — the most typed names
 /// there are.
 ///
-/// 863 names of PostgreSQL 16.15's 2,706. **Sorted**, because
+/// 863 names of PostgreSQL 16.15's 2,706, and 16.16's one addition. **Sorted**, because
 /// [`is_suggested`] binary-searches it, and a test asserts the sort rather than
 /// trusting the generator.
 pub const PG_SUGGESTED: &[&str] = &[
@@ -11226,6 +11234,7 @@ pub const PG_SUGGESTED: &[&str] = &[
     "binary_upgrade_create_empty_extension",
     "binary_upgrade_set_missing_value",
     "binary_upgrade_set_next_array_pg_type_oid",
+    "binary_upgrade_set_next_attribute_versions",
     "binary_upgrade_set_next_heap_pg_class_oid",
     "binary_upgrade_set_next_heap_relfilenode",
     "binary_upgrade_set_next_index_pg_class_oid",
