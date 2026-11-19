@@ -167,6 +167,13 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: false
+      # **DuckDB's C++ from `main`'s sccache.** A tag run can read caches saved
+      # from the default branch, and the dev profile builds dependencies at the
+      # release profile's `opt-level` and `debug`, so CMake should invoke the
+      # compiler identically and the release can reuse the objects CI compiled.
+      # Linux is the expected exception: zigbuild compiles with `zig cc`, not
+      # CI's gcc, so its objects are its own.
+      - uses: ./.github/actions/sccache-cpp
 
       # Linux: build against an older glibc (2.31 = Ubuntu 20.04 / Debian 11) with
       # cargo-zigbuild, so the binary runs on distros older than the CI runner

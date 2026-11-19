@@ -1,0 +1,45 @@
+name: sccache for DuckDB's C++
+description: >-
+  Route the bundled DuckDB's C and C++ compiles through sccache with the GitHub
+  Actions cache backend, so a cold Rust build (a new rustc, an evicted cache, a
+  tag) reuses the objects an earlier run compiled.
+
+# **Only the C/C++ compiles, never rustc.** `libduckdb-sys` builds DuckDB through
+# CMake and forwards `CMAKE_C_COMPILER_LAUNCHER` / `CMAKE_CXX_COMPILER_LAUNCHER`
+# to it, so setting those two wraps exactly DuckDB's compiler calls. Rust stays
+# with rust-cache: wrapping rustc too (`RUSTC_WRAPPER`) would store every crate a
+# second time in the repository's 10 GB of cache, where rust-cache already keeps
+# `target/`.
+#
+# **Windows needs Ninja and the MSVC environment.** CMake ignores a compiler
+# launcher under its default Visual Studio generator. `libduckdb-sys` switches to
+# Ninja by itself when `ninja` is on PATH, and the developer environment puts
+# Visual Studio's bundled Ninja and `cl` there; the step after it fails the job
+# if it did not, rather than letting the launcher be silently ignored.
+
+runs:
+  using: composite
+  steps:
+    - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      with:
+        version: v0.19.0
+    - name: Point CMake's compiler launchers at sccache
+      shell: bash
+      run: |
+        {
+          echo "SCCACHE_GHA_ENABLED=true"
+          echo "CMAKE_C_COMPILER_LAUNCHER=sccache"
+          echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache"
+        } >> "$GITHUB_ENV"
+    - name: MSVC developer environment (Windows)
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+    - name: Require Ninja (Windows)
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        if ! command -v ninja >/dev/null; then
+          echo "::error::ninja is not on PATH, so CMake would use the Visual Studio generator and ignore the sccache launcher"
+          exit 1
+        fi
+        ninja --version

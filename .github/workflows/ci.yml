@@ -61,6 +61,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # DuckDB's C++ through sccache, here and in the two jobs below — see the
+      # action for why only the C/C++ compiles and not rustc.
+      - uses: ./.github/actions/sccache-cpp
       - name: Formatting
         run: cargo fmt --all -- --check
       # `--features schemaic-db/live-tests` is what compiles the live engine
@@ -140,6 +143,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/sccache-cpp
       # The lint job runs on Linux, where `#[cfg(windows)]` and
       # `#[cfg(target_os = "macos")]` code is never compiled — so clippy had
       # never seen it: Windows-only code was linted only when someone happened
@@ -265,6 +269,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/sccache-cpp
       # **Contained database authentication on**, so SQL Server's contained-user
       # round trip runs rather than reporting itself skipped. It is a server-wide
       # setting, which is why the test only reads it and this step — on a
