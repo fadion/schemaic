@@ -212,16 +212,42 @@ never builds the `release` profile, so a release finds nothing to restore. (`rel
 longer saves at all, and `ci.yml` saves from `main` only, which keeps the repository's 10 GB of
 cache for the caches CI actually restores. The workflow comments say why.)
 
-### Plan
+The first cold run after a new `rustc` costs more than the table: Rust 1.100's first run on
+`main` took an hour.
 
-- **Share the C++ object files through sccache**, with its GitHub Actions cache backend,
-   wrapping the C and C++ compilers (`CC`/`CXX`) rather than only `rustc`. The point is reuse
-   *across profiles*: `[profile.dev.package."*"]` already builds dependencies at `opt-level = 3`
-   with `debug = false`, the same as `release`, so the `cc` crate should invoke the compiler
-   identically for CI's debug build and the release build. A release could then pick up the
-   objects `main`'s CI compiled. **Measure before relying on it:** check sccache's hit rate on a
-   release run after a `main` run, on all three OSes. The objects would go in the same 10 GB, so
-  check the total stays under it.
+### Status: parked, with one open recommendation
+
+**The plan this section used to hold doesn't work, and an attempt at it was closed unmerged.**
+It was to share DuckDB's object files through sccache, with its GitHub Actions cache backend,
+so a release could reuse what `main`'s CI compiled. It rested on `[profile.dev.package."*"]`
+building dependencies at `opt-level = 3` with `debug = false`, the same as `release`, so the
+compiler would be invoked identically. Two facts sink it:
+
+- **`bundled` compiles DuckDB with the `cc` crate, not CMake.** CMake is `libduckdb-sys`'s other
+  route, behind its `bundled-cmake` feature, and is what forwards
+  `CMAKE_C_COMPILER_LAUNCHER`/`CMAKE_CXX_COMPILER_LAUNCHER`. Under `bundled` those two variables do
+  nothing. The `cc` route is wrapped through `CXX` (`sccache cl`, `sccache c++`) or
+  `RUSTC_WRAPPER`, and the second also wraps every Rust crate.
+- **Even wrapped, the `cc` route misses where it matters.** It unpacks DuckDB's sources into the
+  build script's `OUT_DIR` and compiles them from there. That path carries a hash that changes
+  with the profile (dev vs release) and with the `rustc` version, and the paths go into
+  sccache's key. `SCCACHE_BASEDIRS` strips only a fixed prefix, and the hash sits below it. So a
+  release would miss CI's objects every time, and so would the first build after a new `rustc`.
+  Those are the only two cases rust-cache doesn't already cover.
+
+**Open recommendation: `bundled-cmake` plus sccache.** CMake compiles from the crate's own
+`duckdb-sources` directory in the cargo registry, a path that is the same across profiles and
+`rustc` versions. That makes cross-profile hits plausible, though nobody has measured them. It
+changes how DuckDB is built everywhere, not only in CI:
+
+- CMake becomes a build requirement on every machine, contributors' included.
+- jemalloc is on by default on Linux (`DUCKDB_DISABLE_JEMALLOC` turns it off).
+- Extensions are configured differently.
+- The Linux zigbuild release has to work through CMake.
+
+Weigh those before trying it. Then measure on a branch: a cold dev build followed by a cold
+`--release` build of `schemaic-db` with rust-cache off, comparing sccache's stats, on all three
+OSes. The objects go in the same 10 GB of cache, so check the total stays under it.
 
 ### Non-goals
 
@@ -234,9 +260,22 @@ cache for the caches CI actually restores. The workflow comments say why.)
 
 ### Traps
 
+- **Check which route `libduckdb-sys` takes before wrapping anything.** Its features choose
+  between `build_bundled_cc.rs` and `build_bundled_cmake.rs`, and a variable the other one reads
+  is silently ignored. Reading the CMake route while the workspace used `cc` is how the last
+  attempt went wrong.
+- **`libduckdb-sys`'s `cc` build script can't re-run over a restored `OUT_DIR`.** Unpacking its
+  sources panics with "directory is not empty". Anything that makes the script re-run on a cache
+  restored from `main` triggers it, for example a change to an environment variable it watches
+  (`CXX`, or the MSVC developer environment's variables). Change rust-cache's `key` in the same
+  change, so the first run after it starts cold instead of failing.
+- **On Windows, bash steps find Git's `link.exe` before MSVC's** once the MSVC developer
+  environment is loaded, and Rust's linking fails. Steps that run cargo there belong in the
+  default PowerShell shell.
 - **The Linux release links through `cargo zigbuild`** (glibc 2.31), so it compiles with
-  `zig cc` rather than CI's `gcc`. sccache will miss on it unless the compiler it wraps is the
-  same, so Linux may stay cold even if phase 2 works on Windows and macOS.
+  `zig cc` rather than CI's `gcc`. zigbuild also sets its own target-specific `CC`/`CXX`, which
+  take precedence over a generic one, so sccache will miss on it, or not be used at all, unless
+  the compiler it wraps is the same. Linux may stay cold even if Windows and macOS hit.
 - **Check sccache's hit rate, not the wall-clock time.** A run that took less time may just have
   landed on a faster runner.
 
