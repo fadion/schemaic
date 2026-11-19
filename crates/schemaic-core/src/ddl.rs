@@ -15850,10 +15850,7 @@ fn sqlite_native_add(column: &ColumnInfo, position: Option<&Position>) -> bool {
     {
         return false;
     }
-    if !column.nullable && !default.is_some_and(|d| !d.eq_ignore_ascii_case("NULL")) {
-        return false;
-    }
-    true
+    column.nullable || default.is_some_and(|d| !d.eq_ignore_ascii_case("NULL"))
 }
 
 /// Is `default` a *constant* in SQLite's sense — something `ADD COLUMN` will
