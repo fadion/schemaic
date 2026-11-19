@@ -82,6 +82,29 @@ ignore = [
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
     "RUSTSEC-2026-0429",
+    # `zip` < 9.0 again, on the same zip 8 under rust_xlsxwriter and velopack:
+    # AES entries returned without checking their MAC (-0545), `extract`
+    # escaping the destination through symlinks (-0546), the legacy Shrink/
+    # Reduce/Implode decoders preallocating a declared size (-0547), and
+    # `ZipStreamReader` naming entries by their local header (-0548, fixed in
+    # 9.0.5; the workspace's zip 9 is past that). Unreachable here: -0545 needs
+    # zip's `aes-crypto` feature and -0547 its `legacy-zip`, and neither is on
+    # (`cargo tree -i zip@8.6.0 -e features`); -0546 is `extract`, which
+    # nothing calls; and nothing uses `ZipStreamReader` (velopack's `bundle`
+    # opens a `ZipArchive` in memory and reads entries). velopack's newest
+    # release, 1.2.161, still asks for `zip` ^8.6, which is what keeps 8 in the
+    # tree. Remove these with the four above.
+    "RUSTSEC-2026-0545",
+    "RUSTSEC-2026-0546",
+    "RUSTSEC-2026-0547",
+    "RUSTSEC-2026-0548",
+    # `chrono` is unmaintained (an informational advisory, with no patched
+    # version). It is flagged because core and db name it directly
+    # (`unmaintained = "workspace"`), but arrow (under DuckDB) and russh-util
+    # pull it too, so replacing our own use with `jiff` or `time` would not take
+    # it out of the tree. Remove this when the workspace stops depending on it
+    # directly.
+    "RUSTSEC-2026-0543",
 ]
 
 [bans]
