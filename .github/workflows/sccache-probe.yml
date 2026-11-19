@@ -1,0 +1,66 @@
+name: sccache probe (temporary)
+
+# **Delete before merging.** Measures the one thing docs/roadmap.md says to
+# measure before relying on sccache: whether a cold `--release` build reuses the
+# DuckDB objects a dev build compiled. No rust-cache here on purpose, so DuckDB
+# is compiled every time and the sccache stats are the whole answer. Read the
+# hit rate in each "stats" step, not the wall-clock time.
+on:
+  pull_request:
+
+concurrency:
+  group: sccache-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  probe:
+    name: Probe (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: ./.github/actions/sccache-cpp
+      - name: Dev build (fills sccache)
+        shell: bash
+        run: |
+          sccache --zero-stats
+          cargo build -p schemaic-db
+      - name: Stats after the dev build
+        shell: bash
+        run: sccache --show-stats
+      - name: Release build (should hit)
+        shell: bash
+        run: |
+          sccache --zero-stats
+          cargo build --release -p schemaic-db
+      - name: Stats after the release build
+        shell: bash
+        run: sccache --show-stats
+      - name: Install Zig (Linux)
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.13.0
+      - name: Install cargo-zigbuild (Linux)
+        if: runner.os == 'Linux'
+        run: cargo install --locked cargo-zigbuild
+      - name: Zigbuild release (Linux, expected to miss)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sccache --zero-stats
+          cargo zigbuild --release -p schemaic-db --target x86_64-unknown-linux-gnu.2.31
+      - name: Stats after the zigbuild
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sccache --show-stats
