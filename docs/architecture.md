@@ -1,13 +1,14 @@
 # Schemaic — architecture
 
 A native SQL editor (Rust + [Floem](https://github.com/lapce/floem) 0.2.0), MySQL/MariaDB-first,
-Zed-inspired, aiming to replace DataGrip. PostgreSQL and SQLite are wired too; SQLite is
+Zed-inspired, aiming to replace DataGrip. It has five engines: MySQL/MariaDB, PostgreSQL and
+Microsoft SQL Server are full, and DuckDB and SQLite are embedded. SQLite is
 read/write and edits **tables** (through the twelve-step rebuild), **views** and **triggers**, but
 has no manual-transaction mode — see `db::session`'s `Session::open` for what that one is a
-statement about. All three engines now edit all three of those objects, and they get there
+statement about. Every engine edits those objects, and they get there
 differently, so ask the *narrow* capability (`ddl::supports_or_replace_view`,
-`ddl::supports_view_rename`) rather than the engine. **Microsoft SQL Server is a fourth, and a
-full one, as MySQL/MariaDB and PostgreSQL are**: it connects, reads, validates, introspects, runs
+`ddl::supports_view_rename`) rather than the engine. **Microsoft SQL Server is full, as
+MySQL/MariaDB and PostgreSQL are**: it connects, reads, validates, introspects, runs
 scripts, writes the grid's edits back, imports a file into a table, designs tables, edits views,
 triggers and stored routines, drops a table, view or routine, holds a Manual tab's transaction,
 shows a query plan, dumps a database to a `.sql` file, creates and drops a database or a schema
@@ -16,7 +17,7 @@ sequences, alias types, synonyms and XML schema collections are browsed in the s
 created and edited in the object editor, dropped from their rows and compared. What it does not do
 yet is named rather than left to a label, under `db::mssql`; the last index kinds on that list, a
 selective XML index and an ordered columnstore one, are read, restated and authored now.
-**DuckDB is a fifth, embedded like SQLite**: it connects to a file, reads,
+**DuckDB is embedded, like SQLite**: it connects to a file, reads,
 introspects, runs scripts and DDL plans, shows a plan, backs the file up, writes grid edits back,
 imports, dumps, holds a Manual tab's transaction, designs tables and edits views and macros,
 creates and drops schemas, compares two files' schemas and applies the plan, and
